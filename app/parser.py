@@ -64,40 +64,46 @@ class Lift:
     weight_kg: float
     bodyweight_add: bool = False   # True if weight is added on top of bodyweight
     raw: str = ""                  # original line for reference
+    # True when the weight was extracted with an explicit unit (kg / plates /
+    # BW+) rather than a bare number. Used to decide whether a single-line
+    # message is confident enough to auto-store.
+    confident: bool = False
 
 
-def _extract_weight(value: str) -> tuple[float | None, bool]:
-    """Extract (weight_kg, bodyweight_add_flag) from the right-hand-side text.
+def _extract_weight(value: str) -> tuple[float | None, bool, bool]:
+    """Extract (weight_kg, bodyweight_add_flag, confident) from the RHS text.
 
-    Returns (None, False) if no usable number is found.
+    ``confident`` is True when the input used an explicit unit (kg / plates /
+    BW / BW+), False for bare numbers with no unit.
+    Returns (None, False, False) if no usable number is found.
     """
     v = value.strip()
     if not v:
-        return None, False
+        return None, False, False
 
     # BW+20kg
     m = _BW_PLUS_RE.search(v)
     if m:
-        return float(m.group(1)), True
+        return float(m.group(1)), True, True
 
     # "50 - 77 kg" range -> take the higher end (represents top working weight)
     m = _RANGE_RE.search(v)
     if m:
-        return max(float(m.group(1)), float(m.group(2))), False
+        return max(float(m.group(1)), float(m.group(2))), False, True
 
     # "6 plates" / "3.5 plates"
     m = _PLATES_RE.search(v)
     if m:
-        return float(m.group(1)) * PLATE_KG, False
+        return float(m.group(1)) * PLATE_KG, False, True
 
     # explicit "Xkg"
     m = _KG_RE.search(v)
     if m:
-        return float(m.group(1)), False
+        return float(m.group(1)), False, True
 
     # "BW" alone -> bodyweight, weight 0
     if _BW_RE.search(v) and not _BARE_NUM_RE.search(v):
-        return 0.0, True
+        return 0.0, True, True
 
     # bare number with no unit (e.g. "Incline bench 70")
     m = _BARE_NUM_RE.search(v)
@@ -105,9 +111,9 @@ def _extract_weight(value: str) -> tuple[float | None, bool]:
         n = float(m.group(1))
         # Sanity filter: ignore tiny numbers that are likely rep counts.
         if n >= 5:
-            return n, False
+            return n, False, False
 
-    return None, False
+    return None, False, False
 
 
 def _looks_like_equipment(label: str) -> bool:
@@ -167,7 +173,7 @@ def parse_message(text: str) -> list[Lift]:
         if not _looks_like_equipment(label):
             continue
 
-        weight, bw_flag = _extract_weight(value)
+        weight, bw_flag, confident = _extract_weight(value)
         if weight is None:
             continue
 
@@ -179,6 +185,7 @@ def parse_message(text: str) -> list[Lift]:
             continue
         seen.add(canon)
         lifts.append(Lift(equipment=canon, weight_kg=weight,
-                          bodyweight_add=bw_flag, raw=line))
+                          bodyweight_add=bw_flag, raw=line,
+                          confident=confident))
 
     return lifts

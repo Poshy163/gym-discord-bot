@@ -128,7 +128,9 @@ async def _backfill_channel(
             continue
         scanned += 1
         lifts = parse_message(msg.content)
-        if len(lifts) < MIN_LIFTS_FOR_AUTO:
+        if not lifts:
+            continue
+        if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(l.confident for l in lifts):
             continue
         n = await _store_lifts(msg, lifts)
         if n:
@@ -168,7 +170,14 @@ async def on_message(message: discord.Message) -> None:
         return
 
     lifts = parse_message(message.content)
-    if len(lifts) >= MIN_LIFTS_FOR_AUTO:
+    # Auto-store when either:
+    #  * the message is a clear "stats dump" (>= MIN_LIFTS_FOR_AUTO lifts), or
+    #  * at least one lift was parsed with an explicit unit (kg / plates / BW+),
+    #    which is a strong enough signal on its own (e.g. "Bench 100kg today").
+    should_store = len(lifts) >= MIN_LIFTS_FOR_AUTO or any(
+        l.confident for l in lifts
+    )
+    if lifts and should_store:
         inserted = await _store_lifts(message, lifts)
         if inserted > 0:
             try:
