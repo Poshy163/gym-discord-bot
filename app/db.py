@@ -173,6 +173,67 @@ class Database:
                 (guild_id,),
             )]
 
+    def delete_equipment(self, guild_id: int, equipment: str) -> int:
+        """Delete every row for a given equipment name in a guild. Returns
+        the number of rows removed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM lifts WHERE guild_id = ? AND equipment = ?",
+                (guild_id, equipment),
+            )
+            return cur.rowcount or 0
+
+    def rename_equipment(
+        self, guild_id: int, src: str, dst: str
+    ) -> int:
+        """Re-label every row from equipment=src to equipment=dst. Returns
+        the number of rows affected. The unique (message_id, equipment) index
+        is respected: if the destination already exists for a given message,
+        the duplicate source row is dropped instead of renamed."""
+        with self._conn() as c:
+            # Remove rows that would collide with the dedupe index after rename.
+            c.execute(
+                """
+                DELETE FROM lifts
+                WHERE guild_id = ? AND equipment = ?
+                  AND message_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM lifts b
+                      WHERE b.guild_id = lifts.guild_id
+                        AND b.message_id = lifts.message_id
+                        AND b.equipment = ?
+                  )
+                """,
+                (guild_id, src, dst),
+            )
+            cur = c.execute(
+                "UPDATE lifts SET equipment = ? WHERE guild_id = ? AND equipment = ?",
+                (dst, guild_id, src),
+            )
+            return cur.rowcount or 0
+
+    def delete_entry(
+        self,
+        guild_id: int,
+        equipment: str,
+        date: str,
+        user_id: int | None = None,
+    ) -> int:
+        """Delete entries matching equipment + YYYY-MM-DD date, optionally
+        scoped to a specific user. Returns rows deleted."""
+        sql = (
+            "DELETE FROM lifts "
+            "WHERE guild_id = ? AND equipment = ? "
+            "AND substr(logged_at, 1, 10) = ?"
+        )
+        params: list[object] = [guild_id, equipment, date]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        with self._conn() as c:
+            cur = c.execute(sql, params)
+            return cur.rowcount or 0
+
     def history(
         self, guild_id: int, user_id: int, equipment: str, limit: int = 25
     ) -> list[sqlite3.Row]:
@@ -203,6 +264,100 @@ class Database:
                 LIMIT ?
                 """,
                 (guild_id, equipment, limit),
+            ))
+
+    def user_summary(self, guild_id: int, user_id: int) -> dict | None:
+        """High-level counters for a user. Returns None if they have no lifts."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COUNT(*)                          AS total_lifts,
+                       COUNT(DISTINCT equipment)         AS unique_equip,
+                       COUNT(DISTINCT message_id)        AS sessions,
+                       MIN(logged_at)                    AS first_at,
+                       MAX(logged_at)                    AS last_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if not row or row["total_lifts"] == 0:
+                return None
+            return dict(row)
+
+    def user_top_prs(
+        self, guild_id: int, user_id: int, limit: int = 5
+    ) -> list[sqlite3.Row]:
+        """Heaviest (by weight) personal bests for the user, ignoring BW-only."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT equipment,
+                       MAX(weight_kg) AS best,
+                       MAX(bodyweight_add) AS bw
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                GROUP BY equipment
+                ORDER BY best DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, limit),
+            ))
+
+    def user_most_trained(
+        self, guild_id: int, user_id: int, limit: int = 5
+    ) -> list[sqlite3.Row]:
+        """Equipment the user logs most often."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT equipment, COUNT(*) AS n
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                GROUP BY equipment
+                ORDER BY n DESC, equipment
+                LIMIT ?
+                """,
+                (guild_id, user_id, limit),
+            ))
+
+    def user_biggest_gains(
+        self, guild_id: int, user_id: int, limit: int = 5
+    ) -> list[sqlite3.Row]:
+        """Largest (latest - first) weight difference per equipment,
+        restricted to equipment the user has logged at least twice."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                WITH firsts AS (
+                    SELECT equipment,
+                           weight_kg AS first_w,
+                           logged_at AS first_at,
+                           ROW_NUMBER() OVER (PARTITION BY equipment
+                                              ORDER BY logged_at ASC) AS rn
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ?
+                ),
+                lasts AS (
+                    SELECT equipment,
+                           weight_kg AS last_w,
+                           logged_at AS last_at,
+                           ROW_NUMBER() OVER (PARTITION BY equipment
+                                              ORDER BY logged_at DESC) AS rn
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ?
+                )
+                SELECT f.equipment,
+                       f.first_w, f.first_at,
+                       l.last_w,  l.last_at,
+                       (l.last_w - f.first_w) AS delta
+                FROM firsts f JOIN lasts l USING (equipment)
+                WHERE f.rn = 1 AND l.rn = 1
+                  AND f.first_at <> l.last_at
+                ORDER BY delta DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, guild_id, user_id, limit),
             ))
 
     def recent_user_equipment(

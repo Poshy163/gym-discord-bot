@@ -22,6 +22,17 @@ from .aliases import canonicalize
 from .aliases import _ALIAS_GROUPS as _AG  # noqa: PLC2701  (internal use)
 _KNOWN_CANONICALS: set[str] = set(_AG.keys())
 
+# All alias phrases (canonical + aliases) as lowercase strings, sorted longest
+# first so "leg press" matches before "press" when scanning free-form text.
+_ALL_ALIAS_PHRASES: list[str] = sorted(
+    {p.lower() for canon, aliases in _AG.items() for p in (canon, *aliases)},
+    key=lambda s: (-len(s), s),
+)
+_FREEFORM_ALIAS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(p) for p in _ALL_ALIAS_PHRASES) + r")\b",
+    re.IGNORECASE,
+)
+
 # Assumed plate weight in kg (standard Olympic plate per side).
 PLATE_KG = 20.0
 
@@ -130,6 +141,37 @@ def _looks_like_equipment(label: str) -> bool:
     return True
 
 
+def _freeform_match(line: str) -> tuple[str, float, bool] | None:
+    """Scan a free-form sentence for (equipment, weight_kg, bodyweight_add).
+
+    Returns None unless the line contains both a known equipment phrase and
+    a weight carrying an explicit unit. Avoids false positives from casual
+    chat.
+    """
+    m = _FREEFORM_ALIAS_RE.search(line)
+    if not m:
+        return None
+    canon = canonicalize(m.group(1))
+    if canon not in _KNOWN_CANONICALS:
+        return None
+
+    # Only accept weights with an explicit unit in free-form — bare numbers
+    # are too ambiguous in a sentence.
+    bw_plus = _BW_PLUS_RE.search(line)
+    if bw_plus:
+        return canon, float(bw_plus.group(1)), True
+    rng = _RANGE_RE.search(line)
+    if rng:
+        return canon, max(float(rng.group(1)), float(rng.group(2))), False
+    plates = _PLATES_RE.search(line)
+    if plates:
+        return canon, float(plates.group(1)) * PLATE_KG, False
+    kg = _KG_RE.search(line)
+    if kg:
+        return canon, float(kg.group(1)), False
+    return None
+
+
 def parse_message(text: str) -> list[Lift]:
     """Parse a whole message and return any lifts detected."""
     lifts: list[Lift] = []
@@ -149,7 +191,12 @@ def parse_message(text: str) -> list[Lift]:
 
         label: str | None = None
         value: str | None = None
-        require_known = False  # when no unit, only accept known equipment
+        # For non-colon lines we always require the label to be a known
+        # exercise. Without a colon, there's no reliable cue where the label
+        # ends, so "i did 46kg on the leg curl" would otherwise be stored as
+        # equipment="i did". Colon-separated lines remain free-form because the
+        # writer explicitly said "<thing>: <value>".
+        require_known = False
 
         m = _COLON_RE.match(line)
         if m:
@@ -162,13 +209,21 @@ def parse_message(text: str) -> list[Lift]:
             if m2:
                 label = m2.group(1).strip()
                 value = m2.group(2).strip()
-                if not (_KG_RE.search(value) or _PLATES_RE.search(value)
-                        or _BW_PLUS_RE.search(value)):
-                    # No explicit unit — require the label to be a recognised
-                    # exercise so we don't mis-parse random chatter.
-                    require_known = True
+                require_known = True
 
         if not label or value is None:
+            # Free-form fallback: if the line contains a weight AND any known
+            # equipment name as a phrase, pair them. Handles casual messages
+            # like "i did 46kg on the leg curl" or "hit bench press 100kg today".
+            fb = _freeform_match(line)
+            if fb is not None:
+                canon_fb, weight_fb, bw_fb = fb
+                if canon_fb not in seen:
+                    seen.add(canon_fb)
+                    lifts.append(Lift(
+                        equipment=canon_fb, weight_kg=weight_fb,
+                        bodyweight_add=bw_fb, raw=line, confident=True,
+                    ))
             continue
         if not _looks_like_equipment(label):
             continue
@@ -179,6 +234,16 @@ def parse_message(text: str) -> list[Lift]:
 
         canon = canonicalize(label)
         if require_known and canon not in _KNOWN_CANONICALS:
+            # Try the free-form fallback on this line before giving up.
+            fb = _freeform_match(line)
+            if fb is not None:
+                canon_fb, weight_fb, bw_fb = fb
+                if canon_fb not in seen:
+                    seen.add(canon_fb)
+                    lifts.append(Lift(
+                        equipment=canon_fb, weight_kg=weight_fb,
+                        bodyweight_add=bw_fb, raw=line, confident=True,
+                    ))
             continue
         if not canon or canon in seen:
             # Skip duplicate equipment within the same message (keep first).

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import discord
@@ -502,6 +503,104 @@ async def backfill_cmd(
     )
 
 
+@bot.tree.command(
+    name="purge",
+    description="Admin: delete every row for a specific equipment name.",
+)
+@app_commands.describe(
+    equipment="Equipment name to remove (use the exact stored name)",
+)
+async def purge_cmd(
+    interaction: discord.Interaction, equipment: str
+) -> None:
+    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
+    if not perms.manage_messages:
+        await interaction.response.send_message(
+            "You need Manage Messages to purge data.", ephemeral=True
+        )
+        return
+    canon = canonicalize(equipment)
+    n = db.delete_equipment(interaction.guild_id or 0, canon)
+    await interaction.response.send_message(
+        f"Removed {n} row(s) for `{canon}`.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="rename",
+    description="Admin: merge every row from one equipment name into another.",
+)
+@app_commands.describe(
+    old="The current (bad / misparsed) equipment name.",
+    new="The correct equipment to merge the rows into.",
+)
+async def rename_cmd(
+    interaction: discord.Interaction,
+    old: str,
+    new: str,
+) -> None:
+    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
+    if not perms.manage_messages:
+        await interaction.response.send_message(
+            "You need Manage Messages to rename data.", ephemeral=True
+        )
+        return
+
+    src = canonicalize(old)
+    dst = canonicalize(new)
+    if src == dst:
+        await interaction.response.send_message(
+            "Source and destination are the same after canonicalization.",
+            ephemeral=True,
+        )
+        return
+    n = db.rename_equipment(interaction.guild_id or 0, src, dst)
+    await interaction.response.send_message(
+        f"Re-labelled {n} row(s): `{src}` → `{dst}`.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="delete_entry",
+    description="Delete one day's entries for a lift (yours by default).",
+)
+@app_commands.describe(
+    equipment="Equipment / lift name",
+    date="Date of the entry to remove (YYYY-MM-DD)",
+    user="Target user (admin only; defaults to you).",
+)
+async def delete_entry_cmd(
+    interaction: discord.Interaction,
+    equipment: str,
+    date: str,
+    user: discord.Member | None = None,
+) -> None:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        await interaction.response.send_message(
+            "`date` must be in YYYY-MM-DD format.", ephemeral=True
+        )
+        return
+
+    target = user or interaction.user
+    if user is not None and user.id != interaction.user.id:
+        perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
+        if not perms.manage_messages:
+            await interaction.response.send_message(
+                "You need Manage Messages to delete someone else's entry.",
+                ephemeral=True,
+            )
+            return
+
+    canon = canonicalize(equipment)
+    n = db.delete_entry(
+        interaction.guild_id or 0, canon, date, user_id=target.id
+    )
+    await interaction.response.send_message(
+        f"Deleted {n} entry(ies) for {target.display_name} — `{canon}` on {date}.",
+        ephemeral=True,
+    )
+
+
 # ---- autocomplete for equipment names ------------------------------------
 
 
@@ -520,6 +619,10 @@ leaderboard_cmd.autocomplete("equipment")(_equipment_autocomplete)
 log_cmd.autocomplete("equipment")(_equipment_autocomplete)
 history_cmd.autocomplete("equipment")(_equipment_autocomplete)
 machine_cmd.autocomplete("equipment")(_equipment_autocomplete)
+purge_cmd.autocomplete("equipment")(_equipment_autocomplete)
+rename_cmd.autocomplete("old")(_equipment_autocomplete)
+rename_cmd.autocomplete("new")(_equipment_autocomplete)
+delete_entry_cmd.autocomplete("equipment")(_equipment_autocomplete)
 
 
 def main() -> None:
