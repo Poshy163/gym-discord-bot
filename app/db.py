@@ -100,48 +100,66 @@ class Database:
         return inserted
 
     def personal_bests(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
+        # For each equipment, pick the row with the highest weight_kg, and
+        # return the date that PR was set on (earliest date at that weight).
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT equipment,
-                       MAX(weight_kg) AS best,
-                       MAX(bodyweight_add) AS bw
-                FROM lifts
-                WHERE guild_id = ? AND user_id = ?
-                GROUP BY equipment
-                ORDER BY equipment
+                SELECT l.equipment,
+                       l.weight_kg    AS best,
+                       l.bodyweight_add AS bw,
+                       MIN(l.logged_at) AS set_on
+                FROM lifts l
+                JOIN (
+                    SELECT equipment, MAX(weight_kg) AS mx
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ?
+                    GROUP BY equipment
+                ) m ON m.equipment = l.equipment AND m.mx = l.weight_kg
+                WHERE l.guild_id = ? AND l.user_id = ?
+                GROUP BY l.equipment
+                ORDER BY l.equipment
                 """,
-                (guild_id, user_id),
+                (guild_id, user_id, guild_id, user_id),
             ))
 
     def leaderboard(self, guild_id: int, equipment: str) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT username,
-                       MAX(weight_kg) AS best,
-                       MAX(bodyweight_add) AS bw
-                FROM lifts
-                WHERE guild_id = ? AND equipment = ?
-                GROUP BY user_id
+                SELECT l.username,
+                       l.weight_kg       AS best,
+                       l.bodyweight_add  AS bw,
+                       MIN(l.logged_at)  AS set_on
+                FROM lifts l
+                JOIN (
+                    SELECT user_id, MAX(weight_kg) AS mx
+                    FROM lifts
+                    WHERE guild_id = ? AND equipment = ?
+                    GROUP BY user_id
+                ) m ON m.user_id = l.user_id AND m.mx = l.weight_kg
+                WHERE l.guild_id = ? AND l.equipment = ?
+                GROUP BY l.user_id
                 ORDER BY best DESC
                 LIMIT 25
                 """,
-                (guild_id, equipment),
+                (guild_id, equipment, guild_id, equipment),
             ))
 
     def progress(
         self, guild_id: int, user_id: int, equipment: str
     ) -> list[sqlite3.Row]:
-        """Best weight per calendar month for a user/equipment."""
+        """Best weight per calendar month for a user/equipment, plus the
+        date within the month the best was achieved."""
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT substr(logged_at, 1, 7) AS month,
-                       MAX(weight_kg)           AS best,
-                       MAX(bodyweight_add)      AS bw
-                FROM lifts
-                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                SELECT substr(l.logged_at, 1, 7) AS month,
+                       MAX(l.weight_kg)          AS best,
+                       MAX(l.bodyweight_add)     AS bw,
+                       MIN(l.logged_at)          AS first_seen
+                FROM lifts l
+                WHERE l.guild_id = ? AND l.user_id = ? AND l.equipment = ?
                 GROUP BY month
                 ORDER BY month
                 """,
@@ -154,6 +172,22 @@ class Database:
                 "SELECT DISTINCT equipment FROM lifts WHERE guild_id = ? ORDER BY equipment",
                 (guild_id,),
             )]
+
+    def history(
+        self, guild_id: int, user_id: int, equipment: str, limit: int = 25
+    ) -> list[sqlite3.Row]:
+        """Chronological per-entry history for one user/equipment."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT weight_kg, bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                ORDER BY logged_at
+                LIMIT ?
+                """,
+                (guild_id, user_id, equipment, limit),
+            ))
 
     def recent_user_equipment(
         self, guild_id: int, user_id: int, limit: int = 25

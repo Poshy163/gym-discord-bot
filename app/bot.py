@@ -64,6 +64,13 @@ def _format_weight(weight: float, bw: bool) -> str:
     return f"{weight:g}kg"
 
 
+def _format_date(iso: str | None) -> str:
+    """Return 'YYYY-MM-DD' from a stored ISO timestamp."""
+    if not iso:
+        return "?"
+    return iso[:10]
+
+
 async def _store_lifts(
     message: discord.Message, lifts: list[Lift]
 ) -> int:
@@ -137,7 +144,11 @@ async def stats_cmd(
 
     lines = [f"**{target.display_name} — personal bests**"]
     for r in rows:
-        lines.append(f"• {r['equipment']}: {_format_weight(r['best'], bool(r['bw']))}")
+        date = _format_date(r["set_on"])
+        lines.append(
+            f"• {r['equipment']}: {_format_weight(r['best'], bool(r['bw']))}"
+            f"  _(set {date})_"
+        )
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -170,7 +181,11 @@ async def progress_cmd(
             d = best - prev
             if d:
                 delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
-        lines.append(f"• {r['month']}: {_format_weight(best, bool(r['bw']))}{delta}")
+        date = _format_date(r["first_seen"])
+        lines.append(
+            f"• {r['month']} (first logged {date}): "
+            f"{_format_weight(best, bool(r['bw']))}{delta}"
+        )
         prev = best
     await interaction.response.send_message("\n".join(lines))
 
@@ -193,8 +208,10 @@ async def leaderboard_cmd(
     medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(rows):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
+        date = _format_date(r["set_on"])
         lines.append(
-            f"{prefix} {r['username']} — {_format_weight(r['best'], bool(r['bw']))}"
+            f"{prefix} {r['username']} — "
+            f"{_format_weight(r['best'], bool(r['bw']))}  _(set {date})_"
         )
     await interaction.response.send_message("\n".join(lines))
 
@@ -240,6 +257,46 @@ async def log_cmd(
 
 
 @bot.tree.command(
+    name="history",
+    description="Timeline of every logged entry for one lift.",
+)
+@app_commands.describe(
+    equipment="Equipment / lift name",
+    user="The user to look up (defaults to you).",
+)
+async def history_cmd(
+    interaction: discord.Interaction,
+    equipment: str,
+    user: discord.Member | None = None,
+) -> None:
+    target = user or interaction.user
+    canon = canonicalize(equipment)
+    guild_id = interaction.guild_id or 0
+    rows = db.history(guild_id, target.id, canon)
+    if not rows:
+        await interaction.response.send_message(
+            f"No {canon} history for {target.display_name}.", ephemeral=True
+        )
+        return
+
+    lines = [f"**{target.display_name} — {canon} timeline**"]
+    prev: float | None = None
+    for r in rows:
+        w = r["weight_kg"]
+        delta = ""
+        if prev is not None:
+            d = w - prev
+            if d:
+                delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
+        lines.append(
+            f"• {_format_date(r['logged_at'])}: "
+            f"{_format_weight(w, bool(r['bw']))}{delta}"
+        )
+        prev = w
+    await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
     name="parse",
     description="Reparse a message by ID in this channel and store detected lifts.",
 )
@@ -267,7 +324,11 @@ async def parse_cmd(
         )
         return
     inserted = await _store_lifts(msg, lifts)
-    lines = [f"Stored {inserted} new lift(s) for {msg.author.display_name}:"]
+    date = _format_date(msg.created_at.isoformat())
+    lines = [
+        f"Stored {inserted} new lift(s) for {msg.author.display_name} "
+        f"_(posted {date})_:"
+    ]
     for l in lifts:
         lines.append(f"• {l.equipment}: {_format_weight(l.weight_kg, l.bodyweight_add)}")
     await interaction.response.send_message("\n".join(lines))
@@ -289,6 +350,15 @@ async def _equipment_autocomplete(
 progress_cmd.autocomplete("equipment")(_equipment_autocomplete)
 leaderboard_cmd.autocomplete("equipment")(_equipment_autocomplete)
 log_cmd.autocomplete("equipment")(_equipment_autocomplete)
+history_cmd.autocomplete("equipment")(_equipment_autocomplete)
+
+
+def main() -> None:
+    bot.run(TOKEN, log_handler=None)
+
+
+if __name__ == "__main__":
+    main()
 
 
 def main() -> None:
