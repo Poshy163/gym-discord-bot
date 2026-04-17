@@ -185,6 +185,26 @@ async def on_message(message: discord.Message) -> None:
                 await message.add_reaction("✅")
             except discord.HTTPException:
                 pass
+            # Reply with a short confirmation so the user can see exactly
+            # what the bot understood from their message.
+            try:
+                if len(lifts) == 1:
+                    l = lifts[0]
+                    reply = (
+                        f"Added **{_format_weight(l.weight_kg, l.bodyweight_add)}** "
+                        f"to **{l.equipment}**."
+                    )
+                else:
+                    lines = [f"Added {inserted} lift(s):"]
+                    for l in lifts:
+                        lines.append(
+                            f"• **{l.equipment}** — "
+                            f"{_format_weight(l.weight_kg, l.bodyweight_add)}"
+                        )
+                    reply = "\n".join(lines)
+                await message.reply(reply, mention_author=False)
+            except discord.HTTPException:
+                pass
             LOG.info(
                 "Stored %d lifts from %s in #%s",
                 inserted, message.author, message.channel,
