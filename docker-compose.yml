@@ -1,0 +1,13 @@
+services:
+  gym-bot:
+    build: .
+    image: gym-discord-bot:latest
+    container_name: gym-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - gym-data:/data
+
+volumes:
+  gym-data:

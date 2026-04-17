@@ -1,0 +1,184 @@
+# Parse gym-post messages into structured lift entries.
+#
+# Handles lines like:
+#   "Shoulder press: 31kg"
+#   "Bench Press 1RM: 100kg"
+#   "Incline bench 70"
+#   "Legs 3.5 plates chill"
+#   "Dips: BW+20kg"
+#   "Leg curls: 50 - 77 kg"
+#   "Pec fly: 45kg L and R"
+#   "Squats: 60 kg"
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from .aliases import canonicalize
+
+# Set of all canonical equipment names known to the alias table. Used to
+# gate "label number" lines where no weight unit is given.
+from .aliases import _ALIAS_GROUPS as _AG  # noqa: PLC2701  (internal use)
+_KNOWN_CANONICALS: set[str] = set(_AG.keys())
+
+# Assumed plate weight in kg (standard Olympic plate per side).
+PLATE_KG = 20.0
+
+# Section headers we want to ignore as exercise names.
+_SECTION_HEADERS = {
+    "chest", "back", "arms", "legs", "core", "other", "shoulders", "biceps",
+    "triceps",
+}
+
+# Lines that contain these tokens are treated as non-lift chatter and skipped
+# even if they look numeric (e.g. "BW (Body Weight) - 67kg").
+_SKIP_LINE_TOKENS = ("body weight", "bodyweight")
+
+_NUM = r"\d+(?:\.\d+)?"
+
+# Matches "equipment: value" style lines.
+_COLON_RE = re.compile(rf"^\s*([A-Za-z][A-Za-z '\-/]{{1,60}}?)\s*[:\-]\s*(.+?)\s*$")
+
+# Matches a value portion and pulls out a weight.
+#   "45kg", "45 kg", "BW+20kg", "6 plates", "3.5 plates",
+#   "50 - 77 kg", "45kg L and R", "80kg", "BW"
+_RANGE_RE = re.compile(rf"({_NUM})\s*-\s*({_NUM})\s*kg?", re.IGNORECASE)
+_BW_PLUS_RE = re.compile(rf"bw\s*\+\s*({_NUM})\s*kg?", re.IGNORECASE)
+_PLATES_RE = re.compile(rf"({_NUM})\s*plates?", re.IGNORECASE)
+_KG_RE = re.compile(rf"({_NUM})\s*kg", re.IGNORECASE)
+_BARE_NUM_RE = re.compile(rf"(?<![\w.])({_NUM})(?!\s*(?:rm|rep|reps|set|sets))", re.IGNORECASE)
+_BW_RE = re.compile(r"\bbw\b", re.IGNORECASE)
+
+# Matches headings like "April" or "May 2026" - skip these as lines
+_MONTH_HEADING_RE = re.compile(
+    r"^\s*(january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)(\s+\d{4})?\s*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class Lift:
+    equipment: str   # canonical name
+    weight_kg: float
+    bodyweight_add: bool = False   # True if weight is added on top of bodyweight
+    raw: str = ""                  # original line for reference
+
+
+def _extract_weight(value: str) -> tuple[float | None, bool]:
+    """Extract (weight_kg, bodyweight_add_flag) from the right-hand-side text.
+
+    Returns (None, False) if no usable number is found.
+    """
+    v = value.strip()
+    if not v:
+        return None, False
+
+    # BW+20kg
+    m = _BW_PLUS_RE.search(v)
+    if m:
+        return float(m.group(1)), True
+
+    # "50 - 77 kg" range -> take the higher end (represents top working weight)
+    m = _RANGE_RE.search(v)
+    if m:
+        return max(float(m.group(1)), float(m.group(2))), False
+
+    # "6 plates" / "3.5 plates"
+    m = _PLATES_RE.search(v)
+    if m:
+        return float(m.group(1)) * PLATE_KG, False
+
+    # explicit "Xkg"
+    m = _KG_RE.search(v)
+    if m:
+        return float(m.group(1)), False
+
+    # "BW" alone -> bodyweight, weight 0
+    if _BW_RE.search(v) and not _BARE_NUM_RE.search(v):
+        return 0.0, True
+
+    # bare number with no unit (e.g. "Incline bench 70")
+    m = _BARE_NUM_RE.search(v)
+    if m:
+        n = float(m.group(1))
+        # Sanity filter: ignore tiny numbers that are likely rep counts.
+        if n >= 5:
+            return n, False
+
+    return None, False
+
+
+def _looks_like_equipment(label: str) -> bool:
+    key = label.strip().lower()
+    if not key:
+        return False
+    if key in _SECTION_HEADERS:
+        return False
+    if _MONTH_HEADING_RE.match(key):
+        return False
+    # require at least one letter
+    if not re.search(r"[a-z]", key):
+        return False
+    return True
+
+
+def parse_message(text: str) -> list[Lift]:
+    """Parse a whole message and return any lifts detected."""
+    lifts: list[Lift] = []
+    seen: set[str] = set()  # canonical equipment names in this message
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if any(tok in lower for tok in _SKIP_LINE_TOKENS):
+            continue
+        if _MONTH_HEADING_RE.match(line):
+            continue
+        if lower in _SECTION_HEADERS:
+            continue
+
+        label: str | None = None
+        value: str | None = None
+        require_known = False  # when no unit, only accept known equipment
+
+        m = _COLON_RE.match(line)
+        if m:
+            label = m.group(1).strip()
+            value = m.group(2).strip()
+        else:
+            # "equipment number..." — capture everything up to the first digit
+            # as the label so multi-word names ("Calf Raises", "Chest Fly") work.
+            m2 = re.match(r"^\s*([A-Za-z][A-Za-z '\-/]*?)\s+(\d.*)$", line)
+            if m2:
+                label = m2.group(1).strip()
+                value = m2.group(2).strip()
+                if not (_KG_RE.search(value) or _PLATES_RE.search(value)
+                        or _BW_PLUS_RE.search(value)):
+                    # No explicit unit — require the label to be a recognised
+                    # exercise so we don't mis-parse random chatter.
+                    require_known = True
+
+        if not label or value is None:
+            continue
+        if not _looks_like_equipment(label):
+            continue
+
+        weight, bw_flag = _extract_weight(value)
+        if weight is None:
+            continue
+
+        canon = canonicalize(label)
+        if require_known and canon not in _KNOWN_CANONICALS:
+            continue
+        if not canon or canon in seen:
+            # Skip duplicate equipment within the same message (keep first).
+            continue
+        seen.add(canon)
+        lifts.append(Lift(equipment=canon, weight_kg=weight,
+                          bodyweight_add=bw_flag, raw=line))
+
+    return lifts
