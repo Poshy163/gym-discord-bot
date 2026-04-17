@@ -64,6 +64,21 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "squat": ["squat", "squats", "back squat"],
     "diddy machine": ["diddy machine"],
     "deadlift": ["deadlift", "deadlifts", "dead lift"],
+    "romanian deadlift": [
+        "romanian deadlift", "romanian deadlifts", "rdl", "rdls",
+        "stiff leg deadlift", "stiff legged deadlift",
+    ],
+    "push up": [
+        "push up", "push ups", "pushup", "pushups", "push-up", "push-ups",
+    ],
+    "dumbbell press": [
+        "dumbbell press", "db press", "dumbell press", "dumbbell bench",
+        "dumbell bench", "db bench", "db bench press",
+    ],
+    "dumbbell shoulder press": [
+        "dumbbell shoulder press", "db shoulder press",
+        "dumbell shoulder press",
+    ],
 }
 
 
@@ -72,6 +87,11 @@ def _normalize_token(s: str) -> str:
     s = re.sub(r"[^a-z0-9 +]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# Public re-export so other modules don't need to reach into the underscore
+# name. The underscore form is kept for backwards compat with existing imports.
+normalize_token = _normalize_token
 
 
 # Build reverse lookup (alias -> canonical)
@@ -100,3 +120,14 @@ def canonicalize(name: str) -> str:
     if key.endswith(" s") and key[:-2] in _ALIAS_TO_CANON:
         return _ALIAS_TO_CANON[key[:-2]]
     return key
+
+
+def aliases_for(canonical: str) -> list[str]:
+    """Return the list of aliases known for a canonical equipment name.
+    Returns an empty list if the canonical name isn't in the table."""
+    return list(_ALIAS_GROUPS.get(canonical, []))
+
+
+def all_canonicals() -> list[str]:
+    """Return the full list of canonical equipment names known to the bot."""
+    return list(_ALIAS_GROUPS.keys())

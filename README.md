@@ -34,11 +34,70 @@ per `(message_id, equipment)` so edits / re-parses won't double-count.
 
 ## Slash commands
 
+Stats & progress:
+
+- `/help` — in-bot command reference.
 - `/stats [user]` — personal bests for a user.
+- `/summary [user]` — profile overview (totals, top PRs, most trained, gains,
+  current weekly streak).
 - `/progress <equipment> [user]` — best lift per calendar month, with deltas.
+- `/graph <equipment> [user]` — PNG chart of weight over time with a
+  running-best reference line.
+- `/history <equipment> [user]` — per-entry timeline for one user.
+- `/recent [user] [limit]` — most recent entries across all equipment.
 - `/leaderboard <equipment>` — top 25 in the server for that lift.
-- `/log <equipment> <weight_kg> [bodyweight]` — manual entry.
+- `/machine <equipment>` — everyone's timeline on one lift.
+- `/compare <user> [equipment]` — head-to-head PRs with a win tally.
+- `/serverstats` — server-wide totals, top lifters, and popular equipment.
+
+Goals:
+
+- `/goal_set <equipment> <target_kg> [bodyweight]` — set a personal goal.
+- `/goals [user]` — show active goals with percentage progress bars.
+- `/goal_remove <equipment>` — remove one of your goals.
+
+When a logged lift reaches a goal, the bot celebrates with 🎯 in its reply and
+clears the goal automatically.
+
+Logging & editing:
+
+- `/log <equipment> <weight_kg> [bodyweight]` — manual entry (🎉 on PRs).
+- `/undo` — remove your most recent entry.
+- **React ❌ on the bot's reply** to undo the specific lifts that reply stored.
+  Only the original poster can do this; other users' reactions are ignored.
 - `/parse <message_id>` — re-parse a specific message in the current channel.
+- `/delete_entry <equipment> <date>` — remove one day's entries.
+
+Discovery & utilities:
+
+- `/equipment_list` — every canonical equipment name the bot knows.
+- `/aliases <equipment>` — all spellings the parser accepts for a lift
+  (including any custom aliases configured in this server).
+- `/export [user]` — download lifts as a CSV attachment.
+- `/ping` · `/version`
+
+Admin (needs **Manage Messages**):
+
+- `/backfill [limit]` — rescan this channel's history.
+- `/rename <old> <new>` — merge one equipment name into another.
+- `/purge <equipment>` — delete every row for a lift name.
+- `/alias_add <phrase> <equipment>` — teach the bot a server-specific alias
+  (e.g. "hack sled" → "leg press"). Custom aliases currently only apply to
+  slash-command inputs, not auto-parsed chat messages.
+- `/alias_remove <phrase>` · `/alias_list`
+
+Auto-parsing also celebrates PRs: when a stored lift beats your previous best
+for that equipment, the bot's reply tags it with 🎉 and shows the old → new
+weight. Duplicate posts (same `message_id` + equipment) get a 🔁 reaction
+instead of a second ✅ so nothing is double-counted.
+
+## Weekly check-in reminder
+
+Set `REMINDER_CHANNEL_ID` in `.env` to have the bot post a weekly prompt asking
+everyone to drop their current bests. Defaults are **Wednesday 12:00** in
+`DISPLAY_TIMEZONE` (defaults to `Australia/Adelaide`, which handles ACST/ACDT
+automatically). Tune with `REMINDER_WEEKDAY` (0=Mon … 6=Sun), `REMINDER_HOUR`,
+`REMINDER_MINUTE`, and optionally `REMINDER_ROLE_ID` to @mention a role.
 
 ## Setup
 

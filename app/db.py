@@ -31,6 +31,43 @@ CREATE INDEX IF NOT EXISTS idx_lifts_equip
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_lifts_dedupe
     ON lifts (message_id, equipment) WHERE message_id IS NOT NULL;
+
+-- Per-user training goals. target_kg is the weight to hit; bodyweight_add
+-- tracks whether the goal is relative to bodyweight (e.g. BW+30kg dips).
+CREATE TABLE IF NOT EXISTS goals (
+    guild_id       INTEGER NOT NULL,
+    user_id        INTEGER NOT NULL,
+    equipment      TEXT    NOT NULL,
+    target_kg      REAL    NOT NULL,
+    bodyweight_add INTEGER NOT NULL DEFAULT 0,
+    set_at         TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id, equipment)
+);
+
+-- Server-local alias table: lets admins teach the bot nicknames the built-in
+-- table doesn't know (e.g. "hack sled" -> "leg press").
+CREATE TABLE IF NOT EXISTS custom_aliases (
+    guild_id         INTEGER NOT NULL,
+    alias_normalized TEXT    NOT NULL,
+    canonical        TEXT    NOT NULL,
+    added_by         INTEGER NOT NULL,
+    added_at         TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, alias_normalized)
+);
+
+-- Tracks bot replies to parsed messages so we can implement reaction-based
+-- undo. reply_message_id is what the user reacts on; message_id is the
+-- original gym post whose rows we'd delete. lift_ids stores the inserted
+-- row ids as a comma-separated string for /log-style single inserts where
+-- there's no parseable message_id.
+CREATE TABLE IF NOT EXISTS reply_tracking (
+    reply_message_id INTEGER PRIMARY KEY,
+    guild_id         INTEGER NOT NULL,
+    user_id          INTEGER NOT NULL,
+    message_id       INTEGER,
+    lift_ids         TEXT,
+    created_at       TEXT    NOT NULL
+);
 """
 
 
@@ -374,3 +411,360 @@ class Database:
                 """,
                 (guild_id, user_id, limit),
             )]
+
+    def previous_best(
+        self, guild_id: int, user_id: int, equipment: str,
+        before_id: int | None = None,
+    ) -> float | None:
+        """Highest weight the user had recorded for this equipment, optionally
+        strictly before a given row id. Returns None if no prior entry."""
+        sql = (
+            "SELECT MAX(weight_kg) AS best FROM lifts "
+            "WHERE guild_id = ? AND user_id = ? AND equipment = ?"
+        )
+        params: list[object] = [guild_id, user_id, equipment]
+        if before_id is not None:
+            sql += " AND id < ?"
+            params.append(before_id)
+        with self._conn() as c:
+            row = c.execute(sql, params).fetchone()
+            return row["best"] if row and row["best"] is not None else None
+
+    def user_recent(
+        self, guild_id: int, user_id: int, limit: int = 10
+    ) -> list[sqlite3.Row]:
+        """Most recent N lift entries across all equipment for one user."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT id, equipment, weight_kg,
+                       bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, limit),
+            ))
+
+    def pop_last_for_user(
+        self, guild_id: int, user_id: int
+    ) -> sqlite3.Row | None:
+        """Delete the user's most recently logged row and return it. Returns
+        None if they have no entries."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, equipment, weight_kg,
+                       bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM lifts WHERE id = ?", (row["id"],))
+            return row
+
+    def server_totals(self, guild_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COUNT(*)                    AS total_lifts,
+                       COUNT(DISTINCT user_id)     AS lifters,
+                       COUNT(DISTINCT equipment)   AS unique_equip,
+                       COUNT(DISTINCT message_id)  AS sessions,
+                       MIN(logged_at)              AS first_at,
+                       MAX(logged_at)              AS last_at
+                FROM lifts
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+            if not row or row["total_lifts"] == 0:
+                return None
+            return dict(row)
+
+    def server_top_users(
+        self, guild_id: int, limit: int = 5
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT username, COUNT(*) AS n,
+                       COUNT(DISTINCT equipment) AS equip
+                FROM lifts
+                WHERE guild_id = ?
+                GROUP BY user_id
+                ORDER BY n DESC, username
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            ))
+
+    def server_popular_equipment(
+        self, guild_id: int, limit: int = 5
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT equipment, COUNT(*) AS n,
+                       COUNT(DISTINCT user_id) AS users
+                FROM lifts
+                WHERE guild_id = ?
+                GROUP BY equipment
+                ORDER BY n DESC, equipment
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            ))
+
+    def export_rows(
+        self, guild_id: int, user_id: int | None = None
+    ) -> list[sqlite3.Row]:
+        """All lift rows for a guild, optionally scoped to one user. Used
+        by /export to produce a CSV."""
+        sql = (
+            "SELECT logged_at, username, equipment, weight_kg, "
+            "bodyweight_add AS bw, raw "
+            "FROM lifts WHERE guild_id = ?"
+        )
+        params: list[object] = [guild_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY logged_at"
+        with self._conn() as c:
+            return list(c.execute(sql, params))
+
+    # ---- streaks ---------------------------------------------------------
+
+    def user_log_dates(
+        self, guild_id: int, user_id: int
+    ) -> list[str]:
+        """All distinct YYYY-MM-DD dates on which the user logged at least
+        one lift, ordered ascending."""
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                """
+                SELECT DISTINCT substr(logged_at, 1, 10)
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY 1
+                """,
+                (guild_id, user_id),
+            )]
+
+    # ---- goals -----------------------------------------------------------
+
+    def goal_set(
+        self, guild_id: int, user_id: int, equipment: str,
+        target_kg: float, bodyweight_add: bool,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO goals (guild_id, user_id, equipment,
+                                   target_kg, bodyweight_add, set_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (guild_id, user_id, equipment) DO UPDATE SET
+                    target_kg = excluded.target_kg,
+                    bodyweight_add = excluded.bodyweight_add,
+                    set_at = excluded.set_at
+                """,
+                (
+                    guild_id, user_id, equipment,
+                    target_kg, 1 if bodyweight_add else 0,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def goal_remove(
+        self, guild_id: int, user_id: int, equipment: str
+    ) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                DELETE FROM goals
+                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                """,
+                (guild_id, user_id, equipment),
+            )
+            return cur.rowcount or 0
+
+    def goal_get(
+        self, guild_id: int, user_id: int, equipment: str
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT equipment, target_kg, bodyweight_add AS bw, set_at
+                FROM goals
+                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                """,
+                (guild_id, user_id, equipment),
+            ).fetchone()
+
+    def goal_list(
+        self, guild_id: int, user_id: int
+    ) -> list[sqlite3.Row]:
+        """Each goal joined with the user's current best on that equipment."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT g.equipment, g.target_kg,
+                       g.bodyweight_add AS bw,
+                       g.set_at,
+                       COALESCE(
+                           (SELECT MAX(weight_kg) FROM lifts l
+                            WHERE l.guild_id = g.guild_id
+                              AND l.user_id  = g.user_id
+                              AND l.equipment = g.equipment),
+                           0
+                       ) AS current_best
+                FROM goals g
+                WHERE g.guild_id = ? AND g.user_id = ?
+                ORDER BY g.equipment
+                """,
+                (guild_id, user_id),
+            ))
+
+    # ---- custom aliases --------------------------------------------------
+
+    def alias_set(
+        self, guild_id: int, alias_normalized: str, canonical: str,
+        added_by: int,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO custom_aliases
+                    (guild_id, alias_normalized, canonical,
+                     added_by, added_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (guild_id, alias_normalized) DO UPDATE SET
+                    canonical = excluded.canonical,
+                    added_by  = excluded.added_by,
+                    added_at  = excluded.added_at
+                """,
+                (
+                    guild_id, alias_normalized, canonical,
+                    added_by, datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def alias_remove(
+        self, guild_id: int, alias_normalized: str
+    ) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                DELETE FROM custom_aliases
+                WHERE guild_id = ? AND alias_normalized = ?
+                """,
+                (guild_id, alias_normalized),
+            )
+            return cur.rowcount or 0
+
+    def alias_list(self, guild_id: int) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT alias_normalized, canonical, added_at
+                FROM custom_aliases
+                WHERE guild_id = ?
+                ORDER BY canonical, alias_normalized
+                """,
+                (guild_id,),
+            ))
+
+    def alias_resolve(
+        self, guild_id: int, alias_normalized: str
+    ) -> str | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT canonical FROM custom_aliases
+                WHERE guild_id = ? AND alias_normalized = ?
+                """,
+                (guild_id, alias_normalized),
+            ).fetchone()
+            return row["canonical"] if row else None
+
+    # ---- reaction-undo bookkeeping --------------------------------------
+
+    def track_reply(
+        self, reply_message_id: int, guild_id: int, user_id: int,
+        message_id: int | None, lift_ids: list[int] | None,
+    ) -> None:
+        ids_str = ",".join(str(i) for i in (lift_ids or [])) or None
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO reply_tracking
+                    (reply_message_id, guild_id, user_id,
+                     message_id, lift_ids, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reply_message_id, guild_id, user_id,
+                    message_id, ids_str,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def get_reply(
+        self, reply_message_id: int
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT reply_message_id, guild_id, user_id,
+                       message_id, lift_ids, created_at
+                FROM reply_tracking
+                WHERE reply_message_id = ?
+                """,
+                (reply_message_id,),
+            ).fetchone()
+
+    def delete_reply(self, reply_message_id: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            )
+
+    def delete_lifts_for_message(
+        self, guild_id: int, user_id: int, message_id: int
+    ) -> int:
+        """Used by reaction-undo: remove every row the bot stored for a
+        specific gym post, scoped to that user so another member can't
+        retroactively affect someone else's history."""
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                DELETE FROM lifts
+                WHERE guild_id = ? AND user_id = ? AND message_id = ?
+                """,
+                (guild_id, user_id, message_id),
+            )
+            return cur.rowcount or 0
+
+    def delete_lifts_by_ids(
+        self, guild_id: int, user_id: int, ids: list[int]
+    ) -> int:
+        """Delete specific lift rows by id. Scoped to (guild_id, user_id)
+        for safety so a stale reply record can't nuke someone else's data."""
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._conn() as c:
+            cur = c.execute(
+                f"DELETE FROM lifts "
+                f"WHERE guild_id = ? AND user_id = ? AND id IN ({placeholders})",
+                [guild_id, user_id, *ids],
+            )
+            return cur.rowcount or 0
