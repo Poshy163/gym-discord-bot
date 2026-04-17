@@ -189,6 +189,22 @@ class Database:
                 (guild_id, user_id, equipment, limit),
             ))
 
+    def machine_history(
+        self, guild_id: int, equipment: str, limit: int = 50
+    ) -> list[sqlite3.Row]:
+        """Chronological timeline of all users' entries on one equipment."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT username, weight_kg, bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND equipment = ?
+                ORDER BY logged_at
+                LIMIT ?
+                """,
+                (guild_id, equipment, limit),
+            ))
+
     def recent_user_equipment(
         self, guild_id: int, user_id: int, limit: int = 25
     ) -> list[str]:

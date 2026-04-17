@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from .aliases import canonicalize
 from .db import Database
 from .parser import Lift, parse_message
+from . import __version__
 
 load_dotenv()
 
@@ -47,6 +48,14 @@ DEV_GUILD: discord.Object | None = (
 # A parsed message must yield at least this many lifts before we auto-store it.
 # Keeps casual chatter out of the DB.
 MIN_LIFTS_FOR_AUTO = int(os.getenv("MIN_LIFTS_FOR_AUTO", "2"))
+
+# On startup, scan recent history of every configured gym channel so posts made
+# while the bot was offline (or before it existed) get imported automatically.
+BACKFILL_ON_START = os.getenv("BACKFILL_ON_START", "true").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+# How far back to look per channel on startup. Use 0 for "no limit".
+BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "1000"))
 
 db = Database(DB_PATH)
 
@@ -87,7 +96,10 @@ async def _store_lifts(
 
 @bot.event
 async def on_ready() -> None:
-    LOG.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "?")
+    LOG.info(
+        "Logged in as %s (id=%s) — gym-bot v%s",
+        bot.user, bot.user.id if bot.user else "?", __version__,
+    )
     try:
         if DEV_GUILD is not None:
             bot.tree.copy_global_to(guild=DEV_GUILD)
@@ -97,6 +109,54 @@ async def on_ready() -> None:
         LOG.info("Synced %d slash commands", len(synced))
     except Exception:  # pragma: no cover - discord runtime only
         LOG.exception("Failed to sync commands")
+
+    if BACKFILL_ON_START and GYM_CHANNEL_IDS:
+        bot.loop.create_task(_run_startup_backfill())
+
+
+async def _backfill_channel(
+    channel: discord.abc.Messageable, limit: int | None
+) -> tuple[int, int, int]:
+    """Scan a channel's history and store any detected lifts.
+
+    Returns (messages_scanned, messages_with_lifts, lifts_inserted).
+    Dedupe on (message_id, equipment) means re-running is safe.
+    """
+    scanned = matched = inserted = 0
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        if msg.author.bot or not msg.guild:
+            continue
+        scanned += 1
+        lifts = parse_message(msg.content)
+        if len(lifts) < MIN_LIFTS_FOR_AUTO:
+            continue
+        n = await _store_lifts(msg, lifts)
+        if n:
+            matched += 1
+            inserted += n
+    return scanned, matched, inserted
+
+
+async def _run_startup_backfill() -> None:
+    limit = BACKFILL_LIMIT if BACKFILL_LIMIT > 0 else None
+    for channel_id in GYM_CHANNEL_IDS:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                LOG.warning("Backfill: cannot access channel %s", channel_id)
+                continue
+        LOG.info("Backfill: scanning #%s (limit=%s)", channel, limit)
+        try:
+            scanned, matched, inserted = await _backfill_channel(channel, limit)
+        except discord.Forbidden:
+            LOG.warning("Backfill: missing permission to read #%s", channel)
+            continue
+        LOG.info(
+            "Backfill done for #%s: scanned=%d, posts_with_lifts=%d, new_lifts=%d",
+            channel, scanned, matched, inserted,
+        )
 
 
 @bot.event
@@ -334,6 +394,105 @@ async def parse_cmd(
     await interaction.response.send_message("\n".join(lines))
 
 
+@bot.tree.command(
+    name="machine",
+    description="Timeline of everyone's entries for one lift.",
+)
+@app_commands.describe(equipment="Equipment / lift name")
+async def machine_cmd(
+    interaction: discord.Interaction, equipment: str
+) -> None:
+    canon = canonicalize(equipment)
+    guild_id = interaction.guild_id or 0
+    rows = db.machine_history(guild_id, canon)
+    if not rows:
+        await interaction.response.send_message(
+            f"No entries for {canon} yet.", ephemeral=True
+        )
+        return
+
+    lines = [f"**Timeline — {canon}**"]
+    # Track each user's previous weight so we can show deltas per person.
+    last_by_user: dict[str, float] = {}
+    for r in rows:
+        user = r["username"]
+        w = r["weight_kg"]
+        delta = ""
+        prev = last_by_user.get(user)
+        if prev is not None:
+            d = w - prev
+            if d:
+                delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
+        last_by_user[user] = w
+        lines.append(
+            f"• {_format_date(r['logged_at'])} — **{user}**: "
+            f"{_format_weight(w, bool(r['bw']))}{delta}"
+        )
+    await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(name="version", description="Show the bot's version info.")
+async def version_cmd(interaction: discord.Interaction) -> None:
+    lines = [
+        f"**gym-bot v{__version__}**",
+        f"discord.py: {discord.__version__}",
+        f"auto-scan channels: {len(GYM_CHANNEL_IDS) or 'all'}",
+        f"backfill on start: {'on' if BACKFILL_ON_START else 'off'}"
+        f" (limit={BACKFILL_LIMIT or 'unlimited'})",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Check the bot's latency.")
+async def ping_cmd(interaction: discord.Interaction) -> None:
+    # Gateway (websocket) latency reported by discord.py, in ms.
+    gateway_ms = round(bot.latency * 1000)
+    # Round-trip latency: how long between Discord sending us the interaction
+    # and us acknowledging it.
+    sent_at = interaction.created_at
+    rtt_ms = round((datetime.now(timezone.utc) - sent_at).total_seconds() * 1000)
+    await interaction.response.send_message(
+        f"Pong! 🏓  gateway: {gateway_ms} ms · round-trip: {rtt_ms} ms"
+    )
+
+
+@bot.tree.command(
+    name="backfill",
+    description="Rescan this channel's history and import any missed lifts.",
+)
+@app_commands.describe(
+    limit="Max messages to scan (default 1000, use 0 for no limit).",
+)
+async def backfill_cmd(
+    interaction: discord.Interaction, limit: int = 1000
+) -> None:
+    # Only allow server members with Manage Messages to trigger a rescan.
+    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
+    if not perms.manage_messages:
+        await interaction.response.send_message(
+            "You need Manage Messages to run backfill.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    lim = limit if limit and limit > 0 else None
+    try:
+        scanned, matched, inserted = await _backfill_channel(
+            interaction.channel, lim
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to read this channel's history.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"Backfill complete — scanned {scanned} messages, "
+        f"{matched} had lifts, {inserted} new lifts stored.",
+        ephemeral=True,
+    )
+
+
 # ---- autocomplete for equipment names ------------------------------------
 
 
@@ -351,14 +510,7 @@ progress_cmd.autocomplete("equipment")(_equipment_autocomplete)
 leaderboard_cmd.autocomplete("equipment")(_equipment_autocomplete)
 log_cmd.autocomplete("equipment")(_equipment_autocomplete)
 history_cmd.autocomplete("equipment")(_equipment_autocomplete)
-
-
-def main() -> None:
-    bot.run(TOKEN, log_handler=None)
-
-
-if __name__ == "__main__":
-    main()
+machine_cmd.autocomplete("equipment")(_equipment_autocomplete)
 
 
 def main() -> None:
