@@ -8,6 +8,14 @@ services:
       - .env
     volumes:
       - gym-data:/data
+    # The bot has no HTTP surface, so health is "can we still open the SQLite
+    # store?". Cheap and detects volume / disk issues early.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3, os; sqlite3.connect(os.getenv('DB_PATH', '/data/gym.sqlite3')).execute('SELECT 1')"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
 volumes:
   gym-data:

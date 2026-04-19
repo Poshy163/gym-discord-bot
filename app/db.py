@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,7 +21,8 @@ CREATE TABLE IF NOT EXISTS lifts (
     message_id    INTEGER,
     channel_id    INTEGER,
     logged_at     TEXT    NOT NULL,
-    raw           TEXT
+    raw           TEXT,
+    reps          INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_lifts_user_equip
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS goals (
     PRIMARY KEY (guild_id, user_id, equipment)
 );
 
--- Server-local alias table: lets admins teach the bot nicknames the built-in
+-- Server-local alias table: lets users teach the bot nicknames the built-in
 -- table doesn't know (e.g. "hack sled" -> "leg press").
 CREATE TABLE IF NOT EXISTS custom_aliases (
     guild_id         INTEGER NOT NULL,
@@ -71,6 +73,15 @@ CREATE TABLE IF NOT EXISTS reply_tracking (
 """
 
 
+def _normalize_iso(dt: datetime | None) -> str:
+    """Always store timestamps as UTC ISO-8601, regardless of caller tz."""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 @dataclass
 class LiftRow:
     username: str
@@ -81,21 +92,74 @@ class LiftRow:
 
 
 class Database:
+    """Tiny SQLite wrapper.
+
+    A single connection is held for the lifetime of the process (SQLite is
+    happy with one writer + many readers when WAL mode is on). All access
+    is serialised via a thread lock because discord.py occasionally calls
+    blocking sync code from worker threads (e.g. autocomplete callbacks).
+    """
+
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._conn() as c:
-            c.executescript(SCHEMA)
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            isolation_level=None,  # we manage transactions explicitly
+        )
+        self._connection.row_factory = sqlite3.Row
+        # WAL boosts concurrent reads while a writer is active. NORMAL sync
+        # is the standard recommendation for WAL — durable enough for our
+        # workload and noticeably faster than FULL.
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=NORMAL")
+        self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply lightweight, idempotent schema migrations.
+
+        Older databases were created without the ``reps`` column. ``ALTER
+        TABLE ... ADD COLUMN`` is a no-op when the column already exists
+        (we check pragma first to keep the operation truly idempotent).
+        """
+        with self._lock:
+            cols = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(lifts)")
+            }
+            if "reps" not in cols:
+                self._connection.execute("ALTER TABLE lifts ADD COLUMN reps INTEGER")
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._connection.close()
+            except sqlite3.Error:
+                pass
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        """Yield the shared connection inside an immediate transaction.
+
+        Using ``BEGIN IMMEDIATE`` means writers are serialised while readers
+        keep flowing on the WAL. Commit on clean exit, rollback otherwise —
+        this is what makes ``add_lifts`` (and friends) atomic across the
+        whole batch instead of row-by-row.
+        """
+        with self._lock:
+            conn = self._connection
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
 
     def add_lifts(
         self,
@@ -108,10 +172,14 @@ class Database:
         logged_at: datetime | None = None,
     ) -> int:
         """Insert lifts. Returns the number of rows actually inserted
-        (duplicates from the same message are ignored)."""
+        (duplicates from the same message are ignored).
+
+        The whole batch runs inside a single transaction (see ``_conn``),
+        so a mid-batch failure won't leave half the lifts persisted.
+        """
         if not lifts:
             return 0
-        ts = (logged_at or datetime.now(timezone.utc)).isoformat()
+        ts = _normalize_iso(logged_at)
         inserted = 0
         with self._conn() as c:
             for lift in lifts:
@@ -120,21 +188,69 @@ class Database:
                         """
                         INSERT INTO lifts
                         (guild_id, user_id, username, equipment, weight_kg,
-                         bodyweight_add, message_id, channel_id, logged_at, raw)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         bodyweight_add, message_id, channel_id, logged_at,
+                         raw, reps)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             guild_id, user_id, username,
                             lift.equipment, lift.weight_kg,
                             1 if lift.bodyweight_add else 0,
                             message_id, channel_id, ts, lift.raw,
+                            getattr(lift, "reps", None),
                         ),
                     )
                     inserted += 1
                 except sqlite3.IntegrityError:
-                    # dedupe on (message_id, equipment)
+                    # dedupe on (message_id, equipment) — silent skip is
+                    # intentional so re-runs of /parse and backfills are
+                    # safe to repeat.
                     continue
         return inserted
+
+    def add_lifts_returning_ids(
+        self,
+        guild_id: int,
+        user_id: int,
+        username: str,
+        lifts: list,
+        message_id: int | None = None,
+        channel_id: int | None = None,
+        logged_at: datetime | None = None,
+    ) -> list[int]:
+        """Same as ``add_lifts`` but returns the row ids that were inserted.
+
+        Used by ``/log``-style flows where there's no source message_id, so
+        the reaction-undo path can target the exact rows we just created.
+        """
+        if not lifts:
+            return []
+        ts = _normalize_iso(logged_at)
+        ids: list[int] = []
+        with self._conn() as c:
+            for lift in lifts:
+                try:
+                    cur = c.execute(
+                        """
+                        INSERT INTO lifts
+                        (guild_id, user_id, username, equipment, weight_kg,
+                         bodyweight_add, message_id, channel_id, logged_at,
+                         raw, reps)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            guild_id, user_id, username,
+                            lift.equipment, lift.weight_kg,
+                            1 if lift.bodyweight_add else 0,
+                            message_id, channel_id, ts, lift.raw,
+                            getattr(lift, "reps", None),
+                        ),
+                    )
+                    if cur.lastrowid:
+                        ids.append(int(cur.lastrowid))
+                except sqlite3.IntegrityError:
+                    continue
+        return ids
 
     def personal_bests(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
         # For each equipment, pick the row with the highest weight_kg, and
@@ -232,6 +348,11 @@ class Database:
         If ``user_id`` is provided, the rename is scoped to only that user's
         rows — useful when one lifter mislabels their entry without affecting
         anyone else's history.
+
+        When the rename is guild-wide (no user filter), any custom_aliases
+        whose canonical pointed at ``src`` are repointed at ``dst`` so the
+        alias table doesn't go stale. Per-user renames don't touch aliases
+        because aliases are guild-scoped, not user-scoped.
         """
         user_clause = " AND user_id = ?" if user_id is not None else ""
         user_params: tuple[object, ...] = (
@@ -261,6 +382,20 @@ class Database:
                 f"WHERE guild_id = ? AND equipment = ?{user_clause}",
                 (dst, guild_id, src, *user_params),
             )
+            if user_id is None:
+                # Repoint guild aliases so future parses land on the new
+                # canonical instead of the old one.
+                c.execute(
+                    "UPDATE custom_aliases SET canonical = ? "
+                    "WHERE guild_id = ? AND canonical = ?",
+                    (dst, guild_id, src),
+                )
+                # Also repoint any active goals so users don't lose them.
+                c.execute(
+                    "UPDATE OR REPLACE goals SET equipment = ? "
+                    "WHERE guild_id = ? AND equipment = ?",
+                    (dst, guild_id, src),
+                )
             return cur.rowcount or 0
 
     def count_equipment_rows(
@@ -310,7 +445,7 @@ class Database:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT weight_kg, bodyweight_add AS bw, logged_at
+                SELECT weight_kg, bodyweight_add AS bw, logged_at, reps
                 FROM lifts
                 WHERE guild_id = ? AND user_id = ? AND equipment = ?
                 ORDER BY logged_at
@@ -501,6 +636,37 @@ class Database:
             c.execute("DELETE FROM lifts WHERE id = ?", (row["id"],))
             return row
 
+    def pop_last_n_for_user(
+        self, guild_id: int, user_id: int, n: int,
+    ) -> list[sqlite3.Row]:
+        """Delete the user's N most recent rows and return them, newest first.
+
+        Used by ``/undo count:N``. Returns an empty list if the user has no
+        entries; if N exceeds available rows, removes whatever exists.
+        """
+        if n <= 0:
+            return []
+        with self._conn() as c:
+            rows = list(c.execute(
+                """
+                SELECT id, equipment, weight_kg,
+                       bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, n),
+            ))
+            if not rows:
+                return []
+            placeholders = ",".join("?" for _ in rows)
+            c.execute(
+                f"DELETE FROM lifts WHERE id IN ({placeholders})",
+                [r["id"] for r in rows],
+            )
+            return rows
+
     def server_totals(self, guild_id: int) -> dict | None:
         with self._conn() as c:
             row = c.execute(
@@ -610,7 +776,7 @@ class Database:
                 (
                     guild_id, user_id, equipment,
                     target_kg, 1 if bodyweight_add else 0,
-                    datetime.now(timezone.utc).isoformat(),
+                    _normalize_iso(None),
                 ),
             )
 
@@ -684,7 +850,7 @@ class Database:
                 """,
                 (
                     guild_id, alias_normalized, canonical,
-                    added_by, datetime.now(timezone.utc).isoformat(),
+                    added_by, _normalize_iso(None),
                 ),
             )
 
@@ -744,7 +910,7 @@ class Database:
                 (
                     reply_message_id, guild_id, user_id,
                     message_id, ids_str,
-                    datetime.now(timezone.utc).isoformat(),
+                    _normalize_iso(None),
                 ),
             )
 
@@ -762,12 +928,16 @@ class Database:
                 (reply_message_id,),
             ).fetchone()
 
-    def delete_reply(self, reply_message_id: int) -> None:
+    def delete_reply(self, reply_message_id: int) -> int:
+        """Delete a reply-tracking row. Returns the rowcount so callers can
+        race-protect themselves: if two ❌ reactions land at once, only the
+        first delete returns 1 and the second sees 0."""
         with self._conn() as c:
-            c.execute(
+            cur = c.execute(
                 "DELETE FROM reply_tracking WHERE reply_message_id = ?",
                 (reply_message_id,),
             )
+            return cur.rowcount or 0
 
     def delete_lifts_for_message(
         self, guild_id: int, user_id: int, message_id: int
@@ -800,3 +970,35 @@ class Database:
                 [guild_id, user_id, *ids],
             )
             return cur.rowcount or 0
+
+    def lifts_for_message(
+        self, guild_id: int, message_id: int,
+    ) -> list[sqlite3.Row]:
+        """All rows the bot stored for one source message. Used by the edit
+        handler to diff parsed-now vs. stored-then."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT id, equipment, weight_kg,
+                       bodyweight_add AS bw, reps
+                FROM lifts
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            ))
+
+    def update_lift_weight(
+        self, lift_id: int, weight_kg: float, bodyweight_add: bool,
+        reps: int | None,
+    ) -> None:
+        """Update one lift row in place. Used when a user edits their gym
+        post and the new weight differs from what we previously stored."""
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE lifts
+                SET weight_kg = ?, bodyweight_add = ?, reps = ?
+                WHERE id = ?
+                """,
+                (weight_kg, 1 if bodyweight_add else 0, reps, lift_id),
+            )

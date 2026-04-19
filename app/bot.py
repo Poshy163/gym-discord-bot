@@ -31,15 +31,43 @@ from .aliases import (
     normalize_token,
 )
 from .db import Database
-from .parser import Lift, parse_message
+from .parser import Lift, estimated_one_rep_max, parse_message
 from . import __version__
 
 load_dotenv()
 
 LOG = logging.getLogger("gymbot")
+
+
+class _JsonFormatter(logging.Formatter):
+    """Minimal JSON log formatter — chosen over python-json-logger to avoid
+    pulling in a dep just for one optional output mode. Container log shippers
+    (Loki, Datadog, etc.) generally prefer one JSON object per line."""
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D401
+        import json
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_log_handler = logging.StreamHandler()
+if os.getenv("LOG_FORMAT", "text").lower() == "json":
+    _log_handler.setFormatter(_JsonFormatter())
+else:
+    _log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[_log_handler],
+    force=True,
 )
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -150,6 +178,80 @@ def _resolve(guild_id: int, name: str) -> str:
     if hit:
         return hit
     return canonicalize(name)
+
+
+def _custom_alias_map(guild_id: int) -> dict[str, str]:
+    """Snapshot of the guild's custom aliases as ``{normalized: canonical}``.
+
+    Built fresh per call — the alias table is tiny (handful of rows per
+    guild) so a cache would only add invalidation complexity. If it ever
+    grows, swap in a TTL cache here.
+    """
+    return {
+        r["alias_normalized"]: r["canonical"]
+        for r in db.alias_list(guild_id)
+    }
+
+
+async def _resolve_or_warn(
+    interaction: discord.Interaction, name: str,
+    *, kind: str = "equipment",
+) -> str | None:
+    """Centralised "did you mean…?" guard for slash command equipment input.
+
+    Returns the canonical name on success, or ``None`` after sending an
+    ephemeral error to the user (caller should ``return`` immediately).
+    Suggests the closest known equipment via difflib when the input doesn't
+    match anything we've seen.
+    """
+    if not name or not name.strip():
+        await interaction.response.send_message(
+            f"Please provide an {kind} name.", ephemeral=True
+        )
+        return None
+    canon = _resolve(interaction.guild_id or 0, name)
+    if not canon:
+        await interaction.response.send_message(
+            f"Couldn't read `{name}` as an {kind} name.", ephemeral=True
+        )
+        return None
+    return canon
+
+
+def _suggest_equipment(guild_id: int, name: str, n: int = 3) -> list[str]:
+    """Closest known equipment matches for a (possibly mis-spelled) input.
+
+    Sources include both the built-in canonicals and anything actually
+    stored in this guild — that way 'incine' suggests both 'incline bench
+    press' (built-in) and any custom names members have used.
+    """
+    import difflib
+
+    pool = set(all_canonicals())
+    pool.update(db.known_equipment(guild_id))
+    return difflib.get_close_matches(name.lower(), [p.lower() for p in pool], n=n, cutoff=0.6)
+
+
+async def _equipment_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest equipment names for slash-command parameters.
+
+    Pulls from both the built-in canonicals and anything the guild has
+    actually used, so users can autocomplete custom-aliased names too.
+    Returns up to 25 choices (Discord's hard cap).
+    """
+    guild_id = interaction.guild_id or 0
+    pool = sorted(set(all_canonicals()) | set(db.known_equipment(guild_id)))
+    needle = (current or "").lower().strip()
+    if needle:
+        # Prefer prefix matches, then anywhere-substring matches.
+        prefix = [p for p in pool if p.lower().startswith(needle)]
+        contains = [p for p in pool if needle in p.lower() and p not in prefix]
+        results = (prefix + contains)[:25]
+    else:
+        results = pool[:25]
+    return [app_commands.Choice(name=p, value=p) for p in results]
 
 
 def _compute_streak_weeks(dates: list[str]) -> int:
@@ -324,7 +426,8 @@ async def _backfill_channel(
         if msg.author.bot or not msg.guild:
             continue
         scanned += 1
-        lifts = parse_message(msg.content)
+        guild_aliases = _custom_alias_map(msg.guild.id)
+        lifts = parse_message(msg.content, custom_aliases=guild_aliases)
         if not lifts:
             continue
         if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(l.confident for l in lifts):
@@ -366,7 +469,8 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
-    lifts = parse_message(message.content)
+    guild_aliases = _custom_alias_map(message.guild.id)
+    lifts = parse_message(message.content, custom_aliases=guild_aliases)
     # Auto-store when either:
     #  * the message is a clear "stats dump" (>= MIN_LIFTS_FOR_AUTO lifts), or
     #  * at least one lift was parsed with an explicit unit (kg / plates / BW+),
@@ -462,6 +566,69 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
+@bot.event
+async def on_message_edit(
+    before: discord.Message, after: discord.Message,
+) -> None:
+    """Re-parse edited gym posts so corrections (added lifts, fixed numbers)
+    flow into the DB.
+
+    Behaviour:
+      * Author-bot / DM messages and edits in non-gym channels are skipped.
+      * Only *new* lifts are inserted; the unique-on-(message_id, equipment)
+        index handles dedupe naturally so re-edits never double-count.
+      * Existing equipment whose weight changed is updated in place rather
+        than left stale.
+    """
+    if after.author.bot or not after.guild:
+        return
+    if GYM_CHANNEL_IDS and after.channel.id not in GYM_CHANNEL_IDS:
+        return
+    if before.content == after.content:
+        return  # ignore embed/attachment-only edits
+
+    guild_id = after.guild.id
+    aliases = _custom_alias_map(guild_id)
+    new_lifts = parse_message(after.content, custom_aliases=aliases)
+    if not new_lifts:
+        return
+
+    # Detect updates (same equipment, new weight) vs. brand-new entries so
+    # corrections don't leave stale rows behind.
+    existing = {
+        r["equipment"]: r for r in db.lifts_for_message(guild_id, after.id)
+    }
+
+    fresh: list[Lift] = []
+    updated = 0
+    for lift in new_lifts:
+        prev = existing.get(lift.equipment)
+        if prev is None:
+            fresh.append(lift)
+            continue
+        if abs(prev["weight_kg"] - lift.weight_kg) > 1e-6 or \
+                bool(prev["bw"]) != lift.bodyweight_add:
+            db.update_lift_weight(
+                int(prev["id"]), lift.weight_kg, lift.bodyweight_add,
+                getattr(lift, "reps", None),
+            )
+            updated += 1
+
+    inserted = 0
+    if fresh:
+        inserted = await _store_lifts(after, fresh)
+
+    if inserted or updated:
+        try:
+            await after.add_reaction("✏️")
+        except discord.HTTPException:
+            pass
+        LOG.info(
+            "Edit applied to message %s in #%s: +%d new, %d updated",
+            after.id, after.channel, inserted, updated,
+        )
+
+
 def _check_goal_hits(
     guild_id: int, user_id: int,
     prs: list[tuple[Lift, float | None]],
@@ -499,6 +666,12 @@ async def on_raw_reaction_add(
     if payload.user_id != rec["user_id"]:
         return  # Someone else tried to undo — ignore silently.
 
+    # Race protection: claim the reply by deleting its tracking row first.
+    # If two ❌ reactions land at once, only one gets rowcount==1 and goes
+    # on to delete the lifts; the other no-ops.
+    if db.delete_reply(payload.message_id) == 0:
+        return
+
     guild_id = rec["guild_id"]
     removed = 0
     if rec["lift_ids"]:
@@ -508,9 +681,6 @@ async def on_raw_reaction_add(
         removed = db.delete_lifts_for_message(
             guild_id, rec["user_id"], rec["message_id"]
         )
-
-    # Mark the reply so it can't be undone twice.
-    db.delete_reply(payload.message_id)
 
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
@@ -575,6 +745,7 @@ async def stats_cmd(
     equipment="Equipment / lift name",
     user="The user to look up (defaults to you).",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def progress_cmd(
     interaction: discord.Interaction,
     equipment: str,
@@ -610,6 +781,7 @@ async def progress_cmd(
 
 @bot.tree.command(name="leaderboard", description="Top lifters for an equipment.")
 @app_commands.describe(equipment="Equipment / lift name")
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def leaderboard_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
@@ -640,6 +812,7 @@ async def leaderboard_cmd(
     weight_kg="Weight in kg (use 0 with bodyweight=True for pure BW work)",
     bodyweight="True if this weight is added on top of bodyweight",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def log_cmd(
     interaction: discord.Interaction,
     equipment: str,
@@ -704,6 +877,7 @@ async def log_cmd(
     equipment="Equipment / lift name",
     user="The user to look up (defaults to you).",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def history_cmd(
     interaction: discord.Interaction,
     equipment: str,
@@ -728,9 +902,15 @@ async def history_cmd(
             d = w - prev
             if d:
                 delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
+        # If we captured rep count, show an Epley 1RM estimate alongside the
+        # raw weight — only meaningful for low-rep working sets.
+        reps = r["reps"] if "reps" in r.keys() else None
+        one_rm = estimated_one_rep_max(w, reps) if reps else None
+        rm_str = f"  _est. 1RM ≈ {one_rm:g}kg_" if one_rm else ""
+        rep_str = f"  ×{reps}" if reps else ""
         lines.append(
             f"• {_format_date(r['logged_at'])}: "
-            f"{_format_weight(w, bool(r['bw']))}{delta}"
+            f"{_format_weight(w, bool(r['bw']))}{rep_str}{delta}{rm_str}"
         )
         prev = w
     await interaction.response.send_message("\n".join(lines))
@@ -757,7 +937,10 @@ async def parse_cmd(
         )
         return
 
-    lifts = parse_message(msg.content)
+    lifts = parse_message(
+        msg.content,
+        custom_aliases=_custom_alias_map(interaction.guild_id or 0),
+    )
     if not lifts:
         await interaction.response.send_message(
             "No lifts detected in that message.", ephemeral=True
@@ -779,6 +962,7 @@ async def parse_cmd(
     description="Timeline of everyone's entries for one lift.",
 )
 @app_commands.describe(equipment="Equipment / lift name")
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def machine_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
@@ -882,12 +1066,40 @@ async def backfill_cmd(
 )
 @app_commands.describe(
     equipment="Equipment name to remove (use the exact stored name)",
+    confirm="Set to True to actually delete (default False shows a preview).",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def purge_cmd(
-    interaction: discord.Interaction, equipment: str
+    interaction: discord.Interaction, equipment: str,
+    confirm: bool = False,
 ) -> None:
-    canon = _resolve(interaction.guild_id or 0, equipment)
-    n = db.delete_equipment(interaction.guild_id or 0, canon)
+    guild_id = interaction.guild_id or 0
+    canon = _resolve(guild_id, equipment)
+    if not canon:
+        await interaction.response.send_message(
+            f"Couldn't read `{equipment}` as an equipment name.",
+            ephemeral=True,
+        )
+        return
+    available = db.count_equipment_rows(guild_id, canon)
+    if available == 0:
+        suggestions = _suggest_equipment(guild_id, canon)
+        hint = (
+            f"\nDid you mean: {', '.join('`' + s + '`' for s in suggestions)}?"
+            if suggestions else ""
+        )
+        await interaction.response.send_message(
+            f"No rows found for `{canon}`.{hint}", ephemeral=True
+        )
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            f"Would delete **{available}** row(s) for `{canon}`. "
+            "Re-run with `confirm:True` to actually purge.",
+            ephemeral=True,
+        )
+        return
+    n = db.delete_equipment(guild_id, canon)
     await interaction.response.send_message(
         f"Removed {n} row(s) for `{canon}`.", ephemeral=True
     )
@@ -905,17 +1117,23 @@ async def purge_cmd(
         "'mine' (default) renames only your rows; "
         "'all' renames every matching row in the guild."
     ),
+    confirm="Required when scope=all (guild-wide rename) — set True to proceed.",
 )
 @app_commands.choices(scope=[
     app_commands.Choice(name="mine", value="mine"),
     app_commands.Choice(name="all", value="all"),
 ])
+@app_commands.autocomplete(
+    old=_equipment_autocomplete,
+    new=_equipment_autocomplete,
+)
 async def rename_cmd(
     interaction: discord.Interaction,
     old: str,
     new: str,
     user: discord.Member | None = None,
     scope: app_commands.Choice[str] | None = None,
+    confirm: bool = False,
 ) -> None:
     # Resolve who the rename targets. Precedence:
     #   * explicit `user` argument wins
@@ -956,8 +1174,24 @@ async def rename_cmd(
             "you" if target_user_id == interaction.user.id and user is None
             else target_label
         )
+        suggestions = _suggest_equipment(guild_id, src)
+        hint = (
+            f"\nDid you mean: {', '.join('`' + s + '`' for s in suggestions)}?"
+            if suggestions else ""
+        )
         await interaction.response.send_message(
-            f"No `{src}` rows found for {scope_text}.", ephemeral=True
+            f"No `{src}` rows found for {scope_text}.{hint}",
+            ephemeral=True,
+        )
+        return
+
+    # Guild-wide renames (no user filter) require explicit confirmation —
+    # they're easy to fire accidentally and affect everyone's history.
+    if target_user_id is None and not confirm:
+        await interaction.response.send_message(
+            f"Would rename **{available}** row(s) guild-wide: "
+            f"`{src}` → `{dst}`. Re-run with `confirm:True` to proceed.",
+            ephemeral=True,
         )
         return
 
@@ -986,6 +1220,7 @@ async def rename_cmd(
     date="Date of the entry to remove (YYYY-MM-DD)",
     user="Target user (defaults to you).",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def delete_entry_cmd(
     interaction: discord.Interaction,
     equipment: str,
@@ -1196,23 +1431,40 @@ async def recent_cmd(
 
 @bot.tree.command(
     name="undo",
-    description="Remove your most recently logged entry.",
+    description="Remove your most recently logged entry (or the last N).",
 )
-async def undo_cmd(interaction: discord.Interaction) -> None:
-    row = db.pop_last_for_user(
-        interaction.guild_id or 0, interaction.user.id
+@app_commands.describe(
+    count="How many recent entries to remove (default 1, max 10).",
+)
+async def undo_cmd(
+    interaction: discord.Interaction, count: int = 1,
+) -> None:
+    n = max(1, min(10, count))
+    rows = db.pop_last_n_for_user(
+        interaction.guild_id or 0, interaction.user.id, n,
     )
-    if row is None:
+    if not rows:
         await interaction.response.send_message(
             "You don't have any entries to undo.", ephemeral=True
         )
         return
-    await interaction.response.send_message(
-        f"Removed your most recent entry — **{row['equipment']}**: "
-        f"{_format_weight(row['weight_kg'], bool(row['bw']))} "
-        f"_(logged {_format_date(row['logged_at'])})_.",
-        ephemeral=True,
-    )
+    if len(rows) == 1:
+        r = rows[0]
+        msg = (
+            f"Removed your most recent entry — **{r['equipment']}**: "
+            f"{_format_weight(r['weight_kg'], bool(r['bw']))} "
+            f"_(logged {_format_date(r['logged_at'])})_."
+        )
+    else:
+        lines = [f"Removed your last {len(rows)} entries:"]
+        for r in rows:
+            lines.append(
+                f"• **{r['equipment']}** — "
+                f"{_format_weight(r['weight_kg'], bool(r['bw']))} "
+                f"_(logged {_format_date(r['logged_at'])})_"
+            )
+        msg = "\n".join(lines)
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1223,6 +1475,7 @@ async def undo_cmd(interaction: discord.Interaction) -> None:
     user="User to compare against.",
     equipment="Optional: only compare this lift.",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def compare_cmd(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1392,6 +1645,7 @@ async def export_cmd(
     description="Show the spellings the bot accepts for an equipment name.",
 )
 @app_commands.describe(equipment="Equipment / lift name")
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def aliases_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
@@ -1457,6 +1711,7 @@ async def equipment_list_cmd(interaction: discord.Interaction) -> None:
     target_kg="Target weight in kg",
     bodyweight="True if the target is BW+X (e.g. weighted dips)",
 )
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def goal_set_cmd(
     interaction: discord.Interaction,
     equipment: str,
@@ -1497,6 +1752,7 @@ async def goal_set_cmd(
     description="Remove one of your goals.",
 )
 @app_commands.describe(equipment="Equipment / lift name")
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def goal_remove_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
