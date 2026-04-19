@@ -857,14 +857,6 @@ async def ping_cmd(interaction: discord.Interaction) -> None:
 async def backfill_cmd(
     interaction: discord.Interaction, limit: int = 1000
 ) -> None:
-    # Only allow server members with Manage Messages to trigger a rescan.
-    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-    if not perms.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to run backfill.", ephemeral=True
-        )
-        return
-
     await interaction.response.defer(thinking=True, ephemeral=True)
     lim = limit if limit and limit > 0 else None
     try:
@@ -886,7 +878,7 @@ async def backfill_cmd(
 
 @bot.tree.command(
     name="purge",
-    description="Admin: delete every row for a specific equipment name.",
+    description="Delete every row for a specific equipment name.",
 )
 @app_commands.describe(
     equipment="Equipment name to remove (use the exact stored name)",
@@ -894,12 +886,6 @@ async def backfill_cmd(
 async def purge_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
-    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-    if not perms.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to purge data.", ephemeral=True
-        )
-        return
     canon = _resolve(interaction.guild_id or 0, equipment)
     n = db.delete_equipment(interaction.guild_id or 0, canon)
     await interaction.response.send_message(
@@ -909,36 +895,85 @@ async def purge_cmd(
 
 @bot.tree.command(
     name="rename",
-    description="Admin: merge every row from one equipment name into another.",
+    description="Re-label rows from one equipment name to another (yours, someone else's, or guild-wide).",
 )
 @app_commands.describe(
     old="The current (bad / misparsed) equipment name.",
     new="The correct equipment to merge the rows into.",
+    user="Whose entries to rename. Defaults to you.",
+    scope=(
+        "'mine' (default) renames only your rows; "
+        "'all' renames every matching row in the guild."
+    ),
 )
+@app_commands.choices(scope=[
+    app_commands.Choice(name="mine", value="mine"),
+    app_commands.Choice(name="all", value="all"),
+])
 async def rename_cmd(
     interaction: discord.Interaction,
     old: str,
     new: str,
+    user: discord.Member | None = None,
+    scope: app_commands.Choice[str] | None = None,
 ) -> None:
-    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-    if not perms.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to rename data.", ephemeral=True
-        )
-        return
+    # Resolve who the rename targets. Precedence:
+    #   * explicit `user` argument wins
+    #   * scope=all means guild-wide (no user filter)
+    #   * default is the caller themselves
+    scope_value = scope.value if scope else "mine"
+    if user is not None:
+        target_user_id: int | None = user.id
+        target_label = user.display_name
+    elif scope_value == "all":
+        target_user_id = None
+        target_label = "everyone"
+    else:
+        target_user_id = interaction.user.id
+        target_label = "your"
 
     guild_id = interaction.guild_id or 0
     src = _resolve(guild_id, old)
     dst = _resolve(guild_id, new)
-    if src == dst:
+    if not src or not dst:
         await interaction.response.send_message(
-            "Source and destination are the same after canonicalization.",
+            "Both `old` and `new` must be non-empty equipment names.",
             ephemeral=True,
         )
         return
-    n = db.rename_equipment(guild_id, src, dst)
+    if src == dst:
+        await interaction.response.send_message(
+            f"Source and destination both resolve to `{src}` — nothing to do.",
+            ephemeral=True,
+        )
+        return
+
+    # Bail early if there's nothing to rename, so we don't post a misleading
+    # "0 row(s)" success message in the channel.
+    available = db.count_equipment_rows(guild_id, src, target_user_id)
+    if available == 0:
+        scope_text = (
+            "you" if target_user_id == interaction.user.id and user is None
+            else target_label
+        )
+        await interaction.response.send_message(
+            f"No `{src}` rows found for {scope_text}.", ephemeral=True
+        )
+        return
+
+    n = db.rename_equipment(guild_id, src, dst, user_id=target_user_id)
+    if target_user_id is None:
+        scope_msg = "guild-wide"
+    elif target_user_id == interaction.user.id and user is None:
+        scope_msg = "your entries"
+    else:
+        scope_msg = f"{target_label}'s entries"
+    # When scoped to the caller, send ephemerally so we don't clutter the
+    # channel with everyone's individual cleanups.
+    ephemeral = target_user_id == interaction.user.id and user is None
     await interaction.response.send_message(
-        f"Re-labelled {n} row(s): `{src}` → `{dst}`."
+        f"Re-labelled {n} row(s) ({scope_msg}): `{src}` → `{dst}`.",
+        ephemeral=ephemeral,
     )
 
 
@@ -949,7 +984,7 @@ async def rename_cmd(
 @app_commands.describe(
     equipment="Equipment / lift name",
     date="Date of the entry to remove (YYYY-MM-DD)",
-    user="Target user (admin only; defaults to you).",
+    user="Target user (defaults to you).",
 )
 async def delete_entry_cmd(
     interaction: discord.Interaction,
@@ -964,15 +999,6 @@ async def delete_entry_cmd(
         return
 
     target = user or interaction.user
-    if user is not None and user.id != interaction.user.id:
-        perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-        if not perms.manage_messages:
-            await interaction.response.send_message(
-                "You need Manage Messages to delete someone else's entry.",
-                ephemeral=True,
-            )
-            return
-
     canon = _resolve(interaction.guild_id or 0, equipment)
     n = db.delete_entry(
         interaction.guild_id or 0, canon, date, user_id=target.id
@@ -1034,7 +1060,9 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "React ❌ on my reply to undo that specific post "
             "(original author only)\n"
             "`/parse <message_id>` — reparse a message\n"
-            "`/delete_entry <equipment> <date>` — remove one day"
+            "`/delete_entry <equipment> <date>` — remove one day\n"
+            "`/rename <old> <new> [user] [scope:all]` — relabel your "
+            "entries (or someone else's, or guild-wide)"
         ),
         inline=False,
     )
@@ -1049,10 +1077,9 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
-        name="🛠 Admin (needs Manage Messages)",
+        name="🛠 Maintenance",
         value=(
             "`/backfill [limit]` — rescan this channel\n"
-            "`/rename <old> <new>` — merge equipment names\n"
             "`/purge <equipment>` — delete all rows for a lift\n"
             "`/alias_add <phrase> <equipment>` — teach a custom name\n"
             "`/alias_remove <phrase>` · `/alias_list`"
@@ -1327,22 +1354,13 @@ async def serverstats_cmd(interaction: discord.Interaction) -> None:
     description="Export lifts as a CSV file.",
 )
 @app_commands.describe(
-    user="Only export this user's lifts (admins only; defaults to you).",
+    user="Only export this user's lifts (defaults to you).",
 )
 async def export_cmd(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    if user is not None and user.id != interaction.user.id:
-        perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-        if not perms.manage_messages:
-            await interaction.response.send_message(
-                "You need Manage Messages to export someone else's data.",
-                ephemeral=True,
-            )
-            return
-
     rows = db.export_rows(interaction.guild_id or 0, user_id=target.id)
     if not rows:
         await interaction.response.send_message(
@@ -1540,13 +1558,13 @@ async def goals_cmd(
 
 
 # ---------------------------------------------------------------------------
-# Custom aliases (admin)
+# Custom aliases
 # ---------------------------------------------------------------------------
 
 
 @bot.tree.command(
     name="alias_add",
-    description="Admin: teach the bot a custom name for a lift.",
+    description="Teach the bot a custom name for a lift.",
 )
 @app_commands.describe(
     phrase="The phrase / nickname to recognise (e.g. 'hack sled')",
@@ -1555,13 +1573,6 @@ async def goals_cmd(
 async def alias_add_cmd(
     interaction: discord.Interaction, phrase: str, equipment: str
 ) -> None:
-    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-    if not perms.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to change aliases.", ephemeral=True
-        )
-        return
-
     guild_id = interaction.guild_id or 0
     key = normalize_token(phrase)
     if not key:
@@ -1589,18 +1600,12 @@ async def alias_add_cmd(
 
 @bot.tree.command(
     name="alias_remove",
-    description="Admin: remove a custom alias.",
+    description="Remove a custom alias.",
 )
 @app_commands.describe(phrase="The phrase to un-map")
 async def alias_remove_cmd(
     interaction: discord.Interaction, phrase: str
 ) -> None:
-    perms = interaction.channel.permissions_for(interaction.user)  # type: ignore[arg-type]
-    if not perms.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to change aliases.", ephemeral=True
-        )
-        return
     key = normalize_token(phrase)
     n = db.alias_remove(interaction.guild_id or 0, key)
     if n:

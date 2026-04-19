@@ -221,33 +221,65 @@ class Database:
             return cur.rowcount or 0
 
     def rename_equipment(
-        self, guild_id: int, src: str, dst: str
+        self, guild_id: int, src: str, dst: str,
+        user_id: int | None = None,
     ) -> int:
         """Re-label every row from equipment=src to equipment=dst. Returns
         the number of rows affected. The unique (message_id, equipment) index
         is respected: if the destination already exists for a given message,
-        the duplicate source row is dropped instead of renamed."""
+        the duplicate source row is dropped instead of renamed.
+
+        If ``user_id`` is provided, the rename is scoped to only that user's
+        rows — useful when one lifter mislabels their entry without affecting
+        anyone else's history.
+        """
+        user_clause = " AND user_id = ?" if user_id is not None else ""
+        user_params: tuple[object, ...] = (
+            (user_id,) if user_id is not None else ()
+        )
         with self._conn() as c:
             # Remove rows that would collide with the dedupe index after rename.
+            # When scoped to a single user, the collision check is also scoped
+            # so we don't drop someone else's row.
             c.execute(
-                """
+                f"""
                 DELETE FROM lifts
-                WHERE guild_id = ? AND equipment = ?
+                WHERE guild_id = ? AND equipment = ?{user_clause}
                   AND message_id IS NOT NULL
                   AND EXISTS (
                       SELECT 1 FROM lifts b
                       WHERE b.guild_id = lifts.guild_id
                         AND b.message_id = lifts.message_id
                         AND b.equipment = ?
+                        AND b.user_id = lifts.user_id
                   )
                 """,
-                (guild_id, src, dst),
+                (guild_id, src, *user_params, dst),
             )
             cur = c.execute(
-                "UPDATE lifts SET equipment = ? WHERE guild_id = ? AND equipment = ?",
-                (dst, guild_id, src),
+                "UPDATE lifts SET equipment = ? "
+                f"WHERE guild_id = ? AND equipment = ?{user_clause}",
+                (dst, guild_id, src, *user_params),
             )
             return cur.rowcount or 0
+
+    def count_equipment_rows(
+        self, guild_id: int, equipment: str,
+        user_id: int | None = None,
+    ) -> int:
+        """How many rows match equipment (optionally for one user). Used for
+        rename previews / dry-runs."""
+        sql = (
+            "SELECT COUNT(*) FROM lifts "
+            "WHERE guild_id = ? AND equipment = ?"
+        )
+        params: list[object] = [guild_id, equipment]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        with self._conn() as c:
+            row = c.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
 
     def delete_entry(
         self,
