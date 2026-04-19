@@ -57,7 +57,10 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "cable crunch": ["cable crunch", "crunch", "crunches"],
     "dragon fly": ["dragon fly", "dragon flys", "dragon flies"],
     "leg raise": ["leg raise", "leg raises"],
-    "leg press": ["leg press", "inclined leg press", "incline leg press"],
+    "leg press": [
+        "leg press", "inclined leg press", "incline leg press",
+        "angled leg press", "angle leg press", "hack squat leg press",
+    ],
     "leg extension": ["leg extension", "leg extensions"],
     "leg curl": ["leg curl", "leg curls", "hamstring curl", "hamstring curls"],
     "calf raise": ["calf raise", "calf raises"],

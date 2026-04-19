@@ -133,6 +133,110 @@ class Database:
             }
             if "reps" not in cols:
                 self._connection.execute("ALTER TABLE lifts ADD COLUMN reps INTEGER")
+            self._recanonicalize_equipment()
+
+    def _recanonicalize_equipment(self) -> None:
+        """Re-run the alias table over every stored equipment label.
+
+        Lets newly-added aliases (e.g. mapping ``angled leg press`` ->
+        ``leg press``) retroactively merge old rows. Idempotent: rows that
+        are already canonical are no-ops.
+        """
+        # Local import to avoid a circular import at module load.
+        from .aliases import canonicalize
+
+        conn = self._connection
+        # Build the rename map from distinct equipment values across the
+        # tables that store one. ``custom_aliases.canonical`` is also
+        # rewritten so user-defined aliases stay pointed at the right name.
+        sources = (
+            ("lifts", "equipment"),
+            ("goals", "equipment"),
+            ("custom_aliases", "canonical"),
+        )
+        rename: dict[str, str] = {}
+        for table, col in sources:
+            for row in conn.execute(f"SELECT DISTINCT {col} AS v FROM {table}"):
+                old = row["v"]
+                if not old:
+                    continue
+                new = canonicalize(old)
+                if new and new != old:
+                    rename[old] = new
+        if not rename:
+            return
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for old, new in rename.items():
+                # ``lifts`` has a unique index on (message_id, equipment).
+                # Drop rows that would collide with an already-canonical
+                # entry from the same source message before renaming.
+                conn.execute(
+                    """
+                    DELETE FROM lifts
+                    WHERE equipment = ?
+                      AND message_id IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM lifts l2
+                          WHERE l2.message_id = lifts.message_id
+                            AND l2.equipment  = ?
+                      )
+                    """,
+                    (old, new),
+                )
+                conn.execute(
+                    "UPDATE lifts SET equipment = ? WHERE equipment = ?",
+                    (new, old),
+                )
+                # ``goals`` PK is (guild_id, user_id, equipment). When
+                # both old and new rows exist for the same user, bump the
+                # surviving canonical row to the higher target_kg and
+                # drop the obsolete one.
+                conn.execute(
+                    """
+                    UPDATE goals
+                       SET target_kg = MAX(target_kg, (
+                           SELECT target_kg FROM goals g_old
+                           WHERE g_old.guild_id  = goals.guild_id
+                             AND g_old.user_id   = goals.user_id
+                             AND g_old.equipment = ?
+                       ))
+                     WHERE equipment = ?
+                       AND EXISTS (
+                           SELECT 1 FROM goals g_old
+                           WHERE g_old.guild_id  = goals.guild_id
+                             AND g_old.user_id   = goals.user_id
+                             AND g_old.equipment = ?
+                       )
+                    """,
+                    (old, new, old),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM goals
+                     WHERE equipment = ?
+                       AND EXISTS (
+                           SELECT 1 FROM goals g_new
+                           WHERE g_new.guild_id  = goals.guild_id
+                             AND g_new.user_id   = goals.user_id
+                             AND g_new.equipment = ?
+                       )
+                    """,
+                    (old, new),
+                )
+                conn.execute(
+                    "UPDATE goals SET equipment = ? WHERE equipment = ?",
+                    (new, old),
+                )
+                conn.execute(
+                    "UPDATE custom_aliases SET canonical = ? WHERE canonical = ?",
+                    (new, old),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:
