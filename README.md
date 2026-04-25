@@ -40,6 +40,8 @@ Stats & progress:
 - `/stats [user]` — personal bests for a user.
 - `/summary [user]` — profile overview (totals, top PRs, most trained, gains,
   current weekly streak).
+- `/checkin [user]` — copy/paste stat template prefilled with current bests.
+- `/stale [user] [days]` — lifts that haven't been updated recently.
 - `/progress <equipment> [user]` — best lift per calendar month, with deltas.
 - `/graph <equipment> [user]` — PNG chart of weight over time with a
   running-best reference line.
@@ -92,6 +94,10 @@ Auto-parsing also celebrates PRs: when a stored lift beats your previous best
 for that equipment, the bot's reply tags it with 🎉 and shows the old → new
 weight. Duplicate posts (same `message_id` + equipment) get a 🔁 reaction
 instead of a second ✅ so nothing is double-counted.
+
+Long stat dumps are compacted in bot replies after `PARSE_REPLY_MAX_ITEMS`
+rows so check-ins don't flood the channel. The entries are still stored; the
+reply just hides the tail.
 
 ## Weekly check-in reminder
 

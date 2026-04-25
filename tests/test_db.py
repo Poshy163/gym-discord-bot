@@ -158,6 +158,49 @@ def test_daily_activity_counts_popular_lifts_and_prs(db):
     assert prs == {("u100", "bench"), ("u200", "squat")}
 
 
+def test_delete_entry_between_uses_timestamp_range(db):
+    _add(
+        db, 1, 100, "bench", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 24, 13, 0, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 70, msg_id=2,
+        logged_at=datetime(2026, 4, 24, 14, 0, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 80, msg_id=3,
+        logged_at=datetime(2026, 4, 25, 14, 0, tzinfo=timezone.utc),
+    )
+    deleted = db.delete_entry_between(
+        1,
+        "bench",
+        "2026-04-24T13:30:00+00:00",
+        "2026-04-25T13:30:00+00:00",
+        user_id=100,
+    )
+    assert deleted == 1
+    assert db.count_equipment_rows(1, "bench", user_id=100) == 2
+
+
+def test_user_latest_by_equipment_returns_latest_rows(db):
+    _add(
+        db, 1, 100, "bench", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 80, msg_id=2,
+        logged_at=datetime(2026, 4, 20, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "squat", 100, msg_id=3,
+        logged_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
+    )
+    rows = {row["equipment"]: row for row in db.user_latest_by_equipment(1, 100)}
+    assert rows["bench"]["weight_kg"] == 80
+    assert rows["bench"]["n"] == 2
+    assert rows["squat"]["weight_kg"] == 100
+
+
 def test_pop_last_n_for_user_returns_newest_first(db):
     """``/undo count:N`` reads the returned rows for its receipt message,
     so the order matters — we want newest first."""

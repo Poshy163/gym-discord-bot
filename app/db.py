@@ -591,6 +591,28 @@ class Database:
             cur = c.execute(sql, params)
             return cur.rowcount or 0
 
+    def delete_entry_between(
+        self,
+        guild_id: int,
+        equipment: str,
+        start_iso: str,
+        end_iso: str,
+        user_id: int | None = None,
+    ) -> int:
+        """Delete entries matching equipment inside a UTC timestamp range."""
+        sql = (
+            "DELETE FROM lifts "
+            "WHERE guild_id = ? AND equipment = ? "
+            "AND logged_at >= ? AND logged_at < ?"
+        )
+        params: list[object] = [guild_id, equipment, start_iso, end_iso]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        with self._conn() as c:
+            cur = c.execute(sql, params)
+            return cur.rowcount or 0
+
     def history(
         self, guild_id: int, user_id: int, equipment: str, limit: int = 25
     ) -> list[sqlite3.Row]:
@@ -765,6 +787,32 @@ class Database:
                 LIMIT ?
                 """,
                 (guild_id, user_id, limit),
+            ))
+
+    def user_latest_by_equipment(
+        self, guild_id: int, user_id: int,
+    ) -> list[sqlite3.Row]:
+        """Latest row for each equipment a user has logged."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                WITH ranked AS (
+                    SELECT equipment, weight_kg,
+                           bodyweight_add AS bw, logged_at,
+                           COUNT(*) OVER (PARTITION BY equipment) AS n,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY equipment
+                               ORDER BY logged_at DESC, id DESC
+                           ) AS rn
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ?
+                )
+                SELECT equipment, weight_kg, bw, logged_at, n
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY logged_at ASC, equipment
+                """,
+                (guild_id, user_id),
             ))
 
     def pop_last_for_user(

@@ -91,6 +91,10 @@ DEV_GUILD: discord.Object | None = (
 # Keeps casual chatter out of the DB.
 MIN_LIFTS_FOR_AUTO = int(os.getenv("MIN_LIFTS_FOR_AUTO", "2"))
 
+# Keep parser confirmation replies readable when someone posts a full stats dump.
+# Use 0 to show every parsed lift.
+PARSE_REPLY_MAX_ITEMS = int(os.getenv("PARSE_REPLY_MAX_ITEMS", "15"))
+
 # On startup, scan recent history of every configured gym channel so posts made
 # while the bot was offline (or before it existed) get imported automatically.
 BACKFILL_ON_START = os.getenv("BACKFILL_ON_START", "true").lower() in (
@@ -168,6 +172,20 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {word}"
 
 
+def _format_lift_lines(lifts: list[Lift], limit: int | None = None) -> list[str]:
+    if limit is None:
+        limit = PARSE_REPLY_MAX_ITEMS
+    shown = lifts if limit <= 0 else lifts[:limit]
+    lines = [
+        f"• **{lift.equipment}** — {_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+        for lift in shown
+    ]
+    remaining = len(lifts) - len(shown)
+    if remaining > 0:
+        lines.append(f"• ... and {_plural(remaining, 'more lift')}")
+    return lines
+
+
 def _format_date(iso: str | None) -> str:
     """Return 'YYYY-MM-DD' for an ISO timestamp, converted to DISPLAY_TZ so
     dates match the reader's local calendar day (esp. important for Adelaide
@@ -182,6 +200,28 @@ def _format_date(iso: str | None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d")
+
+
+def _format_local_day_age(iso: str) -> tuple[str, int]:
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso[:10], 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local_date = dt.astimezone(DISPLAY_TZ).date()
+    today = datetime.now(DISPLAY_TZ).date()
+    return local_date.strftime("%Y-%m-%d"), max(0, (today - local_date).days)
+
+
+def _local_date_window(date: str) -> tuple[str, str]:
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+    start_local = datetime.combine(day, dtime.min, tzinfo=DISPLAY_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
 
 
 def _resolve(guild_id: int, name: str) -> str:
@@ -393,6 +433,25 @@ async def on_ready() -> None:
 _WEEKDAY_NAMES = [
     "Monday", "Tuesday", "Wednesday", "Thursday",
     "Friday", "Saturday", "Sunday",
+]
+
+_CHECKIN_DEFAULT_EQUIPMENT = [
+    "bench press",
+    "incline bench press",
+    "shoulder press",
+    "lat pulldown",
+    "low row",
+    "pec dec",
+    "rear delt fly",
+    "tricep pushdown",
+    "preacher curl",
+    "hammer curl",
+    "lateral raise",
+    "leg press",
+    "leg extension",
+    "leg curl",
+    "calf raise",
+    "squat",
 ]
 
 
@@ -669,11 +728,7 @@ async def on_message(message: discord.Message) -> None:
                     )
                 else:
                     lines = [f"Added {_plural(inserted, 'lift')}:"]
-                    for lift in lifts:
-                        lines.append(
-                            f"• **{lift.equipment}** — "
-                            f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
-                        )
+                    lines.extend(_format_lift_lines(lifts))
                     reply = "\n".join(lines)
                 if prs:
                     pr_lines = ["", "🎉 **New PR!**"]
@@ -736,16 +791,7 @@ async def on_message(message: discord.Message) -> None:
 async def on_message_edit(
     before: discord.Message, after: discord.Message,
 ) -> None:
-    """Re-parse edited gym posts so corrections (added lifts, fixed numbers)
-    flow into the DB.
-
-    Behaviour:
-      * Author-bot / DM messages and edits in non-gym channels are skipped.
-            * New confident lifts are inserted; the unique-on-(message_id, equipment)
-                index handles dedupe naturally so re-edits never double-count.
-            * Existing equipment whose weight changed is updated in place, and lifts
-                removed from the edited post are deleted rather than left stale.
-    """
+    """Re-parse edited gym posts so corrections flow into the DB."""
     if after.author.bot or not after.guild:
         return
     if GYM_CHANNEL_IDS and after.channel.id not in GYM_CHANNEL_IDS:
@@ -1168,11 +1214,7 @@ async def parse_cmd(
         f"Stored {_plural(inserted, 'new lift')} for {msg.author.display_name} "
         f"_(posted {date})_:"
     ]
-    for lift in lifts:
-        lines.append(
-            f"• {lift.equipment}: "
-            f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
-        )
+    lines.extend(_format_lift_lines(lifts))
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -1462,8 +1504,9 @@ async def delete_entry_cmd(
 
     target = user or interaction.user
     canon = _resolve(interaction.guild_id or 0, equipment)
-    n = db.delete_entry(
-        interaction.guild_id or 0, canon, date, user_id=target.id
+    start_iso, end_iso = _local_date_window(date)
+    n = db.delete_entry_between(
+        interaction.guild_id or 0, canon, start_iso, end_iso, user_id=target.id
     )
     await interaction.response.send_message(
         f"Deleted {n} entry(ies) for {target.display_name} — `{canon}` on {date}.",
@@ -1494,6 +1537,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/stats [user]` — personal bests\n"
             "`/summary [user]` — profile overview\n"
+            "`/checkin [user]` — copy/paste stat template\n"
+            "`/stale [user] [days]` — lifts not updated lately\n"
             "`/progress <equipment> [user]` — best per month\n"
             "`/graph <equipment> [user]` — plot a PNG chart\n"
             "`/history <equipment> [user]` — your timeline\n"
@@ -1655,6 +1700,102 @@ async def recent_cmd(
             f"{_format_weight(r['weight_kg'], bool(r['bw']))}"
         )
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
+    name="checkin",
+    description="Generate a copy/paste gym stats check-in template.",
+)
+@app_commands.describe(
+    user="Whose current bests to prefill (defaults to you).",
+    include_missing="Include common lifts you have not logged yet.",
+)
+async def checkin_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    include_missing: bool = True,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    rows = db.personal_bests(guild_id, target.id)
+    bests = {r["equipment"]: r for r in rows}
+
+    ordered: list[str] = []
+    for equipment in _CHECKIN_DEFAULT_EQUIPMENT:
+        if include_missing or equipment in bests:
+            ordered.append(equipment)
+    for equipment in sorted(bests):
+        if equipment not in ordered:
+            ordered.append(equipment)
+
+    if not ordered:
+        ordered = list(_CHECKIN_DEFAULT_EQUIPMENT)
+
+    template_lines: list[str] = []
+    for equipment in ordered:
+        row = bests.get(equipment)
+        value = _format_weight(row["best"], bool(row["bw"])) if row else ""
+        template_lines.append(f"{equipment}: {value}".rstrip())
+
+    body = "\n".join(template_lines)
+    if len(body) > 1500:
+        body = body[:1500].rstrip() + "\n..."
+    await interaction.response.send_message(
+        f"**{target.display_name} — check-in template**\n"
+        "Update the numbers, delete anything irrelevant, then post it:\n"
+        f"```\n{body}\n```",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="stale",
+    description="Show lifts a user has not updated recently.",
+)
+@app_commands.describe(
+    user="The user to check (defaults to you).",
+    days="How old a lift must be before it counts as stale (default 30).",
+)
+async def stale_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    days: int = 30,
+) -> None:
+    target = user or interaction.user
+    threshold = max(1, min(365, days))
+    rows = db.user_latest_by_equipment(interaction.guild_id or 0, target.id)
+    stale_rows = []
+    for row in rows:
+        local_date, age_days = _format_local_day_age(row["logged_at"])
+        if age_days >= threshold:
+            stale_rows.append((age_days, local_date, row))
+    stale_rows.sort(reverse=True, key=lambda item: (item[0], item[2]["equipment"]))
+
+    if not rows:
+        await interaction.response.send_message(
+            f"No lifts logged for {target.display_name} yet.", ephemeral=True
+        )
+        return
+    if not stale_rows:
+        await interaction.response.send_message(
+            f"Nothing stale for {target.display_name} at {threshold}+ days.",
+            ephemeral=True,
+        )
+        return
+
+    lines = [
+        f"**{target.display_name} — lifts not updated in {threshold}+ days**"
+    ]
+    for age_days, local_date, row in stale_rows[:15]:
+        lines.append(
+            f"• **{row['equipment']}** — "
+            f"{_format_weight(row['weight_kg'], bool(row['bw']))} "
+            f"on {local_date} ({_plural(age_days, 'day')} ago)"
+        )
+    remaining = len(stale_rows) - 15
+    if remaining > 0:
+        lines.append(f"• ... and {_plural(remaining, 'more lift')}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(
