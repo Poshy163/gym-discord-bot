@@ -56,7 +56,7 @@ _SKIP_LINE_TOKENS = ("body weight", "bodyweight")
 _NUM = r"\d+(?:\.\d+)?"
 
 # Matches "equipment: value" style lines.
-_COLON_RE = re.compile(rf"^\s*([A-Za-z][A-Za-z '\-/]{{1,60}}?)\s*[:\-]\s*(.+?)\s*$")
+_COLON_RE = re.compile(r"^\s*([A-Za-z][A-Za-z '\-/]{1,60}?)\s*[:\-]\s*(.+?)\s*$")
 
 # Matches a value portion and pulls out a weight.
 #   "45kg", "45 kg", "BW+20kg", "6 plates", "3.5 plates",

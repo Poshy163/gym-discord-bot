@@ -10,6 +10,7 @@ think they "won" the deletion).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pytest
 
@@ -33,11 +34,12 @@ def db(tmp_path):
     d.close()
 
 
-def _add(db, guild, user, eq, w, *, msg_id=None):
+def _add(db, guild, user, eq, w, *, msg_id=None, logged_at=None, bw=False):
     """Compact helper for seeding a single lift row."""
     return db.add_lifts(
         guild_id=guild, user_id=user, username=f"u{user}",
-        lifts=[_Lift(eq, w)], message_id=msg_id,
+        lifts=[_Lift(eq, w, bodyweight_add=bw)], message_id=msg_id,
+        logged_at=logged_at,
     )
 
 
@@ -84,6 +86,76 @@ def test_rename_guild_wide_repoints_custom_aliases(db):
     db.rename_equipment(1, "leg press", "angled leg press")
     aliases = {r["alias_normalized"]: r["canonical"] for r in db.alias_list(1)}
     assert aliases["lp"] == "angled leg press"
+
+
+def test_rename_repoints_user_scoped_goal(db):
+    db.goal_set(1, 100, "leg press", 120, False)
+    _add(db, 1, 100, "leg press", 80, msg_id=1)
+    db.rename_equipment(1, "leg press", "angled leg press", user_id=100)
+    assert db.goal_get(1, 100, "leg press") is None
+    goal = db.goal_get(1, 100, "angled leg press")
+    assert goal is not None
+    assert goal["target_kg"] == 120
+
+
+def test_rename_merges_goal_collisions_using_higher_target(db):
+    db.goal_set(1, 100, "leg press", 120, False)
+    db.goal_set(1, 100, "angled leg press", 150, False)
+    _add(db, 1, 100, "leg press", 80, msg_id=1)
+    db.rename_equipment(1, "leg press", "angled leg press")
+    assert db.goal_get(1, 100, "leg press") is None
+    goal = db.goal_get(1, 100, "angled leg press")
+    assert goal is not None
+    assert goal["target_kg"] == 150
+
+
+def test_progress_first_seen_is_date_best_was_first_reached(db):
+    _add(
+        db, 1, 100, "bench", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 80, msg_id=2,
+        logged_at=datetime(2026, 4, 10, tzinfo=timezone.utc), bw=True,
+    )
+    _add(
+        db, 1, 100, "bench", 80, msg_id=3,
+        logged_at=datetime(2026, 4, 20, tzinfo=timezone.utc),
+    )
+    rows = db.progress(1, 100, "bench")
+    assert len(rows) == 1
+    assert rows[0]["best"] == 80
+    assert rows[0]["first_seen"].startswith("2026-04-10")
+    assert rows[0]["bw"] == 1
+
+
+def test_daily_activity_counts_popular_lifts_and_prs(db):
+    _add(
+        db, 1, 100, "bench", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 24, 23, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 80, msg_id=2,
+        logged_at=datetime(2026, 4, 25, 9, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 200, "squat", 100, msg_id=3,
+        logged_at=datetime(2026, 4, 25, 10, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 70, msg_id=4,
+        logged_at=datetime(2026, 4, 26, 1, tzinfo=timezone.utc),
+    )
+    summary = db.daily_activity(
+        1,
+        "2026-04-25T00:00:00+00:00",
+        "2026-04-26T00:00:00+00:00",
+    )
+    assert summary["totals"]["total_lifts"] == 2
+    assert summary["totals"]["lifters"] == 2
+    assert summary["popular_equipment"][0]["equipment"] == "bench"
+    prs = {(row["username"], row["equipment"]) for row in summary["prs"]}
+    assert prs == {("u100", "bench"), ("u200", "squat")}
 
 
 def test_pop_last_n_for_user_returns_newest_first(db):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import importlib
 import logging
 import os
 import re
@@ -128,6 +129,18 @@ REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "0"))
 _role = os.getenv("REMINDER_ROLE_ID", "").strip()
 REMINDER_ROLE_ID: int | None = int(_role) if _role.isdigit() else None
 
+# Daily update: posts yesterday's server activity summary on a schedule.
+# DAILY_UPDATE_CHANNEL_ID is required to enable it. Defaults to 08:00 local.
+_daily_id = os.getenv("DAILY_UPDATE_CHANNEL_ID", "").strip()
+DAILY_UPDATE_CHANNEL_ID: int | None = (
+    int(_daily_id) if _daily_id.isdigit() else None
+)
+DAILY_UPDATE_HOUR = int(os.getenv("DAILY_UPDATE_HOUR", "8"))
+DAILY_UPDATE_MINUTE = int(os.getenv("DAILY_UPDATE_MINUTE", "0"))
+DAILY_UPDATE_POST_EMPTY = os.getenv("DAILY_UPDATE_POST_EMPTY", "false").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+
 # Bot "accent" colour for embeds.
 EMBED_COLOUR = discord.Colour.from_str("#f26522")
 
@@ -148,6 +161,11 @@ def _format_weight(weight: float, bw: bool) -> str:
         lb_str = f"{lb:g}"
         base += f" (≈{lb_str} lb)"
     return base
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
 
 
 def _format_date(iso: str | None) -> str:
@@ -178,6 +196,12 @@ def _resolve(guild_id: int, name: str) -> str:
     if hit:
         return hit
     return canonicalize(name)
+
+
+def _should_auto_store(lifts: list[Lift]) -> bool:
+    return bool(lifts) and (
+        len(lifts) >= MIN_LIFTS_FOR_AUTO or any(lift.confident for lift in lifts)
+    )
 
 
 def _custom_alias_map(guild_id: int) -> dict[str, str]:
@@ -307,12 +331,12 @@ def _new_prs_for_lifts(
     user, paired with the previous best (or None if it's the first entry).
     Only considers positive weight (pure-BW 0kg entries don't celebrate)."""
     prs: list[tuple[Lift, float | None]] = []
-    for l in lifts:
-        if l.weight_kg <= 0:
+    for lift in lifts:
+        if lift.weight_kg <= 0:
             continue
-        prev = db.previous_best(guild_id, user_id, l.equipment)
-        if prev is None or l.weight_kg > prev:
-            prs.append((l, prev))
+        prev = db.previous_best(guild_id, user_id, lift.equipment)
+        if prev is None or lift.weight_kg > prev:
+            prs.append((lift, prev))
     return prs
 
 
@@ -357,6 +381,14 @@ async def on_ready() -> None:
             REMINDER_HOUR, REMINDER_MINUTE, DISPLAY_TZ, REMINDER_CHANNEL_ID,
         )
 
+    if DAILY_UPDATE_CHANNEL_ID and not daily_update.is_running():
+        daily_update.start()
+        LOG.info(
+            "Daily update scheduled for %02d:%02d (%s) in channel %s",
+            DAILY_UPDATE_HOUR, DAILY_UPDATE_MINUTE,
+            DISPLAY_TZ, DAILY_UPDATE_CHANNEL_ID,
+        )
+
 
 _WEEKDAY_NAMES = [
     "Monday", "Tuesday", "Wednesday", "Thursday",
@@ -367,10 +399,18 @@ _WEEKDAY_NAMES = [
 # The loop fires once every 24 hours at REMINDER_HOUR:REMINDER_MINUTE in
 # DISPLAY_TZ; we then check the weekday inside the task so a single loop
 # definition suffices regardless of which day the user configures.
-def _reminder_time() -> dtime:
-    hh = max(0, min(23, REMINDER_HOUR))
-    mm = max(0, min(59, REMINDER_MINUTE))
+def _scheduled_time(hour: int, minute: int) -> dtime:
+    hh = max(0, min(23, hour))
+    mm = max(0, min(59, minute))
     return dtime(hour=hh, minute=mm, tzinfo=DISPLAY_TZ)
+
+
+def _reminder_time() -> dtime:
+    return _scheduled_time(REMINDER_HOUR, REMINDER_MINUTE)
+
+
+def _daily_update_time() -> dtime:
+    return _scheduled_time(DAILY_UPDATE_HOUR, DAILY_UPDATE_MINUTE)
 
 
 @tasks.loop(time=_reminder_time())
@@ -413,6 +453,132 @@ async def _before_weekly_reminder() -> None:  # pragma: no cover - discord runti
     await bot.wait_until_ready()
 
 
+def _daily_window(days_ago: int = 1) -> tuple[str, str, str]:
+    days = max(0, min(30, days_ago))
+    day = datetime.now(DISPLAY_TZ).date() - timedelta(days=days)
+    start_local = datetime.combine(day, dtime.min, tzinfo=DISPLAY_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        day.strftime("%Y-%m-%d"),
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _daily_update_text(
+    guild_id: int,
+    date_label: str,
+    start_iso: str,
+    end_iso: str,
+    *,
+    post_empty: bool = False,
+) -> str | None:
+    activity = db.daily_activity(guild_id, start_iso, end_iso, limit=5)
+    totals = activity["totals"]
+    total_lifts = int(totals["total_lifts"] or 0)
+    if total_lifts == 0:
+        if not post_empty:
+            return None
+        return (
+            f"📊 **Daily gym update — {date_label}**\n"
+            "No lifts logged for this day. Fresh slate next session."
+        )
+
+    lifters = int(totals["lifters"] or 0)
+    unique_equip = int(totals["unique_equip"] or 0)
+    sessions = int(totals["sessions"] or 0)
+    lines = [
+        f"📊 **Daily gym update — {date_label}**",
+        (
+            f"{_plural(total_lifts, 'lift')} logged by "
+            f"{_plural(lifters, 'lifter')} across "
+            f"{_plural(unique_equip, 'exercise')} from "
+            f"{_plural(sessions, 'session')}."
+        ),
+    ]
+
+    prs = activity["prs"]
+    if prs:
+        lines.append("\n🎉 **PRs**")
+        for row in prs:
+            previous = row["prev_best"]
+            if previous is None:
+                tail = "first logged"
+            else:
+                gain = row["weight_kg"] - previous
+                tail = f"+{gain:g}kg"
+            lines.append(
+                f"• **{row['username']}** — {row['equipment']}: "
+                f"{_format_weight(row['weight_kg'], bool(row['bw']))} ({tail})"
+            )
+
+    top_users = activity["top_users"]
+    if top_users:
+        lines.append("\n🏅 **Most active**")
+        for row in top_users:
+            lifts = int(row["n"])
+            exercises = int(row["equip"])
+            lines.append(
+                f"• **{row['username']}** — {_plural(lifts, 'lift')}, "
+                f"{_plural(exercises, 'exercise')}"
+            )
+
+    popular = activity["popular_equipment"]
+    if popular:
+        lines.append("\n🏋️ **Popular lifts**")
+        for row in popular:
+            entries = int(row["n"])
+            users = int(row["users"])
+            lines.append(
+                f"• **{row['equipment']}** — {_plural(entries, 'entry', 'entries')}, "
+                f"{_plural(users, 'lifter')}"
+            )
+
+    lines.append("\nUse `/summary`, `/leaderboard`, or `/goals` to dig in.")
+    return "\n".join(lines)
+
+
+@tasks.loop(time=_daily_update_time())
+async def daily_update() -> None:
+    if DAILY_UPDATE_CHANNEL_ID is None:
+        return
+    channel = bot.get_channel(DAILY_UPDATE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(DAILY_UPDATE_CHANNEL_ID)
+        except discord.HTTPException:
+            LOG.warning(
+                "Daily update: cannot access channel %s", DAILY_UPDATE_CHANNEL_ID
+            )
+            return
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        LOG.warning("Daily update channel %s is not in a guild", DAILY_UPDATE_CHANNEL_ID)
+        return
+
+    date_label, start_iso, end_iso = _daily_window(days_ago=1)
+    text = _daily_update_text(
+        guild.id,
+        date_label,
+        start_iso,
+        end_iso,
+        post_empty=DAILY_UPDATE_POST_EMPTY,
+    )
+    if text is None:
+        LOG.info("Daily update skipped for %s: no activity", date_label)
+        return
+    try:
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        LOG.info("Daily update posted to #%s for %s", channel, date_label)
+    except discord.HTTPException:
+        LOG.exception("Failed to post daily update")
+
+
+@daily_update.before_loop
+async def _before_daily_update() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
+
+
 async def _backfill_channel(
     channel: discord.abc.Messageable, limit: int | None
 ) -> tuple[int, int, int]:
@@ -430,7 +596,9 @@ async def _backfill_channel(
         lifts = parse_message(msg.content, custom_aliases=guild_aliases)
         if not lifts:
             continue
-        if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(l.confident for l in lifts):
+        if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(
+            lift.confident for lift in lifts
+        ):
             continue
         n = await _store_lifts(msg, lifts)
         if n:
@@ -475,9 +643,7 @@ async def on_message(message: discord.Message) -> None:
     #  * the message is a clear "stats dump" (>= MIN_LIFTS_FOR_AUTO lifts), or
     #  * at least one lift was parsed with an explicit unit (kg / plates / BW+),
     #    which is a strong enough signal on its own (e.g. "Bench 100kg today").
-    should_store = len(lifts) >= MIN_LIFTS_FOR_AUTO or any(
-        l.confident for l in lifts
-    )
+    should_store = _should_auto_store(lifts)
     if lifts and should_store:
         # Detect PRs BEFORE inserting, so we can compare against the prior state.
         guild_id = message.guild.id if message.guild else 0
@@ -496,33 +662,33 @@ async def on_message(message: discord.Message) -> None:
             # what the bot understood from their message.
             try:
                 if len(lifts) == 1:
-                    l = lifts[0]
+                    lift = lifts[0]
                     reply = (
-                        f"Added **{_format_weight(l.weight_kg, l.bodyweight_add)}** "
-                        f"to **{l.equipment}**."
+                        f"Added **{_format_weight(lift.weight_kg, lift.bodyweight_add)}** "
+                        f"to **{lift.equipment}**."
                     )
                 else:
-                    lines = [f"Added {inserted} lift(s):"]
-                    for l in lifts:
+                    lines = [f"Added {_plural(inserted, 'lift')}:"]
+                    for lift in lifts:
                         lines.append(
-                            f"• **{l.equipment}** — "
-                            f"{_format_weight(l.weight_kg, l.bodyweight_add)}"
+                            f"• **{lift.equipment}** — "
+                            f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
                         )
                     reply = "\n".join(lines)
                 if prs:
                     pr_lines = ["", "🎉 **New PR!**"]
-                    for l, prev in prs:
+                    for lift, prev in prs:
                         if prev is None:
                             pr_lines.append(
-                                f"• **{l.equipment}**: first logged at "
-                                f"{_format_weight(l.weight_kg, l.bodyweight_add)}"
+                                f"• **{lift.equipment}**: first logged at "
+                                f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
                             )
                         else:
-                            gain = l.weight_kg - prev
+                            gain = lift.weight_kg - prev
                             pr_lines.append(
-                                f"• **{l.equipment}**: "
-                                f"{_format_weight(prev, l.bodyweight_add)} → "
-                                f"{_format_weight(l.weight_kg, l.bodyweight_add)} "
+                                f"• **{lift.equipment}**: "
+                                f"{_format_weight(prev, lift.bodyweight_add)} → "
+                                f"{_format_weight(lift.weight_kg, lift.bodyweight_add)} "
                                 f"(+{gain:g}kg)"
                             )
                     reply += "\n" + "\n".join(pr_lines)
@@ -575,10 +741,10 @@ async def on_message_edit(
 
     Behaviour:
       * Author-bot / DM messages and edits in non-gym channels are skipped.
-      * Only *new* lifts are inserted; the unique-on-(message_id, equipment)
-        index handles dedupe naturally so re-edits never double-count.
-      * Existing equipment whose weight changed is updated in place rather
-        than left stale.
+            * New confident lifts are inserted; the unique-on-(message_id, equipment)
+                index handles dedupe naturally so re-edits never double-count.
+            * Existing equipment whose weight changed is updated in place, and lifts
+                removed from the edited post are deleted rather than left stale.
     """
     if after.author.bot or not after.guild:
         return
@@ -590,17 +756,41 @@ async def on_message_edit(
     guild_id = after.guild.id
     aliases = _custom_alias_map(guild_id)
     new_lifts = parse_message(after.content, custom_aliases=aliases)
-    if not new_lifts:
+    existing_rows = db.lifts_for_message(guild_id, after.id)
+    existing = {r["equipment"]: r for r in existing_rows}
+    should_store = _should_auto_store(new_lifts)
+
+    if not existing and not should_store:
         return
 
-    # Detect updates (same equipment, new weight) vs. brand-new entries so
-    # corrections don't leave stale rows behind.
-    existing = {
-        r["equipment"]: r for r in db.lifts_for_message(guild_id, after.id)
-    }
+    if existing and new_lifts and not should_store:
+        new_lifts = [lift for lift in new_lifts if lift.equipment in existing]
+
+    if not new_lifts:
+        removed = db.delete_lifts_by_ids(
+            guild_id, after.author.id, [int(r["id"]) for r in existing_rows]
+        )
+        if removed:
+            try:
+                await after.add_reaction("✏️")
+            except discord.HTTPException:
+                pass
+            LOG.info(
+                "Edit removed all stored lifts from message %s in #%s: -%d",
+                after.id, after.channel, removed,
+            )
+        return
 
     fresh: list[Lift] = []
     updated = 0
+    parsed_equipment = {lift.equipment for lift in new_lifts}
+    stale_ids = [
+        int(row["id"])
+        for equipment, row in existing.items()
+        if equipment not in parsed_equipment
+    ]
+    removed = db.delete_lifts_by_ids(guild_id, after.author.id, stale_ids)
+
     for lift in new_lifts:
         prev = existing.get(lift.equipment)
         if prev is None:
@@ -618,14 +808,14 @@ async def on_message_edit(
     if fresh:
         inserted = await _store_lifts(after, fresh)
 
-    if inserted or updated:
+    if inserted or updated or removed:
         try:
             await after.add_reaction("✏️")
         except discord.HTTPException:
             pass
         LOG.info(
-            "Edit applied to message %s in #%s: +%d new, %d updated",
-            after.id, after.channel, inserted, updated,
+            "Edit applied to message %s in #%s: +%d new, %d updated, -%d removed",
+            after.id, after.channel, inserted, updated, removed,
         )
 
 
@@ -693,7 +883,7 @@ async def on_raw_reaction_add(
     except discord.HTTPException:
         return
     note = (
-        f"↩️ Undid {removed} stored lift(s) at the user's request."
+        f"↩️ Undid {_plural(removed, 'stored lift')} at the user's request."
         if removed
         else "↩️ Nothing to undo (already removed)."
     )
@@ -819,6 +1009,18 @@ async def log_cmd(
     weight_kg: float,
     bodyweight: bool = False,
 ) -> None:
+    if weight_kg < 0:
+        await interaction.response.send_message(
+            "Weight must be zero or positive.", ephemeral=True
+        )
+        return
+    if weight_kg == 0 and not bodyweight:
+        await interaction.response.send_message(
+            "Use `bodyweight:True` for pure BW work, or enter a positive kg value.",
+            ephemeral=True,
+        )
+        return
+
     guild_id = interaction.guild_id or 0
     canon = _resolve(guild_id, equipment)
     if not canon:
@@ -830,7 +1032,7 @@ async def log_cmd(
     lift = Lift(equipment=canon, weight_kg=weight_kg,
                 bodyweight_add=bodyweight, raw=f"/log {equipment} {weight_kg}")
     prev = db.previous_best(guild_id, interaction.user.id, canon)
-    inserted = db.add_lifts(
+    inserted_ids = db.add_lifts_returning_ids(
         guild_id=guild_id,
         user_id=interaction.user.id,
         username=interaction.user.display_name,
@@ -839,7 +1041,7 @@ async def log_cmd(
         channel_id=interaction.channel_id,
         logged_at=datetime.now(timezone.utc),
     )
-    if inserted:
+    if inserted_ids:
         msg = f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}."
         is_pr = weight_kg > 0 and (prev is None or weight_kg > prev)
         if is_pr:
@@ -861,8 +1063,22 @@ async def log_cmd(
                 "reached (goal cleared)."
             )
             db.goal_remove(guild_id, interaction.user.id, canon)
-        msg += "\n-# Use `/undo` if this was logged by mistake."
+        msg += (
+            "\n-# React ❌ to this response or use `/undo` "
+            "if this was logged by mistake."
+        )
         await interaction.response.send_message(msg)
+        try:
+            sent = await interaction.original_response()
+            db.track_reply(
+                reply_message_id=sent.id,
+                guild_id=guild_id,
+                user_id=interaction.user.id,
+                message_id=None,
+                lift_ids=inserted_ids,
+            )
+        except Exception:  # pragma: no cover - discord runtime only
+            LOG.exception("Failed to track /log response for undo")
     else:
         await interaction.response.send_message(
             "Could not log that entry.", ephemeral=True
@@ -949,11 +1165,14 @@ async def parse_cmd(
     inserted = await _store_lifts(msg, lifts)
     date = _format_date(msg.created_at.isoformat())
     lines = [
-        f"Stored {inserted} new lift(s) for {msg.author.display_name} "
+        f"Stored {_plural(inserted, 'new lift')} for {msg.author.display_name} "
         f"_(posted {date})_:"
     ]
-    for l in lifts:
-        lines.append(f"• {l.equipment}: {_format_weight(l.weight_kg, l.bodyweight_add)}")
+    for lift in lifts:
+        lines.append(
+            f"• {lift.equipment}: "
+            f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+        )
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -1005,6 +1224,13 @@ async def version_cmd(interaction: discord.Interaction) -> None:
         )
     else:
         reminder_line = "reminder: off"
+    if DAILY_UPDATE_CHANNEL_ID:
+        daily_line = (
+            f"daily update: {DAILY_UPDATE_HOUR:02d}:{DAILY_UPDATE_MINUTE:02d} "
+            f"({DISPLAY_TZ}) in <#{DAILY_UPDATE_CHANNEL_ID}>"
+        )
+    else:
+        daily_line = "daily update: off"
     lines = [
         f"**gym-bot v{__version__}**",
         f"discord.py: {discord.__version__}",
@@ -1014,6 +1240,7 @@ async def version_cmd(interaction: discord.Interaction) -> None:
         f"show lb: {'on' if SHOW_LB else 'off'}",
         f"display timezone: {DISPLAY_TZ}",
         reminder_line,
+        daily_line,
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -1306,6 +1533,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/equipment_list` — what the bot knows about\n"
             "`/aliases <equipment>` — spellings I accept\n"
+            "`/daily_update [days_ago]` — post a daily recap\n"
             "`/export [user]` — download lifts as CSV\n"
             "`/ping` · `/version`"
         ),
@@ -1653,7 +1881,7 @@ async def aliases_cmd(
     canon = _resolve(guild_id, equipment)
     al = aliases_for(canon)
     # Also surface any server-local custom aliases that resolve to the same
-    # canonical, so admins can see what they (or a previous admin) added.
+    # canonical, so users can see what this server has configured.
     custom = [
         r["alias_normalized"] for r in db.alias_list(guild_id)
         if r["canonical"] == canon
@@ -1802,7 +2030,7 @@ async def goals_cmd(
         bar = "█" * filled + "░" * (10 - filled)
         remaining = max(0.0, tgt - cur)
         tail = (
-            f"· **hit!**" if cur >= tgt and tgt > 0
+            "· **hit!**" if cur >= tgt and tgt > 0
             else f"· {remaining:g}kg to go"
         )
         lines.append(
@@ -1837,9 +2065,9 @@ async def alias_add_cmd(
             ephemeral=True,
         )
         return
-    # Resolve the canonical the admin is pointing at (respecting built-in
-    # aliases so "/alias_add foo chest fly" still lands on "pec dec").
-    canon = canonicalize(equipment)
+    # Resolve the canonical being pointed at (respecting built-in and
+    # existing custom aliases so "/alias_add foo chest fly" lands on "pec dec").
+    canon = _resolve(guild_id, equipment)
     if not canon:
         await interaction.response.send_message(
             "Please provide an equipment name to map to.", ephemeral=True
@@ -1848,8 +2076,7 @@ async def alias_add_cmd(
     db.alias_set(guild_id, key, canon, interaction.user.id)
     await interaction.response.send_message(
         f"Added alias: `{key}` → **{canon}**.\n"
-        "Note: custom aliases currently only apply to slash-command inputs, "
-        "not auto-parsed messages.",
+        "Custom aliases now apply to slash commands and auto-parsed messages.",
         ephemeral=True,
     )
 
@@ -1882,8 +2109,7 @@ async def alias_list_cmd(interaction: discord.Interaction) -> None:
     rows = db.alias_list(interaction.guild_id or 0)
     if not rows:
         await interaction.response.send_message(
-            "No custom aliases configured. Admins can add one with "
-            "`/alias_add`.",
+            "No custom aliases configured. Add one with `/alias_add`.",
             ephemeral=True,
         )
         return
@@ -1897,6 +2123,31 @@ async def alias_list_cmd(interaction: discord.Interaction) -> None:
             f"• **{canon}**: " + ", ".join(f"`{a}`" for a in by_canon[canon])
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(
+    name="daily_update",
+    description="Post a daily gym recap for this server.",
+)
+@app_commands.describe(
+    days_ago="Which day to recap: 1=yesterday, 0=today, max 30.",
+)
+async def daily_update_cmd(
+    interaction: discord.Interaction,
+    days_ago: int = 1,
+) -> None:
+    date_label, start_iso, end_iso = _daily_window(days_ago=days_ago)
+    text = _daily_update_text(
+        interaction.guild_id or 0,
+        date_label,
+        start_iso,
+        end_iso,
+        post_empty=True,
+    )
+    await interaction.response.send_message(
+        text,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1919,10 +2170,10 @@ async def graph_cmd(
 ) -> None:
     # Lazy import so the bot still boots if matplotlib isn't installed.
     try:
-        import matplotlib
+        matplotlib = importlib.import_module("matplotlib")
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
+        plt = importlib.import_module("matplotlib.pyplot")
+        mdates = importlib.import_module("matplotlib.dates")
     except ImportError:
         await interaction.response.send_message(
             "Graphing isn't available — matplotlib isn't installed. "

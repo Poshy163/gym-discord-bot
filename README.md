@@ -49,6 +49,8 @@ Stats & progress:
 - `/machine <equipment>` — everyone's timeline on one lift.
 - `/compare <user> [equipment]` — head-to-head PRs with a win tally.
 - `/serverstats` — server-wide totals, top lifters, and popular equipment.
+- `/daily_update [days_ago]` — post a daily server recap (PRs, active lifters,
+  popular lifts).
 
 Goals:
 
@@ -76,14 +78,14 @@ Discovery & utilities:
 - `/export [user]` — download lifts as a CSV attachment.
 - `/ping` · `/version`
 
-Admin (needs **Manage Messages**):
+Maintenance (available to everyone):
 
 - `/backfill [limit]` — rescan this channel's history.
 - `/rename <old> <new>` — merge one equipment name into another.
 - `/purge <equipment>` — delete every row for a lift name.
 - `/alias_add <phrase> <equipment>` — teach the bot a server-specific alias
-  (e.g. "hack sled" → "leg press"). Custom aliases currently only apply to
-  slash-command inputs, not auto-parsed chat messages.
+  (e.g. "hack sled" → "leg press"). Custom aliases apply to both
+  slash-command inputs and auto-parsed chat messages.
 - `/alias_remove <phrase>` · `/alias_list`
 
 Auto-parsing also celebrates PRs: when a stored lift beats your previous best
@@ -98,6 +100,14 @@ everyone to drop their current bests. Defaults are **Wednesday 12:00** in
 `DISPLAY_TIMEZONE` (defaults to `Australia/Adelaide`, which handles ACST/ACDT
 automatically). Tune with `REMINDER_WEEKDAY` (0=Mon … 6=Sun), `REMINDER_HOUR`,
 `REMINDER_MINUTE`, and optionally `REMINDER_ROLE_ID` to @mention a role.
+
+## Daily gym update
+
+Set `DAILY_UPDATE_CHANNEL_ID` in `.env` to have the bot post a daily recap of
+yesterday's activity: total lifts, active lifters, popular lifts, and PRs.
+Defaults are **08:00** in `DISPLAY_TIMEZONE`. Tune with `DAILY_UPDATE_HOUR` and
+`DAILY_UPDATE_MINUTE`. Empty days are skipped by default; set
+`DAILY_UPDATE_POST_EMPTY=true` if you want a quiet "no lifts" update too.
 
 ## Setup
 

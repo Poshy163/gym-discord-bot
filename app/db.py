@@ -411,13 +411,24 @@ class Database:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT substr(l.logged_at, 1, 7) AS month,
-                       MAX(l.weight_kg)          AS best,
-                       MAX(l.bodyweight_add)     AS bw,
-                       MIN(l.logged_at)          AS first_seen
-                FROM lifts l
-                WHERE l.guild_id = ? AND l.user_id = ? AND l.equipment = ?
-                GROUP BY month
+                WITH ranked AS (
+                    SELECT substr(logged_at, 1, 7) AS month,
+                           weight_kg,
+                           bodyweight_add,
+                           logged_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY substr(logged_at, 1, 7)
+                               ORDER BY weight_kg DESC, logged_at ASC, id ASC
+                           ) AS rn
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                )
+                SELECT month,
+                       weight_kg      AS best,
+                       bodyweight_add AS bw,
+                       logged_at      AS first_seen
+                FROM ranked
+                WHERE rn = 1
                 ORDER BY month
                 """,
                 (guild_id, user_id, equipment),
@@ -494,11 +505,49 @@ class Database:
                     "WHERE guild_id = ? AND canonical = ?",
                     (dst, guild_id, src),
                 )
-                # Also repoint any active goals so users don't lose them.
+            goal_sql = (
+                "SELECT user_id, equipment, target_kg, bodyweight_add, set_at "
+                "FROM goals WHERE guild_id = ? AND equipment IN (?, ?)"
+            )
+            goal_params: list[object] = [guild_id, src, dst]
+            if user_id is not None:
+                goal_sql += " AND user_id = ?"
+                goal_params.append(user_id)
+            goals_by_user: dict[int, dict[str, sqlite3.Row]] = {}
+            for row in c.execute(goal_sql, goal_params):
+                goals_by_user.setdefault(row["user_id"], {})[row["equipment"]] = row
+            for goal_user_id, goals in goals_by_user.items():
+                src_goal = goals.get(src)
+                if src_goal is None:
+                    continue
+                dst_goal = goals.get(dst)
+                if dst_goal is None:
+                    c.execute(
+                        "UPDATE goals SET equipment = ? "
+                        "WHERE guild_id = ? AND user_id = ? AND equipment = ?",
+                        (dst, guild_id, goal_user_id, src),
+                    )
+                    continue
+                if src_goal["target_kg"] > dst_goal["target_kg"]:
+                    c.execute(
+                        """
+                        UPDATE goals
+                        SET target_kg = ?, bodyweight_add = ?, set_at = ?
+                        WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                        """,
+                        (
+                            src_goal["target_kg"],
+                            src_goal["bodyweight_add"],
+                            src_goal["set_at"],
+                            guild_id,
+                            goal_user_id,
+                            dst,
+                        ),
+                    )
                 c.execute(
-                    "UPDATE OR REPLACE goals SET equipment = ? "
-                    "WHERE guild_id = ? AND equipment = ?",
-                    (dst, guild_id, src),
+                    "DELETE FROM goals "
+                    "WHERE guild_id = ? AND user_id = ? AND equipment = ?",
+                    (guild_id, goal_user_id, src),
                 )
             return cur.rowcount or 0
 
@@ -823,6 +872,87 @@ class Database:
                 """,
                 (guild_id, limit),
             ))
+
+    def daily_activity(
+        self, guild_id: int, start_iso: str, end_iso: str, limit: int = 5,
+    ) -> dict[str, object]:
+        """Activity summary for rows logged in [start_iso, end_iso)."""
+        with self._conn() as c:
+            totals = c.execute(
+                """
+                SELECT COUNT(*)                    AS total_lifts,
+                       COUNT(DISTINCT user_id)     AS lifters,
+                       COUNT(DISTINCT equipment)   AS unique_equip,
+                       COUNT(DISTINCT message_id)  AS sessions
+                FROM lifts
+                WHERE guild_id = ? AND logged_at >= ? AND logged_at < ?
+                """,
+                (guild_id, start_iso, end_iso),
+            ).fetchone()
+            top_users = list(c.execute(
+                """
+                SELECT username, COUNT(*) AS n,
+                       COUNT(DISTINCT equipment) AS equip
+                FROM lifts
+                WHERE guild_id = ? AND logged_at >= ? AND logged_at < ?
+                GROUP BY user_id
+                ORDER BY n DESC, username
+                LIMIT ?
+                """,
+                (guild_id, start_iso, end_iso, limit),
+            ))
+            popular_equipment = list(c.execute(
+                """
+                SELECT equipment, COUNT(*) AS n,
+                       COUNT(DISTINCT user_id) AS users
+                FROM lifts
+                WHERE guild_id = ? AND logged_at >= ? AND logged_at < ?
+                GROUP BY equipment
+                ORDER BY n DESC, equipment
+                LIMIT ?
+                """,
+                (guild_id, start_iso, end_iso, limit),
+            ))
+            prs = list(c.execute(
+                """
+                WITH period AS (
+                    SELECT l.username, l.equipment, l.weight_kg,
+                           l.bodyweight_add AS bw, l.logged_at,
+                           (
+                               SELECT MAX(prev.weight_kg)
+                               FROM lifts prev
+                               WHERE prev.guild_id = l.guild_id
+                                 AND prev.user_id = l.user_id
+                                 AND prev.equipment = l.equipment
+                                 AND prev.id < l.id
+                           ) AS prev_best
+                    FROM lifts l
+                    WHERE l.guild_id = ?
+                      AND l.logged_at >= ?
+                      AND l.logged_at < ?
+                )
+                SELECT username, equipment, weight_kg, bw, logged_at, prev_best
+                FROM period
+                WHERE weight_kg > 0
+                  AND (prev_best IS NULL OR weight_kg > prev_best)
+                ORDER BY (weight_kg - COALESCE(prev_best, 0)) DESC,
+                         weight_kg DESC,
+                         logged_at ASC
+                LIMIT ?
+                """,
+                (guild_id, start_iso, end_iso, limit),
+            ))
+            return {
+                "totals": dict(totals) if totals else {
+                    "total_lifts": 0,
+                    "lifters": 0,
+                    "unique_equip": 0,
+                    "sessions": 0,
+                },
+                "top_users": top_users,
+                "popular_equipment": popular_equipment,
+                "prs": prs,
+            }
 
     def export_rows(
         self, guild_id: int, user_id: int | None = None

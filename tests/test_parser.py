@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 # Pin plate weight before importing the parser so PLATE_KG is deterministic.
 os.environ.setdefault("PLATE_KG", "20")
 
@@ -19,7 +17,7 @@ from app.parser import estimated_one_rep_max, parse_message  # noqa: E402
 
 
 def _by(eq: str, lifts):
-    return [l for l in lifts if l.equipment == eq]
+    return [lift for lift in lifts if lift.equipment == eq]
 
 
 def test_colon_syntax_kg():
@@ -49,10 +47,10 @@ def test_plate_count_uses_env():
 def test_bodyweight_plus():
     lifts = parse_message("Dips: BW+20kg x5")
     assert lifts
-    l = lifts[0]
-    assert l.bodyweight_add is True
-    assert l.weight_kg == 20
-    assert l.reps == 5
+    lift = lifts[0]
+    assert lift.bodyweight_add is True
+    assert lift.weight_kg == 20
+    assert lift.reps == 5
 
 
 def test_plate_math_expression():
@@ -72,7 +70,7 @@ def test_reps_capture_variants():
 def test_section_headers_are_not_lifts():
     # "Chest" alone should not produce a lift even with a number after.
     lifts = parse_message("Chest\nBench: 80kg")
-    assert all(l.equipment != "chest" for l in lifts)
+    assert all(lift.equipment != "chest" for lift in lifts)
 
 
 def test_skips_bodyweight_chatter_lines():
@@ -86,6 +84,15 @@ def test_custom_alias_resolution():
     custom = {"wonky press": "shoulder press"}
     lifts = parse_message("Wonky press: 40kg", custom_aliases=custom)
     assert lifts and lifts[0].equipment == "shoulder press"
+
+
+def test_custom_alias_freeform_resolution():
+    custom = {"hack sled": "leg press"}
+    lifts = parse_message("Hit 120kg on hack sled today", custom_aliases=custom)
+    assert lifts
+    assert lifts[0].equipment == "leg press"
+    assert lifts[0].weight_kg == 120
+    assert lifts[0].confident is True
 
 
 def test_epley_one_rep_max():
