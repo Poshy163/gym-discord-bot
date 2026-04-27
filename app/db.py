@@ -613,6 +613,90 @@ class Database:
             cur = c.execute(sql, params)
             return cur.rowcount or 0
 
+    def _latest_lift(
+        self,
+        c: sqlite3.Connection,
+        guild_id: int,
+        user_id: int,
+        equipment: str,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> sqlite3.Row | None:
+        sql = (
+            "SELECT id, equipment, weight_kg, bodyweight_add AS bw, reps, logged_at "
+            "FROM lifts WHERE guild_id = ? AND user_id = ? AND equipment = ?"
+        )
+        params: list[object] = [guild_id, user_id, equipment]
+        if start_iso is not None and end_iso is not None:
+            sql += " AND logged_at >= ? AND logged_at < ?"
+            params.extend([start_iso, end_iso])
+        sql += " ORDER BY logged_at DESC, id DESC LIMIT 1"
+        return c.execute(sql, params).fetchone()
+
+    def update_latest_lift_weight(
+        self,
+        guild_id: int,
+        user_id: int,
+        equipment: str,
+        weight_kg: float,
+        bodyweight_add: bool,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Update the latest matching row and return its previous values."""
+        with self._conn() as c:
+            row = self._latest_lift(
+                c, guild_id, user_id, equipment, start_iso, end_iso,
+            )
+            if row is None:
+                return None
+            c.execute(
+                """
+                UPDATE lifts
+                SET weight_kg = ?, bodyweight_add = ?
+                WHERE id = ?
+                """,
+                (weight_kg, 1 if bodyweight_add else 0, row["id"]),
+            )
+            return row
+
+    def swap_latest_lift_weights(
+        self,
+        guild_id: int,
+        user_id: int,
+        first_equipment: str,
+        second_equipment: str,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row] | None:
+        """Swap weight/bodyweight/reps between two latest matching rows."""
+        with self._conn() as c:
+            first = self._latest_lift(
+                c, guild_id, user_id, first_equipment, start_iso, end_iso,
+            )
+            second = self._latest_lift(
+                c, guild_id, user_id, second_equipment, start_iso, end_iso,
+            )
+            if first is None or second is None or first["id"] == second["id"]:
+                return None
+            c.execute(
+                """
+                UPDATE lifts
+                SET weight_kg = ?, bodyweight_add = ?, reps = ?
+                WHERE id = ?
+                """,
+                (second["weight_kg"], second["bw"], second["reps"], first["id"]),
+            )
+            c.execute(
+                """
+                UPDATE lifts
+                SET weight_kg = ?, bodyweight_add = ?, reps = ?
+                WHERE id = ?
+                """,
+                (first["weight_kg"], first["bw"], first["reps"], second["id"]),
+            )
+            return first, second
+
     def history(
         self, guild_id: int, user_id: int, equipment: str, limit: int = 25
     ) -> list[sqlite3.Row]:
