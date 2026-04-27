@@ -71,6 +71,11 @@ Logging & editing:
   Only the original poster can do this; other users' reactions are ignored.
 - `/parse <message_id>` — re-parse a specific message in the current channel.
 - `/delete_entry <equipment> <date>` — remove one day's entries.
+- `/change_weight <equipment> <weight_kg> [user] [date]` — change the latest
+  matching entry's weight for you or another user.
+- `/swap_weights <first_equipment> <second_equipment> [user] [date]` — swap
+  weights between two latest matching entries (for example, leg curl ↔ leg
+  extension when a post mixed them up).
 
 Discovery & utilities:
 

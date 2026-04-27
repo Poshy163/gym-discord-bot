@@ -34,11 +34,13 @@ def db(tmp_path):
     d.close()
 
 
-def _add(db, guild, user, eq, w, *, msg_id=None, logged_at=None, bw=False):
+def _add(
+    db, guild, user, eq, w, *, msg_id=None, logged_at=None, bw=False, reps=None,
+):
     """Compact helper for seeding a single lift row."""
     return db.add_lifts(
         guild_id=guild, user_id=user, username=f"u{user}",
-        lifts=[_Lift(eq, w, bodyweight_add=bw)], message_id=msg_id,
+        lifts=[_Lift(eq, w, bodyweight_add=bw, reps=reps)], message_id=msg_id,
         logged_at=logged_at,
     )
 
@@ -180,6 +182,55 @@ def test_delete_entry_between_uses_timestamp_range(db):
     )
     assert deleted == 1
     assert db.count_equipment_rows(1, "bench", user_id=100) == 2
+
+
+def test_update_latest_lift_weight_can_target_another_user(db):
+    _add(db, 1, 100, "bench", 60, msg_id=1)
+    _add(db, 1, 200, "bench", 70, msg_id=2)
+    previous = db.update_latest_lift_weight(1, 200, "bench", 90, False)
+    assert previous is not None
+    assert previous["weight_kg"] == 70
+    assert db.progress(1, 100, "bench")[0]["best"] == 60
+    assert db.progress(1, 200, "bench")[0]["best"] == 90
+
+
+def test_update_latest_lift_weight_respects_date_window(db):
+    _add(
+        db, 1, 100, "bench", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 24, 13, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 70, msg_id=2,
+        logged_at=datetime(2026, 4, 25, 13, tzinfo=timezone.utc),
+    )
+    previous = db.update_latest_lift_weight(
+        1,
+        100,
+        "bench",
+        65,
+        False,
+        "2026-04-24T00:00:00+00:00",
+        "2026-04-25T00:00:00+00:00",
+    )
+    assert previous is not None
+    assert previous["weight_kg"] == 60
+    rows = db.history(1, 100, "bench")
+    assert [r["weight_kg"] for r in rows] == [65, 70]
+
+
+def test_swap_latest_lift_weights_between_two_entries(db):
+    _add(db, 1, 100, "leg curl", 45, msg_id=1, reps=8)
+    _add(db, 1, 100, "leg extension", 80, msg_id=2, bw=True, reps=10)
+    swapped = db.swap_latest_lift_weights(1, 100, "leg curl", "leg extension")
+    assert swapped is not None
+    rows = {
+        row["equipment"]: row
+        for row in db.user_latest_by_equipment(1, 100)
+    }
+    assert rows["leg curl"]["weight_kg"] == 80
+    assert rows["leg curl"]["bw"] == 1
+    assert rows["leg extension"]["weight_kg"] == 45
+    assert rows["leg extension"]["bw"] == 0
 
 
 def test_user_latest_by_equipment_returns_latest_rows(db):

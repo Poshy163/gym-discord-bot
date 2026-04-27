@@ -1514,6 +1514,127 @@ async def delete_entry_cmd(
     )
 
 
+@bot.tree.command(
+    name="change_weight",
+    description="Change the latest matching weight for you or another user.",
+)
+@app_commands.describe(
+    equipment="Equipment / lift name",
+    weight_kg="New weight to store in kg",
+    user="Target user (defaults to you).",
+    date="Optional local date to restrict the edit to (YYYY-MM-DD).",
+    bodyweight="Whether this is a bodyweight-relative lift (e.g. BW+20kg).",
+)
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
+async def change_weight_cmd(
+    interaction: discord.Interaction,
+    equipment: str,
+    weight_kg: float,
+    user: discord.Member | None = None,
+    date: str | None = None,
+    bodyweight: bool = False,
+) -> None:
+    if weight_kg < 0:
+        await interaction.response.send_message(
+            "`weight_kg` must be zero or higher.", ephemeral=True,
+        )
+        return
+    if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        await interaction.response.send_message(
+            "`date` must be in YYYY-MM-DD format.", ephemeral=True,
+        )
+        return
+
+    guild_id = interaction.guild_id or 0
+    target = user or interaction.user
+    canon = _resolve(guild_id, equipment)
+    start_iso = end_iso = None
+    if date:
+        start_iso, end_iso = _local_date_window(date)
+    previous = db.update_latest_lift_weight(
+        guild_id, target.id, canon, weight_kg, bodyweight, start_iso, end_iso,
+    )
+    if previous is None:
+        suffix = f" on {date}" if date else ""
+        await interaction.response.send_message(
+            f"No `{canon}` entry found for {target.display_name}{suffix}.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"Updated {target.display_name}'s `{canon}` "
+        f"({_format_date(previous['logged_at'])}): "
+        f"{_format_weight(previous['weight_kg'], bool(previous['bw']))} → "
+        f"{_format_weight(weight_kg, bodyweight)}.",
+        ephemeral=target.id == interaction.user.id,
+    )
+
+
+@bot.tree.command(
+    name="swap_weights",
+    description="Swap weights between two latest matching lift entries.",
+)
+@app_commands.describe(
+    first_equipment="First equipment / lift name",
+    second_equipment="Second equipment / lift name",
+    user="Target user (defaults to you).",
+    date="Optional local date to restrict the swap to (YYYY-MM-DD).",
+)
+@app_commands.autocomplete(
+    first_equipment=_equipment_autocomplete,
+    second_equipment=_equipment_autocomplete,
+)
+async def swap_weights_cmd(
+    interaction: discord.Interaction,
+    first_equipment: str,
+    second_equipment: str,
+    user: discord.Member | None = None,
+    date: str | None = None,
+) -> None:
+    if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        await interaction.response.send_message(
+            "`date` must be in YYYY-MM-DD format.", ephemeral=True,
+        )
+        return
+
+    guild_id = interaction.guild_id or 0
+    target = user or interaction.user
+    first = _resolve(guild_id, first_equipment)
+    second = _resolve(guild_id, second_equipment)
+    if not first or not second:
+        await interaction.response.send_message(
+            "Both equipment names must be non-empty.", ephemeral=True,
+        )
+        return
+    if first == second:
+        await interaction.response.send_message(
+            "Pick two different equipment names to swap.", ephemeral=True,
+        )
+        return
+
+    start_iso = end_iso = None
+    if date:
+        start_iso, end_iso = _local_date_window(date)
+    swapped = db.swap_latest_lift_weights(
+        guild_id, target.id, first, second, start_iso, end_iso,
+    )
+    if swapped is None:
+        suffix = f" on {date}" if date else ""
+        await interaction.response.send_message(
+            f"Could not find both `{first}` and `{second}` entries for "
+            f"{target.display_name}{suffix}.",
+            ephemeral=True,
+        )
+        return
+    first_row, second_row = swapped
+    await interaction.response.send_message(
+        f"Swapped {target.display_name}'s weights: "
+        f"`{first}` {_format_weight(first_row['weight_kg'], bool(first_row['bw']))} "
+        f"↔ `{second}` {_format_weight(second_row['weight_kg'], bool(second_row['bw']))}.",
+        ephemeral=target.id == interaction.user.id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Quality-of-life commands
 # ---------------------------------------------------------------------------
@@ -1568,6 +1689,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "(original author only)\n"
             "`/parse <message_id>` — reparse a message\n"
             "`/delete_entry <equipment> <date>` — remove one day\n"
+            "`/change_weight <equipment> <weight_kg> [user] [date]` — edit a weight\n"
+            "`/swap_weights <first> <second> [user] [date]` — swap two weights\n"
             "`/rename <old> <new> [user] [scope:all]` — relabel your "
             "entries (or someone else's, or guild-wide)"
         ),
@@ -2434,6 +2557,9 @@ purge_cmd.autocomplete("equipment")(_equipment_autocomplete)
 rename_cmd.autocomplete("old")(_equipment_autocomplete)
 rename_cmd.autocomplete("new")(_equipment_autocomplete)
 delete_entry_cmd.autocomplete("equipment")(_equipment_autocomplete)
+change_weight_cmd.autocomplete("equipment")(_equipment_autocomplete)
+swap_weights_cmd.autocomplete("first_equipment")(_equipment_autocomplete)
+swap_weights_cmd.autocomplete("second_equipment")(_equipment_autocomplete)
 compare_cmd.autocomplete("equipment")(_equipment_autocomplete)
 aliases_cmd.autocomplete("equipment")(_equipment_autocomplete)
 goal_set_cmd.autocomplete("equipment")(_equipment_autocomplete)
