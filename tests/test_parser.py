@@ -53,6 +53,15 @@ def test_bodyweight_plus():
     assert lift.reps == 5
 
 
+def test_hip_machine_bare_weight_lines_are_known_equipment():
+    add = parse_message("hip adduction 55kg")
+    abd = parse_message("hip abductor 40kg")
+    assert add and add[0].equipment == "hip adduction"
+    assert add[0].weight_kg == 55
+    assert abd and abd[0].equipment == "hip abduction"
+    assert abd[0].weight_kg == 40
+
+
 def test_plate_math_expression():
     lifts = parse_message("Bench: 2x20 + 10 kg")
     assert lifts and lifts[0].weight_kg == 50

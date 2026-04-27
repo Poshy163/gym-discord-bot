@@ -63,6 +63,8 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     ],
     "leg extension": ["leg extension", "leg extensions"],
     "leg curl": ["leg curl", "leg curls", "hamstring curl", "hamstring curls"],
+    "hip adduction": ["hip adduction", "hip adductor", "adduction", "adductor"],
+    "hip abduction": ["hip abduction", "hip abductor", "abduction", "abductor"],
     "calf raise": ["calf raise", "calf raises"],
     "squat": ["squat", "squats", "back squat"],
     "diddy machine": ["diddy machine"],
