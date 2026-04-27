@@ -32,7 +32,9 @@ from .aliases import (
     normalize_token,
 )
 from .db import Database
+from .graphing import daily_best_points, running_best_values
 from .message_targeting import strip_leading_user_mention
+from .overview import lift_overview
 from .parser import Lift, estimated_one_rep_max, parse_message
 from . import __version__
 
@@ -1801,6 +1803,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/stats [user]` — personal bests\n"
             "`/summary [user]` — profile overview\n"
+            "`/overview <equipment> [user]` — lift consistency\n"
             "`/checkin [user]` — copy/paste stat template\n"
             "`/stale [user] [days]` — lifts not updated lately\n"
             "`/progress <equipment> [user]` — best per month\n"
@@ -2560,13 +2563,101 @@ async def daily_update_cmd(
 
 
 # ---------------------------------------------------------------------------
+# Lift consistency overview
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(
+    name="overview",
+    description="Show consistency and progress for one user's lift.",
+)
+@app_commands.describe(
+    equipment="Equipment / lift name",
+    user="The user to summarise (defaults to you).",
+)
+async def overview_cmd(
+    interaction: discord.Interaction,
+    equipment: str,
+    user: discord.Member | None = None,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    canon = _resolve(guild_id, equipment)
+    rows = db.history(guild_id, target.id, canon, limit=1000)
+    if not rows:
+        await interaction.response.send_message(
+            f"No {canon} history for {target.display_name}.", ephemeral=True
+        )
+        return
+
+    stats = lift_overview(
+        ((r["logged_at"], float(r["weight_kg"])) for r in rows),
+        DISPLAY_TZ,
+    )
+    if stats is None:
+        await interaction.response.send_message(
+            "Couldn't build an overview — no datable entries.", ephemeral=True
+        )
+        return
+    bodyweight = any(bool(r["bw"]) for r in rows)
+
+    trend = stats.improvement_kg
+    trend_text = "flat"
+    if trend > 0:
+        trend_text = f"+{trend:g}kg"
+    elif trend < 0:
+        trend_text = f"{trend:g}kg"
+
+    avg_gap = (
+        f"{stats.avg_gap_days:.1f} days"
+        if stats.avg_gap_days is not None else "only one day logged"
+    )
+    longest_gap = (
+        f"{stats.longest_gap_days} days"
+        if stats.longest_gap_days is not None else "only one day logged"
+    )
+    stale = (
+        "today" if stats.days_since_latest == 0
+        else f"{_plural(stats.days_since_latest, 'day')} ago"
+    )
+
+    lines = [
+        f"**{target.display_name} — {canon} overview**",
+        (
+            f"Consistency: **{stats.consistency_score}/100** · "
+            f"current streak: **{_plural(stats.current_week_streak, 'week')}**"
+        ),
+        (
+            f"Logged **{stats.total_logs}** times across "
+            f"**{_plural(stats.active_days, 'day')}** and "
+            f"**{stats.active_weeks}/{stats.total_weeks} active weeks**."
+        ),
+        (
+            f"Latest: **{_format_weight(stats.latest_kg, bodyweight)}** "
+            f"({stale}) · best: **{_format_weight(stats.best_kg, bodyweight)}**"
+        ),
+        (
+            f"Change: {_format_weight(stats.first_kg, bodyweight)} "
+            f"({_format_date(stats.first_day.isoformat())}) → "
+            f"{_format_weight(stats.latest_kg, bodyweight)} "
+            f"({_format_date(stats.latest_day.isoformat())}) · **{trend_text}**"
+        ),
+        (
+            f"Spacing: avg gap **{avg_gap}** · longest gap **{longest_gap}** · "
+            f"last 30 days: **{_plural(stats.logs_last_30_days, 'log')}**"
+        ),
+    ]
+    await interaction.response.send_message("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Progress graph
 # ---------------------------------------------------------------------------
 
 
 @bot.tree.command(
     name="graph",
-    description="Plot a lift's weight over time as a PNG chart.",
+    description="Plot a lift's daily-best progress as a PNG chart.",
 )
 @app_commands.describe(
     equipment="Equipment / lift name",
@@ -2583,6 +2674,7 @@ async def graph_cmd(
         matplotlib.use("Agg")
         plt = importlib.import_module("matplotlib.pyplot")
         mdates = importlib.import_module("matplotlib.dates")
+        ticker = importlib.import_module("matplotlib.ticker")
     except ImportError:
         await interaction.response.send_message(
             "Graphing isn't available — matplotlib isn't installed. "
@@ -2603,55 +2695,110 @@ async def graph_cmd(
 
     await interaction.response.defer(thinking=True)
 
-    xs: list[datetime] = []
-    ys: list[float] = []
-    for r in rows:
-        try:
-            dt = datetime.fromisoformat(r["logged_at"])
-        except ValueError:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        xs.append(dt.astimezone(DISPLAY_TZ))
-        ys.append(float(r["weight_kg"]))
-    if not xs:
+    points = daily_best_points(
+        ((r["logged_at"], float(r["weight_kg"])) for r in rows),
+        DISPLAY_TZ,
+    )
+    if not points:
         await interaction.followup.send(
             "Couldn't plot — no datable entries.", ephemeral=True
         )
         return
 
-    # Also compute running-best for a reference line so gains are visible.
-    running_best: list[float] = []
-    cur = 0.0
-    for y in ys:
-        cur = max(cur, y)
-        running_best.append(cur)
+    xs = [point.when for point in points]
+    ys = [point.weight_kg for point in points]
+    running_best = running_best_values(ys)
 
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=120)
-    ax.plot(xs, ys, marker="o", linewidth=1.5,
-            color="#f26522", label="Logged")
-    ax.plot(xs, running_best, linestyle="--", linewidth=1.2,
-            color="#444", alpha=0.7, label="Best to date")
-    ax.set_title(f"{target.display_name} — {canon}")
-    ax.set_ylabel("kg")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right")
+    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=150)
+    fig.patch.set_facecolor("#f6f3ee")
+    ax.set_facecolor("#fffdfa")
+    primary = "#f26522"
+    best_colour = "#24756f"
+
+    ax.plot(
+        xs, ys,
+        marker="o", markersize=6.5, markerfacecolor="#fffdfa",
+        markeredgewidth=2.0, linewidth=2.4,
+        color=primary, label="Daily best",
+    )
     if len(xs) > 1:
-        locator = mdates.AutoDateLocator()
+        ax.step(
+            xs, running_best, where="post", linewidth=1.8,
+            linestyle=(0, (4, 3)), color=best_colour,
+            label="Best to date",
+        )
+
+    ax.set_title(
+        f"{target.display_name} — {canon}", loc="left",
+        fontsize=14, fontweight="bold", pad=16,
+    )
+    subtitle = (
+        f"{len(rows)} log{'s' if len(rows) != 1 else ''} · "
+        f"{len(points)} day{'s' if len(points) != 1 else ''} · "
+        f"peak {max(ys):g}kg"
+    )
+    ax.text(
+        0, 1.015, subtitle, transform=ax.transAxes,
+        fontsize=9, color="#6b625a", va="bottom",
+    )
+    ax.set_ylabel("kg")
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+    ax.grid(axis="y", color="#d9d3cb", linewidth=0.8, alpha=0.85)
+    ax.grid(axis="x", color="#eee9e1", linewidth=0.7, alpha=0.55)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#b8afa4")
+    ax.spines["bottom"].set_color("#b8afa4")
+    ax.tick_params(colors="#332f2a", labelsize=9)
+
+    ymin = min(ys)
+    ymax = max(ys)
+    ypad = max(5.0, (ymax - ymin) * 0.18)
+    ax.set_ylim(max(0, ymin - ypad), ymax + ypad)
+
+    label_indexes = (
+        range(len(xs))
+        if len(xs) <= 8
+        else sorted({ys.index(ymax), len(xs) - 1})
+    )
+    for idx in label_indexes:
+        ax.annotate(
+            f"{ys[idx]:g}kg",
+            xy=(xs[idx], ys[idx]), xytext=(0, 9),
+            textcoords="offset points", ha="center", va="bottom",
+            fontsize=8, color="#332f2a",
+        )
+
+    if len(xs) > 1:
+        span = max(xs) - min(xs)
+        pad = timedelta(days=max(1.0, span.days * 0.06))
+        ax.set_xlim(min(xs) - pad, max(xs) + pad)
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    fig.autofmt_xdate()
-    fig.tight_layout()
+        ax.legend(loc="upper left", frameon=False, fontsize=9)
+    else:
+        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+
+    fig.autofmt_xdate(rotation=0, ha="center")
+    fig.tight_layout(pad=1.2)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     fname = f"{canon.replace(' ', '_')}_{target.display_name}.png"
     file = discord.File(buf, filename=fname)
+    collapsed_days = sum(1 for point in points if point.entries > 1)
+    note = ""
+    if collapsed_days:
+        plural = "s" if collapsed_days != 1 else ""
+        note = f" · daily bests shown ({collapsed_days} multi-log day{plural})"
     await interaction.followup.send(
         f"📈 **{target.display_name} — {canon}** "
-        f"(peak {max(ys):g}kg)",
+        f"(peak {max(ys):g}kg{note})",
         file=file,
     )
 
@@ -2709,6 +2856,7 @@ compare_cmd.autocomplete("equipment")(_equipment_autocomplete)
 aliases_cmd.autocomplete("equipment")(_equipment_autocomplete)
 goal_set_cmd.autocomplete("equipment")(_equipment_autocomplete)
 goal_remove_cmd.autocomplete("equipment")(_equipment_autocomplete)
+overview_cmd.autocomplete("equipment")(_equipment_autocomplete)
 graph_cmd.autocomplete("equipment")(_equipment_autocomplete)
 alias_add_cmd.autocomplete("equipment")(_equipment_autocomplete)
 

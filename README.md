@@ -45,10 +45,12 @@ Stats & progress:
 - `/stats [user]` — personal bests for a user.
 - `/summary [user]` — profile overview (totals, top PRs, most trained, gains,
   current weekly streak).
+- `/overview <equipment> [user]` — consistency overview for one lift: logs,
+  active weeks, streak, spacing, current weight, and best.
 - `/checkin [user]` — copy/paste stat template prefilled with current bests.
 - `/stale [user] [days]` — lifts that haven't been updated recently.
 - `/progress <equipment> [user]` — best lift per calendar month, with deltas.
-- `/graph <equipment> [user]` — PNG chart of weight over time with a
+- `/graph <equipment> [user]` — PNG chart of daily-best weight over time with a
   running-best reference line.
 - `/history <equipment> [user]` — per-entry timeline for one user.
 - `/recent [user] [limit]` — most recent entries across all equipment.
