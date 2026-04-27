@@ -20,6 +20,10 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "shoulder press": [
         "shoulder press", "ohp", "overhead press", "military press",
     ],
+    "chest press": [
+        "chest press", "machine chest press", "plate loaded chest press",
+        "pin loaded chest press",
+    ],
     "lat pulldown": [
         "lat pulldown", "lat pull down", "lat pull", "pulldown",
     ],
@@ -67,6 +71,7 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "hip abduction": ["hip abduction", "hip abductor", "abduction", "abductor"],
     "calf raise": ["calf raise", "calf raises"],
     "squat": ["squat", "squats", "back squat"],
+    "squat rack": ["squat rack", "squat racks", "power rack"],
     "diddy machine": ["diddy machine"],
     "deadlift": ["deadlift", "deadlifts", "dead lift"],
     "romanian deadlift": [
@@ -84,6 +89,32 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
         "dumbbell shoulder press", "db shoulder press",
         "dumbell shoulder press",
     ],
+    "dumbbell": ["dumbbell", "dumbbells", "dumbell", "dumbells", "db"],
+    "barbell": [
+        "barbell", "barbells", "straight barbell", "straight barbells",
+        "olympic barbell", "olympic bar",
+    ],
+    "ez bar": ["ez bar", "ez-bar", "ez barbell", "ez barbells", "curl bar"],
+    "weight plate": ["weight plate", "weight plates"],
+    "treadmill": ["treadmill", "treadmills"],
+    "stairmaster": [
+        "stairmaster", "stairmasters", "stair master", "stair masters",
+        "stair climber",
+    ],
+    "spin bike": [
+        "spin bike", "spin bikes", "exercise bike", "stationary bike",
+    ],
+    "assault bike": ["assault bike", "assault bikes", "air bike"],
+    "elliptical": ["elliptical", "ellipticals", "cross trainer"],
+    "rowing machine": [
+        "rowing machine", "rowing machines", "rower", "erg", "ergometer",
+    ],
+    "plyo box": ["plyo box", "plyo boxes", "box jump", "box jumps"],
+    "resistance band": ["resistance band", "resistance bands"],
+    "kettlebell": ["kettlebell", "kettlebells", "kb"],
+    "slam ball": ["slam ball", "slam balls"],
+    "medicine ball": ["medicine ball", "medicine balls", "med ball", "med balls"],
+    "sled": ["sled", "sleds", "push sled", "sled push", "prowler", "prowler sled"],
 }
 
 

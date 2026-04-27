@@ -62,6 +62,28 @@ def test_hip_machine_bare_weight_lines_are_known_equipment():
     assert abd[0].weight_kg == 40
 
 
+def test_revo_equipment_bare_weight_lines_are_known_equipment():
+    lifts = parse_message(
+        "machine chest press 55kg\n"
+        "stair master 20kg\n"
+        "assault bike 10kg\n"
+        "rowing machine 12kg\n"
+        "ez bar 30kg\n"
+        "kettlebell 24kg\n"
+        "sled push 80kg\n"
+        "med ball 8kg"
+    )
+    by_name = {lift.equipment: lift.weight_kg for lift in lifts}
+    assert by_name["chest press"] == 55
+    assert by_name["stairmaster"] == 20
+    assert by_name["assault bike"] == 10
+    assert by_name["rowing machine"] == 12
+    assert by_name["ez bar"] == 30
+    assert by_name["kettlebell"] == 24
+    assert by_name["sled"] == 80
+    assert by_name["medicine ball"] == 8
+
+
 def test_plate_math_expression():
     lifts = parse_message("Bench: 2x20 + 10 kg")
     assert lifts and lifts[0].weight_kg == 50
