@@ -280,3 +280,36 @@ def test_delete_reply_rowcount_is_race_safe(db):
     )
     assert db.delete_reply(20) == 1
     assert db.delete_reply(20) == 0
+
+
+def test_reply_tracking_can_target_another_lifter(db):
+    db.track_reply(
+        reply_message_id=20, guild_id=1, user_id=100,
+        message_id=10, lift_ids=[], target_user_id=200,
+    )
+    row = db.get_reply(20)
+    assert row is not None
+    assert row["user_id"] == 100
+    assert row["target_user_id"] == 200
+
+
+def test_retarget_replies_for_edited_message(db):
+    db.track_reply(
+        reply_message_id=20, guild_id=1, user_id=100,
+        message_id=10, lift_ids=[], target_user_id=100,
+    )
+    updated = db.retarget_replies_for_message(1, 10, 200)
+    assert updated == 1
+    row = db.get_reply(20)
+    assert row is not None
+    assert row["target_user_id"] == 200
+
+
+def test_delete_lifts_by_ids_can_delete_after_retarget(db):
+    _add(db, 1, 100, "bench", 60, msg_id=1)
+    _add(db, 1, 200, "bench", 70, msg_id=2)
+    rows = db.lifts_for_message(1, 1)
+    deleted = db.delete_lifts_by_ids(1, None, [int(rows[0]["id"])])
+    assert deleted == 1
+    assert db.count_equipment_rows(1, "bench", user_id=100) == 0
+    assert db.count_equipment_rows(1, "bench", user_id=200) == 1

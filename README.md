@@ -16,6 +16,7 @@ Incline bench 70
 Dips: BW+20kg
 Leg Press: 6 plates
 Leg curls: 50 - 77 kg
+@Cookie Monster squat 55kg
 ```
 
 Rules it uses:
@@ -26,6 +27,10 @@ Rules it uses:
 - `N plates` -> N × 20 kg (configurable via `PLATE_KG` in `app/parser.py`).
 - `BW+Xkg` -> X kg recorded with the bodyweight-add flag.
 - `A - B kg` range -> the higher number (treated as top working weight).
+- A leading Discord user mention logs the lift for that person instead of the
+  message author, so `@Cookie Monster squat 55kg` stores Cookie Monster's squat.
+- Weights over `MAX_WEIGHT_KG` are skipped as likely typos/fakes. The default is
+  `500`, which catches mistakes like `2200kg` before they hit leaderboards.
 - Many aliases are unified (e.g. `pec dec`, `pec fly`, `chest fly`, `pekdek`
   all become `pec dec`). See `app/aliases.py`.
 
@@ -65,10 +70,11 @@ clears the goal automatically.
 
 Logging & editing:
 
-- `/log <equipment> <weight_kg> [bodyweight]` — manual entry (🎉 on PRs).
+- `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally
+  for another user (🎉 on PRs).
 - `/undo` — remove your most recent entry.
 - **React ❌ on the bot's reply** to undo the specific lifts that reply stored.
-  Only the original poster can do this; other users' reactions are ignored.
+  The logger and target lifter can do this; other users' reactions are ignored.
 - `/parse <message_id>` — re-parse a specific message in the current channel.
 - `/delete_entry <equipment> <date>` — remove one day's entries.
 - `/change_weight <equipment> <weight_kg> [user] [date]` — change the latest

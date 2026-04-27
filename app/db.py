@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS reply_tracking (
     reply_message_id INTEGER PRIMARY KEY,
     guild_id         INTEGER NOT NULL,
     user_id          INTEGER NOT NULL,
+    target_user_id   INTEGER,
     message_id       INTEGER,
     lift_ids         TEXT,
     created_at       TEXT    NOT NULL
@@ -133,6 +134,20 @@ class Database:
             }
             if "reps" not in cols:
                 self._connection.execute("ALTER TABLE lifts ADD COLUMN reps INTEGER")
+            reply_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(reply_tracking)"
+                )
+            }
+            if "target_user_id" not in reply_cols:
+                self._connection.execute(
+                    "ALTER TABLE reply_tracking ADD COLUMN target_user_id INTEGER"
+                )
+                self._connection.execute(
+                    "UPDATE reply_tracking SET target_user_id = user_id "
+                    "WHERE target_user_id IS NULL"
+                )
             self._recanonicalize_equipment()
 
     def _recanonicalize_equipment(self) -> None:
@@ -1263,18 +1278,20 @@ class Database:
     def track_reply(
         self, reply_message_id: int, guild_id: int, user_id: int,
         message_id: int | None, lift_ids: list[int] | None,
+        target_user_id: int | None = None,
     ) -> None:
+        target_id = user_id if target_user_id is None else target_user_id
         ids_str = ",".join(str(i) for i in (lift_ids or [])) or None
         with self._conn() as c:
             c.execute(
                 """
                 INSERT OR REPLACE INTO reply_tracking
-                    (reply_message_id, guild_id, user_id,
+                    (reply_message_id, guild_id, user_id, target_user_id,
                      message_id, lift_ids, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    reply_message_id, guild_id, user_id,
+                    reply_message_id, guild_id, user_id, target_id,
                     message_id, ids_str,
                     _normalize_iso(None),
                 ),
@@ -1287,6 +1304,7 @@ class Database:
             return c.execute(
                 """
                 SELECT reply_message_id, guild_id, user_id,
+                       COALESCE(target_user_id, user_id) AS target_user_id,
                        message_id, lift_ids, created_at
                 FROM reply_tracking
                 WHERE reply_message_id = ?
@@ -1302,6 +1320,26 @@ class Database:
             cur = c.execute(
                 "DELETE FROM reply_tracking WHERE reply_message_id = ?",
                 (reply_message_id,),
+            )
+            return cur.rowcount or 0
+
+    def retarget_replies_for_message(
+        self, guild_id: int, message_id: int, target_user_id: int,
+    ) -> int:
+        """Point tracked replies for a source message at the current lifter.
+
+        Used when a user edits a message to add, remove, or change a leading
+        @mention. Without this, reaction undo could remain scoped to the old
+        lifter even though the stored rows moved to the new one.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                UPDATE reply_tracking
+                SET target_user_id = ?
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (target_user_id, guild_id, message_id),
             )
             return cur.rowcount or 0
 
@@ -1322,18 +1360,21 @@ class Database:
             return cur.rowcount or 0
 
     def delete_lifts_by_ids(
-        self, guild_id: int, user_id: int, ids: list[int]
+        self, guild_id: int, user_id: int | None, ids: list[int]
     ) -> int:
         """Delete specific lift rows by id. Scoped to (guild_id, user_id)
-        for safety so a stale reply record can't nuke someone else's data."""
+        for safety when a user id is supplied so a stale reply record can't
+        nuke someone else's data."""
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
+        user_clause = " AND user_id = ?" if user_id is not None else ""
+        user_params: list[object] = [user_id] if user_id is not None else []
         with self._conn() as c:
             cur = c.execute(
-                f"DELETE FROM lifts "
-                f"WHERE guild_id = ? AND user_id = ? AND id IN ({placeholders})",
-                [guild_id, user_id, *ids],
+                "DELETE FROM lifts "
+                f"WHERE guild_id = ?{user_clause} AND id IN ({placeholders})",
+                [guild_id, *user_params, *ids],
             )
             return cur.rowcount or 0
 
@@ -1345,7 +1386,7 @@ class Database:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT id, equipment, weight_kg,
+                SELECT id, user_id, username, equipment, weight_kg,
                        bodyweight_add AS bw, reps
                 FROM lifts
                 WHERE guild_id = ? AND message_id = ?

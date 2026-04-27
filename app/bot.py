@@ -32,6 +32,7 @@ from .aliases import (
     normalize_token,
 )
 from .db import Database
+from .message_targeting import strip_leading_user_mention
 from .parser import Lift, estimated_one_rep_max, parse_message
 from . import __version__
 
@@ -107,6 +108,13 @@ BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "1000"))
 # anyone reading who isn't on metric.
 SHOW_LB = os.getenv("SHOW_LB", "false").lower() in ("1", "true", "yes", "y", "on")
 
+# Guardrail against typos such as "2200kg" becoming a leaderboard PR. Set to
+# 0 to disable if your server genuinely needs to log heavier machine numbers.
+try:
+    MAX_WEIGHT_KG = float(os.getenv("MAX_WEIGHT_KG", "500"))
+except ValueError:
+    MAX_WEIGHT_KG = 500.0
+
 # Timezone used when rendering dates in user-facing messages. Defaults to
 # Australia/Adelaide (the author's crew). Falls back to UTC if zoneinfo isn't
 # available or the name is invalid.
@@ -165,6 +173,73 @@ def _format_weight(weight: float, bw: bool) -> str:
         lb_str = f"{lb:g}"
         base += f" (≈{lb_str} lb)"
     return base
+
+
+def _display_name(user: object) -> str:
+    return str(
+        getattr(user, "display_name", None)
+        or getattr(user, "global_name", None)
+        or getattr(user, "name", "Unknown user")
+    )
+
+
+def _message_lift_target(message: discord.Message) -> tuple[object, str]:
+    """Return the lifter and content to parse for a Discord message.
+
+    A leading user mention means "log this for that person", e.g.
+    ``@Cookie Monster squat 55kg``. Mentions elsewhere in the sentence remain
+    ordinary chat text because they are ambiguous.
+    """
+    mentioned_id, body = strip_leading_user_mention(message.content)
+    if mentioned_id is None:
+        return message.author, message.content
+    if bot.user and mentioned_id == bot.user.id:
+        return message.author, message.content
+    target = discord.utils.get(message.mentions, id=mentioned_id)
+    if target is None or getattr(target, "bot", False):
+        return message.author, message.content
+    return target, body
+
+
+def _target_suffix(author: object, target: object) -> str:
+    if getattr(author, "id", None) == getattr(target, "id", None):
+        return ""
+    return f" for **{_display_name(target)}**"
+
+
+def _split_reasonable_lifts(lifts: list[Lift]) -> tuple[list[Lift], list[Lift]]:
+    if MAX_WEIGHT_KG <= 0:
+        return lifts, []
+    accepted: list[Lift] = []
+    rejected: list[Lift] = []
+    for lift in lifts:
+        if lift.weight_kg > MAX_WEIGHT_KG:
+            rejected.append(lift)
+        else:
+            accepted.append(lift)
+    return accepted, rejected
+
+
+def _rejected_lifts_note(rejected: list[Lift]) -> str:
+    if not rejected:
+        return ""
+    lines = [
+        "",
+        (
+            f"⚠️ Skipped {_plural(len(rejected), 'lift')} over "
+            f"{MAX_WEIGHT_KG:g}kg. If that was real, use `/log` after "
+            "raising `MAX_WEIGHT_KG`."
+        ),
+    ]
+    for lift in rejected[:5]:
+        lines.append(
+            f"• **{lift.equipment}** — "
+            f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+        )
+    remaining = len(rejected) - 5
+    if remaining > 0:
+        lines.append(f"• ... and {_plural(remaining, 'more lift')}")
+    return "\n".join(lines)
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -381,12 +456,13 @@ def _new_prs_for_lifts(
 
 
 async def _store_lifts(
-    message: discord.Message, lifts: list[Lift]
+    message: discord.Message, lifts: list[Lift], target_user: object | None = None
 ) -> int:
+    target = target_user or message.author
     return db.add_lifts(
         guild_id=message.guild.id if message.guild else 0,
-        user_id=message.author.id,
-        username=message.author.display_name,
+        user_id=int(getattr(target, "id")),
+        username=_display_name(target),
         lifts=lifts,
         message_id=message.id,
         channel_id=message.channel.id,
@@ -652,14 +728,16 @@ async def _backfill_channel(
             continue
         scanned += 1
         guild_aliases = _custom_alias_map(msg.guild.id)
-        lifts = parse_message(msg.content, custom_aliases=guild_aliases)
+        target, content = _message_lift_target(msg)
+        lifts = parse_message(content, custom_aliases=guild_aliases)
+        lifts, _rejected = _split_reasonable_lifts(lifts)
         if not lifts:
             continue
         if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(
             lift.confident for lift in lifts
         ):
             continue
-        n = await _store_lifts(msg, lifts)
+        n = await _store_lifts(msg, lifts, target)
         if n:
             matched += 1
             inserted += n
@@ -697,7 +775,9 @@ async def on_message(message: discord.Message) -> None:
         return
 
     guild_aliases = _custom_alias_map(message.guild.id)
-    lifts = parse_message(message.content, custom_aliases=guild_aliases)
+    target, content = _message_lift_target(message)
+    lifts = parse_message(content, custom_aliases=guild_aliases)
+    lifts, rejected_lifts = _split_reasonable_lifts(lifts)
     # Auto-store when either:
     #  * the message is a clear "stats dump" (>= MIN_LIFTS_FOR_AUTO lifts), or
     #  * at least one lift was parsed with an explicit unit (kg / plates / BW+),
@@ -706,16 +786,17 @@ async def on_message(message: discord.Message) -> None:
     if lifts and should_store:
         # Detect PRs BEFORE inserting, so we can compare against the prior state.
         guild_id = message.guild.id if message.guild else 0
-        prs = _new_prs_for_lifts(guild_id, message.author.id, lifts)
+        target_user_id = int(getattr(target, "id"))
+        prs = _new_prs_for_lifts(guild_id, target_user_id, lifts)
 
-        inserted = await _store_lifts(message, lifts)
+        inserted = await _store_lifts(message, lifts, target)
         if inserted > 0:
             try:
                 await message.add_reaction("✅")
             except discord.HTTPException:
                 pass
             # Check goal hits (PRs that meet or beat the user's goal).
-            goal_hits = _check_goal_hits(guild_id, message.author.id, prs)
+            goal_hits = _check_goal_hits(guild_id, target_user_id, prs)
 
             # Reply with a short confirmation so the user can see exactly
             # what the bot understood from their message.
@@ -724,10 +805,14 @@ async def on_message(message: discord.Message) -> None:
                     lift = lifts[0]
                     reply = (
                         f"Added **{_format_weight(lift.weight_kg, lift.bodyweight_add)}** "
-                        f"to **{lift.equipment}**."
+                        f"to **{lift.equipment}**"
+                        f"{_target_suffix(message.author, target)}."
                     )
                 else:
-                    lines = [f"Added {_plural(inserted, 'lift')}:"]
+                    lines = [
+                        f"Added {_plural(inserted, 'lift')}"
+                        f"{_target_suffix(message.author, target)}:"
+                    ]
                     lines.extend(_format_lift_lines(lifts))
                     reply = "\n".join(lines)
                 if prs:
@@ -755,9 +840,10 @@ async def on_message(message: discord.Message) -> None:
                             f"{_format_weight(tgt, bw)} reached "
                             "(goal cleared)"
                         )
+                reply += _rejected_lifts_note(rejected_lifts)
                 reply += (
                     "\n-# React ❌ to this reply if I got it wrong — "
-                    "only you can undo your own entry."
+                    "the logger or target lifter can undo this entry."
                 )
                 sent = await message.reply(reply, mention_author=False)
                 try:
@@ -767,6 +853,7 @@ async def on_message(message: discord.Message) -> None:
                         user_id=message.author.id,
                         message_id=message.id,
                         lift_ids=None,
+                        target_user_id=target_user_id,
                     )
                 except Exception:  # pragma: no cover - non-critical
                     LOG.exception("Failed to track reply for undo")
@@ -774,7 +861,7 @@ async def on_message(message: discord.Message) -> None:
                 pass
             LOG.info(
                 "Stored %d lifts from %s in #%s",
-                inserted, message.author, message.channel,
+                inserted, target, message.channel,
             )
         else:
             # Lifts were detected but every one was a duplicate — give a quiet
@@ -783,6 +870,15 @@ async def on_message(message: discord.Message) -> None:
                 await message.add_reaction("🔁")
             except discord.HTTPException:
                 pass
+    elif rejected_lifts:
+        try:
+            await message.add_reaction("⚠️")
+            await message.reply(
+                _rejected_lifts_note(rejected_lifts).lstrip(),
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
 
     await bot.process_commands(message)
 
@@ -801,20 +897,39 @@ async def on_message_edit(
 
     guild_id = after.guild.id
     aliases = _custom_alias_map(guild_id)
-    new_lifts = parse_message(after.content, custom_aliases=aliases)
+    target, content = _message_lift_target(after)
+    target_user_id = int(getattr(target, "id"))
+    db.retarget_replies_for_message(guild_id, after.id, target_user_id)
+    new_lifts = parse_message(content, custom_aliases=aliases)
+    new_lifts, _rejected = _split_reasonable_lifts(new_lifts)
     existing_rows = db.lifts_for_message(guild_id, after.id)
+    wrong_target_ids = [
+        int(row["id"]) for row in existing_rows
+        if int(row["user_id"]) != target_user_id
+    ]
+    retargeted_removed = db.delete_lifts_by_ids(
+        guild_id, None, wrong_target_ids,
+    )
+    existing_rows = [
+        row for row in existing_rows if int(row["user_id"]) == target_user_id
+    ]
     existing = {r["equipment"]: r for r in existing_rows}
     should_store = _should_auto_store(new_lifts)
 
     if not existing and not should_store:
+        if retargeted_removed:
+            try:
+                await after.add_reaction("✏️")
+            except discord.HTTPException:
+                pass
         return
 
     if existing and new_lifts and not should_store:
         new_lifts = [lift for lift in new_lifts if lift.equipment in existing]
 
     if not new_lifts:
-        removed = db.delete_lifts_by_ids(
-            guild_id, after.author.id, [int(r["id"]) for r in existing_rows]
+        removed = retargeted_removed + db.delete_lifts_by_ids(
+            guild_id, target_user_id, [int(r["id"]) for r in existing_rows]
         )
         if removed:
             try:
@@ -835,7 +950,9 @@ async def on_message_edit(
         for equipment, row in existing.items()
         if equipment not in parsed_equipment
     ]
-    removed = db.delete_lifts_by_ids(guild_id, after.author.id, stale_ids)
+    removed = retargeted_removed + db.delete_lifts_by_ids(
+        guild_id, target_user_id, stale_ids,
+    )
 
     for lift in new_lifts:
         prev = existing.get(lift.equipment)
@@ -852,7 +969,7 @@ async def on_message_edit(
 
     inserted = 0
     if fresh:
-        inserted = await _store_lifts(after, fresh)
+        inserted = await _store_lifts(after, fresh, target)
 
     if inserted or updated or removed:
         try:
@@ -889,9 +1006,7 @@ def _check_goal_hits(
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
-    """Author-only reaction undo. If the original message author reacts ❌
-    to one of the bot's reply messages, we delete the rows that reply
-    represents."""
+    """Logger-or-target reaction undo for a tracked bot reply."""
     if payload.user_id == (bot.user.id if bot.user else 0):
         return
     if str(payload.emoji) not in ("❌", "✖️", "🚫"):
@@ -899,7 +1014,8 @@ async def on_raw_reaction_add(
     rec = db.get_reply(payload.message_id)
     if rec is None:
         return
-    if payload.user_id != rec["user_id"]:
+    target_user_id = int(rec["target_user_id"])
+    if payload.user_id not in {int(rec["user_id"]), target_user_id}:
         return  # Someone else tried to undo — ignore silently.
 
     # Race protection: claim the reply by deleting its tracking row first.
@@ -912,10 +1028,10 @@ async def on_raw_reaction_add(
     removed = 0
     if rec["lift_ids"]:
         ids = [int(x) for x in rec["lift_ids"].split(",") if x]
-        removed = db.delete_lifts_by_ids(guild_id, rec["user_id"], ids)
+        removed = db.delete_lifts_by_ids(guild_id, target_user_id, ids)
     elif rec["message_id"] is not None:
         removed = db.delete_lifts_for_message(
-            guild_id, rec["user_id"], rec["message_id"]
+            guild_id, target_user_id, rec["message_id"]
         )
 
     channel = bot.get_channel(payload.channel_id)
@@ -1046,6 +1162,7 @@ async def leaderboard_cmd(
 @app_commands.describe(
     equipment="Equipment / lift name",
     weight_kg="Weight in kg (use 0 with bodyweight=True for pure BW work)",
+    user="Who this lift belongs to (defaults to you).",
     bodyweight="True if this weight is added on top of bodyweight",
 )
 @app_commands.autocomplete(equipment=_equipment_autocomplete)
@@ -1053,6 +1170,7 @@ async def log_cmd(
     interaction: discord.Interaction,
     equipment: str,
     weight_kg: float,
+    user: discord.Member | None = None,
     bodyweight: bool = False,
 ) -> None:
     if weight_kg < 0:
@@ -1066,8 +1184,16 @@ async def log_cmd(
             ephemeral=True,
         )
         return
+    if MAX_WEIGHT_KG > 0 and weight_kg > MAX_WEIGHT_KG:
+        await interaction.response.send_message(
+            f"That looks too high to log safely ({weight_kg:g}kg > "
+            f"{MAX_WEIGHT_KG:g}kg). If it is intentional, raise `MAX_WEIGHT_KG`.",
+            ephemeral=True,
+        )
+        return
 
     guild_id = interaction.guild_id or 0
+    target = user or interaction.user
     canon = _resolve(guild_id, equipment)
     if not canon:
         await interaction.response.send_message(
@@ -1077,18 +1203,19 @@ async def log_cmd(
 
     lift = Lift(equipment=canon, weight_kg=weight_kg,
                 bodyweight_add=bodyweight, raw=f"/log {equipment} {weight_kg}")
-    prev = db.previous_best(guild_id, interaction.user.id, canon)
+    prev = db.previous_best(guild_id, target.id, canon)
     inserted_ids = db.add_lifts_returning_ids(
         guild_id=guild_id,
-        user_id=interaction.user.id,
-        username=interaction.user.display_name,
+        user_id=target.id,
+        username=_display_name(target),
         lifts=[lift],
         message_id=None,
         channel_id=interaction.channel_id,
         logged_at=datetime.now(timezone.utc),
     )
     if inserted_ids:
-        msg = f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}."
+        suffix = _target_suffix(interaction.user, target)
+        msg = f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}{suffix}."
         is_pr = weight_kg > 0 and (prev is None or weight_kg > prev)
         if is_pr:
             if prev is None:
@@ -1101,17 +1228,17 @@ async def log_cmd(
                     f"{_format_weight(weight_kg, bodyweight)} (+{gain:g}kg)"
                 )
         # Goal hit check — uses the same semantics as auto-parse.
-        goal = db.goal_get(guild_id, interaction.user.id, canon)
+        goal = db.goal_get(guild_id, target.id, canon)
         if goal and weight_kg >= goal["target_kg"]:
             msg += (
                 f"\n🎯 **Goal hit!** Target "
                 f"{_format_weight(goal['target_kg'], bool(goal['bw']))} "
                 "reached (goal cleared)."
             )
-            db.goal_remove(guild_id, interaction.user.id, canon)
+            db.goal_remove(guild_id, target.id, canon)
         msg += (
             "\n-# React ❌ to this response or use `/undo` "
-            "if this was logged by mistake."
+            "if this was logged by mistake. The logger or target lifter can react."
         )
         await interaction.response.send_message(msg)
         try:
@@ -1122,6 +1249,7 @@ async def log_cmd(
                 user_id=interaction.user.id,
                 message_id=None,
                 lift_ids=inserted_ids,
+                target_user_id=target.id,
             )
         except Exception:  # pragma: no cover - discord runtime only
             LOG.exception("Failed to track /log response for undo")
@@ -1199,22 +1327,28 @@ async def parse_cmd(
         )
         return
 
+    target, content = _message_lift_target(msg)
     lifts = parse_message(
-        msg.content,
+        content,
         custom_aliases=_custom_alias_map(interaction.guild_id or 0),
     )
+    lifts, rejected_lifts = _split_reasonable_lifts(lifts)
     if not lifts:
+        note = _rejected_lifts_note(rejected_lifts).lstrip()
         await interaction.response.send_message(
-            "No lifts detected in that message.", ephemeral=True
+            note or "No lifts detected in that message.", ephemeral=True
         )
         return
-    inserted = await _store_lifts(msg, lifts)
+    inserted = await _store_lifts(msg, lifts, target)
     date = _format_date(msg.created_at.isoformat())
     lines = [
-        f"Stored {_plural(inserted, 'new lift')} for {msg.author.display_name} "
+        f"Stored {_plural(inserted, 'new lift')} for {_display_name(target)} "
         f"_(posted {date})_:"
     ]
     lines.extend(_format_lift_lines(lifts))
+    note = _rejected_lifts_note(rejected_lifts)
+    if note:
+        lines.append(note)
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -1280,6 +1414,8 @@ async def version_cmd(interaction: discord.Interaction) -> None:
         f"backfill on start: {'on' if BACKFILL_ON_START else 'off'}"
         f" (limit={BACKFILL_LIMIT or 'unlimited'})",
         f"show lb: {'on' if SHOW_LB else 'off'}",
+        f"max auto/log weight: {MAX_WEIGHT_KG:g}kg"
+        if MAX_WEIGHT_KG > 0 else "max auto/log weight: off",
         f"display timezone: {DISPLAY_TZ}",
         reminder_line,
         daily_line,
@@ -1539,6 +1675,13 @@ async def change_weight_cmd(
             "`weight_kg` must be zero or higher.", ephemeral=True,
         )
         return
+    if MAX_WEIGHT_KG > 0 and weight_kg > MAX_WEIGHT_KG:
+        await interaction.response.send_message(
+            f"That looks too high to store safely ({weight_kg:g}kg > "
+            f"{MAX_WEIGHT_KG:g}kg). If it is intentional, raise `MAX_WEIGHT_KG`.",
+            ephemeral=True,
+        )
+        return
     if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         await interaction.response.send_message(
             "`date` must be in YYYY-MM-DD format.", ephemeral=True,
@@ -1683,16 +1826,18 @@ async def help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="✏️ Logging & editing",
         value=(
-            "`/log <equipment> <weight_kg> [bodyweight]` — manual entry\n"
+            "`/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry\n"
             "`/undo` — remove your most recent entry\n"
             "React ❌ on my reply to undo that specific post "
-            "(original author only)\n"
+            "(logger or target lifter only)\n"
             "`/parse <message_id>` — reparse a message\n"
             "`/delete_entry <equipment> <date>` — remove one day\n"
             "`/change_weight <equipment> <weight_kg> [user] [date]` — edit a weight\n"
             "`/swap_weights <first> <second> [user] [date]` — swap two weights\n"
             "`/rename <old> <new> [user] [scope:all]` — relabel your "
-            "entries (or someone else's, or guild-wide)"
+            "entries (or someone else's, or guild-wide)\n"
+            "Prefix a gym post with `@user` to log it for them: "
+            "`@user squat 55kg`"
         ),
         inline=False,
     )
