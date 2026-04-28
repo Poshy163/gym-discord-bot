@@ -35,7 +35,12 @@ from .db import Database
 from .graphing import daily_best_points, running_best_values
 from .message_targeting import strip_leading_user_mention
 from .overview import lift_overview
-from .parser import Lift, estimated_one_rep_max, parse_message
+from .parser import (
+    Lift,
+    estimated_one_rep_max,
+    parse_message,
+    should_auto_store_lifts,
+)
 from . import __version__
 
 load_dotenv()
@@ -316,9 +321,7 @@ def _resolve(guild_id: int, name: str) -> str:
 
 
 def _should_auto_store(lifts: list[Lift]) -> bool:
-    return bool(lifts) and (
-        len(lifts) >= MIN_LIFTS_FOR_AUTO or any(lift.confident for lift in lifts)
-    )
+    return should_auto_store_lifts(lifts, MIN_LIFTS_FOR_AUTO)
 
 
 def _custom_alias_map(guild_id: int) -> dict[str, str]:
@@ -735,9 +738,7 @@ async def _backfill_channel(
         lifts, _rejected = _split_reasonable_lifts(lifts)
         if not lifts:
             continue
-        if len(lifts) < MIN_LIFTS_FOR_AUTO and not any(
-            lift.confident for lift in lifts
-        ):
+        if not _should_auto_store(lifts):
             continue
         n = await _store_lifts(msg, lifts, target)
         if n:
@@ -927,7 +928,10 @@ async def on_message_edit(
         return
 
     if existing and new_lifts and not should_store:
-        new_lifts = [lift for lift in new_lifts if lift.equipment in existing]
+        new_lifts = [
+            lift for lift in new_lifts
+            if lift.structured and lift.equipment in existing
+        ]
 
     if not new_lifts:
         removed = retargeted_removed + db.delete_lifts_by_ids(

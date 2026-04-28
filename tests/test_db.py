@@ -160,6 +160,68 @@ def test_daily_activity_counts_popular_lifts_and_prs(db):
     assert prs == {("u100", "bench"), ("u200", "squat")}
 
 
+def test_daily_activity_reports_best_same_day_pr_per_lift(db):
+    _add(
+        db, 1, 100, "squat", 60, msg_id=1,
+        logged_at=datetime(2026, 4, 25, 12, 40, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "squat", 70, msg_id=2,
+        logged_at=datetime(2026, 4, 25, 12, 42, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "leg press", 235, msg_id=3,
+        logged_at=datetime(2026, 4, 24, 12, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "leg press", 275, msg_id=4,
+        logged_at=datetime(2026, 4, 25, 13, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "leg press", 290, msg_id=5,
+        logged_at=datetime(2026, 4, 25, 13, 5, tzinfo=timezone.utc),
+    )
+
+    summary = db.daily_activity(
+        1,
+        "2026-04-25T00:00:00+00:00",
+        "2026-04-26T00:00:00+00:00",
+        limit=10,
+    )
+
+    prs = {row["equipment"]: row for row in summary["prs"]}
+    assert prs["squat"]["weight_kg"] == 70
+    assert prs["squat"]["prev_best"] == 60
+    assert prs["leg press"]["weight_kg"] == 290
+    assert prs["leg press"]["prev_best"] == 275
+
+
+def test_daily_activity_uses_lift_time_not_insert_order_for_prs(db):
+    _add(
+        db, 1, 100, "bench", 110, msg_id=1,
+        logged_at=datetime(2026, 4, 26, 9, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 100, msg_id=2,
+        logged_at=datetime(2026, 4, 25, 9, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 90, msg_id=3,
+        logged_at=datetime(2026, 4, 24, 9, tzinfo=timezone.utc),
+    )
+
+    summary = db.daily_activity(
+        1,
+        "2026-04-25T00:00:00+00:00",
+        "2026-04-26T00:00:00+00:00",
+    )
+
+    assert len(summary["prs"]) == 1
+    assert summary["prs"][0]["equipment"] == "bench"
+    assert summary["prs"][0]["weight_kg"] == 100
+    assert summary["prs"][0]["prev_best"] == 90
+
+
 def test_delete_entry_between_uses_timestamp_range(db):
     _add(
         db, 1, 100, "bench", 60, msg_id=1,

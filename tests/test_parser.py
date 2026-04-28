@@ -13,7 +13,11 @@ import os
 # Pin plate weight before importing the parser so PLATE_KG is deterministic.
 os.environ.setdefault("PLATE_KG", "20")
 
-from app.parser import estimated_one_rep_max, parse_message  # noqa: E402
+from app.parser import (  # noqa: E402
+    estimated_one_rep_max,
+    parse_message,
+    should_auto_store_lifts,
+)
 
 
 def _by(eq: str, lifts):
@@ -31,6 +35,28 @@ def test_colon_syntax_kg():
 def test_freeform_mention():
     lifts = parse_message("Hit incline bench 70kg today, felt good")
     assert _by("incline bench press", lifts)
+    assert lifts[0].structured is False
+
+
+def test_conversational_sentence_is_not_auto_stored():
+    lifts = parse_message(
+        "You hit 295 kg on leg press and I swear we did 90 kg on calf raises"
+    )
+    assert _by("leg press", lifts)
+    assert should_auto_store_lifts(lifts, min_lifts=2) is False
+
+
+def test_structured_lift_line_is_auto_stored():
+    lifts = parse_message("leg press 295kg")
+    assert lifts and lifts[0].equipment == "leg press"
+    assert lifts[0].structured is True
+    assert should_auto_store_lifts(lifts, min_lifts=2) is True
+
+
+def test_structured_stat_dump_is_auto_stored():
+    lifts = parse_message("Bench press: 80kg\nSquat: 100kg")
+    assert len(lifts) == 2
+    assert should_auto_store_lifts(lifts, min_lifts=2) is True
 
 
 def test_range_takes_upper_bound():

@@ -29,6 +29,9 @@ Rules it uses:
 - `A - B kg` range -> the higher number (treated as top working weight).
 - A leading Discord user mention logs the lift for that person instead of the
   message author, so `@Cookie Monster squat 55kg` stores Cookie Monster's squat.
+- Passive auto-logging only stores structured lift lines such as
+  `leg press 295kg`, `squat: 70kg`, or `@Cookie Monster calf raise 90kg`.
+  Conversational sentences are ignored unless you explicitly run `/parse`.
 - Weights over `MAX_WEIGHT_KG` are skipped as likely typos/fakes. The default is
   `500`, which catches mistakes like `2200kg` before they hit leaderboards.
 - Many aliases are unified (e.g. `pec dec`, `pec fly`, `chest fly`, `pekdek`

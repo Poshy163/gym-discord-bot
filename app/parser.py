@@ -106,6 +106,10 @@ class Lift:
     # the user didn't say. Pure metadata — the bot stores it for future
     # 1RM estimates and never blocks on its absence.
     reps: int | None = None
+    # False when the parser had to use the free-form sentence fallback. The
+    # bot only auto-stores structured lift lines, but explicit commands can
+    # still use free-form parses.
+    structured: bool = True
 
 
 def _eval_plate_expr(expr: str) -> float | None:
@@ -371,7 +375,7 @@ def parse_message(
                     lifts.append(Lift(
                         equipment=canon_fb, weight_kg=weight_fb,
                         bodyweight_add=bw_fb, raw=line, confident=True,
-                        reps=reps_fb,
+                        reps=reps_fb, structured=False,
                     ))
             continue
         if not _looks_like_equipment(label):
@@ -394,7 +398,7 @@ def parse_message(
                     lifts.append(Lift(
                         equipment=canon_fb, weight_kg=weight_fb,
                         bodyweight_add=bw_fb, raw=line, confident=True,
-                        reps=reps_fb,
+                        reps=reps_fb, structured=False,
                     ))
             continue
         if not canon or canon in seen:
@@ -406,6 +410,17 @@ def parse_message(
                           confident=confident, reps=reps))
 
     return lifts
+
+
+def should_auto_store_lifts(lifts: list[Lift], min_lifts: int) -> bool:
+    """Return True when parsed lifts are safe to store from passive chat.
+
+    Free-form sentence matches are useful for explicit `/parse`, but too
+    easy to trigger accidentally during normal conversation.
+    """
+    return bool(lifts) and all(lift.structured for lift in lifts) and (
+        len(lifts) >= min_lifts or any(lift.confident for lift in lifts)
+    )
 
 
 def estimated_one_rep_max(weight_kg: float, reps: int) -> float | None:

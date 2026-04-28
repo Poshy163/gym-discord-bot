@@ -1063,25 +1063,40 @@ class Database:
             prs = list(c.execute(
                 """
                 WITH period AS (
-                    SELECT l.username, l.equipment, l.weight_kg,
-                           l.bodyweight_add AS bw, l.logged_at,
+                    SELECT l.user_id, l.username, l.equipment, l.weight_kg,
+                           l.bodyweight_add AS bw, l.logged_at, l.id,
                            (
                                SELECT MAX(prev.weight_kg)
                                FROM lifts prev
                                WHERE prev.guild_id = l.guild_id
                                  AND prev.user_id = l.user_id
                                  AND prev.equipment = l.equipment
-                                 AND prev.id < l.id
+                                 AND (
+                                     prev.logged_at < l.logged_at
+                                     OR (
+                                         prev.logged_at = l.logged_at
+                                         AND prev.id < l.id
+                                     )
+                                 )
                            ) AS prev_best
                     FROM lifts l
                     WHERE l.guild_id = ?
                       AND l.logged_at >= ?
                       AND l.logged_at < ?
+                ),
+                period_prs AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id, equipment
+                               ORDER BY weight_kg DESC, logged_at DESC, id DESC
+                           ) AS rn
+                    FROM period
+                    WHERE weight_kg > 0
+                      AND (prev_best IS NULL OR weight_kg > prev_best)
                 )
                 SELECT username, equipment, weight_kg, bw, logged_at, prev_best
-                FROM period
-                WHERE weight_kg > 0
-                  AND (prev_best IS NULL OR weight_kg > prev_best)
+                FROM period_prs
+                WHERE rn = 1
                 ORDER BY (weight_kg - COALESCE(prev_best, 0)) DESC,
                          weight_kg DESC,
                          logged_at ASC
