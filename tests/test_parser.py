@@ -135,6 +135,18 @@ def test_skips_bodyweight_chatter_lines():
     assert lifts == []
 
 
+def test_skips_lines_containing_urls():
+    # GIF / image links pasted in chat have digits in their query strings
+    # that the weight extractor would otherwise read as absurd lifts.
+    samples = [
+        "https://tenor.com/view/lifting-gym-cool-12345.gif",
+        "check this out https://example.com/clip.mp4?t=42",
+        "www.youtube.com/watch?v=abc123",
+    ]
+    for text in samples:
+        assert parse_message(text) == [], text
+
+
 def test_custom_alias_resolution():
     # Even though "wonky press" isn't a built-in alias, a custom mapping
     # should make it parse to the canonical.

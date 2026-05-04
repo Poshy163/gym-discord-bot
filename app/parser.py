@@ -91,6 +91,11 @@ _MONTH_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Detects URLs anywhere in a line. Discord pastes (gif links, tenor previews,
+# youtube, etc.) often contain digits that the weight extractor would happily
+# read as a 1.5e19 kg lift. Lines that include a URL are dropped wholesale.
+_URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
+
 
 @dataclass
 class Lift:
@@ -334,6 +339,10 @@ def parse_message(
         if not line:
             continue
         lower = line.lower()
+        if _URL_RE.search(line):
+            # Skip GIF/image/video links — their query strings are full of
+            # digits that look like absurd weights.
+            continue
         if any(tok in lower for tok in _SKIP_LINE_TOKENS):
             continue
         if _MONTH_HEADING_RE.match(line):
