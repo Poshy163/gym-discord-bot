@@ -96,6 +96,34 @@ _MONTH_HEADING_RE = re.compile(
 # read as a 1.5e19 kg lift. Lines that include a URL are dropped wholesale.
 _URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 
+# Discord custom emoji (`<:name:123456789>`, animated `<a:name:123>`) and
+# user/role/channel mentions (`<@123>`, `<@!123>`, `<@&123>`, `<#123>`) embed
+# 17–20 digit snowflake IDs. Stripping them before parsing avoids those IDs
+# being read as monstrous weights.
+_DISCORD_TOKEN_RE = re.compile(r"<a?[:@#&!]?[^<>\s]{0,40}\d{15,25}>")
+
+# Markdown code fences and inline code spans. People paste JSON / logs / shell
+# transcripts that are full of digits but obviously not lift entries.
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+# Hard upper bound on any single weight the parser will emit. Bot layer also
+# enforces MAX_WEIGHT_KG, but capping here means even buggy callers can never
+# get a 1e19 kg Lift back from us. 10 000 kg is well above any real machine.
+_PARSER_MAX_WEIGHT_KG = 10_000.0
+
+
+def _strip_chat_noise(text: str) -> str:
+    """Remove URLs, code blocks, and Discord mention/emoji tokens.
+
+    Returns text suitable for line-by-line parsing. We replace each match with
+    a single space so word boundaries around stripped tokens are preserved.
+    """
+    text = _CODE_FENCE_RE.sub(" ", text)
+    text = _INLINE_CODE_RE.sub(" ", text)
+    text = _DISCORD_TOKEN_RE.sub(" ", text)
+    return text
+
 
 @dataclass
 class Lift:
@@ -334,6 +362,8 @@ def parse_message(
     lifts: list[Lift] = []
     seen: set[str] = set()  # canonical equipment names in this message
 
+    text = _strip_chat_noise(text)
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -418,7 +448,10 @@ def parse_message(
                           bodyweight_add=bw_flag, raw=line,
                           confident=confident, reps=reps))
 
-    return lifts
+    # Final safety net: never return absurd weights regardless of how they
+    # got past the per-line heuristics. The bot also enforces MAX_WEIGHT_KG,
+    # but capping here keeps any caller (tests, /parse, future callers) safe.
+    return [lift for lift in lifts if lift.weight_kg <= _PARSER_MAX_WEIGHT_KG]
 
 
 def should_auto_store_lifts(lifts: list[Lift], min_lifts: int) -> bool:

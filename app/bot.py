@@ -240,13 +240,28 @@ def _rejected_lifts_note(rejected: list[Lift]) -> str:
     ]
     for lift in rejected[:5]:
         lines.append(
-            f"• **{lift.equipment}** — "
+            f"• **{_safe_label(lift.equipment)}** — "
             f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
         )
     remaining = len(rejected) - 5
     if remaining > 0:
         lines.append(f"• ... and {_plural(remaining, 'more lift')}")
     return "\n".join(lines)
+
+
+def _safe_label(text: str, *, limit: int = 60) -> str:
+    """Make user-supplied text safe to echo back into a Discord message.
+
+    Strips Discord mention/emoji syntax (so we never accidentally ping
+    @everyone via a malformed lift label), escapes Markdown special chars
+    that would break the embed, and truncates to ``limit`` chars.
+    """
+    cleaned = discord.utils.escape_mentions(text or "")
+    cleaned = discord.utils.escape_markdown(cleaned)
+    cleaned = cleaned.replace("\n", " ").replace("\r", " ").strip()
+    if len(cleaned) > limit:
+        cleaned = cleaned[: limit - 1].rstrip() + "…"
+    return cleaned or "(unknown)"
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:

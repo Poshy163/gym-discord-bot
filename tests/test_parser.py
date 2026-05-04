@@ -147,6 +147,43 @@ def test_skips_lines_containing_urls():
         assert parse_message(text) == [], text
 
 
+def test_strips_discord_mentions_and_emoji():
+    # Snowflake IDs in mentions/emoji must not be read as weights.
+    samples = [
+        "<@123456789012345678> nice lift!",
+        "<@!123456789012345678> hyped",
+        "<@&987654321098765432> roll call",
+        "<:flex:111122223333444455>",
+        "<a:flex:111122223333444455> let's go",
+    ]
+    for text in samples:
+        assert parse_message(text) == [], text
+
+
+def test_strips_code_blocks_and_inline_code():
+    # Pasted JSON/log lines often contain digits and colons. The fenced
+    # block must not produce a "user_id" lift at 999...kg.
+    fenced = "```json\n{\"user_id\": 123456789012345678, \"weight\": 999}\n```"
+    assert parse_message(fenced) == []
+    inline = "ran `bench: 9999999999` in the test harness"
+    assert parse_message(inline) == []
+
+
+def test_real_lift_alongside_mention_still_parses():
+    # Stripping noise should not lose the actual lift on the same line.
+    text = "<@123456789012345678> bench press: 80kg"
+    lifts = parse_message(text)
+    assert lifts and lifts[0].equipment == "bench press"
+    assert lifts[0].weight_kg == 80
+
+
+def test_parser_caps_absurd_weights():
+    # Even if a heuristic produced a giant number, the parser must not
+    # return it. 50000 plates would be ~1e6 kg -> dropped.
+    lifts = parse_message("Bench: 50000 plates")
+    assert lifts == []
+
+
 def test_custom_alias_resolution():
     # Even though "wonky press" isn't a built-in alias, a custom mapping
     # should make it parse to the canonical.
