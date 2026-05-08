@@ -1080,6 +1080,14 @@ async def on_message(message: discord.Message) -> None:
                 await message.add_reaction("✅")
             except discord.HTTPException:
                 pass
+            # Extra hype reaction when the post contained a PR — gives a
+            # visible signal in the channel that something special just
+            # happened, without spamming a second bot reply.
+            if prs:
+                try:
+                    await message.add_reaction("🎉")
+                except discord.HTTPException:
+                    pass
             # Check goal hits (PRs that meet or beat the user's goal).
             goal_hits = _check_goal_hits(guild_id, target_user_id, prs)
 
@@ -2167,6 +2175,131 @@ async def db_dump_cmd(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(
+    name="chat_dump",
+    description="Owner only: DM yourself a transcript of recent channel messages.",
+)
+@app_commands.describe(
+    limit="How many recent messages to grab (1-5000, default 1000).",
+    include_bots="Include bot messages too (default False).",
+)
+async def chat_dump_cmd(
+    interaction: discord.Interaction,
+    limit: int = 1000,
+    include_bots: bool = False,
+) -> None:
+    if interaction.user.id != _DB_DUMP_OWNER_ID:
+        await interaction.response.send_message(
+            "This command is restricted.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "history"):
+        await interaction.response.send_message(
+            "This channel doesn't support history reads.", ephemeral=True
+        )
+        return
+
+    limit = max(1, min(5000, limit))
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Pull oldest→newest so the transcript reads top-to-bottom in time
+    # order, which is what a human (or another LLM) would want for
+    # spotting friction patterns.
+    lines: list[str] = []
+    skipped_bots = 0
+    fetched = 0
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            fetched += 1
+            if msg.author.bot and not include_bots:
+                skipped_bots += 1
+                continue
+            ts = msg.created_at.astimezone(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%SZ"
+            )
+            author = f"{msg.author.display_name} ({msg.author.id})"
+            content = msg.content or ""
+            # Note attachments / embeds inline so context isn't lost when
+            # the message itself was just a screenshot or share.
+            extras: list[str] = []
+            if msg.attachments:
+                extras.append(
+                    "attachments=" + ", ".join(
+                        a.filename for a in msg.attachments
+                    )
+                )
+            if msg.embeds:
+                extras.append(f"embeds={len(msg.embeds)}")
+            if msg.reference and msg.reference.message_id:
+                extras.append(f"reply_to={msg.reference.message_id}")
+            extras_str = f" [{'; '.join(extras)}]" if extras else ""
+            # Indent multi-line content so block boundaries stay obvious.
+            body = content.replace("\n", "\n    ")
+            lines.append(
+                f"[{ts}] {author} (msg {msg.id}){extras_str}\n    {body}"
+            )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to read this channel's history.",
+            ephemeral=True,
+        )
+        return
+
+    header = (
+        f"# Channel transcript\n"
+        f"# guild_id={interaction.guild_id} channel_id={channel.id} "
+        f"channel_name={getattr(channel, 'name', '?')}\n"
+        f"# fetched={fetched} kept={len(lines)} "
+        f"skipped_bots={skipped_bots} include_bots={include_bots}\n"
+        f"# generated_at={datetime.now(timezone.utc).isoformat()}\n\n"
+    )
+    blob = header + "\n\n".join(lines)
+    data = blob.encode("utf-8")
+
+    if len(data) > 24 * 1024 * 1024:
+        await interaction.followup.send(
+            f"Transcript is {len(data)/1024/1024:.1f} MiB — too large "
+            "to attach. Lower the limit and try again.",
+            ephemeral=True,
+        )
+        return
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    chan_name = getattr(channel, "name", "channel")
+    filename = f"chat-{chan_name}-{stamp}.txt"
+    with tempfile.NamedTemporaryFile(
+        prefix="gym-chat-", suffix=".txt", delete=False,
+    ) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    try:
+        try:
+            dm = await interaction.user.create_dm()
+            await dm.send(
+                content=(
+                    f"Transcript of #{chan_name} — kept {len(lines)} of "
+                    f"{fetched} messages ({len(data)/1024:.1f} KiB)."
+                ),
+                file=discord.File(str(tmp_path), filename=filename),
+            )
+            await interaction.followup.send(
+                f"Sent {filename} to your DMs.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I can't DM you — open your DMs from server members and "
+                "try again.",
+                ephemeral=True,
+            )
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+@bot.tree.command(
     name="purge",
     description="Delete every row for a specific equipment name.",
 )
@@ -2509,6 +2642,11 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/graph <equipment> [user]` — plot a PNG chart\n"
             "`/history <equipment> [user]` — your timeline\n"
             "`/recent [user]` — your last 10 entries\n"
+            "`/session [user]` — full breakdown of last session\n"
+            "`/streak [user]` — daily & weekly training streaks\n"
+            "`/tonnage [user] [days]` — total kg moved in a window\n"
+            "`/projection <equipment> [target_kg] [user]` — ETA to a goal\n"
+            "`/plates <target_kg> [bar_kg]` — plate-loading helper\n"
             "`/leaderboard <equipment>` — top 25 in server\n"
             "`/machine <equipment>` — everyone's timeline\n"
             "`/compare <user> [equipment]` — head-to-head\n"
@@ -2674,6 +2812,240 @@ async def recent_cmd(
             f"{_format_weight(r['weight_kg'], bool(r['bw']))}"
         )
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
+    name="plates",
+    description="Calculate the plate breakdown for a target barbell weight.",
+)
+@app_commands.describe(
+    target_kg="Total weight on the bar in kg.",
+    bar_kg="Bar weight in kg (default 20kg Olympic bar).",
+)
+async def plates_cmd(
+    interaction: discord.Interaction,
+    target_kg: float,
+    bar_kg: float = 20.0,
+) -> None:
+    from .training_math import plate_breakdown
+    if target_kg <= 0 or bar_kg < 0:
+        await interaction.response.send_message(
+            "target_kg must be positive and bar_kg can't be negative.",
+            ephemeral=True,
+        )
+        return
+    pairs, leftover = plate_breakdown(target_kg, bar_kg=bar_kg)
+    if not pairs and leftover < 0:
+        await interaction.response.send_message(
+            f"**{target_kg:g}kg** is lighter than the bar "
+            f"(**{bar_kg:g}kg**). Drop the bar or raise the target.",
+            ephemeral=True,
+        )
+        return
+    if not pairs:
+        await interaction.response.send_message(
+            f"Just the bar (**{bar_kg:g}kg**). Add some plates!",
+        )
+        return
+    per_side = " + ".join(f"{p:g} × {n}" for p, n in pairs)
+    plates_total = sum(p * n for p, n in pairs)
+    loaded = bar_kg + 2 * plates_total
+    msg = (
+        f"**{target_kg:g}kg** on a **{bar_kg:g}kg** bar →\n"
+        f"Per side: {per_side}\n"
+        f"Loaded: **{loaded:g}kg**"
+    )
+    if leftover > 0:
+        msg += (
+            f"\n_Note: {leftover:g}kg short of target — the standard "
+            "kg plate stack can't hit the exact number._"
+        )
+    await interaction.response.send_message(msg)
+
+
+@bot.tree.command(
+    name="streak",
+    description="Show a user's current and longest training streaks.",
+)
+@app_commands.describe(
+    user="The user to look up (defaults to you).",
+)
+async def streak_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    from .training_math import daily_streak, weekly_streak
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    raw_dates = db.user_log_dates(guild_id, target.id)
+    if not raw_dates:
+        await interaction.response.send_message(
+            f"No training history yet for {target.display_name}.",
+            ephemeral=True,
+        )
+        return
+    parsed = [datetime.fromisoformat(d).date() for d in raw_dates]
+    today = datetime.now(DISPLAY_TZ).date()
+    cur_d, long_d = daily_streak(parsed, today)
+    cur_w, long_w = weekly_streak(parsed, today)
+    fire = "🔥" if cur_d >= 3 or cur_w >= 3 else ""
+    lines = [
+        f"**{target.display_name} — training streaks** {fire}".rstrip(),
+        f"• Daily: **{cur_d}** in a row (longest **{long_d}**)",
+        f"• Weekly: **{cur_w}** in a row (longest **{long_w}**)",
+        f"• Total active days logged: **{len(parsed)}**",
+    ]
+    await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
+    name="tonnage",
+    description="Total weight moved by a user over a recent window.",
+)
+@app_commands.describe(
+    user="The user to look up (defaults to you).",
+    days=(
+        "Number of days back to include (default 7, max 365). Use 0 for "
+        "all-time."
+    ),
+)
+async def tonnage_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    days: int = 7,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    days = max(0, min(365, days))
+    if days == 0:
+        since_iso = None
+        window_label = "all time"
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        window_label = f"last {days} day{'s' if days != 1 else ''}"
+    total_kg, n = db.total_tonnage(guild_id, target.id, since_iso)
+    if n == 0:
+        await interaction.response.send_message(
+            f"{target.display_name} hasn't logged anything in the "
+            f"{window_label}.",
+            ephemeral=True,
+        )
+        return
+    avg = total_kg / n if n else 0.0
+    await interaction.response.send_message(
+        f"**{target.display_name}** moved **{total_kg:g} kg** across "
+        f"**{n}** {('lift' if n == 1 else 'lifts')} in the {window_label} "
+        f"(avg **{avg:g} kg** per entry)."
+    )
+
+
+@bot.tree.command(
+    name="session",
+    description="Show a user's most recent training session.",
+)
+@app_commands.describe(
+    user="The user to look up (defaults to you).",
+)
+async def session_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    day, rows = db.last_session_for_user(guild_id, target.id)
+    if not rows or day is None:
+        await interaction.response.send_message(
+            f"No sessions logged for {target.display_name} yet.",
+            ephemeral=True,
+        )
+        return
+    target_bw = _user_bodyweight(guild_id, target.id)
+    total_kg = sum(float(r["weight_kg"] or 0) for r in rows)
+    lines = [
+        f"**{target.display_name} — last session ({day})**",
+        f"_{len(rows)} entries · {total_kg:g} kg total_",
+        "",
+    ]
+    for r in rows:
+        eq = r["equipment"]
+        w = r["weight_kg"]
+        bw = bool(r["bw"])
+        true_suf = _true_weight_suffix(eq, w, bw, target_bw)
+        reps = r["reps"] if "reps" in r.keys() else None
+        rep_str = f" ×{reps}" if reps else ""
+        lines.append(
+            f"• **{eq}**: {_format_weight(w, bw)}{true_suf}{rep_str}"
+        )
+    await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
+    name="projection",
+    description="Estimate when you'll hit a goal weight at your current pace.",
+)
+@app_commands.describe(
+    equipment="Equipment / lift name.",
+    target_kg=(
+        "Target weight in kg. Omit to use your existing /goal_set target "
+        "for this lift."
+    ),
+    user="The user to project for (defaults to you).",
+)
+@app_commands.autocomplete(equipment=_equipment_autocomplete)
+async def projection_cmd(
+    interaction: discord.Interaction,
+    equipment: str,
+    target_kg: float | None = None,
+    user: discord.Member | None = None,
+) -> None:
+    from .training_math import project_goal_eta
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    canon = _resolve(guild_id, equipment)
+    # Fall back to the user's set goal if no explicit target was given —
+    # /projection plays nicely with the existing goals workflow.
+    if target_kg is None:
+        goal = db.goal_get(guild_id, target.id, canon)
+        if goal is None:
+            await interaction.response.send_message(
+                f"No goal set for **{canon}** — pass `target_kg:` or run "
+                "`/goal_set` first.",
+                ephemeral=True,
+            )
+            return
+        target_kg = float(goal["target_kg"])
+    if target_kg <= 0:
+        await interaction.response.send_message(
+            "target_kg must be positive.", ephemeral=True
+        )
+        return
+    rows = db.history(guild_id, target.id, canon, limit=500)
+    history: list[tuple[datetime, float]] = []
+    for r in rows:
+        ts = datetime.fromisoformat(r["logged_at"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        history.append((ts, float(r["weight_kg"])))
+    rate, eta, reason = project_goal_eta(
+        history, target_kg=target_kg, today=datetime.now(timezone.utc),
+    )
+    if eta is None:
+        await interaction.response.send_message(
+            f"Can't project **{canon}** to **{target_kg:g}kg** — {reason}.",
+            ephemeral=True,
+        )
+        return
+    weeks = max(0.0, (eta - datetime.now(DISPLAY_TZ).date()).days / 7.0)
+    await interaction.response.send_message(
+        f"**{target.display_name} — {canon}** projection\n"
+        f"• Current pace: **{rate:+.2f} kg/week**\n"
+        f"• Target: **{target_kg:g}kg**\n"
+        f"• Projected hit: **{eta.isoformat()}** "
+        f"(~{weeks:.1f} weeks away)\n"
+        f"_Linear estimate from first→latest entry. Real progress is "
+        "rarely a straight line, but it's a useful nudge._"
+    )
 
 
 @bot.tree.command(

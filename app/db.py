@@ -756,6 +756,71 @@ class Database:
                 (guild_id, user_id, equipment, limit),
             ))
 
+    def total_tonnage(
+        self,
+        guild_id: int,
+        user_id: int,
+        since_iso: str | None = None,
+    ) -> tuple[float, int]:
+        """Sum every logged ``weight_kg`` for a user (optionally since an
+        ISO timestamp). Returns ``(total_kg, lift_count)``.
+
+        Rep counts aren't multiplied in — the bot doesn't reliably capture
+        sets, so this is a coarse "weight-on-the-bar across all entries"
+        figure rather than true volume. Bodyweight-relative entries logged
+        as 0kg (pure pull-ups) contribute nothing, which matches the way
+        every other surface treats them.
+        """
+        params: list[object] = [guild_id, user_id]
+        sql = (
+            "SELECT COALESCE(SUM(weight_kg), 0) AS total, COUNT(*) AS n "
+            "FROM lifts WHERE guild_id = ? AND user_id = ?"
+        )
+        if since_iso is not None:
+            sql += " AND logged_at >= ?"
+            params.append(since_iso)
+        with self._conn() as c:
+            row = c.execute(sql, params).fetchone()
+            return float(row["total"] or 0.0), int(row["n"] or 0)
+
+    def last_session_for_user(
+        self, guild_id: int, user_id: int,
+    ) -> tuple[str | None, list[sqlite3.Row]]:
+        """Return ``(date_str, rows)`` for the most recent local-date on
+        which the user logged anything, plus every lift on that date.
+
+        Date bucketing uses the stored ISO timestamp's ``YYYY-MM-DD``
+        prefix (which is UTC). Display layers can convert if they want to
+        be precise about timezone boundaries; sessions still group sanely
+        as long as the user trains in roughly the same TZ each time.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT substr(logged_at, 1, 10) AS d
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if not row:
+                return None, []
+            day = row["d"]
+            rows = list(c.execute(
+                """
+                SELECT equipment, weight_kg, bodyweight_add AS bw,
+                       logged_at, reps
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                  AND substr(logged_at, 1, 10) = ?
+                ORDER BY logged_at ASC, id ASC
+                """,
+                (guild_id, user_id, day),
+            ))
+            return day, rows
+
     def machine_history(
         self, guild_id: int, equipment: str, limit: int = 50
     ) -> list[sqlite3.Row]:
