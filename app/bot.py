@@ -304,6 +304,94 @@ def _parse_bodyweight_message(text: str) -> float | None:
         return None
 
 
+# Backdated logging: detect a date hint anywhere in a message so that posts
+# like "bench 90kg yesterday" or "squat 100kg on 2026-05-06" can be stored
+# against the date the workout actually happened, not the message's own
+# timestamp. Patterns are intentionally narrow to avoid hijacking weights:
+#   * "yesterday" / "today" / "tonight"
+#   * "N day(s) ago"
+#   * weekday names ("monday" .. "sunday"), resolved to the most recent past
+#     occurrence (today if it matches today's weekday)
+#   * ISO calendar dates "YYYY-MM-DD"
+_WEEKDAY_LOOKUP = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+_DATE_HINT_YESTERDAY = re.compile(r"\byesterday\b", re.IGNORECASE)
+_DATE_HINT_TODAY = re.compile(r"\b(today|tonight)\b", re.IGNORECASE)
+_DATE_HINT_DAYS_AGO = re.compile(
+    r"\b(\d{1,2})\s*d(?:ays?)?\s*ago\b", re.IGNORECASE
+)
+_DATE_HINT_WEEKDAY = re.compile(
+    r"\b(?:last\s+)?(monday|mon|tuesday|tue|tues|wednesday|wed|"
+    r"thursday|thu|thurs|friday|fri|saturday|sat|sunday|sun)\b",
+    re.IGNORECASE,
+)
+_DATE_HINT_ISO = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+
+
+def _resolve_date_hint(
+    text: str, now_local: datetime,
+) -> datetime | None:
+    """Return a UTC datetime for any date hint found in ``text``.
+
+    ``now_local`` is the message's own timestamp converted to ``DISPLAY_TZ``
+    and acts as the reference point for relative phrases ("yesterday",
+    "monday", "3 days ago"). The returned datetime is anchored at noon
+    local time on the resolved date — exact time-of-day doesn't matter for
+    daily-grain stats and noon avoids DST/midnight ambiguity. Returns
+    ``None`` when no recognised hint is present.
+    """
+    if not text:
+        return None
+    today_local = now_local.date()
+    target_date = None
+
+    if _DATE_HINT_YESTERDAY.search(text):
+        target_date = today_local - timedelta(days=1)
+    elif _DATE_HINT_TODAY.search(text):
+        target_date = today_local
+    else:
+        m = _DATE_HINT_DAYS_AGO.search(text)
+        if m:
+            try:
+                n = int(m.group(1))
+            except (TypeError, ValueError):  # pragma: no cover - regex guards
+                n = 0
+            if 1 <= n <= 30:
+                target_date = today_local - timedelta(days=n)
+        if target_date is None:
+            m = _DATE_HINT_ISO.search(text)
+            if m:
+                try:
+                    parsed = datetime.strptime(
+                        m.group(1), "%Y-%m-%d"
+                    ).date()
+                except ValueError:
+                    parsed = None
+                if parsed is not None and parsed <= today_local + timedelta(
+                    days=1
+                ):
+                    target_date = parsed
+        if target_date is None:
+            m = _DATE_HINT_WEEKDAY.search(text)
+            if m:
+                wd = _WEEKDAY_LOOKUP.get(m.group(1).lower())
+                if wd is not None:
+                    delta = (today_local.weekday() - wd) % 7
+                    target_date = today_local - timedelta(days=delta)
+
+    if target_date is None:
+        return None
+    local_dt = datetime.combine(target_date, dtime(12, 0), DISPLAY_TZ)
+    return local_dt.astimezone(timezone.utc)
+
+
 def _display_name(user: object) -> str:
     return str(
         getattr(user, "display_name", None)
@@ -603,9 +691,11 @@ def _new_prs_for_lifts(
 
 
 async def _store_lifts(
-    message: discord.Message, lifts: list[Lift], target_user: object | None = None
+    message: discord.Message, lifts: list[Lift], target_user: object | None = None,
+    *, logged_at: datetime | None = None,
 ) -> int:
     target = target_user or message.author
+    when = logged_at or message.created_at.astimezone(timezone.utc)
     return db.add_lifts(
         guild_id=message.guild.id if message.guild else 0,
         user_id=int(getattr(target, "id")),
@@ -613,7 +703,7 @@ async def _store_lifts(
         lifts=lifts,
         message_id=message.id,
         channel_id=message.channel.id,
-        logged_at=message.created_at.astimezone(timezone.utc),
+        logged_at=when,
     )
 
 
@@ -835,9 +925,13 @@ async def bodyweight_reminder() -> None:
     )
     text = (
         f"{mention}⚖️ **Weekly bodyweight check-in!**\n"
-        "Run `/bodyweight weight_kg:<your kg>` so the bot can show your "
-        "true load on bodyweight-relative lifts.\n"
-        "Examples:\n"
+        "Drop your current weight in chat — the bot picks it up automatically. "
+        "Just type one of:\n"
+        "```\nbw 83.4\nbodyweight 83.4kg\n```\n"
+        "Or run `/bodyweight weight_kg:<your kg>` if you prefer a slash "
+        "command.\n"
+        "Why it matters — the bot uses your bodyweight to show **true load** "
+        "on bodyweight-relative lifts:\n"
         "• Assisted pull-up at 70kg with 100kg bodyweight → "
         "**30kg actual lifted**.\n"
         "• `BW+20kg` weighted dip at 100kg bodyweight → **120kg actual**."
@@ -1008,7 +1102,12 @@ async def _backfill_channel(
             continue
         if not _should_auto_store(lifts):
             continue
-        n = await _store_lifts(msg, lifts, target)
+        n = await _store_lifts(
+            msg, lifts, target,
+            logged_at=_resolve_date_hint(
+                content, msg.created_at.astimezone(DISPLAY_TZ),
+            ),
+        )
         if n:
             matched += 1
             inserted += n
@@ -1063,6 +1162,12 @@ async def on_message(message: discord.Message) -> None:
 
     lifts = parse_message(content, custom_aliases=guild_aliases)
     lifts, rejected_lifts = _split_reasonable_lifts(lifts)
+    # Backdated logging: phrases like "yesterday", "3 days ago", "monday",
+    # or an ISO date in the message override the message's own timestamp
+    # so a workout posted the morning after still files under the prior day.
+    backdated_at = _resolve_date_hint(
+        content, message.created_at.astimezone(DISPLAY_TZ),
+    )
     # Auto-store when either:
     #  * the message is a clear "stats dump" (>= MIN_LIFTS_FOR_AUTO lifts), or
     #  * at least one lift was parsed with an explicit unit (kg / plates / BW+),
@@ -1074,7 +1179,9 @@ async def on_message(message: discord.Message) -> None:
         target_user_id = int(getattr(target, "id"))
         prs = _new_prs_for_lifts(guild_id, target_user_id, lifts)
 
-        inserted = await _store_lifts(message, lifts, target)
+        inserted = await _store_lifts(
+            message, lifts, target, logged_at=backdated_at,
+        )
         if inserted > 0:
             try:
                 await message.add_reaction("✅")
@@ -1097,6 +1204,14 @@ async def on_message(message: discord.Message) -> None:
             # lifts (assisted pull-ups, weighted dips, etc.) with their true
             # load — the suffix is a no-op for everyone else.
             target_bw = _user_bodyweight(guild_id, target_user_id)
+            backdate_note = ""
+            if backdated_at is not None:
+                msg_local_date = message.created_at.astimezone(DISPLAY_TZ).date()
+                used_local_date = backdated_at.astimezone(DISPLAY_TZ).date()
+                if used_local_date != msg_local_date:
+                    backdate_note = (
+                        f" _(logged for {used_local_date.strftime('%Y-%m-%d')})_"
+                    )
             try:
                 if len(lifts) == 1:
                     lift = lifts[0]
@@ -1113,6 +1228,8 @@ async def on_message(message: discord.Message) -> None:
                     ]
                     lines.extend(_format_lift_lines(lifts, bodyweight=target_bw))
                     reply = "\n".join(lines)
+                if backdate_note:
+                    reply = reply + backdate_note
                 if prs:
                     pr_lines = ["", "🎉 **New PR!**"]
                     for lift, prev in prs:
@@ -1279,7 +1396,12 @@ async def on_message_edit(
 
     inserted = 0
     if fresh:
-        inserted = await _store_lifts(after, fresh, target)
+        inserted = await _store_lifts(
+            after, fresh, target,
+            logged_at=_resolve_date_hint(
+                content, after.created_at.astimezone(DISPLAY_TZ),
+            ),
+        )
 
     if inserted or updated or removed:
         try:
@@ -1555,6 +1677,7 @@ async def bodyweight_cmd(
     weight_kg="Weight in kg (use 0 with bodyweight=True for pure BW work)",
     user="Who this lift belongs to (defaults to you).",
     bodyweight="True if this weight is added on top of bodyweight",
+    date="Optional: 'yesterday', 'monday', '3 days ago', or YYYY-MM-DD",
 )
 @app_commands.autocomplete(equipment=_equipment_autocomplete)
 async def log_cmd(
@@ -1563,6 +1686,7 @@ async def log_cmd(
     weight_kg: float,
     user: discord.Member | None = None,
     bodyweight: bool = False,
+    date: str | None = None,
 ) -> None:
     if weight_kg < 0:
         await interaction.response.send_message(
@@ -1594,6 +1718,17 @@ async def log_cmd(
 
     lift = Lift(equipment=canon, weight_kg=weight_kg,
                 bodyweight_add=bodyweight, raw=f"/log {equipment} {weight_kg}")
+    logged_at = datetime.now(timezone.utc)
+    if date:
+        resolved = _resolve_date_hint(date, datetime.now(DISPLAY_TZ))
+        if resolved is None:
+            await interaction.response.send_message(
+                f"Couldn't understand `date={date}`. Try `yesterday`, "
+                "`monday`, `3 days ago`, or `YYYY-MM-DD`.",
+                ephemeral=True,
+            )
+            return
+        logged_at = resolved
     prev = db.previous_best(guild_id, target.id, canon)
     inserted_ids = db.add_lifts_returning_ids(
         guild_id=guild_id,
@@ -1602,7 +1737,7 @@ async def log_cmd(
         lifts=[lift],
         message_id=None,
         channel_id=interaction.channel_id,
-        logged_at=datetime.now(timezone.utc),
+        logged_at=logged_at,
     )
     if inserted_ids:
         suffix = _target_suffix(interaction.user, target)
@@ -1612,6 +1747,9 @@ async def log_cmd(
             f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}"
             f"{true_suf}{suffix}."
         )
+        if date:
+            used_local = logged_at.astimezone(DISPLAY_TZ).date()
+            msg += f" _(logged for {used_local.strftime('%Y-%m-%d')})_"
         is_pr = weight_kg > 0 and (prev is None or weight_kg > prev)
         if is_pr:
             if prev is None:
@@ -1735,7 +1873,10 @@ async def parse_cmd(
             note or "No lifts detected in that message.", ephemeral=True
         )
         return
-    inserted = await _store_lifts(msg, lifts, target)
+    inserted = await _store_lifts(
+        msg, lifts, target,
+        logged_at=_resolve_date_hint(content, msg.created_at.astimezone(DISPLAY_TZ)),
+    )
     date = _format_date(msg.created_at.isoformat())
     lines = [
         f"Stored {_plural(inserted, 'new lift')} for {_display_name(target)} "

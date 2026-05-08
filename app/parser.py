@@ -65,6 +65,11 @@ _RANGE_RE = re.compile(rf"({_NUM})\s*-\s*({_NUM})\s*kg?", re.IGNORECASE)
 _BW_PLUS_RE = re.compile(rf"bw\s*\+\s*({_NUM})\s*kg?", re.IGNORECASE)
 _PLATES_RE = re.compile(rf"({_NUM})\s*plates?", re.IGNORECASE)
 _KG_RE = re.compile(rf"({_NUM})\s*kg", re.IGNORECASE)
+# Imperial: "225lb", "225 lbs", "225 pounds". Auto-converted to kg downstream
+# so users from the imperial world don't accidentally log a 225kg bench they
+# didn't actually hit.
+_LB_RE = re.compile(rf"({_NUM})\s*(?:lbs?|pounds?)\b", re.IGNORECASE)
+_LB_TO_KG = 0.45359237
 _BARE_NUM_RE = re.compile(rf"(?<![\w.])({_NUM})(?!\s*(?:rm|rep|reps|set|sets))", re.IGNORECASE)
 _BW_RE = re.compile(r"\bbw\b", re.IGNORECASE)
 
@@ -226,6 +231,12 @@ def _extract_weight(value: str) -> tuple[float | None, bool, bool]:
         if total is not None:
             return total, False, True
 
+    # explicit "Xlb" / "Xlbs" / "Xpounds" — convert to kg up-front so the
+    # rest of the pipeline only ever sees one unit.
+    m = _LB_RE.search(v)
+    if m:
+        return round(float(m.group(1)) * _LB_TO_KG, 2), False, True
+
     # explicit "Xkg"
     m = _KG_RE.search(v)
     if m:
@@ -340,6 +351,9 @@ def _freeform_match(
         total = _eval_plate_expr(expr.group(1))
         if total is not None:
             return canon, total, False, reps
+    lb = _LB_RE.search(line)
+    if lb:
+        return canon, round(float(lb.group(1)) * _LB_TO_KG, 2), False, reps
     kg = _KG_RE.search(line)
     if kg:
         return canon, float(kg.group(1)), False, reps

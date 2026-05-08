@@ -213,3 +213,24 @@ def test_epley_caps_at_high_reps():
 def test_epley_rejects_zero_reps():
     assert estimated_one_rep_max(100, 0) is None
     assert estimated_one_rep_max(0, 5) is None
+
+
+def test_pound_unit_converts_to_kg():
+    lifts = parse_message("Bench press: 225lb")
+    assert len(lifts) == 1
+    assert abs(lifts[0].weight_kg - 102.06) < 0.02
+    assert lifts[0].confident is True
+
+
+def test_pound_freeform_lbs():
+    lifts = parse_message("hit bench press 135 lbs today")
+    assert len(lifts) == 1
+    assert lifts[0].equipment == "bench press"
+    assert abs(lifts[0].weight_kg - 61.23) < 0.02
+
+
+def test_pounds_word():
+    lifts = parse_message("Squat: 315 pounds")
+    assert len(lifts) == 1
+    assert abs(lifts[0].weight_kg - 142.88) < 0.02
+
