@@ -375,3 +375,36 @@ def test_delete_lifts_by_ids_can_delete_after_retarget(db):
     assert deleted == 1
     assert db.count_equipment_rows(1, "bench", user_id=100) == 0
     assert db.count_equipment_rows(1, "bench", user_id=200) == 1
+
+
+# --- Bodyweight tracking --------------------------------------------------
+
+def test_bodyweight_round_trip(db):
+    """Latest-write-wins is purely chronological (recorded_at, then id)."""
+    db.set_bodyweight(1, 100, 95.0)
+    db.set_bodyweight(1, 100, 96.5)
+    row = db.get_latest_bodyweight(1, 100)
+    assert row is not None
+    assert row["weight_kg"] == 96.5
+
+
+def test_bodyweight_missing_user_returns_none(db):
+    assert db.get_latest_bodyweight(1, 999) is None
+
+
+def test_bodyweight_scoped_per_guild(db):
+    db.set_bodyweight(1, 100, 90.0)
+    db.set_bodyweight(2, 100, 110.0)
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 90.0
+    assert db.get_latest_bodyweight(2, 100)["weight_kg"] == 110.0
+
+
+def test_bodyweight_bulk_returns_only_known(db):
+    db.set_bodyweight(1, 100, 90.0)
+    db.set_bodyweight(1, 200, 80.0)
+    out = db.latest_bodyweights_bulk(1, [100, 200, 300])
+    assert out == {100: 90.0, 200: 80.0}
+
+
+def test_bodyweight_bulk_empty_input(db):
+    assert db.latest_bodyweights_bulk(1, []) == {}

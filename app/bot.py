@@ -148,6 +148,22 @@ REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "0"))
 _role = os.getenv("REMINDER_ROLE_ID", "").strip()
 REMINDER_ROLE_ID: int | None = int(_role) if _role.isdigit() else None
 
+# Weekly bodyweight check-in reminder. Defaults to Monday 07:30 in the
+# DISPLAY_TIMEZONE so the user can update their bodyweight at the start of
+# the week. If BODYWEIGHT_REMINDER_CHANNEL_ID is blank, falls back to
+# REMINDER_CHANNEL_ID so a single channel setting covers both reminders.
+_bw_rid = os.getenv("BODYWEIGHT_REMINDER_CHANNEL_ID", "").strip()
+BODYWEIGHT_REMINDER_CHANNEL_ID: int | None = (
+    int(_bw_rid) if _bw_rid.isdigit() else REMINDER_CHANNEL_ID
+)
+BODYWEIGHT_REMINDER_WEEKDAY = int(os.getenv("BODYWEIGHT_REMINDER_WEEKDAY", "0"))
+BODYWEIGHT_REMINDER_HOUR = int(os.getenv("BODYWEIGHT_REMINDER_HOUR", "7"))
+BODYWEIGHT_REMINDER_MINUTE = int(os.getenv("BODYWEIGHT_REMINDER_MINUTE", "30"))
+_bw_role = os.getenv("BODYWEIGHT_REMINDER_ROLE_ID", "").strip()
+BODYWEIGHT_REMINDER_ROLE_ID: int | None = (
+    int(_bw_role) if _bw_role.isdigit() else None
+)
+
 # Daily update: posts yesterday's server activity summary on a schedule.
 # DAILY_UPDATE_CHANNEL_ID is required to enable it. Defaults to 08:00 local.
 _daily_id = os.getenv("DAILY_UPDATE_CHANNEL_ID", "").strip()
@@ -180,6 +196,72 @@ def _format_weight(weight: float, bw: bool) -> str:
         lb_str = f"{lb:g}"
         base += f" (≈{lb_str} lb)"
     return base
+
+
+# Equipment whose plain-kg log values represent machine *assistance* — the
+# user is logging how much weight the machine is taking off them, not what
+# they pulled. True load = bodyweight − assistance. Weighted variants of
+# the same lifts use the BW+X form (bodyweight_add=True), and are handled
+# separately in `_true_weight_kg` below.
+_BW_ASSISTED_EQUIPMENT: frozenset[str] = frozenset({
+    "pull ups", "dips", "chin assist", "push up",
+})
+
+
+def _true_weight_kg(
+    equipment: str, weight_kg: float, bw_add: bool,
+    bodyweight: float | None,
+) -> float | None:
+    """Return the *true* kg the lifter moved on a bodyweight-relative lift.
+
+    Examples (with bodyweight = 100kg):
+      * `BW+20kg` pull-up  → 120kg lifted.
+      * `pull ups 70kg` (machine assist 70kg) → 30kg lifted.
+      * `bench press 80kg`                    → None (not a BW lift).
+
+    Returns None when no bodyweight is known, when the equipment is not a
+    known bodyweight-relative lift, or when the inputs aren't meaningful
+    (e.g. negative result from over-assistance, which we clamp to None so
+    the caller doesn't render nonsense like "true: -5kg").
+    """
+    if bodyweight is None or bodyweight <= 0:
+        return None
+    if bw_add:
+        # Weighted BW lift: added weight is on top of the lifter.
+        return float(bodyweight) + float(weight_kg)
+    if equipment in _BW_ASSISTED_EQUIPMENT and weight_kg > 0:
+        # Plain-kg log on an assisted machine: subtract the assistance.
+        true_kg = float(bodyweight) - float(weight_kg)
+        if true_kg <= 0:
+            # Assistance >= bodyweight is unusual (would mean negative load);
+            # skip rather than display a confusing 0/negative number.
+            return None
+        return true_kg
+    return None
+
+
+def _true_weight_suffix(
+    equipment: str, weight_kg: float, bw_add: bool,
+    bodyweight: float | None,
+) -> str:
+    """Return ` (true: 30kg)` or empty string when no true weight applies."""
+    true_kg = _true_weight_kg(equipment, weight_kg, bw_add, bodyweight)
+    if true_kg is None:
+        return ""
+    # Round to 1dp to avoid noisy "29.9999kg" from float subtraction.
+    return f" (true: {round(true_kg, 1):g}kg)"
+
+
+def _user_bodyweight(guild_id: int, user_id: int) -> float | None:
+    """Latest known bodyweight for a user in a guild, or None."""
+    try:
+        row = db.get_latest_bodyweight(guild_id, user_id)
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Failed to read bodyweight for user %s", user_id)
+        return None
+    if row is None:
+        return None
+    return float(row["weight_kg"])
 
 
 def _display_name(user: object) -> str:
@@ -269,12 +351,17 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {word}"
 
 
-def _format_lift_lines(lifts: list[Lift], limit: int | None = None) -> list[str]:
+def _format_lift_lines(
+    lifts: list[Lift], limit: int | None = None,
+    bodyweight: float | None = None,
+) -> list[str]:
     if limit is None:
         limit = PARSE_REPLY_MAX_ITEMS
     shown = lifts if limit <= 0 else lifts[:limit]
     lines = [
-        f"• **{lift.equipment}** — {_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+        f"• **{lift.equipment}** — "
+        f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+        f"{_true_weight_suffix(lift.equipment, lift.weight_kg, lift.bodyweight_add, bodyweight)}"
         for lift in shown
     ]
     remaining = len(lifts) - len(shown)
@@ -517,6 +604,15 @@ async def on_ready() -> None:
             REMINDER_HOUR, REMINDER_MINUTE, DISPLAY_TZ, REMINDER_CHANNEL_ID,
         )
 
+    if BODYWEIGHT_REMINDER_CHANNEL_ID and not bodyweight_reminder.is_running():
+        bodyweight_reminder.start()
+        LOG.info(
+            "Bodyweight reminder scheduled for %s %02d:%02d (%s) in channel %s",
+            _WEEKDAY_NAMES[BODYWEIGHT_REMINDER_WEEKDAY % 7],
+            BODYWEIGHT_REMINDER_HOUR, BODYWEIGHT_REMINDER_MINUTE,
+            DISPLAY_TZ, BODYWEIGHT_REMINDER_CHANNEL_ID,
+        )
+
     if DAILY_UPDATE_CHANNEL_ID and not daily_update.is_running():
         daily_update.start()
         LOG.info(
@@ -605,6 +701,60 @@ async def weekly_reminder() -> None:
 
 @weekly_reminder.before_loop
 async def _before_weekly_reminder() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
+
+
+def _bodyweight_reminder_time() -> dtime:
+    return _scheduled_time(BODYWEIGHT_REMINDER_HOUR, BODYWEIGHT_REMINDER_MINUTE)
+
+
+@tasks.loop(time=_bodyweight_reminder_time())
+async def bodyweight_reminder() -> None:
+    """Weekly nudge to update bodyweight via `/bodyweight`.
+
+    Mirrors `weekly_reminder`: the loop fires daily at the configured time
+    in DISPLAY_TIMEZONE and we filter for the right weekday in-task. Default
+    schedule is Monday 07:30 in Australia/Adelaide (matches DISPLAY_TIMEZONE
+    default), so a fresh bodyweight is on file at the start of each week.
+    """
+    if BODYWEIGHT_REMINDER_CHANNEL_ID is None:
+        return
+    now_local = datetime.now(DISPLAY_TZ)
+    if now_local.weekday() != BODYWEIGHT_REMINDER_WEEKDAY % 7:
+        return
+    channel = bot.get_channel(BODYWEIGHT_REMINDER_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(BODYWEIGHT_REMINDER_CHANNEL_ID)
+        except discord.HTTPException:
+            LOG.warning(
+                "Bodyweight reminder: cannot access channel %s",
+                BODYWEIGHT_REMINDER_CHANNEL_ID,
+            )
+            return
+    mention = (
+        f"<@&{BODYWEIGHT_REMINDER_ROLE_ID}> "
+        if BODYWEIGHT_REMINDER_ROLE_ID else ""
+    )
+    text = (
+        f"{mention}⚖️ **Weekly bodyweight check-in!**\n"
+        "Run `/bodyweight weight_kg:<your kg>` so the bot can show your "
+        "true load on bodyweight-relative lifts.\n"
+        "Examples:\n"
+        "• Assisted pull-up at 70kg with 100kg bodyweight → "
+        "**30kg actual lifted**.\n"
+        "• `BW+20kg` weighted dip at 100kg bodyweight → **120kg actual**."
+    )
+    try:
+        allowed = discord.AllowedMentions(roles=True)
+        await channel.send(text, allowed_mentions=allowed)
+        LOG.info("Bodyweight reminder posted to #%s", channel)
+    except discord.HTTPException:
+        LOG.exception("Failed to post bodyweight reminder")
+
+
+@bodyweight_reminder.before_loop
+async def _before_bodyweight_reminder() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
 
 
@@ -817,13 +967,18 @@ async def on_message(message: discord.Message) -> None:
             goal_hits = _check_goal_hits(guild_id, target_user_id, prs)
 
             # Reply with a short confirmation so the user can see exactly
-            # what the bot understood from their message.
+            # what the bot understood from their message. Look up the target
+            # lifter's latest bodyweight once so we can tag bodyweight-relative
+            # lifts (assisted pull-ups, weighted dips, etc.) with their true
+            # load — the suffix is a no-op for everyone else.
+            target_bw = _user_bodyweight(guild_id, target_user_id)
             try:
                 if len(lifts) == 1:
                     lift = lifts[0]
                     reply = (
-                        f"Added **{_format_weight(lift.weight_kg, lift.bodyweight_add)}** "
-                        f"to **{lift.equipment}**"
+                        f"Added **{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+                        f"{_true_weight_suffix(lift.equipment, lift.weight_kg, lift.bodyweight_add, target_bw)}**"
+                        f" to **{lift.equipment}**"
                         f"{_target_suffix(message.author, target)}."
                     )
                 else:
@@ -831,22 +986,28 @@ async def on_message(message: discord.Message) -> None:
                         f"Added {_plural(inserted, 'lift')}"
                         f"{_target_suffix(message.author, target)}:"
                     ]
-                    lines.extend(_format_lift_lines(lifts))
+                    lines.extend(_format_lift_lines(lifts, bodyweight=target_bw))
                     reply = "\n".join(lines)
                 if prs:
                     pr_lines = ["", "🎉 **New PR!**"]
                     for lift, prev in prs:
+                        true_suf = _true_weight_suffix(
+                            lift.equipment, lift.weight_kg,
+                            lift.bodyweight_add, target_bw,
+                        )
                         if prev is None:
                             pr_lines.append(
                                 f"• **{lift.equipment}**: first logged at "
                                 f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+                                f"{true_suf}"
                             )
                         else:
                             gain = lift.weight_kg - prev
                             pr_lines.append(
                                 f"• **{lift.equipment}**: "
                                 f"{_format_weight(prev, lift.bodyweight_add)} → "
-                                f"{_format_weight(lift.weight_kg, lift.bodyweight_add)} "
+                                f"{_format_weight(lift.weight_kg, lift.bodyweight_add)}"
+                                f"{true_suf} "
                                 f"(+{gain:g}kg)"
                             )
                     reply += "\n" + "\n".join(pr_lines)
@@ -1169,14 +1330,83 @@ async def leaderboard_cmd(
 
     lines = [f"**Leaderboard — {canon}**"]
     medals = ["🥇", "🥈", "🥉"]
+    # Pull every lifter's most recent bodyweight in one query so we can show
+    # the *true* load on bodyweight-relative lifts (assisted pull-ups, etc.).
+    user_ids = [int(r["user_id"]) for r in rows]
+    bw_map = db.latest_bodyweights_bulk(guild_id, user_ids)
     for i, r in enumerate(rows):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
         date = _format_date(r["set_on"])
+        true_suf = _true_weight_suffix(
+            canon, float(r["best"]), bool(r["bw"]),
+            bw_map.get(int(r["user_id"])),
+        )
         lines.append(
             f"{prefix} {r['username']} — "
-            f"{_format_weight(r['best'], bool(r['bw']))}  _(set {date})_"
+            f"{_format_weight(r['best'], bool(r['bw']))}{true_suf}"
+            f"  _(set {date})_"
         )
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(
+    name="bodyweight",
+    description="Record your current bodyweight (or view it if no weight given).",
+)
+@app_commands.describe(
+    weight_kg="Your current bodyweight in kg. Omit to view your last entry.",
+    user="Whose bodyweight to set/view (defaults to you).",
+)
+async def bodyweight_cmd(
+    interaction: discord.Interaction,
+    weight_kg: float | None = None,
+    user: discord.Member | None = None,
+) -> None:
+    guild_id = interaction.guild_id or 0
+    target = user or interaction.user
+    # If no value supplied, just report the latest entry. Useful for sanity
+    # checking what the bot is using to compute true weights.
+    if weight_kg is None:
+        row = db.get_latest_bodyweight(guild_id, target.id)
+        if row is None:
+            await interaction.response.send_message(
+                f"No bodyweight on file for **{_display_name(target)}** yet. "
+                "Use `/bodyweight weight_kg:<kg>` to record one — it will be "
+                "used to show the true load on pull-ups, dips, and other "
+                "bodyweight-relative lifts.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"**{_display_name(target)}**'s bodyweight: "
+            f"**{float(row['weight_kg']):g}kg** "
+            f"(updated {_format_date(row['recorded_at'])}).",
+            ephemeral=True,
+        )
+        return
+
+    if weight_kg <= 0:
+        await interaction.response.send_message(
+            "Bodyweight must be a positive number of kg.", ephemeral=True
+        )
+        return
+    # Reuse MAX_WEIGHT_KG as a sanity ceiling so a fat-fingered "1500" can't
+    # silently make every leaderboard line look ridiculous.
+    if MAX_WEIGHT_KG > 0 and weight_kg > MAX_WEIGHT_KG:
+        await interaction.response.send_message(
+            f"That bodyweight looks too high to be real ({weight_kg:g}kg > "
+            f"{MAX_WEIGHT_KG:g}kg).",
+            ephemeral=True,
+        )
+        return
+
+    db.set_bodyweight(guild_id, target.id, weight_kg)
+    suffix = _target_suffix(interaction.user, target)
+    await interaction.response.send_message(
+        f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will now "
+        "show your true load on bodyweight-relative lifts (e.g. assisted "
+        "pull-ups, weighted dips)."
+    )
 
 
 @bot.tree.command(name="log", description="Manually log a single lift.")
@@ -1236,7 +1466,12 @@ async def log_cmd(
     )
     if inserted_ids:
         suffix = _target_suffix(interaction.user, target)
-        msg = f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}{suffix}."
+        target_bw = _user_bodyweight(guild_id, target.id)
+        true_suf = _true_weight_suffix(canon, weight_kg, bodyweight, target_bw)
+        msg = (
+            f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}"
+            f"{true_suf}{suffix}."
+        )
         is_pr = weight_kg > 0 and (prev is None or weight_kg > prev)
         if is_pr:
             if prev is None:
@@ -1428,6 +1663,15 @@ async def version_cmd(interaction: discord.Interaction) -> None:
         )
     else:
         daily_line = "daily update: off"
+    if BODYWEIGHT_REMINDER_CHANNEL_ID:
+        bw_reminder_line = (
+            f"bodyweight reminder: "
+            f"{_WEEKDAY_NAMES[BODYWEIGHT_REMINDER_WEEKDAY % 7]} "
+            f"{BODYWEIGHT_REMINDER_HOUR:02d}:{BODYWEIGHT_REMINDER_MINUTE:02d} "
+            f"({DISPLAY_TZ}) in <#{BODYWEIGHT_REMINDER_CHANNEL_ID}>"
+        )
+    else:
+        bw_reminder_line = "bodyweight reminder: off"
     lines = [
         f"**gym-bot v{__version__}**",
         f"discord.py: {discord.__version__}",
@@ -1439,6 +1683,7 @@ async def version_cmd(interaction: discord.Interaction) -> None:
         if MAX_WEIGHT_KG > 0 else "max auto/log weight: off",
         f"display timezone: {DISPLAY_TZ}",
         reminder_line,
+        bw_reminder_line,
         daily_line,
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -1849,6 +2094,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         name="✏️ Logging & editing",
         value=(
             "`/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry\n"
+            "`/bodyweight [weight_kg] [user]` — record your bodyweight so the bot "
+            "shows your true load on pull-ups, dips, etc.\n"
             "`/undo` — remove your most recent entry\n"
             "React ❌ on my reply to undo that specific post "
             "(logger or target lifter only)\n"

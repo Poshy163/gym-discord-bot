@@ -71,6 +71,22 @@ CREATE TABLE IF NOT EXISTS reply_tracking (
     lift_ids         TEXT,
     created_at       TEXT    NOT NULL
 );
+
+-- Per-user bodyweight history. Used to compute the "true" load for
+-- bodyweight-relative lifts (assisted pull-ups/dips give the assistance
+-- amount, weighted pull-ups/dips give bodyweight + added kg). One row per
+-- update; we read the most recent row (or the most recent on/before a
+-- given lift's logged_at) when displaying true weights.
+CREATE TABLE IF NOT EXISTS bodyweights (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    weight_kg    REAL    NOT NULL,
+    recorded_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bodyweights_user
+    ON bodyweights (guild_id, user_id, recorded_at);
 """
 
 
@@ -399,7 +415,8 @@ class Database:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT l.username,
+                SELECT l.user_id,
+                       l.username,
                        l.weight_kg       AS best,
                        l.bodyweight_add  AS bw,
                        MIN(l.logged_at)  AS set_on
@@ -1424,3 +1441,69 @@ class Database:
                 """,
                 (weight_kg, 1 if bodyweight_add else 0, reps, lift_id),
             )
+
+    # ------------------------------------------------------------------
+    # Bodyweight tracking
+    # ------------------------------------------------------------------
+    def set_bodyweight(
+        self, guild_id: int, user_id: int, weight_kg: float,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        """Record a new bodyweight measurement for a user.
+
+        We append rather than overwrite so the user can see how their
+        bodyweight has trended and so historical lifts can in principle
+        be re-rendered against the bodyweight that was current at the time.
+        """
+        ts = _normalize_iso(recorded_at)
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO bodyweights (guild_id, user_id, weight_kg, recorded_at) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, float(weight_kg), ts),
+            )
+
+    def get_latest_bodyweight(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        """Return the most recent bodyweight row for this user, or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT weight_kg, recorded_at FROM bodyweights "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+            return row
+
+    def latest_bodyweights_bulk(
+        self, guild_id: int, user_ids: list[int],
+    ) -> dict[int, float]:
+        """Latest known bodyweight per user_id, as a {user_id: kg} dict.
+
+        Used by `/leaderboard` to compute everyone's true weight without
+        issuing one query per row. Users without any bodyweight entry are
+        omitted from the result.
+        """
+        if not user_ids:
+            return {}
+        # Dedupe and parameterise; SQLite has a default limit of 999 host
+        # parameters, well above what /leaderboard ever passes (max 25).
+        unique = list({int(u) for u in user_ids})
+        placeholders = ",".join("?" * len(unique))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""
+                SELECT b.user_id, b.weight_kg
+                FROM bodyweights b
+                JOIN (
+                    SELECT user_id, MAX(recorded_at) AS mx
+                    FROM bodyweights
+                    WHERE guild_id = ? AND user_id IN ({placeholders})
+                    GROUP BY user_id
+                ) m ON m.user_id = b.user_id AND m.mx = b.recorded_at
+                WHERE b.guild_id = ?
+                """,
+                [guild_id, *unique, guild_id],
+            ).fetchall()
+        return {int(r["user_id"]): float(r["weight_kg"]) for r in rows}

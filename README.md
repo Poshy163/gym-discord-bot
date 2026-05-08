@@ -77,6 +77,13 @@ Logging & editing:
 
 - `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally
   for another user (🎉 on PRs).
+- `/bodyweight [weight_kg] [user]` — record (or view) your current bodyweight.
+  Once on file, the bot annotates bodyweight-relative lifts with the **true
+  load** in inline replies and the leaderboard:
+  - assisted pull-up logged as `pull ups 70kg` with bodyweight 100kg →
+    **30kg actual** (machine assistance is subtracted)
+  - weighted dip logged as `BW+20kg` with bodyweight 100kg →
+    **120kg actual**
 - `/undo` — remove your most recent entry.
 - **React ❌ on the bot's reply** to undo the specific lifts that reply stored.
   The logger and target lifter can do this; other users' reactions are ignored.
@@ -122,6 +129,15 @@ everyone to drop their current bests. Defaults are **Wednesday 12:00** in
 `DISPLAY_TIMEZONE` (defaults to `Australia/Adelaide`, which handles ACST/ACDT
 automatically). Tune with `REMINDER_WEEKDAY` (0=Mon … 6=Sun), `REMINDER_HOUR`,
 `REMINDER_MINUTE`, and optionally `REMINDER_ROLE_ID` to @mention a role.
+
+## Weekly bodyweight reminder
+
+A second weekly reminder nudges everyone to update their bodyweight via
+`/bodyweight` so true-load annotations on pull-ups, dips, etc. stay accurate.
+By default it inherits `REMINDER_CHANNEL_ID` and posts **Monday 07:30** in
+`DISPLAY_TIMEZONE`. Tune with `BODYWEIGHT_REMINDER_CHANNEL_ID`,
+`BODYWEIGHT_REMINDER_WEEKDAY`, `BODYWEIGHT_REMINDER_HOUR`,
+`BODYWEIGHT_REMINDER_MINUTE`, and `BODYWEIGHT_REMINDER_ROLE_ID`.
 
 ## Daily gym update
 
