@@ -375,3 +375,51 @@ def test_delete_lifts_by_ids_can_delete_after_retarget(db):
     assert deleted == 1
     assert db.count_equipment_rows(1, "bench", user_id=100) == 0
     assert db.count_equipment_rows(1, "bench", user_id=200) == 1
+
+
+# --- Bodyweight tracking --------------------------------------------------
+
+def test_bodyweight_round_trip(db):
+    """Latest-write-wins is purely chronological (recorded_at, then id)."""
+    db.set_bodyweight(1, 100, 95.0)
+    db.set_bodyweight(1, 100, 96.5)
+    row = db.get_latest_bodyweight(1, 100)
+    assert row is not None
+    assert row["weight_kg"] == 96.5
+
+
+def test_bodyweight_missing_user_returns_none(db):
+    assert db.get_latest_bodyweight(1, 999) is None
+
+
+def test_bodyweight_scoped_per_guild(db):
+    db.set_bodyweight(1, 100, 90.0)
+    db.set_bodyweight(2, 100, 110.0)
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 90.0
+    assert db.get_latest_bodyweight(2, 100)["weight_kg"] == 110.0
+
+
+def test_bodyweight_bulk_returns_only_known(db):
+    db.set_bodyweight(1, 100, 90.0)
+    db.set_bodyweight(1, 200, 80.0)
+    out = db.latest_bodyweights_bulk(1, [100, 200, 300])
+    assert out == {100: 90.0, 200: 80.0}
+
+
+def test_bodyweight_bulk_empty_input(db):
+    assert db.latest_bodyweights_bulk(1, []) == {}
+
+
+def test_bodyweight_bulk_picks_latest_with_id_tiebreaker(db):
+    """When two rows share recorded_at, the higher id (later insert) wins.
+
+    Mirrors the ORDER BY in `get_latest_bodyweight`, so the bulk query used
+    by /leaderboard never returns a stale value on tied timestamps.
+    """
+    same_ts = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    db.set_bodyweight(1, 100, 90.0, recorded_at=same_ts)
+    db.set_bodyweight(1, 100, 92.0, recorded_at=same_ts)  # later id wins
+    out = db.latest_bodyweights_bulk(1, [100])
+    assert out == {100: 92.0}
+    # And it agrees with the single-user accessor.
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 92.0

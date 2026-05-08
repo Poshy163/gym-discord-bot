@@ -12,7 +12,13 @@ import os
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
-from app.bot import _rejected_lifts_note, _safe_label  # noqa: E402
+from app.bot import (  # noqa: E402
+    _parse_bodyweight_message,
+    _rejected_lifts_note,
+    _safe_label,
+    _true_weight_kg,
+    _true_weight_suffix,
+)
 from app.parser import Lift  # noqa: E402
 
 
@@ -64,3 +70,54 @@ def test_rejected_lifts_note_sanitizes_equipment():
 
 def test_rejected_lifts_note_empty_returns_blank():
     assert _rejected_lifts_note([]) == ""
+
+
+# --- True-weight helper ---------------------------------------------------
+
+def test_true_weight_assisted_pull_up_subtracts_assistance():
+    # 100kg lifter on assisted pull-up machine set to 70kg of help.
+    assert _true_weight_kg("pull ups", 70, False, 100) == 30
+    assert _true_weight_suffix("pull ups", 70, False, 100) == " (true: 30kg)"
+
+
+def test_true_weight_weighted_dip_adds_to_bodyweight():
+    # 100kg lifter doing BW+20kg dips → 120kg true load.
+    assert _true_weight_kg("dips", 20, True, 100) == 120
+    assert _true_weight_suffix("dips", 20, True, 100) == " (true: 120kg)"
+
+
+def test_true_weight_no_bodyweight_returns_none():
+    assert _true_weight_kg("pull ups", 70, False, None) is None
+    assert _true_weight_suffix("pull ups", 70, False, None) == ""
+
+
+def test_true_weight_skipped_for_non_bw_equipment():
+    # Bench press isn't bodyweight-relative, so no true-weight annotation.
+    assert _true_weight_kg("bench press", 80, False, 100) is None
+    assert _true_weight_suffix("bench press", 80, False, 100) == ""
+
+
+def test_true_weight_clamps_over_assistance_to_none():
+    # Assistance >= bodyweight would yield <=0 kg lifted, which is nonsense
+    # to display. The helper returns None so the suffix stays empty.
+    assert _true_weight_kg("pull ups", 120, False, 100) is None
+    assert _true_weight_suffix("pull ups", 120, False, 100) == ""
+
+
+# --- Chat-message bodyweight parser --------------------------------------
+
+def test_parse_bodyweight_message_variants():
+    assert _parse_bodyweight_message("bodyweight 100kg") == 100.0
+    assert _parse_bodyweight_message("body weight: 95.5kg") == 95.5
+    assert _parse_bodyweight_message("BW 80") == 80.0
+    assert _parse_bodyweight_message("  bodyweight - 72.3 ") == 72.3
+    assert _parse_bodyweight_message("bodyweight 100kg.") == 100.0
+
+
+def test_parse_bodyweight_message_rejects_non_bodyweight():
+    # No number, or it's a lift line, or bodyweight is mentioned mid-sentence.
+    assert _parse_bodyweight_message("bodyweight") is None
+    assert _parse_bodyweight_message("squat 100kg") is None
+    assert _parse_bodyweight_message("bench 80kg bodyweight 100") is None
+    assert _parse_bodyweight_message("") is None
+    assert _parse_bodyweight_message("BW") is None
