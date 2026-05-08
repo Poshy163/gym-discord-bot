@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS bodyweights (
 
 CREATE INDEX IF NOT EXISTS idx_bodyweights_user
     ON bodyweights (guild_id, user_id, recorded_at);
+
+-- Source-message ids whose lifts were explicitly removed via undo. The
+-- startup backfill consults this so it doesn't re-import a post the user
+-- already told us to forget. Cleared automatically when the user edits the
+-- message (treated as a correction worth re-parsing).
+CREATE TABLE IF NOT EXISTS suppressed_messages (
+    guild_id      INTEGER NOT NULL,
+    message_id    INTEGER NOT NULL,
+    suppressed_at TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, message_id)
+);
 """
 
 
@@ -967,7 +978,7 @@ class Database:
             rows = list(c.execute(
                 """
                 SELECT id, equipment, weight_kg,
-                       bodyweight_add AS bw, logged_at
+                       bodyweight_add AS bw, logged_at, message_id
                 FROM lifts
                 WHERE guild_id = ? AND user_id = ?
                 ORDER BY logged_at DESC, id DESC
@@ -1355,6 +1366,49 @@ class Database:
             )
             return cur.rowcount or 0
 
+    # ---- backfill suppression ------------------------------------------
+
+    def suppress_message(self, guild_id: int, message_id: int) -> None:
+        """Mark a source message as 'do not re-import' for backfill.
+
+        Called by the undo paths so a restart doesn't resurrect lifts the
+        user just removed. Idempotent.
+        """
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO suppressed_messages
+                    (guild_id, message_id, suppressed_at)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, message_id, _normalize_iso(None)),
+            )
+
+    def unsuppress_message(self, guild_id: int, message_id: int) -> int:
+        """Clear a backfill-suppression row. Used when the source message
+        is edited so a corrected post can flow through the normal pipeline
+        again."""
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                DELETE FROM suppressed_messages
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            )
+            return cur.rowcount or 0
+
+    def is_message_suppressed(self, guild_id: int, message_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT 1 FROM suppressed_messages
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            ).fetchone()
+            return row is not None
+
     def retarget_replies_for_message(
         self, guild_id: int, message_id: int, target_user_id: int,
     ) -> int:
@@ -1388,6 +1442,23 @@ class Database:
                 WHERE guild_id = ? AND user_id = ? AND message_id = ?
                 """,
                 (guild_id, user_id, message_id),
+            )
+            return cur.rowcount or 0
+
+    def delete_lifts_for_message_any_user(
+        self, guild_id: int, message_id: int
+    ) -> int:
+        """Remove every lift row tied to a specific source message,
+        regardless of who logged it. Used by the admin retroactive cleanup
+        path where we already trust the signal (the bot's own undo
+        footer)."""
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                DELETE FROM lifts
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
             )
             return cur.rowcount or 0
 

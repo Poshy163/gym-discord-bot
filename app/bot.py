@@ -991,6 +991,10 @@ async def _backfill_channel(
         if msg.author.bot or not msg.guild:
             continue
         scanned += 1
+        # Skip messages whose lifts the user explicitly undid; otherwise a
+        # restart would resurrect them on every boot.
+        if db.is_message_suppressed(msg.guild.id, msg.id):
+            continue
         guild_aliases = _custom_alias_map(msg.guild.id)
         target, content = _message_lift_target(msg)
         lifts = parse_message(content, custom_aliases=guild_aliases)
@@ -1183,6 +1187,9 @@ async def on_message_edit(
     aliases = _custom_alias_map(guild_id)
     target, content = _message_lift_target(after)
     target_user_id = int(getattr(target, "id"))
+    # Editing a post is a fresh signal of intent — clear any prior
+    # backfill suppression so the corrected version can be re-imported.
+    db.unsuppress_message(guild_id, after.id)
     db.retarget_replies_for_message(guild_id, after.id, target_user_id)
     new_lifts = parse_message(content, custom_aliases=aliases)
     new_lifts, _rejected = _split_reasonable_lifts(new_lifts)
@@ -1321,6 +1328,9 @@ async def on_raw_reaction_add(
         removed = db.delete_lifts_for_message(
             guild_id, target_user_id, rec["message_id"]
         )
+    # Stop startup backfill from re-importing the now-undone post.
+    if removed and rec["message_id"] is not None:
+        db.suppress_message(guild_id, int(rec["message_id"]))
 
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
@@ -1840,6 +1850,140 @@ async def backfill_cmd(
         f"{matched} had lifts, {inserted} new lifts stored.",
         ephemeral=True,
     )
+
+
+# Marker text the reaction-undo handler appends to the bot's reply when it
+# successfully removes lifts. Used by /cleanup_resurrected to find historical
+# undo events whose source posts may have been re-imported by a later
+# backfill (before the suppression mechanism existed).
+_UNDO_FOOTER_MARKERS = ("↩️ Undid", "↩️ Nothing to undo")
+
+
+async def _scan_channel_for_undone_messages(
+    channel: discord.abc.Messageable, limit: int | None,
+) -> tuple[int, set[int]]:
+    """Walk channel history and collect source-message ids that were undone.
+
+    A "previously undone" reply is one of *our own* messages whose content
+    contains the undo footer and that was sent as a reply to the original
+    gym post. The referenced message id is the source post we should
+    suppress and clean up.
+
+    Returns (messages_scanned, source_message_ids).
+    """
+    bot_user_id = bot.user.id if bot.user else 0
+    scanned = 0
+    source_ids: set[int] = set()
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        scanned += 1
+        if msg.author.id != bot_user_id:
+            continue
+        if not any(marker in msg.content for marker in _UNDO_FOOTER_MARKERS):
+            continue
+        ref = msg.reference
+        ref_id = getattr(ref, "message_id", None) if ref is not None else None
+        if ref_id is not None:
+            source_ids.add(int(ref_id))
+    return scanned, source_ids
+
+
+@bot.tree.command(
+    name="cleanup_resurrected",
+    description=(
+        "Admin: scan history for previously-undone posts and remove any "
+        "lifts a backfill resurrected. Also adds suppression so they "
+        "stay gone."
+    ),
+)
+@app_commands.describe(
+    limit="Max messages to scan per channel (default 5000, 0 for no limit).",
+    all_channels=(
+        "Scan every configured gym channel (default). Set false to scan "
+        "only the channel the command was used in."
+    ),
+)
+async def cleanup_resurrected_cmd(
+    interaction: discord.Interaction,
+    limit: int = 5000,
+    all_channels: bool = True,
+) -> None:
+    if interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(
+            "Admins only.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    lim = limit if limit and limit > 0 else None
+
+    if all_channels and GYM_CHANNEL_IDS:
+        channel_ids = list(GYM_CHANNEL_IDS)
+    elif interaction.channel is not None:
+        channel_ids = [interaction.channel.id]
+    else:
+        await interaction.followup.send(
+            "No channel to scan.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id or 0
+    total_scanned = 0
+    total_sources = 0
+    total_removed = 0
+    total_suppressed = 0
+    per_channel: list[str] = []
+
+    for channel_id in channel_ids:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                per_channel.append(f"• <#{channel_id}>: cannot access")
+                continue
+        try:
+            scanned, source_ids = await _scan_channel_for_undone_messages(
+                channel, lim,
+            )
+        except discord.Forbidden:
+            per_channel.append(
+                f"• {getattr(channel, 'mention', f'#{channel_id}')}: "
+                "missing read-history permission"
+            )
+            continue
+
+        ch_removed = 0
+        ch_suppressed = 0
+        for msg_id in source_ids:
+            removed = db.delete_lifts_for_message_any_user(
+                guild_id, msg_id,
+            )
+            if not db.is_message_suppressed(guild_id, msg_id):
+                ch_suppressed += 1
+            db.suppress_message(guild_id, msg_id)
+            ch_removed += removed
+
+        total_scanned += scanned
+        total_sources += len(source_ids)
+        total_removed += ch_removed
+        total_suppressed += ch_suppressed
+        per_channel.append(
+            f"• {getattr(channel, 'mention', f'#{channel_id}')}: "
+            f"scanned {scanned}, undone-posts found {len(source_ids)}, "
+            f"lifts removed {ch_removed}, newly suppressed {ch_suppressed}"
+        )
+
+    summary = [
+        "**Cleanup complete.**",
+        f"Channels scanned: {len(channel_ids)}",
+        f"Messages scanned: {total_scanned}",
+        f"Previously-undone source posts: {total_sources}",
+        f"Resurrected lifts removed: {total_removed}",
+        f"New suppression rows: {total_suppressed}",
+        "",
+        *per_channel,
+    ]
+    await interaction.followup.send("\n".join(summary), ephemeral=True)
 
 
 @bot.tree.command(
@@ -2459,14 +2603,20 @@ async def undo_cmd(
     interaction: discord.Interaction, count: int = 1,
 ) -> None:
     n = max(1, min(10, count))
+    guild_id = interaction.guild_id or 0
     rows = db.pop_last_n_for_user(
-        interaction.guild_id or 0, interaction.user.id, n,
+        guild_id, interaction.user.id, n,
     )
     if not rows:
         await interaction.response.send_message(
             "You don't have any entries to undo.", ephemeral=True
         )
         return
+    # Suppress the source posts so a reboot's backfill doesn't re-add them.
+    for r in rows:
+        msg_id = r["message_id"]
+        if msg_id is not None:
+            db.suppress_message(guild_id, int(msg_id))
     if len(rows) == 1:
         r = rows[0]
         msg = (
