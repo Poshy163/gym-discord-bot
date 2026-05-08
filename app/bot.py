@@ -13,7 +13,10 @@ import importlib
 import logging
 import os
 import re
+import sqlite3
+import tempfile
 from datetime import datetime, time as dtime, timedelta, timezone
+from pathlib import Path
 
 try:
     from zoneinfo import ZoneInfo
@@ -980,13 +983,14 @@ async def _before_daily_update() -> None:  # pragma: no cover - discord runtime
 
 async def _backfill_channel(
     channel: discord.abc.Messageable, limit: int | None
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """Scan a channel's history and store any detected lifts.
 
-    Returns (messages_scanned, messages_with_lifts, lifts_inserted).
-    Dedupe on (message_id, equipment) means re-running is safe.
+    Returns (messages_scanned, messages_with_lifts, lifts_inserted,
+    skipped_suppressed). Dedupe on (message_id, equipment) means re-runs
+    are safe.
     """
-    scanned = matched = inserted = 0
+    scanned = matched = inserted = skipped = 0
     async for msg in channel.history(limit=limit, oldest_first=True):
         if msg.author.bot or not msg.guild:
             continue
@@ -994,6 +998,7 @@ async def _backfill_channel(
         # Skip messages whose lifts the user explicitly undid; otherwise a
         # restart would resurrect them on every boot.
         if db.is_message_suppressed(msg.guild.id, msg.id):
+            skipped += 1
             continue
         guild_aliases = _custom_alias_map(msg.guild.id)
         target, content = _message_lift_target(msg)
@@ -1007,7 +1012,7 @@ async def _backfill_channel(
         if n:
             matched += 1
             inserted += n
-    return scanned, matched, inserted
+    return scanned, matched, inserted, skipped
 
 
 async def _run_startup_backfill() -> None:
@@ -1022,13 +1027,16 @@ async def _run_startup_backfill() -> None:
                 continue
         LOG.info("Backfill: scanning #%s (limit=%s)", channel, limit)
         try:
-            scanned, matched, inserted = await _backfill_channel(channel, limit)
+            scanned, matched, inserted, skipped = await _backfill_channel(
+                channel, limit,
+            )
         except discord.Forbidden:
             LOG.warning("Backfill: missing permission to read #%s", channel)
             continue
         LOG.info(
-            "Backfill done for #%s: scanned=%d, posts_with_lifts=%d, new_lifts=%d",
-            channel, scanned, matched, inserted,
+            "Backfill done for #%s: scanned=%d, posts_with_lifts=%d, "
+            "new_lifts=%d, skipped_suppressed=%d",
+            channel, scanned, matched, inserted, skipped,
         )
 
 
@@ -1328,8 +1336,11 @@ async def on_raw_reaction_add(
         removed = db.delete_lifts_for_message(
             guild_id, target_user_id, rec["message_id"]
         )
-    # Stop startup backfill from re-importing the now-undone post.
-    if removed and rec["message_id"] is not None:
+    # Always suppress, even when removed==0: the user's clear intent is
+    # "don't keep this post". If the rows were already gone (e.g. a prior
+    # /undo), a future backfill could still re-import the same source
+    # message without this guard.
+    if rec["message_id"] is not None:
         db.suppress_message(guild_id, int(rec["message_id"]))
 
     channel = bot.get_channel(payload.channel_id)
@@ -1836,7 +1847,7 @@ async def backfill_cmd(
     await interaction.response.defer(thinking=True, ephemeral=True)
     lim = limit if limit and limit > 0 else None
     try:
-        scanned, matched, inserted = await _backfill_channel(
+        scanned, matched, inserted, skipped = await _backfill_channel(
             interaction.channel, lim
         )
     except discord.Forbidden:
@@ -1847,7 +1858,8 @@ async def backfill_cmd(
         return
     await interaction.followup.send(
         f"Backfill complete — scanned {scanned} messages, "
-        f"{matched} had lifts, {inserted} new lifts stored.",
+        f"{matched} had lifts, {inserted} new lifts stored, "
+        f"{skipped} skipped (suppressed).",
         ephemeral=True,
     )
 
@@ -1855,8 +1867,10 @@ async def backfill_cmd(
 # Marker text the reaction-undo handler appends to the bot's reply when it
 # successfully removes lifts. Used by /cleanup_resurrected to find historical
 # undo events whose source posts may have been re-imported by a later
-# backfill (before the suppression mechanism existed).
-_UNDO_FOOTER_MARKERS = ("↩️ Undid", "↩️ Nothing to undo")
+# backfill (before the suppression mechanism existed). We only match the
+# "actually removed" footer — "Nothing to undo" replies aren't useful
+# evidence that a post should stay suppressed.
+_UNDO_FOOTER_MARKER = "↩️ Undid"
 
 
 async def _scan_channel_for_undone_messages(
@@ -1878,7 +1892,7 @@ async def _scan_channel_for_undone_messages(
         scanned += 1
         if msg.author.id != bot_user_id:
             continue
-        if not any(marker in msg.content for marker in _UNDO_FOOTER_MARKERS):
+        if _UNDO_FOOTER_MARKER not in msg.content:
             continue
         ref = msg.reference
         ref_id = getattr(ref, "message_id", None) if ref is not None else None
@@ -1899,11 +1913,16 @@ async def _scan_channel_for_undone_messages(
         "Scan every configured gym channel (default). Set false to scan "
         "only the channel the command was used in."
     ),
+    dry_run=(
+        "Preview only — don't delete or suppress anything (default True). "
+        "Set False to actually apply the cleanup."
+    ),
 )
 async def cleanup_resurrected_cmd(
     interaction: discord.Interaction,
     limit: int = 5000,
     all_channels: bool = True,
+    dry_run: bool = True,
 ) -> None:
     if interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
@@ -1927,8 +1946,8 @@ async def cleanup_resurrected_cmd(
     guild_id = interaction.guild_id or 0
     total_scanned = 0
     total_sources = 0
-    total_removed = 0
-    total_suppressed = 0
+    total_removable = 0
+    total_suppressed_new = 0
     per_channel: list[str] = []
 
     for channel_id in channel_ids:
@@ -1950,38 +1969,201 @@ async def cleanup_resurrected_cmd(
             )
             continue
 
-        ch_removed = 0
-        ch_suppressed = 0
+        ch_removable = 0
+        ch_suppressed_new = 0
         for msg_id in source_ids:
-            removed = db.delete_lifts_for_message_any_user(
-                guild_id, msg_id,
-            )
-            if not db.is_message_suppressed(guild_id, msg_id):
-                ch_suppressed += 1
-            db.suppress_message(guild_id, msg_id)
-            ch_removed += removed
+            existing = db.count_lifts_for_message(guild_id, msg_id)
+            already_suppressed = db.is_message_suppressed(guild_id, msg_id)
+            ch_removable += existing
+            if not already_suppressed:
+                ch_suppressed_new += 1
+            if not dry_run:
+                if existing:
+                    db.delete_lifts_for_message_any_user(guild_id, msg_id)
+                db.suppress_message(guild_id, msg_id)
 
         total_scanned += scanned
         total_sources += len(source_ids)
-        total_removed += ch_removed
-        total_suppressed += ch_suppressed
+        total_removable += ch_removable
+        total_suppressed_new += ch_suppressed_new
         per_channel.append(
             f"• {getattr(channel, 'mention', f'#{channel_id}')}: "
             f"scanned {scanned}, undone-posts found {len(source_ids)}, "
-            f"lifts removed {ch_removed}, newly suppressed {ch_suppressed}"
+            f"lifts {'would remove' if dry_run else 'removed'} "
+            f"{ch_removable}, "
+            f"{'would suppress' if dry_run else 'newly suppressed'} "
+            f"{ch_suppressed_new}"
         )
 
-    summary = [
-        "**Cleanup complete.**",
+    header_label = "DRY-RUN preview" if dry_run else "Cleanup complete"
+    summary_lines = [
+        f"**{header_label}.**",
         f"Channels scanned: {len(channel_ids)}",
         f"Messages scanned: {total_scanned}",
         f"Previously-undone source posts: {total_sources}",
-        f"Resurrected lifts removed: {total_removed}",
-        f"New suppression rows: {total_suppressed}",
-        "",
-        *per_channel,
+        f"Resurrected lifts {'to remove' if dry_run else 'removed'}: "
+        f"{total_removable}",
+        f"{'Suppressions to add' if dry_run else 'New suppression rows'}: "
+        f"{total_suppressed_new}",
     ]
-    await interaction.followup.send("\n".join(summary), ephemeral=True)
+    if dry_run:
+        summary_lines.append(
+            "_Re-run with `dry_run:false` to apply._"
+        )
+    if BACKFILL_LIMIT and lim and lim > BACKFILL_LIMIT:
+        summary_lines.append(
+            f"_Note: scan limit ({lim}) exceeds BACKFILL_LIMIT "
+            f"({BACKFILL_LIMIT}); rows beyond BACKFILL_LIMIT can't be "
+            "re-imported anyway, so suppressing them is precautionary._"
+        )
+    summary_lines.append("")
+    summary_lines.extend(per_channel)
+
+    # Discord caps individual messages at 2000 chars. Split the summary
+    # into chunks so a long per-channel report doesn't get rejected.
+    await _send_chunked_followup(interaction, summary_lines)
+
+
+async def _send_chunked_followup(
+    interaction: discord.Interaction, lines: list[str], limit: int = 1900,
+) -> None:
+    """Send `lines` as one or more ephemeral followups, each under `limit`
+    chars. Splits on line boundaries so we don't break formatting.
+    """
+    buf: list[str] = []
+    size = 0
+    for line in lines:
+        # +1 for the newline we'll add when joining.
+        if size + len(line) + 1 > limit and buf:
+            await interaction.followup.send("\n".join(buf), ephemeral=True)
+            buf = []
+            size = 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        await interaction.followup.send("\n".join(buf), ephemeral=True)
+
+
+@bot.tree.command(
+    name="suppress_message",
+    description="Admin: mark a source post id as 'do not import'.",
+)
+@app_commands.describe(
+    message_id="The original gym post's message ID to suppress.",
+    delete_existing=(
+        "Also delete any currently-stored lifts tied to this message "
+        "(default True)."
+    ),
+)
+async def suppress_message_cmd(
+    interaction: discord.Interaction,
+    message_id: str,
+    delete_existing: bool = True,
+) -> None:
+    if interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(
+            "Admins only.", ephemeral=True
+        )
+        return
+    if not message_id.isdigit():
+        await interaction.response.send_message(
+            "message_id must be a numeric Discord message ID.",
+            ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    mid = int(message_id)
+    removed = 0
+    if delete_existing:
+        removed = db.delete_lifts_for_message_any_user(guild_id, mid)
+    already = db.is_message_suppressed(guild_id, mid)
+    db.suppress_message(guild_id, mid)
+    await interaction.response.send_message(
+        f"Suppressed message `{mid}`. Lifts removed: {removed}. "
+        f"{'Already suppressed before this call.' if already else 'New suppression row.'}",
+        ephemeral=True,
+    )
+
+
+# Owner-only: download the live SQLite DB. Hard-coded to one user id so a
+# misconfigured ADMIN_USER_IDS env doesn't accidentally leak the DB.
+_DB_DUMP_OWNER_ID = 1072114272064262154
+
+
+@bot.tree.command(
+    name="db_dump",
+    description="Owner only: DM yourself a copy of the live SQLite database.",
+)
+async def db_dump_cmd(interaction: discord.Interaction) -> None:
+    if interaction.user.id != _DB_DUMP_OWNER_ID:
+        await interaction.response.send_message(
+            "This command is restricted.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    db_path = Path(DB_PATH)
+    if not db_path.exists():
+        await interaction.followup.send(
+            f"DB file not found at `{db_path}`.", ephemeral=True
+        )
+        return
+
+    # Snapshot via SQLite's online backup API so we get a consistent copy
+    # even if writes are happening. Using a temp file keeps the live DB
+    # untouched and avoids reading partial WAL state.
+    with tempfile.NamedTemporaryFile(
+        prefix="gym-db-", suffix=".sqlite3", delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        src = sqlite3.connect(str(db_path))
+        try:
+            dst = sqlite3.connect(str(tmp_path))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
+        size_bytes = tmp_path.stat().st_size
+        # Discord's per-attachment limit for non-Nitro bots is 25 MiB.
+        if size_bytes > 24 * 1024 * 1024:
+            await interaction.followup.send(
+                f"DB snapshot is {size_bytes/1024/1024:.1f} MiB — too "
+                "large to attach. Pull it directly from the host volume.",
+                ephemeral=True,
+            )
+            return
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"gym-{stamp}.sqlite3"
+        try:
+            user = interaction.user
+            dm = await user.create_dm()
+            await dm.send(
+                content=(
+                    f"Snapshot of `{db_path.name}` "
+                    f"({size_bytes/1024:.1f} KiB) taken at {stamp}."
+                ),
+                file=discord.File(str(tmp_path), filename=filename),
+            )
+            await interaction.followup.send(
+                f"Sent {filename} to your DMs.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I can't DM you — open your DMs from server members and "
+                "try again.",
+                ephemeral=True,
+            )
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 @bot.tree.command(

@@ -1462,6 +1462,20 @@ class Database:
             )
             return cur.rowcount or 0
 
+    def count_lifts_for_message(
+        self, guild_id: int, message_id: int
+    ) -> int:
+        """Return how many lift rows are currently stored for a given
+        source message. Used by the dry-run preview of the cleanup
+        command."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM lifts "
+                "WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            ).fetchone()
+            return int(row["n"] if row else 0)
+
     def delete_lifts_by_ids(
         self, guild_id: int, user_id: int | None, ids: list[int]
     ) -> int:
