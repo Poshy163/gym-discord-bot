@@ -1492,18 +1492,24 @@ class Database:
         unique = list({int(u) for u in user_ids})
         placeholders = ",".join("?" * len(unique))
         with self._conn() as c:
+            # Mirror `get_latest_bodyweight`'s ORDER BY exactly: latest
+            # recorded_at wins, with id DESC as the tiebreaker for entries
+            # that share a timestamp. Using ROW_NUMBER avoids the join-by-
+            # timestamp double-counting that a plain GROUP BY MAX would
+            # introduce on ties.
             rows = c.execute(
                 f"""
-                SELECT b.user_id, b.weight_kg
-                FROM bodyweights b
-                JOIN (
-                    SELECT user_id, MAX(recorded_at) AS mx
+                WITH ranked AS (
+                    SELECT user_id, weight_kg,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id
+                               ORDER BY recorded_at DESC, id DESC
+                           ) AS rn
                     FROM bodyweights
                     WHERE guild_id = ? AND user_id IN ({placeholders})
-                    GROUP BY user_id
-                ) m ON m.user_id = b.user_id AND m.mx = b.recorded_at
-                WHERE b.guild_id = ?
+                )
+                SELECT user_id, weight_kg FROM ranked WHERE rn = 1
                 """,
-                [guild_id, *unique, guild_id],
+                [guild_id, *unique],
             ).fetchall()
         return {int(r["user_id"]): float(r["weight_kg"]) for r in rows}

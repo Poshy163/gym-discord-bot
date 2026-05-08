@@ -408,3 +408,18 @@ def test_bodyweight_bulk_returns_only_known(db):
 
 def test_bodyweight_bulk_empty_input(db):
     assert db.latest_bodyweights_bulk(1, []) == {}
+
+
+def test_bodyweight_bulk_picks_latest_with_id_tiebreaker(db):
+    """When two rows share recorded_at, the higher id (later insert) wins.
+
+    Mirrors the ORDER BY in `get_latest_bodyweight`, so the bulk query used
+    by /leaderboard never returns a stale value on tied timestamps.
+    """
+    same_ts = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    db.set_bodyweight(1, 100, 90.0, recorded_at=same_ts)
+    db.set_bodyweight(1, 100, 92.0, recorded_at=same_ts)  # later id wins
+    out = db.latest_bodyweights_bulk(1, [100])
+    assert out == {100: 92.0}
+    # And it agrees with the single-user accessor.
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 92.0
