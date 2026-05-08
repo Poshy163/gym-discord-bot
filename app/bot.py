@@ -1890,9 +1890,7 @@ async def _scan_channel_for_undone_messages(
 @bot.tree.command(
     name="cleanup_resurrected",
     description=(
-        "Admin: scan history for previously-undone posts and remove any "
-        "lifts a backfill resurrected. Also adds suppression so they "
-        "stay gone."
+        "Admin: remove lifts that a backfill re-added after they were undone."
     ),
 )
 @app_commands.describe(
