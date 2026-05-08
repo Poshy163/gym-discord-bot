@@ -122,6 +122,13 @@ try:
 except ValueError:
     MAX_WEIGHT_KG = 500.0
 
+# Discord user IDs allowed to ❌-undo *any* tracked bot reply, not just their
+# own or the lift's target. Comma-separated. Defaults to the repo owner.
+_admins = os.getenv("ADMIN_USER_IDS", "1072114272064262154").strip()
+ADMIN_USER_IDS: set[int] = {
+    int(x) for x in _admins.split(",") if x.strip().isdigit()
+}
+
 # Timezone used when rendering dates in user-facing messages. Defaults to
 # Australia/Adelaide (the author's crew). Falls back to UTC if zoneinfo isn't
 # available or the name is invalid.
@@ -1295,7 +1302,8 @@ async def on_raw_reaction_add(
     if rec is None:
         return
     target_user_id = int(rec["target_user_id"])
-    if payload.user_id not in {int(rec["user_id"]), target_user_id}:
+    allowed = {int(rec["user_id"]), target_user_id} | ADMIN_USER_IDS
+    if payload.user_id not in allowed:
         return  # Someone else tried to undo — ignore silently.
 
     # Race protection: claim the reply by deleting its tracking row first.
@@ -1324,8 +1332,13 @@ async def on_raw_reaction_add(
         reply_msg = await channel.fetch_message(payload.message_id)
     except discord.HTTPException:
         return
+    by_admin = (
+        payload.user_id in ADMIN_USER_IDS
+        and payload.user_id not in {int(rec["user_id"]), target_user_id}
+    )
+    actor = "an admin" if by_admin else "the user"
     note = (
-        f"↩️ Undid {_plural(removed, 'stored lift')} at the user's request."
+        f"↩️ Undid {_plural(removed, 'stored lift')} at {actor}'s request."
         if removed
         else "↩️ Nothing to undo (already removed)."
     )
