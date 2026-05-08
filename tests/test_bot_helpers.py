@@ -13,6 +13,7 @@ os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
+    _parse_bodyweight_message,
     _rejected_lifts_note,
     _safe_label,
     _true_weight_kg,
@@ -101,3 +102,22 @@ def test_true_weight_clamps_over_assistance_to_none():
     # to display. The helper returns None so the suffix stays empty.
     assert _true_weight_kg("pull ups", 120, False, 100) is None
     assert _true_weight_suffix("pull ups", 120, False, 100) == ""
+
+
+# --- Chat-message bodyweight parser --------------------------------------
+
+def test_parse_bodyweight_message_variants():
+    assert _parse_bodyweight_message("bodyweight 100kg") == 100.0
+    assert _parse_bodyweight_message("body weight: 95.5kg") == 95.5
+    assert _parse_bodyweight_message("BW 80") == 80.0
+    assert _parse_bodyweight_message("  bodyweight - 72.3 ") == 72.3
+    assert _parse_bodyweight_message("bodyweight 100kg.") == 100.0
+
+
+def test_parse_bodyweight_message_rejects_non_bodyweight():
+    # No number, or it's a lift line, or bodyweight is mentioned mid-sentence.
+    assert _parse_bodyweight_message("bodyweight") is None
+    assert _parse_bodyweight_message("squat 100kg") is None
+    assert _parse_bodyweight_message("bench 80kg bodyweight 100") is None
+    assert _parse_bodyweight_message("") is None
+    assert _parse_bodyweight_message("BW") is None

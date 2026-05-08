@@ -78,6 +78,8 @@ Logging & editing:
 - `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally
   for another user (🎉 on PRs).
 - `/bodyweight [weight_kg] [user]` — record (or view) your current bodyweight.
+  You can also just post `bodyweight 100kg` (or `body weight: 100kg`, or
+  `bw 80`) in chat, and `@user bodyweight 100kg` to set someone else's.
   Once on file, the bot annotates bodyweight-relative lifts with the **true
   load** in inline replies and the leaderboard:
   - assisted pull-up logged as `pull ups 70kg` with bodyweight 100kg →

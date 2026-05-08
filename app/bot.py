@@ -264,6 +264,36 @@ def _user_bodyweight(guild_id: int, user_id: int) -> float | None:
     return float(row["weight_kg"])
 
 
+# Chat-message bodyweight update, e.g. "bodyweight 100kg",
+# "body weight: 95.5kg", "bw 80". Matches the *whole* (stripped) message so
+# we don't accidentally hijack stats dumps that mention bodyweight in
+# passing — those are already filtered from lift parsing by parser.py's
+# _SKIP_LINE_TOKENS. Combined with the existing leading-@user targeting,
+# this means `@dos bodyweight 100kg` updates dos's bodyweight.
+_BODYWEIGHT_MSG_RE = re.compile(
+    r"^\s*(?:body\s*weight|bodyweight|bw)\s*[:\-]?\s*"
+    r"(\d+(?:\.\d+)?)\s*(?:kg)?\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_bodyweight_message(text: str) -> float | None:
+    """If ``text`` is a bare bodyweight statement, return the kg value.
+
+    Returns ``None`` for anything else so the caller can fall through to
+    the regular lift parser.
+    """
+    if not text:
+        return None
+    m = _BODYWEIGHT_MSG_RE.match(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):  # pragma: no cover - regex guards this
+        return None
+
+
 def _display_name(user: object) -> str:
     return str(
         getattr(user, "display_name", None)
@@ -574,6 +604,63 @@ async def _store_lifts(
         message_id=message.id,
         channel_id=message.channel.id,
         logged_at=message.created_at.astimezone(timezone.utc),
+    )
+
+
+async def _handle_bodyweight_message(
+    message: discord.Message, target: object, weight_kg: float,
+) -> None:
+    """Persist a chat-message bodyweight update and reply with confirmation.
+
+    Mirrors the validation done by `/bodyweight`: positive values only,
+    capped by ``MAX_WEIGHT_KG`` so a fat-fingered "1500" can't poison
+    every leaderboard line.
+    """
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    if weight_kg <= 0:
+        try:
+            await message.reply(
+                "Bodyweight must be a positive number of kg.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if MAX_WEIGHT_KG > 0 and weight_kg > MAX_WEIGHT_KG:
+        try:
+            await message.reply(
+                f"That bodyweight looks too high to be real "
+                f"({weight_kg:g}kg > {MAX_WEIGHT_KG:g}kg).",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    try:
+        db.set_bodyweight(guild_id, target_id, weight_kg)
+    except Exception:
+        LOG.exception("Failed to store bodyweight for user %s", target_id)
+        return
+
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    suffix = _target_suffix(message.author, target)
+    try:
+        await message.reply(
+            f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will "
+            "now show the true load on bodyweight-relative lifts (e.g. "
+            "assisted pull-ups, weighted dips).",
+            mention_author=False,
+        )
+    except discord.HTTPException:
+        pass
+    LOG.info(
+        "Stored bodyweight %.2fkg for %s in #%s",
+        weight_kg, target, message.channel,
     )
 
 
@@ -944,6 +1031,17 @@ async def on_message(message: discord.Message) -> None:
 
     guild_aliases = _custom_alias_map(message.guild.id)
     target, content = _message_lift_target(message)
+
+    # Quick bodyweight update path: `bodyweight 100kg`, `body weight: 95.5`,
+    # `bw 80`, or `@dos bodyweight 100kg` (leading mention re-targets just
+    # like for lifts). Handled before parse_message so it doesn't get
+    # filtered out as bodyweight chatter.
+    bw_kg = _parse_bodyweight_message(content)
+    if bw_kg is not None:
+        await _handle_bodyweight_message(message, target, bw_kg)
+        await bot.process_commands(message)
+        return
+
     lifts = parse_message(content, custom_aliases=guild_aliases)
     lifts, rejected_lifts = _split_reasonable_lifts(lifts)
     # Auto-store when either:
@@ -2095,7 +2193,9 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry\n"
             "`/bodyweight [weight_kg] [user]` — record your bodyweight so the bot "
-            "shows your true load on pull-ups, dips, etc.\n"
+            "shows your true load on pull-ups, dips, etc. "
+            "(`bodyweight 100kg` in chat works too, and `@user bodyweight 100kg` "
+            "sets someone else's)\n"
             "`/undo` — remove your most recent entry\n"
             "React ❌ on my reply to undo that specific post "
             "(logger or target lifter only)\n"
