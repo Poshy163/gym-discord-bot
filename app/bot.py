@@ -2927,7 +2927,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/revo_link <email> <password>` — link your account (reply is private)\n"
             "`/help_revo_link` — public explainer for `/revo_link`\n"
             "`/revo_unlink` — remove the link\n"
-            "`/revo_streak` — your weekly check-in streak"
+            "`/revo_streak` — your weekly check-in streak\n"
+            "`/revo_streak_compare` — streak leaderboard for all linked members\n"
+            "`/revo_calendar` — monthly check-in calendar\n"
+            "`/revo_calendar_compare` — side-by-side calendars for all linked members"
         ),
         inline=False,
     )
@@ -4584,6 +4587,9 @@ async def help_revo_link_cmd(interaction: discord.Interaction) -> None:
         name="What you unlock",
         value=(
             "• `/revo_streak` — your current weekly check-in streak\n"
+            "• `/revo_streak_compare` — streak leaderboard for all linked members\n"
+            "• `/revo_calendar` — your monthly check-in grid\n"
+            "• `/revo_calendar_compare` — side-by-side calendar for everyone in the server\n"
             "• Automatic attendance pings when you tap into your gym "
             "(posted in the configured notify channel)\n"
             "• Your favourite club is auto-detected from your last visits"
@@ -4986,6 +4992,118 @@ async def revo_calendar_cmd(
     await interaction.followup.send(
         body,
         allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="revo_calendar_compare",
+    description="Compare Revo check-in calendars for all linked members in this server.",
+)
+@app_commands.describe(
+    month="Month number 1-12. Defaults to the current month.",
+    year="Year (e.g. 2026). Defaults to the current year.",
+)
+async def revo_calendar_compare_cmd(
+    interaction: discord.Interaction,
+    month: app_commands.Range[int, 1, 12] | None = None,
+    year: app_commands.Range[int, 2020, 2100] | None = None,
+) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command only works in a server.", ephemeral=True,
+        )
+        return
+
+    today = datetime.now()
+    m = month or today.month
+    y = year or today.year
+
+    await interaction.response.defer(thinking=True)
+
+    # Resolve which linked accounts belong to this guild.
+    accounts = db.list_revo_accounts()
+    guild_member_ids: set[int] = set()
+    for r in accounts:
+        uid = int(r["user_id"])
+        member = interaction.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        if member is not None:
+            guild_member_ids.add(uid)
+    guild_accounts = [r for r in accounts if int(r["user_id"]) in guild_member_ids]
+
+    if not guild_accounts:
+        await interaction.followup.send(
+            "No one in this server has linked a Revo account yet. "
+            "Use `/revo_link` to get started.",
+            ephemeral=True,
+        )
+        return
+
+    def _fetch_all() -> list[tuple[int, "dict[int, bool] | None"]]:
+        out: list[tuple[int, "dict[int, bool] | None"]] = []
+        for row in guild_accounts:
+            uid = int(row["user_id"])
+            try:
+                client = _client_for_user(row)
+                out.append((uid, client.get_streak_calendar(m, y)))
+            except Exception:
+                LOG.warning(
+                    "revo_calendar_compare: fetch failed for user %s", uid, exc_info=True,
+                )
+                out.append((uid, None))
+        return out
+
+    results = await bot.loop.run_in_executor(None, _fetch_all)
+
+    def _count(cal: "dict[int, bool] | None") -> int:
+        return sum(1 for v in cal.values() if v) if cal else -1
+
+    results.sort(key=lambda t: _count(t[1]), reverse=True)
+
+    month_name = datetime(y, m, 1).strftime("%B %Y")
+    n = len(results)
+    lines = [
+        f"**🔥 Revo Check-ins — {month_name}** ({n} member{'s' if n != 1 else ''})",
+        "`Mo Tu We Th Fr Sa Su`",
+    ]
+    for uid, cal in results:
+        count = _count(cal)
+        name = _bot_name(uid, f"<@{uid}>")
+        count_str = (
+            f"{count} day{'s' if count != 1 else ''}" if cal is not None else "unavailable"
+        )
+        lines.append("")
+        lines.append(f"**{name}** — {count_str}")
+        if cal is not None:
+            lines.append(_render_revo_calendar(m, y, cal))
+        else:
+            lines.append("*Could not fetch calendar.*")
+
+    legend = "-# 🔥 attended · ⬜ missed · ⬛ out of month"
+    body = "\n".join(lines)
+    if len(body) + len(legend) + 1 > 1990:
+        body = body[:1900] + "\n*…truncated (too many members to fit)*"
+    else:
+        body += "\n" + legend
+
+    await interaction.followup.send(
+        body,
+        allowed_mentions=discord.AllowedMentions(users=True),
     )
 
 
