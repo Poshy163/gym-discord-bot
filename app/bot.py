@@ -4440,7 +4440,9 @@ def _drop_cached_client(user_id: int) -> None:
 
 
 def _format_busy_line(info: "revo_client.ClubInfo") -> str:
-    return f"**{info.name}** — {info.in_club} in club right now (id={info.club_id})"
+    state = revo_client.state_for_club(info.name)
+    location = f"{info.name}, {state}" if state else info.name
+    return f"**{location}** — {info.in_club} in club right now (id={info.club_id})"
 
 
 @bot.tree.command(

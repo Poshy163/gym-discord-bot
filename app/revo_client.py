@@ -630,6 +630,15 @@ def known_states() -> list[str]:
     return list(_CLUB_NAMES_BY_STATE.keys())
 
 
+def state_for_club(name: str) -> str | None:
+    """Return the state code (e.g. ``"SA"``) for a club name, or ``None`` if unknown."""
+    key = (name or "").strip().lower()
+    for state, names in _CLUB_NAMES_BY_STATE.items():
+        if key in names:
+            return state
+    return None
+
+
 def filter_clubs_by_state(
     clubs: dict[str, ClubInfo], state: str,
 ) -> dict[str, ClubInfo]:
