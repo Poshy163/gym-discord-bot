@@ -45,12 +45,16 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two
 | GET | `/portal/club-counter.php` | ✅ | **Live occupancy for every club** + 24h history |
 | GET | `/portal/rewards/` | ✅ | Rewards landing (ticket count + favourite-club summary) |
 | GET | `/portal/rewards/streaks.php` | ✅ | Current weekly streak + monthly check-in calendar |
+| GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance fo any month (seer §3.2.1) |
 | GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned |
 | GET | `/portal/rewards/raffle.php` | ✅ | Tickets + countdowns to monthly + major draws |
+| GET | `/portal/rewards/raffle.php?optval=<0\|1>` | ⚠️ | **State-changing** — toggles monthly raffle opt-in. JSON `{"Status":"0\|1"}`. Do **not** call casually. |
 | GET | `/portal/rewards/prize-pool.php` | ✅ | Same counters + current prize copy |
 | GET | `/portal/rewards/faq.php` | ✅ | Static |
 | GET | `/portal/rewards/terms-and-conditions.php` | ✅ | Static |
 | GET | `/portal/massage-chair.php` | ✅ (L2) | Renders a QR code image only — no JSON data |
+| GET | `/portal/API/massage-chair-qr.php?hcId=<id>` | ✅ (L2) | **JSON** `{"qrCode":"qr_<uuid>","validUntilUtc":"<iso8601>"}` — the data the QR actually encodes. `$intHCID` is rendered into the page. |
+| GET | `/portal/API/` | ✅ | Returns literal `:)` (parallel to lowercase `/api/`) |
 | GET | `/portal/dashboard.php` | 🚫 | 302 → upgrade page **even at L2**. Mobile-app-only. |
 | GET | `/portal/profile.php` | 🚫 | 302 even at L2. Mobile-app-only. |
 | GET | `/portal/account.php` | 🚫 | 302 even at L2. Mobile-app-only. |
@@ -97,6 +101,39 @@ Visible content:
 - No JS variable exposes the streak as data — extract from DOM:
   - Streak: `re.search(r'>\s*(\d+)\s*WEEKS?\s*<', html)`
   - Day cells: parse the calendar grid; cells with the "attended" CSS class indicate check-in days for that month.
+
+#### 3.2.1 Streaks JSON variant — `streaks.php?m=<MM>&y=<YYYY>`
+
+Discovered in the rewards page's inline `script.js` (the prev/next-month
+buttons fetch it via `$.get`). When the route is called with `m` **and** `y`
+query parameters, the same PHP endpoint returns a JSON document instead of
+the full HTML page (Content-Type is mislabelled as `text/html`):
+
+```json
+{
+  "month_name": "April",
+  "weeks_data": {
+    "week1": {"1": null, "2": null, "3": "0", "4": "0", "5": "0", "6": "0", "7": "0"},
+    "week2": {"8": "0", "9": "1", "10": "0", "11": "1", "12": "0", "13": "0", "14": "0"},
+    "week3": {"15": "0", "16": "1", "17": "0", "18": "0", "19": "1", "20": "0", "21": "0"},
+    "week4": {"22": "0", "23": "0", "24": "0", "25": "1", "26": "0", "27": "0", "28": "0"},
+    "week5": {"29": "1", "30": "0", "31": "0", "32": "0"},
+    "week6": []
+  }
+}
+```
+
+Key points:
+- Slot keys (`"1"`..`"42"`) are **grid positions**, not days-of-month. Weeks are Monday-start (matches the `M T W T F S S` header).
+- `null` cells = leading/trailing padding for days belonging to the neighbouring month.
+- `"0"` = real day with no check-in; `"1"` = real day with a check-in (flame icon).
+- Day-of-month is the running count of non-null cells when read left-to-right, top-to-bottom.
+- Empty trailing weeks are encoded as a JSON list `[]` rather than `{}` — watch out when iterating.
+- Works for any month back to (at least) Jan 2023; pre-account-creation months simply return all zeros.
+- This is the **only level-1 source for per-day attendance** — far more granular than `ticket-tally.php` (which exposes only the most recent ~10 entries).
+
+Parsed by `app.revo_client.parse_streak_calendar()` and exposed on the
+client as `RevoClient.get_streak_calendar(month, year) -> {dom: bool}`.
 
 ### 3.3 Tickets / Attendance log — `/portal/rewards/ticket-tally.php`
 
@@ -154,9 +191,13 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
 
 ### C. Streak tracker / leaderboard
 - Weekly cron: scrape `streaks.php` for each linked Revo account, store `(user_id, week, streak_weeks, days_attended)`.
+- Per-day attendance is now also available without scraping HTML \u2014 use
+  `RevoClient.get_streak_calendar(month, year)` (\u00a73.2.1) to backfill or
+  graph any month's check-ins.
 - Discord commands:
-  - `!streak` → personal streak.
-  - `!leaderboard streaks` → server-wide weekly ranking.
+  - `!streak` \u2192 personal streak.
+  - `!leaderboard streaks` \u2192 server-wide weekly ranking.
+  - `!calendar [month]` \u2192 render a per-day attendance grid (uses the JSON variant).
   - Auto-celebrate when someone hits a milestone (4/8/12/26/52 weeks).
 
 ### D. Heat-map graph integration

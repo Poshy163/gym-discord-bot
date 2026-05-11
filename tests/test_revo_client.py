@@ -63,6 +63,54 @@ def test_parse_streak_weeks():
     assert revo_client.parse_streak_weeks("no streak text") is None
 
 
+def test_parse_streak_calendar_april_2026_real_payload():
+    """Real wire payload captured from streaks.php?m=4&y=2026.
+
+    The slot keys in the JSON (``"1".."35"``) are grid positions, not days
+    of the month — April 2026 starts on a Wednesday so slots 1 and 2 are
+    leading-padding ``null`` cells for Mon/Tue 30-31 March. Day-of-month
+    is the position of each non-null cell when read left-to-right, top-to-
+    bottom: real attended days were 7, 9, 14, 17, 23, 27.
+    """
+    body = (
+        '{"month_name":"April","weeks_data":{'
+        '"week1":{"1":null,"2":null,"3":"0","4":"0","5":"0","6":"0","7":"0"},'
+        '"week2":{"8":"0","9":"1","10":"0","11":"1","12":"0","13":"0","14":"0"},'
+        '"week3":{"15":"0","16":"1","17":"0","18":"0","19":"1","20":"0","21":"0"},'
+        '"week4":{"22":"0","23":"0","24":"0","25":"1","26":"0","27":"0","28":"0"},'
+        '"week5":{"29":"1","30":"0","31":"0","32":"0"},'
+        '"week6":[]}}'
+    )
+    cal = revo_client.parse_streak_calendar(body)
+    # April has 30 days; counter should produce exactly 30 entries.
+    assert len(cal) == 30
+    assert sorted(d for d, hit in cal.items() if hit) == [7, 9, 14, 17, 23, 27]
+    assert cal[1] is False
+    assert cal[10] is False
+    assert cal[30] is False
+
+
+def test_parse_streak_calendar_handles_short_february():
+    body = (
+        '{"month_name":"February","weeks_data":{'
+        '"week1":{"1":"0","2":"0","3":"1","4":"0","5":"0","6":"0","7":"0"},'
+        '"week2":{"8":"0","9":"0","10":"1","11":"0","12":"0","13":"0","14":"0"},'
+        '"week3":{"15":"0","16":"0","17":"0","18":"0","19":"0","20":"0","21":"0"},'
+        '"week4":{"22":"0","23":"0","24":"0","25":"0","26":"0","27":"0","28":"0"},'
+        '"week5":[],"week6":[]}}'
+    )
+    cal = revo_client.parse_streak_calendar(body)
+    assert len(cal) == 28
+    assert sorted(d for d, hit in cal.items() if hit) == [3, 10]
+
+
+def test_parse_streak_calendar_empty_or_garbage():
+    assert revo_client.parse_streak_calendar("") == {}
+    assert revo_client.parse_streak_calendar("not json") == {}
+    assert revo_client.parse_streak_calendar("{}") == {}
+    assert revo_client.parse_streak_calendar('{"weeks_data":"oops"}') == {}
+
+
 def test_parse_tickets_filters_available_pseudo_row():
     html = """
         <h1>10 Tickets Available</h1>

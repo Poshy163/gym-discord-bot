@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from calendar import monthrange
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
@@ -4832,6 +4833,109 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
         "\n".join(lines),
         allowed_mentions=discord.AllowedMentions(users=True),
     )
+
+
+@bot.tree.command(
+    name="revo_calendar",
+    description="Show a Revo per-day check-in calendar for a given month.",
+)
+@app_commands.describe(
+    month="Month number 1-12. Defaults to the current month.",
+    year="Year (e.g. 2026). Defaults to the current year.",
+    member="The server member to look up. Defaults to yourself.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_calendar_cmd(
+    interaction: discord.Interaction,
+    month: app_commands.Range[int, 1, 12] | None = None,
+    year: app_commands.Range[int, 2020, 2100] | None = None,
+    member: discord.Member | None = None,
+) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    today = datetime.now()
+    m = month or today.month
+    y = year or today.year
+
+    target = member or interaction.user
+    row = db.get_revo_account(target.id)
+    if row is None:
+        if target == interaction.user:
+            await interaction.response.send_message(
+                "Link your account first with `/revo_link`.", ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.mention} hasn't linked a Revo account yet.",
+                ephemeral=True,
+            )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    def _do() -> "dict[int, bool] | str":
+        try:
+            client = _client_for_user(row)
+            return client.get_streak_calendar(m, y)
+        except revo_client.RevoAuthError as exc:
+            _drop_cached_client(int(row["user_id"]))
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo calendar fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        msg = (
+            f"Couldn't fetch your calendar ({result})."
+            if target == interaction.user
+            else f"Couldn't fetch {target.mention}'s calendar ({result})."
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    grid = _render_revo_calendar(m, y, result)
+    month_name = datetime(y, m, 1).strftime("%B %Y")
+    attended_count = sum(1 for v in result.values() if v)
+    header = (
+        f"🔥 **{target.display_name}** — Revo check-ins for **{month_name}** "
+        f"({attended_count} day{'s' if attended_count != 1 else ''})"
+    )
+    body = f"{header}\n```\n{grid}\n```"
+    await interaction.followup.send(
+        body,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+def _render_revo_calendar(month: int, year: int, attended: "dict[int, bool]") -> str:
+    """Render a Mon-Sun grid with `*` next to attended days.
+
+    Each column is 3 chars wide (``" 7*"`` for an attended 7th, ``" 7 "``
+    otherwise) joined by a single space, matching the 3-letter weekday
+    header so columns line up in a Discord code block.
+    """
+    first_weekday, days_in_month = monthrange(year, month)  # Monday=0..Sunday=6
+    header = "Mon Tue Wed Thu Fri Sat Sun"
+    cells: list[str] = ["   "] * first_weekday
+    for day in range(1, days_in_month + 1):
+        marker = "*" if attended.get(day) else " "
+        cells.append(f"{day:>2}{marker}")
+    while len(cells) % 7 != 0:
+        cells.append("   ")
+    rows = [" ".join(cells[r : r + 7]) for r in range(0, len(cells), 7)]
+    return header + "\n" + "\n".join(rows)
 
 
 # ---- attendance poller ----------------------------------------------------

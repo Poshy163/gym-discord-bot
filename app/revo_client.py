@@ -190,6 +190,67 @@ def parse_streak_weeks(html: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def parse_streak_calendar(body: str) -> dict[int, bool]:
+    """Decode the JSON returned by ``streaks.php?m=&y=`` into ``{day: attended}``.
+
+    The endpoint returns an inline JSON document (Content-Type is mislabelled
+    as ``text/html``) shaped like::
+
+        {
+          "month_name": "April",
+          "weeks_data": {
+            "week1": {"1": null, "2": null, "3": "0", "4": "0", ...},
+            "week2": {"8": "0", "9": "1", ...},
+            ...
+            "week6": []
+          }
+        }
+
+    Slot keys are grid positions (1..42 across six rows of seven) — *not*
+    days-of-month. ``null`` cells are leading/trailing padding for days that
+    belong to the neighbouring month; ``"0"`` / ``"1"`` are real days, with
+    ``"1"`` meaning the user checked in. We walk the slots in left-to-right
+    week-by-week order and assign ascending day-of-month numbers to the
+    non-null cells.
+
+    Returns a ``{day_of_month: attended}`` dict. Empty dict if the body is
+    missing/unparseable (callers can treat this as "no data for that month").
+    """
+    if not body:
+        return {}
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return {}
+    weeks = payload.get("weeks_data") if isinstance(payload, dict) else None
+    if not isinstance(weeks, dict):
+        return {}
+
+    out: dict[int, bool] = {}
+    dom = 1
+    # Week keys are insertion-ordered ("week1".."week6") in the wire format,
+    # but sort defensively so a future server-side reshuffle doesn't break us.
+    for key in sorted(weeks.keys(), key=lambda k: int(re.sub(r"\D", "", k) or 0)):
+        cells = weeks[key]
+        # An empty trailing week is encoded as a JSON list ([]) rather than {}.
+        if isinstance(cells, list):
+            iterable: list[Any] = list(cells)
+        elif isinstance(cells, dict):
+            iterable = [cells[k] for k in sorted(cells.keys(), key=lambda k: int(k))]
+        else:
+            continue
+        for v in iterable:
+            if v is None:
+                continue
+            try:
+                attended = int(v) == 1
+            except (TypeError, ValueError):
+                continue
+            out[dom] = attended
+            dom += 1
+    return out
+
+
 _TICKET_ROW_RE = re.compile(
     r"\+?(\d+)\s*Tickets\s*([A-Za-z]+)\s*(\d{2}/\d{2}/\d{4})"
 )
@@ -333,6 +394,43 @@ class RevoClient:
 
     def get_streak_weeks(self) -> Optional[int]:
         return parse_streak_weeks(self._get(STREAKS_PATH))
+
+    def get_streak_calendar(self, month: int, year: int) -> dict[int, bool]:
+        """Per-day attendance for the given calendar month.
+
+        Calls the undocumented JSON variant of the streaks page exposed via
+        ``streaks.php?m=<MM>&y=<YYYY>`` (discovered in the rewards
+        ``script.js``). Returns ``{day_of_month: attended_bool}`` — empty
+        dict if the response was unparseable or the route was redirected.
+
+        Suitable for building per-user attendance timelines (the ticket-tally
+        page only exposes the most recent ~10 entries).
+        """
+        if not 1 <= month <= 12:
+            raise ValueError(f"month must be 1..12, got {month!r}")
+        if not 2000 <= year <= 2100:
+            raise ValueError(f"year out of plausible range: {year!r}")
+        if not self._logged_in:
+            self.login()
+
+        def _do_get() -> "requests.Response":
+            return self._http.get(
+                BASE_URL + STREAKS_PATH,
+                params={"m": month, "y": year},
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+
+        r = _do_get()
+        # Same session-expiry handling as _get(): re-login on redirect to login.
+        if r.status_code in (301, 302) and "login.php" in r.headers.get("Location", ""):
+            LOG.info("Revo session expired during calendar fetch, re-logging in")
+            self.login()
+            r = _do_get()
+        if r.status_code in (301, 302):
+            return {}
+        r.raise_for_status()
+        return parse_streak_calendar(r.text)
 
     def get_tickets(self) -> tuple[Optional[int], list[TicketRow]]:
         return parse_tickets(self._get(TICKETS_PATH))
