@@ -389,6 +389,31 @@ def shared_club_counter() -> tuple[dict[str, ClubInfo], Optional[int]]:
     return clubs, favorite
 
 
+def club_counter_with_client(
+    client: RevoClient,
+) -> tuple[dict[str, ClubInfo], Optional[int]]:
+    """Cached club-counter fetch using *any* authenticated client.
+
+    Mirrors :func:`shared_club_counter` but lets callers fall back to a
+    user-supplied :class:`RevoClient` (e.g. one built from the invoking
+    user's linked credentials) when no shared env-var account is set.
+    Results populate the same TTL cache so subsequent /busy calls — from
+    anyone — reuse the data.
+    """
+    global _shared_counters
+    now = time.monotonic()
+    with _shared_lock:
+        cache = _shared_counters
+        if cache.clubs and (now - cache.fetched_at) < CLUB_COUNTER_TTL_SECONDS:
+            return cache.clubs, cache.favorite
+    clubs, favorite = client.get_club_counter()
+    with _shared_lock:
+        _shared_counters = _CountersCache(
+            fetched_at=now, clubs=clubs, favorite=favorite,
+        )
+    return clubs, favorite
+
+
 def find_club(clubs: dict[str, ClubInfo], query: str) -> ClubInfo | None:
     """Case-insensitive substring lookup over club names."""
     q = (query or "").strip().lower()

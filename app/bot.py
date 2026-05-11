@@ -4410,18 +4410,44 @@ async def busy_cmd(
     await interaction.response.defer(thinking=True)
 
     def _do() -> tuple[dict[str, "revo_client.ClubInfo"], int | None] | str:
+        # 1) Try the shared env-var account first — keeps /busy working
+        #    even for users who haven't linked yet.
         try:
             return revo_client.shared_club_counter()
+        except revo_client.RevoUnavailable:
+            pass  # fall through to per-user credentials
+        except revo_client.RevoAuthError as exc:
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo shared club-counter fetch failed")
+            return f"error: {exc}"
+
+        # 2) Fall back to the invoking user's linked credentials.
+        row = db.get_revo_account(interaction.user.id)
+        if row is None:
+            return "no-credentials"
+        try:
+            client = _client_for_user(row)
+            return revo_client.club_counter_with_client(client)
         except revo_client.RevoUnavailable as exc:
             return f"unavailable: {exc}"
         except revo_client.RevoAuthError as exc:
             return f"auth-failed: {exc}"
         except Exception as exc:  # pragma: no cover - network
-            LOG.exception("Revo club-counter fetch failed")
+            LOG.exception("Revo per-user club-counter fetch failed")
             return f"error: {exc}"
 
     result = await bot.loop.run_in_executor(None, _do)
     if isinstance(result, str):
+        if result == "no-credentials":
+            await interaction.followup.send(
+                "🔒 Revo's live counter needs a logged-in session, but no "
+                "shared account is configured and you haven't linked yours.\n"
+                "Run `/help_revo_link` for a walkthrough, then `/revo_link "
+                "email:<you> password:<…>` to enable `/busy` for everyone.",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(
             f"Couldn't fetch the live counter ({result}).", ephemeral=True,
         )
@@ -4659,7 +4685,7 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
 
     def _do() -> str | int | None:
         try:
@@ -4685,9 +4711,8 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
         )
         return
     await interaction.followup.send(
-        f"🔥 Current Revo weekly streak: **{result} week"
-        f"{'s' if result != 1 else ''}**.",
-        ephemeral=True,
+        f"🔥 {interaction.user.mention} — current Revo weekly streak: "
+        f"**{result} week{'s' if result != 1 else ''}**.",
     )
 
 
