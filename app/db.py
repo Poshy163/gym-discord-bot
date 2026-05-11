@@ -119,6 +119,17 @@ CREATE TABLE IF NOT EXISTS revo_account (
     linked_at              TEXT    NOT NULL,
     last_polled_at         TEXT
 );
+
+-- Bot-wide user nicknames. Any admin or the user themselves can assign a
+-- friendly display name (e.g. "Cookie Monster", "Sean") that shows up instead
+-- of the Discord username/mention in bot responses. Not guild-scoped — one
+-- nickname per user across all servers the bot is in.
+CREATE TABLE IF NOT EXISTS user_nicknames (
+    user_id   INTEGER PRIMARY KEY,
+    nickname  TEXT    NOT NULL,
+    set_by    INTEGER NOT NULL,
+    set_at    TEXT    NOT NULL
+);
 """
 
 
@@ -1638,6 +1649,51 @@ class Database:
         """All linked accounts. Used by the attendance poller."""
         with self._conn() as c:
             return list(c.execute("SELECT * FROM revo_account"))
+
+    # ------------------------------------------------------------------
+    # Bot-wide user nicknames
+    # ------------------------------------------------------------------
+
+    def set_user_nickname(self, user_id: int, nickname: str, set_by: int) -> None:
+        """Create or replace a bot-wide display nickname for ``user_id``."""
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO user_nicknames (user_id, nickname, set_by, set_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE
+                    SET nickname = excluded.nickname,
+                        set_by   = excluded.set_by,
+                        set_at   = excluded.set_at
+                """,
+                (user_id, nickname.strip(), set_by, ts),
+            )
+
+    def remove_user_nickname(self, user_id: int) -> bool:
+        """Delete the nickname for ``user_id``. Returns True if one existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM user_nicknames WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def get_user_nickname(self, user_id: int) -> str | None:
+        """Return the stored nickname for ``user_id``, or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT nickname FROM user_nicknames WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row["nickname"] if row else None
+
+    def list_user_nicknames(self) -> list[sqlite3.Row]:
+        """All rows from ``user_nicknames``, ordered by nickname."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, nickname, set_by, set_at "
+                "FROM user_nicknames ORDER BY nickname COLLATE NOCASE"
+            ))
 
     def update_revo_polling_state(
         self,

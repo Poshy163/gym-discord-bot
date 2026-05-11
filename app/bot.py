@@ -4738,9 +4738,11 @@ async def revo_streak_cmd(
             ephemeral=True,
         )
         return
+    display = _bot_name(target.id, target.display_name)
     await interaction.followup.send(
-        f"🔥 {target.mention} — current Revo weekly streak: "
+        f"🔥 **{display}** — current Revo weekly streak: "
         f"**{result} week{'s' if result != 1 else ''}**.",
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -4827,7 +4829,8 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
             if streak is not None
             else "*unknown*"
         )
-        lines.append(f"{badge} <@{uid}> — {streak_txt}")
+        name = _bot_name(uid, f"<@{uid}>")
+        lines.append(f"{badge} **{name}** — {streak_txt}")
 
     await interaction.followup.send(
         "\n".join(lines),
@@ -4908,11 +4911,15 @@ async def revo_calendar_cmd(
     grid = _render_revo_calendar(m, y, result)
     month_name = datetime(y, m, 1).strftime("%B %Y")
     attended_count = sum(1 for v in result.values() if v)
+    display = _bot_name(target.id, target.display_name)
     header = (
-        f"🔥 **{target.display_name}** — Revo check-ins for **{month_name}** "
+        f"🔥 **{display}** — Revo check-ins for **{month_name}** "
         f"({attended_count} day{'s' if attended_count != 1 else ''})"
     )
-    body = f"{header}\n```\n{grid}\n```"
+    legend = "🔥 attended · ⬜ missed · ⬛ out of month"
+    # Weekday header — monospace via code-free bold isn't reliable, so we
+    # sandwich the grid in a small code block just for the header row.
+    body = f"{header}\n`Mo Tu We Th Fr Sa Su`\n{grid}\n-# {legend}"
     await interaction.followup.send(
         body,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -4920,22 +4927,100 @@ async def revo_calendar_cmd(
 
 
 def _render_revo_calendar(month: int, year: int, attended: "dict[int, bool]") -> str:
-    """Render a Mon-Sun grid with `*` next to attended days.
+    """Render a Mon-Sun emoji grid.
 
-    Each column is 3 chars wide (``" 7*"`` for an attended 7th, ``" 7 "``
-    otherwise) joined by a single space, matching the 3-letter weekday
-    header so columns line up in a Discord code block.
+    🔥 = attended day, ⬜ = missed day, ⬛ = out-of-month padding.
+    Each row is one week; no code-block needed.
     """
-    first_weekday, days_in_month = monthrange(year, month)  # Monday=0..Sunday=6
-    header = "Mon Tue Wed Thu Fri Sat Sun"
-    cells: list[str] = ["   "] * first_weekday
+    first_weekday, days_in_month = monthrange(year, month)  # Monday=0
+    # Header row uses thin-space separated day initials
+    header = "Mo Tu We Th Fr Sa Su"
+    FIRE = "🔥"
+    BLANK = "⬜"
+    PAD = "⬛"
+    cells: list[str] = [PAD] * first_weekday
     for day in range(1, days_in_month + 1):
-        marker = "*" if attended.get(day) else " "
-        cells.append(f"{day:>2}{marker}")
+        cells.append(FIRE if attended.get(day) else BLANK)
     while len(cells) % 7 != 0:
-        cells.append("   ")
+        cells.append(PAD)
     rows = [" ".join(cells[r : r + 7]) for r in range(0, len(cells), 7)]
-    return header + "\n" + "\n".join(rows)
+    return "\n".join(rows)
+
+
+def _bot_name(user_id: int, discord_fallback: str) -> str:
+    """Return the bot-wide nickname for ``user_id`` if one is set,
+    otherwise fall back to the supplied Discord display name."""
+    nick = db.get_user_nickname(user_id)
+    return nick if nick is not None else discord_fallback
+
+
+@bot.tree.command(
+    name="set_nick",
+    description="Assign a bot-wide friendly nickname to a user (shown in all bot responses).",
+)
+@app_commands.describe(
+    member="The user to nickname.",
+    nickname="Friendly name to display (e.g. Cookie Monster, Sean). Clear it with /remove_nick.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def set_nick_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | discord.User,
+    nickname: app_commands.Range[str, 1, 32],
+) -> None:
+    db.set_user_nickname(member.id, nickname, interaction.user.id)
+    await interaction.response.send_message(
+        f"✅ **{member.display_name}** will now appear as **{nickname.strip()}** in bot responses.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="remove_nick",
+    description="Remove a bot-wide nickname from a user.",
+)
+@app_commands.describe(member="The user whose nickname to remove.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def remove_nick_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | discord.User,
+) -> None:
+    removed = db.remove_user_nickname(member.id)
+    if removed:
+        await interaction.response.send_message(
+            f"🗑️ Nickname for **{member.display_name}** removed.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"**{member.display_name}** doesn't have a custom nickname set.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="nicks",
+    description="List all bot-wide nicknames.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def nicks_cmd(interaction: discord.Interaction) -> None:
+    rows = db.list_user_nicknames()
+    if not rows:
+        await interaction.response.send_message(
+            "No nicknames set yet. Use `/set_nick` to add one.", ephemeral=True,
+        )
+        return
+    lines = ["**Bot-wide nicknames**"]
+    for r in rows:
+        lines.append(f"• <@{r['user_id']}> → **{r['nickname']}**")
+    await interaction.response.send_message(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+        ephemeral=True,
+    )
 
 
 # ---- attendance poller ----------------------------------------------------
