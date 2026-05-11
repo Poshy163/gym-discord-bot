@@ -419,20 +419,23 @@ def club_counter_with_client(
 # appears in the portal.  Add new entries here when Revo opens SA locations.
 _SA_CLUB_NAMES: frozenset[str] = frozenset({
     # Currently open
-    "aldinga",
-    "christies beach",
-    "gepps cross",
+    "angle vale",
+    "beverley",
+    "blair athol",
+    "blakeview",
     "glenelg",
+    "happy valley",
     "marion",
-    "mawson lakes",
-    "mile end",
+    "modbury",       # Westfield Tea Tree Plus — portal may use either name
+    "tea tree plaza",
     "munno para",
     "noarlunga",
-    "noarlunga centre",
-    "norwood",
     "parafield",
-    "tea tree plaza",
-    "victor harbor",
+    "salisbury downs",
+    "seaford meadows",
+    "windsor gardens",
+    "woodcroft",
+    "woodville",
     # Coming soon (2026)
     "elizabeth",
     "golden grove",
