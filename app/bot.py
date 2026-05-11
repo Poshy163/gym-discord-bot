@@ -4756,9 +4756,14 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
 
     guild_id = interaction.guild.id
     accounts = db.list_revo_accounts()
-    # Filter to accounts that belong to this guild (notify_guild_id) or that
-    # are actually members of this guild — use notify_guild_id as the signal.
-    guild_accounts = [r for r in accounts if r["notify_guild_id"] == guild_id]
+    # Filter to accounts whose Discord user is actually a member of this guild.
+    # We intentionally do NOT filter by notify_guild_id because a user may have
+    # linked without setting up attendance notifications, or may have set them
+    # up in a different server.
+    guild_accounts = [
+        r for r in accounts
+        if interaction.guild.get_member(int(r["user_id"])) is not None
+    ]
 
     if not guild_accounts:
         await interaction.followup.send(
