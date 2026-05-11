@@ -4775,10 +4775,20 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
     # We intentionally do NOT filter by notify_guild_id because a user may have
     # linked without setting up attendance notifications, or may have set them
     # up in a different server.
-    guild_accounts = [
-        r for r in accounts
-        if interaction.guild.get_member(int(r["user_id"])) is not None
-    ]
+    # get_member() is cache-only; with members intent disabled the cache is
+    # sparse, so fall back to fetch_member() (a live API call) on a cache miss.
+    guild_member_ids: set[int] = set()
+    for r in accounts:
+        uid = int(r["user_id"])
+        member = interaction.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        if member is not None:
+            guild_member_ids.add(uid)
+    guild_accounts = [r for r in accounts if int(r["user_id"]) in guild_member_ids]
 
     if not guild_accounts:
         await interaction.followup.send(
