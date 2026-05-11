@@ -4728,6 +4728,82 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
     )
 
 
+@bot.tree.command(
+    name="revo_streak_compare",
+    description="Compare Revo weekly streaks for everyone in this server who has linked their account.",
+)
+async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    # Only makes sense in a guild — we need member context to filter accounts.
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command only works in a server.", ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    guild_id = interaction.guild.id
+    accounts = db.list_revo_accounts()
+    # Filter to accounts that belong to this guild (notify_guild_id) or that
+    # are actually members of this guild — use notify_guild_id as the signal.
+    guild_accounts = [r for r in accounts if r["notify_guild_id"] == guild_id]
+
+    if not guild_accounts:
+        await interaction.followup.send(
+            "No one in this server has linked a Revo account yet. "
+            "Use `/revo_link` to get started.",
+            ephemeral=True,
+        )
+        return
+
+    def _fetch_streaks() -> list[tuple[int, int | None]]:
+        """Return list of (user_id, streak_weeks) fetched live."""
+        out: list[tuple[int, int | None]] = []
+        for row in guild_accounts:
+            uid = int(row["user_id"])
+            try:
+                client = _client_for_user(row)
+                streak = client.get_streak_weeks()
+            except Exception:
+                # Fall back to the cached value stored by the poller.
+                streak = row["last_streak_weeks"]
+            out.append((uid, streak))
+        return out
+
+    results = await bot.loop.run_in_executor(None, _fetch_streaks)
+
+    # Sort: highest streak first; None / 0 go to the bottom.
+    results.sort(key=lambda t: t[1] if t[1] is not None else -1, reverse=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["**🔥 Revo Streak Leaderboard**"]
+    for i, (uid, streak) in enumerate(results):
+        badge = medals[i] if i < len(medals) else f"**#{i + 1}**"
+        streak_txt = (
+            f"**{streak} week{'s' if streak != 1 else ''}**"
+            if streak is not None
+            else "*unknown*"
+        )
+        lines.append(f"{badge} <@{uid}> — {streak_txt}")
+
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+
+
 # ---- attendance poller ----------------------------------------------------
 
 @tasks.loop(minutes=REVO_POLL_MINUTES)
@@ -4812,6 +4888,30 @@ async def _poll_one_account(row) -> None:
         f"🏋️ <@{user_id}> just checked in at Revo "
         f"({head.source}, {head.date}){streak_tail}"
     )
+
+    # Append a streak leaderboard if there are other linked accounts in the
+    # same notify guild (using the cached streak values — no extra HTTP calls).
+    notify_guild_id = row["notify_guild_id"]
+    if notify_guild_id is not None:
+        all_accounts = db.list_revo_accounts()
+        peers = [
+            (int(r["user_id"]), r["last_streak_weeks"])
+            for r in all_accounts
+            if r["notify_guild_id"] == notify_guild_id
+            and r["last_streak_weeks"] is not None
+        ]
+        if len(peers) > 1:
+            peers.sort(key=lambda t: t[1], reverse=True)
+            medals = ["🥇", "🥈", "🥉"]
+            lb_lines = ["**Streak leaderboard**"]
+            for i, (uid, sw) in enumerate(peers):
+                badge = medals[i] if i < len(medals) else f"#{i + 1}"
+                lb_lines.append(
+                    f"{badge} <@{uid}> — "
+                    f"**{sw} week{'s' if sw != 1 else ''}**"
+                )
+            text += "\n" + "\n".join(lb_lines)
+
     try:
         await channel.send(
             text,
