@@ -45,7 +45,7 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two
 | GET | `/portal/club-counter.php` | ✅ | **Live occupancy for every club** + 24h history |
 | GET | `/portal/rewards/` | ✅ | Rewards landing (ticket count + favourite-club summary) |
 | GET | `/portal/rewards/streaks.php` | ✅ | Current weekly streak + monthly check-in calendar |
-| GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance fo any month (seer §3.2.1) |
+| GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance for any month (see §3.2.1) |
 | GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned |
 | GET | `/portal/rewards/raffle.php` | ✅ | Tickets + countdowns to monthly + major draws |
 | GET | `/portal/rewards/raffle.php?optval=<0\|1>` | ⚠️ | **State-changing** — toggles monthly raffle opt-in. JSON `{"Status":"0\|1"}`. Do **not** call casually. |

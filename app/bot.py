@@ -420,6 +420,41 @@ def _message_lift_target(message: discord.Message) -> tuple[object, str]:
     return target, body
 
 
+async def _resolve_nickname_target(
+    text: str, guild: discord.Guild,
+) -> tuple[object | None, str]:
+    """If ``text`` starts with a known bot-wide nickname, return ``(member, rest)``.
+
+    Only fires when the nickname is followed by whitespace (so a nick of
+    "Ben" does not accidentally eat the start of "Bench press").  Nicknames
+    are matched longest-first to avoid a short prefix shadowing a longer one.
+    Returns ``(None, text)`` when no nickname prefix is found.
+    """
+    rows = db.list_user_nicknames()
+    # Longest match first prevents a short nick from shadowing a longer one.
+    for row in sorted(rows, key=lambda r: len(r["nickname"]), reverse=True):
+        nick: str = row["nickname"]
+        if not text.lower().startswith(nick.lower()):
+            continue
+        after_nick = text[len(nick):]
+        # Must be followed by whitespace (or end of string) — not a mid-word match.
+        if after_nick and not after_nick[0].isspace():
+            continue
+        rest = after_nick.lstrip()
+        if not rest:
+            # Nickname with nothing after it — not a lift attribution.
+            continue
+        uid = int(row["user_id"])
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except (discord.NotFound, discord.HTTPException):
+                continue
+        return member, rest
+    return None, text
+
+
 def _target_suffix(author: object, target: object) -> str:
     if getattr(author, "id", None) == getattr(target, "id", None):
         return ""
@@ -1109,6 +1144,14 @@ async def _backfill_channel(
             continue
         guild_aliases = _custom_alias_map(msg.guild.id)
         target, content = _message_lift_target(msg)
+        # Nickname-prefix targeting: "Sean bench 30kg" resolves to the user
+        # nicknamed Sean, exactly like a leading @mention would.
+        if target == msg.author and msg.guild:
+            nick_target, nick_content = await _resolve_nickname_target(
+                msg.content, msg.guild
+            )
+            if nick_target is not None:
+                target, content = nick_target, nick_content
         lifts = parse_message(content, custom_aliases=guild_aliases)
         lifts, _rejected = _split_reasonable_lifts(lifts)
         if not lifts:
@@ -1162,6 +1205,14 @@ async def on_message(message: discord.Message) -> None:
 
     guild_aliases = _custom_alias_map(message.guild.id)
     target, content = _message_lift_target(message)
+    # Nickname-prefix targeting: "Sean bench 30kg" resolves to the user
+    # nicknamed Sean, exactly like a leading @mention would.
+    if target == message.author and message.guild:
+        nick_target, nick_content = await _resolve_nickname_target(
+            message.content, message.guild
+        )
+        if nick_target is not None:
+            target, content = nick_target, nick_content
 
     # Quick bodyweight update path: `bodyweight 100kg`, `body weight: 95.5`,
     # `bw 80`, or `@dos bodyweight 100kg` (leading mention re-targets just
@@ -1332,6 +1383,13 @@ async def on_message_edit(
     guild_id = after.guild.id
     aliases = _custom_alias_map(guild_id)
     target, content = _message_lift_target(after)
+    # Nickname-prefix targeting consistent with on_message.
+    if target == after.author and after.guild:
+        nick_target, nick_content = await _resolve_nickname_target(
+            after.content, after.guild
+        )
+        if nick_target is not None:
+            target, content = nick_target, nick_content
     target_user_id = int(getattr(target, "id"))
     # Editing a post is a fresh signal of intent — clear any prior
     # backfill suppression so the corrected version can be re-imported.
@@ -4948,10 +5006,15 @@ def _render_revo_calendar(month: int, year: int, attended: "dict[int, bool]") ->
 
 
 def _bot_name(user_id: int, discord_fallback: str) -> str:
-    """Return the bot-wide nickname for ``user_id`` if one is set,
-    otherwise fall back to the supplied Discord display name."""
+    """Return a display string for ``user_id``.
+
+    Format: ``Discord Name (Nickname)`` when a bot-wide nickname has been
+    assigned, otherwise just the Discord display name.
+    """
     nick = db.get_user_nickname(user_id)
-    return nick if nick is not None else discord_fallback
+    if nick is None:
+        return discord_fallback
+    return f"{discord_fallback} ({nick})"
 
 
 @bot.tree.command(
