@@ -98,6 +98,27 @@ CREATE TABLE IF NOT EXISTS suppressed_messages (
     suppressed_at TEXT    NOT NULL,
     PRIMARY KEY (guild_id, message_id)
 );
+
+-- Linked Revo Fitness portal accounts. password_enc is a Fernet token; the
+-- plaintext is never persisted. last_ticket_signature is a stable hash of
+-- the most-recently-seen ticket-tally row so the attendance poller can tell
+-- when a fresh check-in has happened. notify_guild_id / notify_channel_id
+-- pin attendance announcements to a specific room (defaults to the channel
+-- the user ran /revo_link from).
+CREATE TABLE IF NOT EXISTS revo_account (
+    user_id                INTEGER PRIMARY KEY,
+    email                  TEXT    NOT NULL,
+    password_enc           TEXT    NOT NULL,
+    member_id              INTEGER,
+    membership_level       INTEGER,
+    favorite_club_id       INTEGER,
+    last_ticket_signature  TEXT,
+    last_streak_weeks      INTEGER,
+    notify_guild_id        INTEGER,
+    notify_channel_id      INTEGER,
+    linked_at              TEXT    NOT NULL,
+    last_polled_at         TEXT
+);
 """
 
 
@@ -1560,6 +1581,84 @@ class Database:
             )
             return cur.rowcount or 0
 
+    # ------------------------------------------------------------------
+    # Revo Fitness portal linking (see app/revo_client.py)
+    # ------------------------------------------------------------------
+
+    def link_revo_account(
+        self,
+        user_id: int,
+        email: str,
+        password_enc: str,
+        member_id: int | None,
+        membership_level: int | None,
+        favorite_club_id: int | None,
+        notify_guild_id: int | None,
+        notify_channel_id: int | None,
+    ) -> None:
+        """Insert or replace a user's Revo credentials.
+
+        ``password_enc`` must already be a Fernet token — this layer never
+        sees the plaintext password. Uses INSERT OR REPLACE so re-running
+        ``/revo_link`` cleanly updates an existing link (and resets the
+        polling cursor, which is the expected behaviour when someone
+        re-authenticates).
+        """
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO revo_account (
+                    user_id, email, password_enc, member_id, membership_level,
+                    favorite_club_id, last_ticket_signature, last_streak_weeks,
+                    notify_guild_id, notify_channel_id, linked_at, last_polled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL)
+                """,
+                (
+                    user_id, email, password_enc, member_id, membership_level,
+                    favorite_club_id, notify_guild_id, notify_channel_id, ts,
+                ),
+            )
+
+    def unlink_revo_account(self, user_id: int) -> bool:
+        """Remove a user's Revo credentials. Returns True if a row existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM revo_account WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def get_revo_account(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM revo_account WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+    def list_revo_accounts(self) -> list[sqlite3.Row]:
+        """All linked accounts. Used by the attendance poller."""
+        with self._conn() as c:
+            return list(c.execute("SELECT * FROM revo_account"))
+
+    def update_revo_polling_state(
+        self,
+        user_id: int,
+        last_ticket_signature: str | None,
+        last_streak_weeks: int | None,
+    ) -> None:
+        """Persist the cursor + cached streak after a poll cycle."""
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE revo_account
+                   SET last_ticket_signature = ?,
+                       last_streak_weeks     = ?,
+                       last_polled_at        = ?
+                 WHERE user_id = ?
+                """,
+                (last_ticket_signature, last_streak_weeks, ts, user_id),
+            )
+
     def lifts_for_message(
         self, guild_id: int, message_id: int,
     ) -> list[sqlite3.Row]:
@@ -1625,6 +1724,22 @@ class Database:
                 (guild_id, user_id),
             ).fetchone()
             return row
+
+    def bodyweight_history(
+        self, guild_id: int, user_id: int, limit: int = 1000,
+    ) -> list[sqlite3.Row]:
+        """Return this user's bodyweight measurements oldest-first.
+
+        Used by ``/bodyweight_history`` and ``/bodyweight_graph`` so the
+        timeline plots left-to-right without an extra reverse step.
+        """
+        with self._conn() as c:
+            return c.execute(
+                "SELECT weight_kg, recorded_at FROM bodyweights "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY recorded_at ASC, id ASC LIMIT ?",
+                (guild_id, user_id, int(limit)),
+            ).fetchall()
 
     def latest_bodyweights_bulk(
         self, guild_id: int, user_ids: list[int],

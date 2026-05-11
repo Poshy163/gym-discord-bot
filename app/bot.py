@@ -45,6 +45,7 @@ from .parser import (
     should_auto_store_lifts,
 )
 from . import __version__
+from . import revo_client
 
 load_dotenv()
 
@@ -806,6 +807,17 @@ async def on_ready() -> None:
             "Daily update scheduled for %02d:%02d (%s) in channel %s",
             DAILY_UPDATE_HOUR, DAILY_UPDATE_MINUTE,
             DISPLAY_TZ, DAILY_UPDATE_CHANNEL_ID,
+        )
+
+    if (
+        not REVO_DISABLED
+        and revo_client.available()
+        and not revo_attendance_poll.is_running()
+    ):
+        revo_attendance_poll.start()
+        LOG.info(
+            "Revo attendance poll scheduled every %d minutes",
+            REVO_POLL_MINUTES,
         )
 
 
@@ -2812,6 +2824,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "shows your true load on pull-ups, dips, etc. "
             "(`bodyweight 100kg` in chat works too, and `@user bodyweight 100kg` "
             "sets someone else's)\n"
+            "`/bodyweight_history [user] [limit]` — list past weigh-ins\n"
+            "`/bodyweight_graph [user]` — plot a PNG chart of weigh-ins\n"
             "`/undo` — remove your most recent entry\n"
             "React ❌ on my reply to undo that specific post "
             "(logger or target lifter only)\n"
@@ -2844,6 +2858,16 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/purge <equipment>` — delete all rows for a lift\n"
             "`/alias_add <phrase> <equipment>` — teach a custom name\n"
             "`/alias_remove <phrase>` · `/alias_list`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏋️ Revo Fitness",
+        value=(
+            "`/busy [club]` — live club occupancy\n"
+            "`/revo_link <email> <password>` — link your account (DM only)\n"
+            "`/revo_unlink` — remove the link\n"
+            "`/revo_streak` — your weekly check-in streak"
         ),
         inline=False,
     )
@@ -4025,6 +4049,220 @@ async def graph_cmd(
     )
 
 
+# ---------------------------------------------------------------------------
+# Bodyweight history
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_to_local_date(iso: str):
+    """Convert a stored ISO timestamp to a DISPLAY_TZ-local ``date``."""
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TZ).date()
+
+
+@bot.tree.command(
+    name="bodyweight_history",
+    description="List your recorded bodyweight measurements.",
+)
+@app_commands.describe(
+    user="The user to look up (defaults to you).",
+    limit="How many recent measurements to show (default 20, max 100).",
+)
+async def bodyweight_history_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    limit: int | None = None,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    cap = max(1, min(100, int(limit) if limit else 20))
+    rows = db.bodyweight_history(guild_id, target.id, limit=1000)
+    if not rows:
+        await interaction.response.send_message(
+            f"No bodyweight entries logged for {target.display_name} yet. "
+            "Set one with `/bodyweight <weight_kg>`.",
+            ephemeral=True,
+        )
+        return
+
+    # Newest-first slice for display, but use full list for trend numbers.
+    weights = [float(r["weight_kg"]) for r in rows]
+    first, latest = weights[0], weights[-1]
+    delta = latest - first
+    sign = "+" if delta >= 0 else ""
+    peak = max(weights)
+    trough = min(weights)
+
+    recent = list(reversed(rows))[:cap]
+    lines = [
+        f"• `{_format_date(r['recorded_at'])}` — **{float(r['weight_kg']):g}kg**"
+        for r in recent
+    ]
+    truncated = ""
+    if len(rows) > cap:
+        truncated = f"\n_…showing {cap} of {len(rows)} entries._"
+
+    embed = discord.Embed(
+        title=f"⚖️ {target.display_name} — bodyweight history",
+        description="\n".join(lines) + truncated,
+        colour=EMBED_COLOUR,
+    )
+    embed.add_field(
+        name="Trend",
+        value=(
+            f"latest **{latest:g}kg** · first **{first:g}kg** "
+            f"({sign}{delta:g}kg overall)\n"
+            f"peak {peak:g}kg · low {trough:g}kg · "
+            f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Tip: /bodyweight_graph plots this as a chart.")
+    await interaction.response.send_message(
+        embed=embed, ephemeral=target.id == interaction.user.id,
+    )
+
+
+@bot.tree.command(
+    name="bodyweight_graph",
+    description="Plot your bodyweight history as a PNG chart.",
+)
+@app_commands.describe(user="The user to plot (defaults to you).")
+async def bodyweight_graph_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    # Lazy import — same pattern as /graph so the bot still boots without
+    # matplotlib installed.
+    try:
+        matplotlib = importlib.import_module("matplotlib")
+        matplotlib.use("Agg")
+        plt = importlib.import_module("matplotlib.pyplot")
+        mdates = importlib.import_module("matplotlib.dates")
+        ticker = importlib.import_module("matplotlib.ticker")
+    except ImportError:
+        await interaction.response.send_message(
+            "Graphing isn't available — matplotlib isn't installed. "
+            "Add it to `requirements.txt` and redeploy.",
+            ephemeral=True,
+        )
+        return
+
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    rows = db.bodyweight_history(guild_id, target.id, limit=1000)
+    if not rows:
+        await interaction.response.send_message(
+            f"No bodyweight entries logged for {target.display_name} yet. "
+            "Set one with `/bodyweight <weight_kg>`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # Collapse multiple same-day measurements to the day's mean — keeps the
+    # line readable when someone weighs in twice on the same morning.
+    by_day: dict = {}
+    for r in rows:
+        d = _parse_iso_to_local_date(r["recorded_at"])
+        if d is None:
+            continue
+        by_day.setdefault(d, []).append(float(r["weight_kg"]))
+    if not by_day:
+        await interaction.followup.send(
+            "Couldn't plot — no datable entries.", ephemeral=True,
+        )
+        return
+
+    xs = sorted(by_day)
+    ys = [sum(by_day[d]) / len(by_day[d]) for d in xs]
+
+    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=150)
+    fig.patch.set_facecolor("#f6f3ee")
+    ax.set_facecolor("#fffdfa")
+    primary = "#3b7dd8"
+
+    ax.plot(
+        xs, ys,
+        marker="o", markersize=6.5, markerfacecolor="#fffdfa",
+        markeredgewidth=2.0, linewidth=2.4,
+        color=primary, label="Bodyweight",
+    )
+
+    ax.set_title(
+        f"{target.display_name} — bodyweight", loc="left",
+        fontsize=14, fontweight="bold", pad=16,
+    )
+    delta = ys[-1] - ys[0]
+    sign = "+" if delta >= 0 else ""
+    subtitle = (
+        f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'} · "
+        f"{len(xs)} day{'s' if len(xs) != 1 else ''} · "
+        f"{ys[0]:g}kg → {ys[-1]:g}kg ({sign}{delta:g}kg)"
+    )
+    ax.text(
+        0, 1.015, subtitle, transform=ax.transAxes,
+        fontsize=9, color="#6b625a", va="bottom",
+    )
+    ax.set_ylabel("kg")
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+    ax.grid(axis="y", color="#d9d3cb", linewidth=0.8, alpha=0.85)
+    ax.grid(axis="x", color="#eee9e1", linewidth=0.7, alpha=0.55)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#b8afa4")
+    ax.spines["bottom"].set_color("#b8afa4")
+    ax.tick_params(colors="#332f2a", labelsize=9)
+
+    ymin, ymax = min(ys), max(ys)
+    ypad = max(1.0, (ymax - ymin) * 0.25)
+    ax.set_ylim(ymin - ypad, ymax + ypad)
+
+    # Annotate first, peak, trough, and latest only — avoids label spaghetti
+    # for users with many weigh-ins.
+    label_idx = sorted({0, len(xs) - 1, ys.index(ymax), ys.index(ymin)})
+    for idx in label_idx:
+        ax.annotate(
+            f"{ys[idx]:g}kg",
+            xy=(xs[idx], ys[idx]), xytext=(0, 9),
+            textcoords="offset points", ha="center", va="bottom",
+            fontsize=8, color="#332f2a",
+        )
+
+    if len(xs) > 1:
+        span = xs[-1] - xs[0]
+        pad = timedelta(days=max(1.0, span.days * 0.06))
+        ax.set_xlim(xs[0] - pad, xs[-1] + pad)
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    else:
+        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+
+    fig.autofmt_xdate(rotation=0, ha="center")
+    fig.tight_layout(pad=1.2)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    fname = f"bodyweight_{target.display_name}.png"
+    file = discord.File(buf, filename=fname)
+    await interaction.followup.send(
+        f"⚖️ **{target.display_name} — bodyweight** "
+        f"({ys[0]:g}kg → {ys[-1]:g}kg, {sign}{delta:g}kg)",
+        file=file,
+    )
+
+
 # ---- autocomplete for equipment names ------------------------------------
 
 
@@ -4081,6 +4319,412 @@ goal_remove_cmd.autocomplete("equipment")(_equipment_autocomplete)
 overview_cmd.autocomplete("equipment")(_equipment_autocomplete)
 graph_cmd.autocomplete("equipment")(_equipment_autocomplete)
 alias_add_cmd.autocomplete("equipment")(_equipment_autocomplete)
+
+
+# ---------------------------------------------------------------------------
+# Revo Fitness portal integration. See docs/REVO_PORTAL.md.
+# ---------------------------------------------------------------------------
+
+# Master kill-switch — set REVO_DISABLED=1 to skip every Revo command/poller
+# (useful if the portal blocks our scraper or we hit rate limits).
+REVO_DISABLED = os.getenv("REVO_DISABLED", "0").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+
+# How often to poll linked accounts for new attendance entries. The portal's
+# ticket-tally only updates after a check-in; 15 minutes is conservative
+# enough to stay well under any plausible rate limit while still feeling
+# "live" to a Discord channel.
+try:
+    REVO_POLL_MINUTES = max(5, int(os.getenv("REVO_POLL_MINUTES", "15")))
+except ValueError:
+    REVO_POLL_MINUTES = 15
+
+# Optional global default channel for attendance notifications. Each linked
+# account can also pin its own notify_channel_id; this is just the fallback
+# when the user doesn't specify one at link time.
+_revo_ch = os.getenv("REVO_NOTIFY_CHANNEL_ID", "").strip()
+REVO_DEFAULT_NOTIFY_CHANNEL_ID: int | None = (
+    int(_revo_ch) if _revo_ch.isdigit() else None
+)
+
+# Per-user RevoClient cache so the poller doesn't construct + re-login a
+# fresh session on every cycle.
+_revo_user_clients: dict[int, "revo_client.RevoClient"] = {}
+_revo_clients_lock = __import__("threading").Lock()
+
+
+def _ticket_signature(rows: list["revo_client.TicketRow"]) -> str | None:
+    """Stable signature of the most-recent ticket-tally entry."""
+    if not rows:
+        return None
+    head = rows[0]
+    return f"{head.date}|{head.delta}|{head.source}"
+
+
+def _client_for_user(row) -> "revo_client.RevoClient":
+    """Return a cached RevoClient for a linked-account row."""
+    user_id = int(row["user_id"])
+    with _revo_clients_lock:
+        client = _revo_user_clients.get(user_id)
+        if client is None:
+            password = revo_client.decrypt_password(row["password_enc"])
+            client = revo_client.RevoClient(row["email"], password)
+            _revo_user_clients[user_id] = client
+    return client
+
+
+def _drop_cached_client(user_id: int) -> None:
+    with _revo_clients_lock:
+        _revo_user_clients.pop(user_id, None)
+
+
+def _format_busy_line(info: "revo_client.ClubInfo") -> str:
+    return f"**{info.name}** — {info.in_club} in club right now (id={info.club_id})"
+
+
+@bot.tree.command(
+    name="busy",
+    description="Show how busy a Revo Fitness club is right now.",
+)
+@app_commands.describe(
+    club="Club name (substring match). Omit for the top 5 busiest right now.",
+)
+async def busy_cmd(
+    interaction: discord.Interaction,
+    club: str | None = None,
+) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    def _do() -> tuple[dict[str, "revo_client.ClubInfo"], int | None] | str:
+        try:
+            return revo_client.shared_club_counter()
+        except revo_client.RevoUnavailable as exc:
+            return f"unavailable: {exc}"
+        except revo_client.RevoAuthError as exc:
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo club-counter fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        await interaction.followup.send(
+            f"Couldn't fetch the live counter ({result}).", ephemeral=True,
+        )
+        return
+
+    clubs, _favorite = result
+    if not clubs:
+        await interaction.followup.send(
+            "Revo returned no club data — try again shortly.", ephemeral=True,
+        )
+        return
+
+    if club:
+        match = revo_client.find_club(clubs, club)
+        if match is None:
+            sample = ", ".join(sorted(clubs)[:8])
+            await interaction.followup.send(
+                f"No Revo club matched `{club}`. Try one of: {sample}…",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(_format_busy_line(match))
+        return
+
+    top = sorted(clubs.values(), key=lambda c: c.in_club, reverse=True)[:5]
+    lines = ["**Busiest Revo clubs right now**"]
+    lines.extend(f"• {_format_busy_line(c)}" for c in top)
+    await interaction.followup.send("\n".join(lines))
+
+
+@bot.tree.command(
+    name="revo_link",
+    description="(DM only) Link your Revo Fitness account. Password is encrypted at rest.",
+)
+@app_commands.describe(
+    email="The email you log into the Revo portal with.",
+    password="Your Revo password. Stored encrypted; rotate it after linking.",
+    notify_channel_id="Channel ID to post your attendance pings into (optional).",
+)
+async def revo_link_cmd(
+    interaction: discord.Interaction,
+    email: str,
+    password: str,
+    notify_channel_id: str | None = None,
+) -> None:
+    # DM-only check: refuse to take a password in a guild channel where
+    # the slash command UI might briefly echo arguments to bystanders or
+    # leave them in the user's command history.
+    if interaction.guild is not None:
+        await interaction.response.send_message(
+            "❌ Run this command in a DM with me — never in a server channel.",
+            ephemeral=True,
+        )
+        return
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install `requests` and `cryptography`.",
+            ephemeral=True,
+        )
+        return
+
+    notify_id: int | None = None
+    if notify_channel_id:
+        nid = notify_channel_id.strip()
+        if not nid.isdigit():
+            await interaction.response.send_message(
+                "`notify_channel_id` must be a numeric Discord channel id.",
+                ephemeral=True,
+            )
+            return
+        notify_id = int(nid)
+    if notify_id is None:
+        notify_id = REVO_DEFAULT_NOTIFY_CHANNEL_ID
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _do() -> str | tuple[int | None, int | None, int | None]:
+        try:
+            password_enc = revo_client.encrypt_password(password)
+        except revo_client.RevoUnavailable as exc:
+            return f"unavailable: {exc}"
+        try:
+            client = revo_client.RevoClient(email, password)
+            client.login()
+        except revo_client.RevoAuthError as exc:
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo link login failed")
+            return f"error: {exc}"
+        favorite = None
+        try:
+            _clubs, favorite = client.get_club_counter()
+        except Exception:  # pragma: no cover - non-fatal
+            LOG.warning("Revo link: failed to capture favorite club", exc_info=True)
+        try:
+            db.link_revo_account(
+                user_id=interaction.user.id,
+                email=email,
+                password_enc=password_enc,
+                member_id=client.member_id,
+                membership_level=client.membership_level,
+                favorite_club_id=favorite,
+                notify_guild_id=None,
+                notify_channel_id=notify_id,
+            )
+        except Exception as exc:
+            LOG.exception("Revo link db write failed")
+            return f"db-error: {exc}"
+        # Cache the freshly-authenticated client.
+        with _revo_clients_lock:
+            _revo_user_clients[interaction.user.id] = client
+        return (client.member_id, client.membership_level, favorite)
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        await interaction.followup.send(
+            f"Couldn't link your Revo account ({result}).", ephemeral=True,
+        )
+        return
+    member_id, level, favorite = result
+    notify_line = (
+        f"\n• Attendance notifications → <#{notify_id}>"
+        if notify_id else "\n• No notification channel set — pings disabled."
+    )
+    await interaction.followup.send(
+        "✅ Revo account linked!\n"
+        f"• Member id: `{member_id}`\n"
+        f"• Membership level: `{level}`\n"
+        f"• Favorite club id: `{favorite}`"
+        f"{notify_line}\n\n"
+        "🔐 Your password is stored encrypted. Even so, **consider rotating it** "
+        "if you reuse it anywhere else.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="revo_unlink",
+    description="Remove your linked Revo Fitness account from the bot.",
+)
+async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
+    removed = db.unlink_revo_account(interaction.user.id)
+    _drop_cached_client(interaction.user.id)
+    if removed:
+        await interaction.response.send_message(
+            "🗑️ Revo account unlinked. Encrypted credentials removed.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "You don't have a linked Revo account.", ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="revo_streak",
+    description="Show your current Revo Fitness weekly check-in streak.",
+)
+async def revo_streak_cmd(interaction: discord.Interaction) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    row = db.get_revo_account(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "Link your account first with `/revo_link` (in DM).",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _do() -> str | int | None:
+        try:
+            client = _client_for_user(row)
+            return client.get_streak_weeks()
+        except revo_client.RevoAuthError as exc:
+            _drop_cached_client(int(row["user_id"]))
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo streak fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        await interaction.followup.send(
+            f"Couldn't fetch your streak ({result}).", ephemeral=True,
+        )
+        return
+    if result is None:
+        await interaction.followup.send(
+            "Revo didn't show a streak count — visit the portal to check.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"🔥 Current Revo weekly streak: **{result} week"
+        f"{'s' if result != 1 else ''}**.",
+        ephemeral=True,
+    )
+
+
+# ---- attendance poller ----------------------------------------------------
+
+@tasks.loop(minutes=REVO_POLL_MINUTES)
+async def revo_attendance_poll() -> None:
+    """Walk every linked Revo account and announce new check-ins.
+
+    Strategy: hit ticket-tally, take the newest history row, compare to
+    the row we last saw (``last_ticket_signature``). On change, post to the
+    user's configured notify channel and update the cursor. We deliberately
+    treat the *first* poll after linking as silent (no signature → record
+    baseline) so users don't get spammed with backfilled history.
+    """
+    if REVO_DISABLED or not revo_client.available():
+        return
+    accounts = db.list_revo_accounts()
+    if not accounts:
+        return
+    for row in accounts:
+        try:
+            await _poll_one_account(row)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Revo poll failed for user %s", row["user_id"])
+
+
+async def _poll_one_account(row) -> None:
+    user_id = int(row["user_id"])
+    notify_channel_id = row["notify_channel_id"]
+    last_sig = row["last_ticket_signature"]
+
+    def _fetch() -> tuple[str | None, int | None, "revo_client.TicketRow" | None] | str:
+        try:
+            client = _client_for_user(row)
+            _avail, rows = client.get_tickets()
+            streak = None
+            try:
+                streak = client.get_streak_weeks()
+            except Exception:  # pragma: no cover
+                LOG.warning("Revo streak fetch failed for user %s", user_id, exc_info=True)
+            sig = _ticket_signature(rows)
+            head = rows[0] if rows else None
+            return sig, streak, head
+        except revo_client.RevoAuthError as exc:
+            _drop_cached_client(user_id)
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _fetch)
+    if isinstance(result, str):
+        LOG.warning("Revo poll skipped user %s: %s", user_id, result)
+        return
+    sig, streak, head = result
+
+    # Persist the cursor first so a notify-failure doesn't replay forever.
+    db.update_revo_polling_state(user_id, sig, streak)
+
+    if sig is None or sig == last_sig:
+        return
+    if last_sig is None:
+        # First poll after link — establish baseline silently.
+        LOG.info("Revo baseline established for user %s (sig=%s)", user_id, sig)
+        return
+    if notify_channel_id is None or head is None:
+        return
+
+    channel = bot.get_channel(int(notify_channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(notify_channel_id))
+        except discord.HTTPException:
+            LOG.warning(
+                "Revo poll: cannot reach notify channel %s for user %s",
+                notify_channel_id, user_id,
+            )
+            return
+
+    streak_tail = (
+        f" — streak: **{streak} week{'s' if streak != 1 else ''}** 🔥"
+        if streak else ""
+    )
+    text = (
+        f"🏋️ <@{user_id}> just checked in at Revo "
+        f"({head.source}, {head.date}){streak_tail}"
+    )
+    try:
+        await channel.send(
+            text,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException:
+        LOG.exception("Revo poll: failed to post attendance ping for user %s", user_id)
+
+
+@revo_attendance_poll.before_loop
+async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
 
 
 def main() -> None:

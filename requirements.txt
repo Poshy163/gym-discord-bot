@@ -2,3 +2,8 @@ discord.py==2.4.0
 python-dotenv==1.0.1
 matplotlib==3.9.2
 tzdata==2024.1
+# Optional — only required when the Revo Fitness portal integration is
+# enabled (see docs/REVO_PORTAL.md). The bot still boots without them; the
+# /busy and /revo_* commands will just report "unavailable".
+requests==2.32.3
+cryptography==43.0.1

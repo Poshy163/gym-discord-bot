@@ -423,3 +423,26 @@ def test_bodyweight_bulk_picks_latest_with_id_tiebreaker(db):
     assert out == {100: 92.0}
     # And it agrees with the single-user accessor.
     assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 92.0
+
+
+def test_bodyweight_history_returns_oldest_first_and_scoped(db):
+    """`/bodyweight_history` and `/bodyweight_graph` rely on chronological
+    order plus strict guild + user scoping."""
+    t0 = datetime(2025, 1, 1, 7, 0, tzinfo=timezone.utc)
+    t1 = datetime(2025, 1, 8, 7, 0, tzinfo=timezone.utc)
+    t2 = datetime(2025, 1, 15, 7, 0, tzinfo=timezone.utc)
+    db.set_bodyweight(1, 100, 95.0, recorded_at=t1)
+    db.set_bodyweight(1, 100, 94.0, recorded_at=t0)  # inserted out of order
+    db.set_bodyweight(1, 100, 96.0, recorded_at=t2)
+    # Noise in other guild / user — must not bleed in.
+    db.set_bodyweight(2, 100, 200.0, recorded_at=t1)
+    db.set_bodyweight(1, 999, 50.0, recorded_at=t1)
+
+    rows = db.bodyweight_history(1, 100)
+    assert [float(r["weight_kg"]) for r in rows] == [94.0, 95.0, 96.0]
+
+    # Limit clamps the result.
+    assert len(db.bodyweight_history(1, 100, limit=2)) == 2
+
+    # Empty for users with no entries.
+    assert db.bodyweight_history(1, 12345) == []
