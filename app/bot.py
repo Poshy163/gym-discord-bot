@@ -2865,7 +2865,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         name="🏋️ Revo Fitness",
         value=(
             "`/busy [club]` — live club occupancy\n"
-            "`/revo_link <email> <password>` — link your account (DM only)\n"
+            "`/revo_link <email> <password>` — link your account (reply is private)\n"
+            "`/help_revo_link` — public explainer for `/revo_link`\n"
             "`/revo_unlink` — remove the link\n"
             "`/revo_streak` — your weekly check-in streak"
         ),
@@ -4452,9 +4453,71 @@ async def busy_cmd(
 
 
 @bot.tree.command(
-    name="revo_link",
-    description="(DM only) Link your Revo Fitness account. Password is encrypted at rest.",
+    name="help_revo_link",
+    description="Public explainer for /revo_link — what it does and how it stores credentials.",
 )
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def help_revo_link_cmd(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="🔗 Linking your Revo Fitness account",
+        description=(
+            "Run `/revo_link` to connect your Revo portal account to the bot. "
+            "Your reply is **always private** (ephemeral), so no one in the "
+            "channel sees your email, password, or confirmation."
+        ),
+        colour=EMBED_COLOUR,
+    )
+    embed.add_field(
+        name="How to link",
+        value=(
+            "`/revo_link email:<you@example.com> password:<your-revo-password> "
+            "[notify_channel_id:<channel id>]`\n"
+            "You can run it in a server channel **or** in a DM with me — "
+            "either way, only you see the response."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="What you unlock",
+        value=(
+            "• `/revo_streak` — your current weekly check-in streak\n"
+            "• Automatic attendance pings when you tap into your gym "
+            "(posted in the configured notify channel)\n"
+            "• Your favourite club is auto-detected from your last visits"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="How your credentials are stored",
+        value=(
+            "• Your password is encrypted with **Fernet (AES-128-CBC + HMAC)** "
+            "before being written to the database — the plaintext never "
+            "touches disk.\n"
+            "• Only the bot host (with the `REVO_FERNET_KEY` env var) can "
+            "decrypt it; rotating that key invalidates every stored password.\n"
+            "• Use `/revo_unlink` any time to wipe your encrypted credentials."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Safety tips",
+        value=(
+            "• Use a Revo password you don't reuse anywhere else.\n"
+            "• Rotate it on the Revo portal after linking if you're paranoid.\n"
+            "• `/busy` works without linking — only personal stats need it."
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="revo_link",
+    description="Link your Revo Fitness account. Password is encrypted at rest. Reply is private.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.describe(
     email="The email you log into the Revo portal with.",
     password="Your Revo password. Stored encrypted; rotate it after linking.",
@@ -4466,15 +4529,10 @@ async def revo_link_cmd(
     password: str,
     notify_channel_id: str | None = None,
 ) -> None:
-    # DM-only check: refuse to take a password in a guild channel where
-    # the slash command UI might briefly echo arguments to bystanders or
-    # leave them in the user's command history.
-    if interaction.guild is not None:
-        await interaction.response.send_message(
-            "❌ Run this command in a DM with me — never in a server channel.",
-            ephemeral=True,
-        )
-        return
+    # Works in DMs or in a guild channel. All replies below are ephemeral
+    # so the password / confirmation never appears to other members. Note
+    # that the *invocation* of a slash command is already private to the
+    # caller in Discord — only the bot ever sees the arguments.
     if REVO_DISABLED:
         await interaction.response.send_message(
             "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
@@ -4566,6 +4624,8 @@ async def revo_link_cmd(
     name="revo_unlink",
     description="Remove your linked Revo Fitness account from the bot.",
 )
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
     removed = db.unlink_revo_account(interaction.user.id)
     _drop_cached_client(interaction.user.id)
@@ -4584,6 +4644,8 @@ async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
     name="revo_streak",
     description="Show your current Revo Fitness weekly check-in streak.",
 )
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def revo_streak_cmd(interaction: discord.Interaction) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
@@ -4593,7 +4655,7 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
     row = db.get_revo_account(interaction.user.id)
     if row is None:
         await interaction.response.send_message(
-            "Link your account first with `/revo_link` (in DM).",
+            "Link your account first with `/revo_link`.",
             ephemeral=True,
         )
         return
