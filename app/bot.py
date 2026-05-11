@@ -4680,22 +4680,34 @@ async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="revo_streak",
-    description="Show your current Revo Fitness weekly check-in streak.",
+    description="Show a Revo Fitness weekly check-in streak (yours, or another member's).",
 )
+@app_commands.describe(member="The server member to look up. Defaults to yourself.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
-async def revo_streak_cmd(interaction: discord.Interaction) -> None:
+async def revo_streak_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
             "Revo integration is disabled.", ephemeral=True,
         )
         return
-    row = db.get_revo_account(interaction.user.id)
+
+    target = member or interaction.user
+    row = db.get_revo_account(target.id)
     if row is None:
-        await interaction.response.send_message(
-            "Link your account first with `/revo_link`.",
-            ephemeral=True,
-        )
+        if target == interaction.user:
+            await interaction.response.send_message(
+                "Link your account first with `/revo_link`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.mention} hasn't linked a Revo account yet.",
+                ephemeral=True,
+            )
         return
     await interaction.response.defer(thinking=True)
 
@@ -4712,9 +4724,12 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
 
     result = await bot.loop.run_in_executor(None, _do)
     if isinstance(result, str):
-        await interaction.followup.send(
-            f"Couldn't fetch your streak ({result}).", ephemeral=True,
+        msg = (
+            f"Couldn't fetch your streak ({result})."
+            if target == interaction.user
+            else f"Couldn't fetch {target.mention}'s streak ({result})."
         )
+        await interaction.followup.send(msg, ephemeral=True)
         return
     if result is None:
         await interaction.followup.send(
@@ -4723,7 +4738,7 @@ async def revo_streak_cmd(interaction: discord.Interaction) -> None:
         )
         return
     await interaction.followup.send(
-        f"🔥 {interaction.user.mention} — current Revo weekly streak: "
+        f"🔥 {target.mention} — current Revo weekly streak: "
         f"**{result} week{'s' if result != 1 else ''}**.",
     )
 
