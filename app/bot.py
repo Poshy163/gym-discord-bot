@@ -4449,16 +4449,19 @@ def _format_busy_line(info: "revo_client.ClubInfo") -> str:
 )
 @app_commands.describe(
     club="Club name (substring match). Omit for the top 5 busiest right now.",
-    state='Filter the top-5 to "SA" (default) or "all" clubs.',
+    state='Filter the top-5 by state (SA/WA/VIC/NSW). Defaults to all clubs.',
 )
 @app_commands.choices(state=[
-    app_commands.Choice(name="SA (South Australia)", value="SA"),
     app_commands.Choice(name="All clubs", value="all"),
+    app_commands.Choice(name="SA (South Australia)", value="SA"),
+    app_commands.Choice(name="WA (Western Australia)", value="WA"),
+    app_commands.Choice(name="VIC (Victoria)", value="VIC"),
+    app_commands.Choice(name="NSW (New South Wales)", value="NSW"),
 ])
 async def busy_cmd(
     interaction: discord.Interaction,
     club: str | None = None,
-    state: str = "SA",
+    state: str = "all",
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
@@ -4538,10 +4541,10 @@ async def busy_cmd(
         return
 
     visible = clubs
-    if state == "SA":
-        sa_clubs = revo_client.filter_sa_clubs(clubs)
-        if sa_clubs:
-            visible = sa_clubs
+    if state and state.upper() != "ALL":
+        filtered = revo_client.filter_clubs_by_state(clubs, state)
+        if filtered:
+            visible = filtered
         # if filter matches nothing fall back to all clubs silently
     top = sorted(visible.values(), key=lambda c: c.in_club, reverse=True)[:5]
     lines = ["**Busiest Revo clubs right now**"]

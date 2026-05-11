@@ -512,45 +512,145 @@ def club_counter_with_client(
     return clubs, favorite
 
 
-# Known SA (South Australia) Revo club suburbs — used by filter_sa_clubs().
-# Names are compared case-insensitively; each entry is a full club name as it
-# appears in the portal.  Add new entries here when Revo opens SA locations.
-_SA_CLUB_NAMES: frozenset[str] = frozenset({
-    # Currently open
-    "angle vale",
-    "beverley",
-    "blair athol",
-    "blakeview",
-    "glenelg",
-    "happy valley",
-    "marion",
-    "modbury",       # Westfield Tea Tree Plus — portal may use either name
-    "tea tree plaza",
-    "munno para",
-    "noarlunga",
-    "parafield",
-    "salisbury downs",
-    "seaford meadows",
-    "windsor gardens",
-    "woodcroft",
-    "woodville",
-    # Coming soon (2026)
-    "elizabeth",
-    "golden grove",
-    "marleston",
-    "mount barker",
-    "port adelaide",
-    "trinity gardens",
-})
+# Known Revo club suburbs grouped by Australian state — used by
+# filter_clubs_by_state().  Names are compared case-insensitively; each entry
+# is a full club name as it appears in the portal.  Add new entries here when
+# Revo opens new locations.
+_CLUB_NAMES_BY_STATE: dict[str, frozenset[str]] = {
+    "SA": frozenset({
+        # Currently open
+        "angle vale",
+        "beverley",
+        "blair athol",
+        "blakeview",
+        "glenelg",
+        "happy valley",
+        "marion",
+        "modbury",       # Westfield Tea Tree Plus — portal may use either name
+        "tea tree plaza",
+        "munno para",
+        "noarlunga",
+        "parafield",
+        "salisbury downs",
+        "seaford meadows",
+        "windsor gardens",
+        "woodcroft",
+        "woodville",
+        # Coming soon (2026)
+        "elizabeth",
+        "golden grove",
+        "marleston",
+        "mount barker",
+        "port adelaide",
+        "trinity gardens",
+    }),
+    "WA": frozenset({
+        # Currently open
+        "australind",
+        "balcatta",
+        "banksia grove",
+        "belmont",        # Cloverdale address
+        "bunbury",
+        "butler",
+        "canning vale",
+        "cannington",
+        "claremont",
+        "clarkson",
+        "cockburn",
+        "dayton",
+        "ellenbrook",
+        "girrawheen",
+        "innaloo",
+        "joondalup",
+        "kelmscott",
+        "kwinana",
+        "malaga",
+        "mandurah",
+        "midland",
+        "mirrabooka",
+        "morley",
+        "mount hawthorn",
+        "myaree",
+        "north beach",
+        "northbridge",
+        "o'connor",
+        "oconnor",
+        "rivervale",
+        "rockingham",
+        "scarborough",
+        "victoria park",
+        "wanneroo",
+        "warwick",
+        "woodbridge",
+        # Coming soon (2026)
+        "forrestdale",
+    }),
+    "VIC": frozenset({
+        # Currently open
+        "ballarat",
+        "braybrook",
+        "chadstone",
+        "cranbourne",
+        "epping",
+        "frankston",
+        "hoppers crossing",
+        "knoxfield",
+        "langwarrin",
+        "maribyrnong",
+        "mentone",
+        "moorabbin airport",
+        "narre warren",
+        "noble park",
+        "nunawading",
+        "plenty valley",
+        "richmond",
+        "southland",       # Cheltenham address
+        "springvale",
+        # Coming soon (2026)
+        "footscray",
+        "bayswater north",
+    }),
+    "NSW": frozenset({
+        # Currently open
+        "castle hill",
+        "charlestown",
+        "jesmond",
+        "pitt st",
+        "pitt street",
+        "shellharbour",
+    }),
+}
+
+# Backwards-compat alias for the old SA-only constant.
+_SA_CLUB_NAMES: frozenset[str] = _CLUB_NAMES_BY_STATE["SA"]
+
+
+def known_states() -> list[str]:
+    """Return the list of state codes for which we have a hardcoded club list."""
+    return list(_CLUB_NAMES_BY_STATE.keys())
+
+
+def filter_clubs_by_state(
+    clubs: dict[str, ClubInfo], state: str,
+) -> dict[str, ClubInfo]:
+    """Return only clubs whose name matches a known location in *state*.
+
+    *state* is a case-insensitive Australian state code (``"SA"``, ``"WA"``,
+    ``"VIC"``, ``"NSW"``).  Unknown states return an empty dict.
+    """
+    names = _CLUB_NAMES_BY_STATE.get((state or "").upper())
+    if not names:
+        return {}
+    return {
+        name: info
+        for name, info in clubs.items()
+        if name.lower() in names
+    }
 
 
 def filter_sa_clubs(clubs: dict[str, ClubInfo]) -> dict[str, ClubInfo]:
     """Return only clubs whose name matches a known SA location."""
-    return {
-        name: info
-        for name, info in clubs.items()
-        if name.lower() in _SA_CLUB_NAMES
-    }
+    return filter_clubs_by_state(clubs, "SA")
 
 
 def find_club(clubs: dict[str, ClubInfo], query: str) -> ClubInfo | None:
