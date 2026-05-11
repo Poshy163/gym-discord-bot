@@ -414,6 +414,44 @@ def club_counter_with_client(
     return clubs, favorite
 
 
+# Known SA (South Australia) Revo club suburbs — used by filter_sa_clubs().
+# Names are compared case-insensitively; each entry is a full club name as it
+# appears in the portal.  Add new entries here when Revo opens SA locations.
+_SA_CLUB_NAMES: frozenset[str] = frozenset({
+    # Currently open
+    "aldinga",
+    "christies beach",
+    "gepps cross",
+    "glenelg",
+    "marion",
+    "mawson lakes",
+    "mile end",
+    "munno para",
+    "noarlunga",
+    "noarlunga centre",
+    "norwood",
+    "parafield",
+    "tea tree plaza",
+    "victor harbor",
+    # Coming soon (2026)
+    "elizabeth",
+    "golden grove",
+    "marleston",
+    "mount barker",
+    "port adelaide",
+    "trinity gardens",
+})
+
+
+def filter_sa_clubs(clubs: dict[str, ClubInfo]) -> dict[str, ClubInfo]:
+    """Return only clubs whose name matches a known SA location."""
+    return {
+        name: info
+        for name, info in clubs.items()
+        if name.lower() in _SA_CLUB_NAMES
+    }
+
+
 def find_club(clubs: dict[str, ClubInfo], query: str) -> ClubInfo | None:
     """Case-insensitive substring lookup over club names."""
     q = (query or "").strip().lower()
