@@ -117,6 +117,16 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 # get a 1e19 kg Lift back from us. 10 000 kg is well above any real machine.
 _PARSER_MAX_WEIGHT_KG = 10_000.0
 
+# Leading list markers in workout dumps: "1. Leg Press", "2) Bench", "- Squat",
+# "* Curls", "• Rows". Stripped before parsing so the equipment label is the
+# first thing on the line.
+_LIST_MARKER_RE = re.compile(r"^(?:[\-\*\u2022]|\d+\s*[.)])\s+")
+
+# Trailing rest/note annotations like "| 3 min rest" or "| 90 sec rest". The
+# pipe character never appears in real lift notation, so anything after it is
+# stripped to keep numbers in the rest column from being read as weights.
+_REST_ANNOTATION_RE = re.compile(r"\s*\|.*$")
+
 
 def _strip_chat_noise(text: str) -> str:
     """Remove URLs, code blocks, and Discord mention/emoji tokens.
@@ -380,6 +390,13 @@ def parse_message(
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
+        if not line:
+            continue
+        # Strip workout-dump decorations: "1. ", "- ", "* ", "• " prefixes
+        # and trailing "| 90 sec rest" annotations. Done before any other
+        # checks so list-formatted exercise lines parse like plain ones.
+        line = _LIST_MARKER_RE.sub("", line)
+        line = _REST_ANNOTATION_RE.sub("", line).strip()
         if not line:
             continue
         lower = line.lower()

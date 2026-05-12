@@ -234,3 +234,48 @@ def test_pounds_word():
     assert len(lifts) == 1
     assert abs(lifts[0].weight_kg - 142.88) < 0.02
 
+
+def test_numbered_list_workout_dump():
+    # Mobile screenshots / pasted programs use numbered lists with rest
+    # annotations after a pipe. Parser should strip both decorations.
+    text = (
+        "LEGS\n"
+        "1. Leg Press - 245kg | 3 min rest\n"
+        "2. Leg Extension - 88kg | 90 sec rest\n"
+        "3. Seated Leg Curl - 70kg | 90 sec rest\n"
+        "4. Diddy Machine - 90kg | 90 sec rest\n"
+        "5. Standing Calf - 150kg | 60 sec rest\n"
+    )
+    lifts = parse_message(text)
+    by_name = {lift.equipment: lift.weight_kg for lift in lifts}
+    assert by_name.get("leg press") == 245
+    assert by_name.get("leg extension") == 88
+    assert by_name.get("seated leg curl") == 70
+    # "Diddy Machine" / "Standing Calf" aren't in the alias table; they
+    # still parse with their raw labels because the structured "label - kg"
+    # form doesn't require a known canonical.
+    assert any(
+        abs(w - 90) < 0.01 and "diddy" in name
+        for name, w in by_name.items()
+    )
+    assert any(
+        abs(w - 150) < 0.01 and "calf" in name
+        for name, w in by_name.items()
+    )
+    # All structured -> safe to auto-store from passive chat.
+    assert should_auto_store_lifts(lifts, min_lifts=2) is True
+
+
+def test_numbered_list_strips_rest_range_annotation():
+    # The "60-90 sec rest" suffix must not be parsed as a 90 kg range.
+    lifts = parse_message("7. Preacher Curls - 15kg + bar | 60-90 sec rest")
+    assert len(lifts) == 1
+    assert lifts[0].weight_kg == 15
+
+
+def test_numbered_list_skips_bodyweight_entries():
+    # "Bodyweight" lines are dropped by the existing skip-token rule even
+    # when they wear list-marker decoration.
+    lifts = parse_message("1. Pull-ups - Bodyweight | 2-3 min rest")
+    assert lifts == []
+
