@@ -56,7 +56,14 @@ _SKIP_LINE_TOKENS = ("body weight", "bodyweight")
 _NUM = r"\d+(?:\.\d+)?"
 
 # Matches "equipment: value" style lines.
-_COLON_RE = re.compile(r"^\s*([A-Za-z][A-Za-z '\-/]{1,60}?)\s*[:\-]\s*(.+?)\s*$")
+# Separators accepted: ASCII colon ``:``, ASCII hyphen ``-``, en-dash ``–``
+# (U+2013), em-dash ``—`` (U+2014). The dash variants show up a lot when
+# people paste from notes apps that auto-correct ``-`` to ``—``.
+# Labels may include spaces, apostrophes, slashes, hyphens, and parentheses
+# so things like "Pull Ups (Assisted)" parse cleanly.
+_COLON_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z '\-/()]{1,60}?)\s*[:\-\u2013\u2014]\s*(.+?)\s*$"
+)
 
 # Matches a value portion and pulls out a weight.
 #   "45kg", "45 kg", "BW+20kg", "6 plates", "3.5 plates",

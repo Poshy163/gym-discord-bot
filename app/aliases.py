@@ -46,7 +46,7 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
         "chest flies",
     ],
     "solo arm pec dec": ["solo arm pec dec", "single arm pec dec"],
-    "chin assist": ["chin assist", "assisted pullups", "assisted pull ups", "assisted pull-ups"],
+    "chin assist": ["chin assist", "assisted pullups", "assisted pull ups", "assisted pull-ups", "pull ups assisted", "pullups assisted", "pull-ups assisted"],
     "pull ups": ["pull ups", "pullups", "pull-ups", "pull up"],
     "dips": ["dips", "dip"],
     "preacher curl": ["preacher curl", "preacher curls", "bicep preacher curls"],

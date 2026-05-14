@@ -279,3 +279,30 @@ def test_numbered_list_skips_bodyweight_entries():
     lifts = parse_message("1. Pull-ups - Bodyweight | 2-3 min rest")
     assert lifts == []
 
+
+def test_em_dash_separated_pb_dump_is_auto_stored():
+    """Notes apps love auto-correcting "-" to "—". The parser should
+    treat em-dash and en-dash as equivalent to ":" / "-", and labels with
+    parentheses ("Pull Ups (Assisted)") should resolve through the alias
+    table just like the bare phrasing.
+    """
+    text = (
+        "Arms / Upper Body PBs\n"
+        "Shoulder Press \u2014 31kg\n"
+        "Lat Pulldown \u2014 38kg\n"
+        "Pull Ups (Assisted) \u2013 50kg\n"
+        "Legs PBs\n"
+        "Leg Press \u2014 290kg\n"
+    )
+    lifts = parse_message(text)
+    by_eq = {lift.equipment: lift.weight_kg for lift in lifts}
+    assert by_eq["shoulder press"] == 31
+    assert by_eq["lat pulldown"] == 38
+    assert by_eq["leg press"] == 290
+    # "Pull Ups (Assisted)" canonicalises into the chin-assist group.
+    assert by_eq["chin assist"] == 50
+    # Section headers ("Arms / Upper Body PBs", "Legs PBs") must not
+    # leak in as fake equipment entries.
+    assert all("pbs" not in eq for eq in by_eq)
+    assert should_auto_store_lifts(lifts, min_lifts=2) is True
+
