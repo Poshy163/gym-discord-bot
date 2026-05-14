@@ -3043,6 +3043,64 @@ async def recent_cmd(
 
 
 @bot.tree.command(
+    name="export_lifts",
+    description="Export every logged lift for a user as a CSV attachment.",
+)
+@app_commands.describe(
+    user="The user whose lifts to export (defaults to you).",
+)
+async def export_lifts_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    rows = db.user_all_lifts(guild_id, target.id)
+    if not rows:
+        await interaction.response.send_message(
+            f"No lifts logged for {_display_name(target)} yet.",
+            ephemeral=True,
+        )
+        return
+
+    # Stream into an in-memory CSV — every column we keep on a lift row
+    # plus an Epley 1RM estimate so the export is useful on its own without
+    # the caller having to recompute it.
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "logged_at", "equipment", "weight_kg", "bodyweight_add",
+        "reps", "estimated_1rm_kg", "message_id", "channel_id", "raw",
+    ])
+    for r in rows:
+        reps = r["reps"] if "reps" in r.keys() else None
+        one_rm = estimated_one_rep_max(float(r["weight_kg"]), reps) if reps else None
+        writer.writerow([
+            r["logged_at"],
+            r["equipment"],
+            r["weight_kg"],
+            1 if r["bw"] else 0,
+            reps if reps is not None else "",
+            f"{one_rm:g}" if one_rm else "",
+            r["message_id"] if r["message_id"] is not None else "",
+            r["channel_id"] if r["channel_id"] is not None else "",
+            r["raw"] or "",
+        ])
+    data = buf.getvalue().encode("utf-8")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", _display_name(target)) or "user"
+    filename = f"lifts-{safe_name}-{stamp}.csv"
+    file = discord.File(io.BytesIO(data), filename=filename)
+    suffix = _target_suffix(interaction.user, target)
+    await interaction.response.send_message(
+        f"Exported {_plural(len(rows), 'lift')} for "
+        f"**{_display_name(target)}**{suffix}.",
+        file=file,
+    )
+
+
+@bot.tree.command(
     name="plates",
     description="Calculate the plate breakdown for a target barbell weight.",
 )

@@ -314,6 +314,31 @@ def test_user_latest_by_equipment_returns_latest_rows(db):
     assert rows["squat"]["weight_kg"] == 100
 
 
+def test_user_all_lifts_returns_every_row_chronologically(db):
+    """``/export_lifts`` relies on this for the CSV — so we need every row
+    for the user (no ``LIMIT``), in time order, and scoped to the right
+    user/guild."""
+    _add(
+        db, 1, 100, "bench", 80, msg_id=1,
+        logged_at=datetime(2026, 4, 20, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "bench", 60, msg_id=2,
+        logged_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
+    )
+    _add(
+        db, 1, 100, "squat", 100, msg_id=3,
+        logged_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
+    )
+    # Other user / other guild rows must be ignored.
+    _add(db, 1, 200, "bench", 70, msg_id=4)
+    _add(db, 2, 100, "bench", 70, msg_id=5)
+
+    rows = db.user_all_lifts(1, 100)
+    assert [r["weight_kg"] for r in rows] == [60, 100, 80]
+    assert [r["equipment"] for r in rows] == ["bench", "squat", "bench"]
+
+
 def test_pop_last_n_for_user_returns_newest_first(db):
     """``/undo count:N`` reads the returned rows for its receipt message,
     so the order matters — we want newest first."""

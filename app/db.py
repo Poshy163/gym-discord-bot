@@ -1013,6 +1013,28 @@ class Database:
                 (guild_id, user_id, limit),
             ))
 
+    def user_all_lifts(
+        self, guild_id: int, user_id: int,
+    ) -> list[sqlite3.Row]:
+        """Every lift entry across all equipment for one user.
+
+        Returned in chronological order so callers can stream straight into
+        a CSV / transcript without re-sorting. No ``LIMIT`` — used by
+        bulk-export surfaces like ``/export_lifts``.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT id, equipment, weight_kg,
+                       bodyweight_add AS bw, reps,
+                       logged_at, message_id, channel_id, raw
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at, id
+                """,
+                (guild_id, user_id),
+            ))
+
     def user_latest_by_equipment(
         self, guild_id: int, user_id: int,
     ) -> list[sqlite3.Row]:
