@@ -47,6 +47,7 @@ from .parser import (
 )
 from .presence import (
     PresenceSummary,
+    estimate_sleep_window,
     format_duration,
     is_online as _presence_is_online,
     summarize_presence,
@@ -5633,6 +5634,15 @@ def _render_schedule_embed(
             value=f"`{spark}`\n`0   6   12  18  23`",
             inline=False,
         )
+    # Sleep estimate (needs >= 3 days of data via by_hour buckets)
+    sleep = estimate_sleep_window(summary.by_hour, days)
+    if sleep is not None:
+        s_start, s_end = sleep
+        embed.add_field(
+            name=f"💤 Est. sleep ({DISPLAY_TZ})",
+            value=f"`{s_start:02d}:00` – `{s_end:02d}:59`",
+            inline=False,
+        )
     embed.set_footer(text=f"{summary.transitions} status changes recorded")
     return embed
 
@@ -5687,6 +5697,101 @@ async def track_schedule_cmd(
         events, window_start, now, display_tz=DISPLAY_TZ,
     )
     embed = _render_schedule_embed(user, summary, days)
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+# Maximum events to show in a single /track raw reply.
+_RAW_EVENT_LIMIT = 40
+
+
+@track_group.command(
+    name="raw",
+    description="Show raw online/offline timestamps for a tracked user.",
+)
+@app_commands.describe(
+    user="The member whose raw presence log to show.",
+    days="How many days back to show (1-90, default 7).",
+)
+async def track_raw_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    days: int = 7,
+) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
+    if days < 1 or days > 90:
+        await interaction.response.send_message(
+            "`days` must be between 1 and 90.", ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    rows = db.presence_events_for(
+        guild_id, user.id, since=window_start, until=now,
+    )
+    # Filter to only events strictly inside the window (not the carry-in).
+    inner = [r for r in rows if r["at"] >= window_start.isoformat()]
+    if not inner:
+        if not db.presence_is_tracked(guild_id, user.id):
+            await interaction.response.send_message(
+                f"No presence data for {user.mention} — an owner needs to "
+                "run `/track start` first.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                f"{user.mention} is being tracked but no status changes "
+                "were seen in that window yet.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return
+
+    # Take the most-recent _RAW_EVENT_LIMIT events, oldest first.
+    shown = inner[-_RAW_EVENT_LIMIT:]
+    truncated = len(inner) > _RAW_EVENT_LIMIT
+
+    lines: list[str] = []
+    for idx, row in enumerate(shown):
+        status = row["status"]
+        ts_str: str = row["at"]
+        ts_dt = datetime.fromisoformat(ts_str)
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        unix = int(ts_dt.timestamp())
+        dot = "🟢" if _presence_is_online(status) else "⚫"
+
+        # Duration since previous event.
+        if idx == 0:
+            dur_str = ""
+        else:
+            prev_ts = datetime.fromisoformat(shown[idx - 1]["at"])
+            if prev_ts.tzinfo is None:
+                prev_ts = prev_ts.replace(tzinfo=timezone.utc)
+            diff = ts_dt - prev_ts
+            dur_str = f"  ·  after {format_duration(diff.total_seconds())}"
+
+        lines.append(f"{dot} **{status}**  <t:{unix}:f>{dur_str}")
+
+    header = (
+        f"**{user.display_name}** — last **{days}** day{'s' if days != 1 else ''}"
+        f" ({len(inner)} event{'s' if len(inner) != 1 else ''})"
+    )
+    if truncated:
+        header += f"\n*Showing most recent {_RAW_EVENT_LIMIT} events only.*"
+
+    embed = discord.Embed(
+        title=f"📋 Raw presence log — {user.display_name}",
+        description=header + "\n\n" + "\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )

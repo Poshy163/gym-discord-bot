@@ -192,3 +192,55 @@ def format_duration(seconds: float) -> str:
     if minutes or not parts:
         parts.append(f"{minutes}m")
     return " ".join(parts)
+
+
+def estimate_sleep_window(
+    by_hour: dict[int, float],
+    days: int,
+    *,
+    offline_threshold: float = 0.75,
+    min_hours: int = 4,
+    max_hours: int = 12,
+) -> tuple[int, int] | None:
+    """Estimate a sleep window from per-hour online data.
+
+    Returns ``(start_hour, end_hour_inclusive)`` in 0–23 range (both in the
+    same timezone as the ``by_hour`` buckets), or ``None`` if the data is
+    insufficient or no clear window is found.
+
+    A "sleep" hour is one where the user was offline for at least
+    ``offline_threshold`` of its total possible duration.  The function finds
+    the longest consecutive run of sleep hours (wrapping around midnight) and
+    returns it only if its length is in ``[min_hours, max_hours]``.
+
+    Requires at least 3 days of data for a meaningful estimate.
+    """
+    if not by_hour or days < 3:
+        return None
+
+    max_possible = days * 3600.0
+    # For each hour 0-23: is the user mostly offline?
+    asleep = [
+        (1.0 - min(1.0, by_hour.get(h, 0.0) / max_possible)) >= offline_threshold
+        for h in range(24)
+    ]
+
+    # Longest consecutive run with circular wrap-around (double the list).
+    best_len, best_start = 0, -1
+    cur_len, cur_start = 0, -1
+    for i, v in enumerate(asleep * 2):
+        if v:
+            if cur_len == 0:
+                cur_start = i
+            cur_len += 1
+            if cur_len > best_len:
+                best_len, best_start = cur_len, cur_start
+        else:
+            cur_len = 0
+
+    if best_len < min_hours or best_len > max_hours or best_start < 0:
+        return None
+
+    start = best_start % 24
+    end = (best_start + best_len - 1) % 24
+    return (start, end)
