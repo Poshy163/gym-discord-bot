@@ -130,6 +130,30 @@ CREATE TABLE IF NOT EXISTS user_nicknames (
     set_by    INTEGER NOT NULL,
     set_at    TEXT    NOT NULL
 );
+
+-- Presence tracking. ``presence_tracked_users`` is the owner-managed
+-- allow-list of (guild, user) pairs whose Discord status transitions we
+-- record. ``presence_events`` is an append-only log of those transitions
+-- — one row per actual status change (we de-dupe consecutive duplicates
+-- in the writer). ``status`` is one of: online, idle, dnd, offline.
+CREATE TABLE IF NOT EXISTS presence_tracked_users (
+    guild_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    started_by  INTEGER NOT NULL,
+    started_at  TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS presence_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    status    TEXT    NOT NULL,
+    at        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_presence_events_user
+    ON presence_events (guild_id, user_id, at);
 """
 
 
@@ -1856,3 +1880,120 @@ class Database:
                 [guild_id, *unique],
             ).fetchall()
         return {int(r["user_id"]): float(r["weight_kg"]) for r in rows}
+
+    # ------------------------------------------------------------------
+    # Presence tracking
+    # ------------------------------------------------------------------
+    def presence_track_add(
+        self, guild_id: int, user_id: int, started_by: int,
+    ) -> bool:
+        """Mark ``user_id`` as tracked in ``guild_id``. Returns True if a new
+        row was inserted, False if it was already being tracked."""
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO presence_tracked_users "
+                "(guild_id, user_id, started_by, started_at) VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, started_by, ts),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def presence_track_remove(
+        self, guild_id: int, user_id: int, *, purge: bool = False,
+    ) -> bool:
+        """Stop tracking ``user_id``. If ``purge`` is True, also delete the
+        recorded event history. Returns True if a tracking row existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM presence_tracked_users "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            removed = (cur.rowcount or 0) > 0
+            if purge:
+                c.execute(
+                    "DELETE FROM presence_events "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+            return removed
+
+    def presence_track_list(self, guild_id: int) -> list[sqlite3.Row]:
+        """All users currently being presence-tracked in ``guild_id``."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, started_by, started_at "
+                "FROM presence_tracked_users WHERE guild_id = ? "
+                "ORDER BY started_at",
+                (guild_id,),
+            ))
+
+    def presence_is_tracked(self, guild_id: int, user_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM presence_tracked_users "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+            return row is not None
+
+    def presence_log_event(
+        self, guild_id: int, user_id: int, status: str,
+        at: datetime | None = None,
+    ) -> bool:
+        """Append a presence event, de-duplicating against the most recent
+        stored status for this user. Returns True if a row was inserted."""
+        ts = _normalize_iso(at)
+        with self._conn() as c:
+            last = c.execute(
+                "SELECT status FROM presence_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY at DESC, id DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+            if last is not None and last["status"] == status:
+                return False
+            c.execute(
+                "INSERT INTO presence_events (guild_id, user_id, status, at) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, status, ts),
+            )
+            return True
+
+    def presence_events_for(
+        self, guild_id: int, user_id: int,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return presence events for ``user_id`` in chronological order.
+
+        Also includes the most recent event strictly before ``since`` (if
+        any) so callers can know the user's status at the start of the
+        window without needing a separate query.
+        """
+        with self._conn() as c:
+            rows: list[sqlite3.Row] = []
+            if since is not None:
+                start_iso = _normalize_iso(since)
+                prior = c.execute(
+                    "SELECT status, at FROM presence_events "
+                    "WHERE guild_id = ? AND user_id = ? AND at < ? "
+                    "ORDER BY at DESC, id DESC LIMIT 1",
+                    (guild_id, user_id, start_iso),
+                ).fetchone()
+                if prior is not None:
+                    rows.append(prior)
+                params: list = [guild_id, user_id, start_iso]
+                where = "guild_id = ? AND user_id = ? AND at >= ?"
+            else:
+                params = [guild_id, user_id]
+                where = "guild_id = ? AND user_id = ?"
+            if until is not None:
+                where += " AND at <= ?"
+                params.append(_normalize_iso(until))
+            rows.extend(c.execute(
+                f"SELECT status, at FROM presence_events WHERE {where} "
+                "ORDER BY at ASC, id ASC",
+                params,
+            ).fetchall())
+            return rows

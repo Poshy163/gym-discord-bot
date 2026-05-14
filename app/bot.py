@@ -45,6 +45,12 @@ from .parser import (
     parse_message,
     should_auto_store_lifts,
 )
+from .presence import (
+    PresenceSummary,
+    format_duration,
+    is_online as _presence_is_online,
+    summarize_presence,
+)
 from . import __version__
 from . import revo_client
 
@@ -196,6 +202,12 @@ db = Database(DB_PATH)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = False
+# Presence tracking (/track) needs the privileged presences + members
+# intents. Both must also be flipped on in the Discord Developer Portal
+# for the bot user; if they aren't, presence updates simply won't fire
+# and the /track schedule command will report "no data".
+intents.presences = True
+intents.members = True
 bot = commands.Bot(command_prefix="!gym ", intents=intents)
 
 
@@ -5387,6 +5399,258 @@ async def _poll_one_account(row) -> None:
 @revo_attendance_poll.before_loop
 async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Presence tracking (/track ...)
+# ---------------------------------------------------------------------------
+# Owner-only commands let admins start/stop logging a user's online/offline
+# transitions. Anyone can run /track schedule to view aggregated activity
+# from the recorded events.
+
+_PRESENCE_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _is_owner(user_id: int) -> bool:
+    """True if ``user_id`` is in the configured ADMIN_USER_IDS allow-list."""
+    return user_id in ADMIN_USER_IDS
+
+
+def _discord_status_to_str(status: discord.Status) -> str:
+    """Map discord.Status enum -> the short string we persist."""
+    # discord.Status.value is already 'online'/'idle'/'dnd'/'offline'/'invisible'
+    return str(status.value)
+
+
+@bot.event
+async def on_presence_update(
+    before: discord.Member, after: discord.Member,
+) -> None:  # pragma: no cover - discord runtime path
+    """Record status transitions for tracked users only."""
+    try:
+        if after.guild is None:
+            return
+        if before.status == after.status:
+            return
+        if not db.presence_is_tracked(after.guild.id, after.id):
+            return
+        status = _discord_status_to_str(after.status)
+        db.presence_log_event(after.guild.id, after.id, status)
+    except Exception:
+        LOG.exception("Failed to record presence update")
+
+
+track_group = app_commands.Group(
+    name="track",
+    description="Track and view a user's online/offline schedule.",
+)
+
+
+@track_group.command(
+    name="start", description="(Owner) Begin recording a user's online/offline status.",
+)
+@app_commands.describe(user="The member whose presence to start tracking.")
+async def track_start_cmd(
+    interaction: discord.Interaction, user: discord.Member,
+) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can start presence tracking.", ephemeral=True,
+        )
+        return
+    if user.bot:
+        await interaction.response.send_message(
+            "I won't track other bots.", ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    inserted = db.presence_track_add(guild_id, user.id, interaction.user.id)
+    # Seed the log with the user's current status so /track schedule has
+    # something useful to report immediately rather than waiting for the
+    # next transition.
+    try:
+        db.presence_log_event(
+            guild_id, user.id, _discord_status_to_str(user.status),
+        )
+    except Exception:
+        LOG.exception("Failed to seed initial presence event")
+    msg = (
+        f"Now tracking {user.mention}'s presence." if inserted
+        else f"{user.mention} was already being tracked."
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@track_group.command(
+    name="stop", description="(Owner) Stop recording a user's presence.",
+)
+@app_commands.describe(
+    user="The member to stop tracking.",
+    purge="Also delete the recorded event history (default: keep history).",
+)
+async def track_stop_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    purge: bool = False,
+) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can stop presence tracking.", ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    removed = db.presence_track_remove(guild_id, user.id, purge=purge)
+    if not removed and not purge:
+        await interaction.response.send_message(
+            f"{user.mention} wasn't being tracked.", ephemeral=True,
+        )
+        return
+    suffix = " (history purged)" if purge else ""
+    await interaction.response.send_message(
+        f"Stopped tracking {user.mention}.{suffix}", ephemeral=True,
+    )
+
+
+@track_group.command(
+    name="list", description="(Owner) Show who is currently being tracked.",
+)
+async def track_list_cmd(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can view the tracking list.", ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    rows = db.presence_track_list(guild_id)
+    if not rows:
+        await interaction.response.send_message(
+            "Nobody is being tracked in this server.", ephemeral=True,
+        )
+        return
+    lines = ["**Tracked users:**"]
+    for r in rows:
+        lines.append(
+            f"• <@{int(r['user_id'])}> — since "
+            f"<t:{int(datetime.fromisoformat(r['started_at']).timestamp())}:R>"
+        )
+    await interaction.response.send_message(
+        "\n".join(lines),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+def _render_schedule_embed(
+    user: discord.abc.User,
+    summary: PresenceSummary,
+    days: int,
+) -> discord.Embed:
+    """Build the /track schedule embed from a PresenceSummary."""
+    embed = discord.Embed(
+        title=f"📅 Presence schedule — {user.display_name}",
+        colour=EMBED_COLOUR,
+        description=f"Last **{days}** day{'s' if days != 1 else ''} of recorded activity.",
+    )
+    online = format_duration(summary.online_seconds)
+    offline = format_duration(summary.offline_seconds)
+    embed.add_field(name="🟢 Online", value=online, inline=True)
+    embed.add_field(name="⚫ Offline", value=offline, inline=True)
+    if summary.final_status:
+        dot = "🟢" if _presence_is_online(summary.final_status) else "⚫"
+        embed.add_field(
+            name="Now", value=f"{dot} {summary.final_status}", inline=True,
+        )
+    if summary.last_online_at is not None:
+        ts = int(summary.last_online_at.timestamp())
+        embed.add_field(
+            name="Last seen online", value=f"<t:{ts}:R>", inline=False,
+        )
+
+    # Per-weekday bar (online time only).
+    if summary.by_weekday:
+        max_wd = max(summary.by_weekday.values()) or 1.0
+        wd_lines = []
+        for i in range(7):
+            secs = summary.by_weekday.get(i, 0.0)
+            bar = "▇" * max(1, int(round(secs / max_wd * 10))) if secs else "·"
+            wd_lines.append(
+                f"`{_PRESENCE_WEEKDAY_NAMES[i]}` {bar}  {format_duration(secs)}"
+            )
+        embed.add_field(
+            name="By weekday", value="\n".join(wd_lines), inline=False,
+        )
+
+    # Per-hour bar (online time only). 24 rows is too long; collapse into
+    # a single 24-character sparkline so it fits in one field.
+    if summary.by_hour:
+        max_hr = max(summary.by_hour.values()) or 1.0
+        glyphs = " ▁▂▃▄▅▆▇█"
+        spark = "".join(
+            glyphs[min(len(glyphs) - 1, int(round(
+                (summary.by_hour.get(h, 0.0) / max_hr) * (len(glyphs) - 1)
+            )))]
+            for h in range(24)
+        )
+        embed.add_field(
+            name=f"By hour ({DISPLAY_TZ})",
+            value=f"`{spark}`\n`0   6   12  18  23`",
+            inline=False,
+        )
+    embed.set_footer(text=f"{summary.transitions} status changes recorded")
+    return embed
+
+
+@track_group.command(
+    name="schedule",
+    description="Show a user's online/offline schedule from recorded data.",
+)
+@app_commands.describe(
+    user="The member whose schedule to show.",
+    days="How many days back to summarise (1-90, default 7).",
+)
+async def track_schedule_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    days: int = 7,
+) -> None:
+    if days < 1 or days > 90:
+        await interaction.response.send_message(
+            "`days` must be between 1 and 90.", ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    rows = db.presence_events_for(
+        guild_id, user.id, since=window_start, until=now,
+    )
+    if not rows:
+        if not db.presence_is_tracked(guild_id, user.id):
+            await interaction.response.send_message(
+                f"No presence data for {user.mention} yet — an owner needs "
+                "to run `/track start` for them first.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                f"{user.mention} is being tracked, but no status changes "
+                "have been seen in that window yet.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return
+    events = [(r["status"], r["at"]) for r in rows]
+    summary = summarize_presence(
+        events, window_start, now, display_tz=DISPLAY_TZ,
+    )
+    embed = _render_schedule_embed(user, summary, days)
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+bot.tree.add_command(track_group)
 
 
 def main() -> None:
