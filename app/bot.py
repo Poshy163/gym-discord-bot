@@ -199,15 +199,22 @@ EMBED_COLOUR = discord.Colour.from_str("#f26522")
 
 db = Database(DB_PATH)
 
+# Presence tracking (/track) needs the privileged presences + members
+# intents. Both must also be flipped on in the Discord Developer Portal
+# for the bot user — without those toggles Discord refuses the gateway
+# connection. We default this OFF so the bot still boots for users who
+# don't need /track; opt in by setting ENABLE_PRESENCE_TRACKING=true and
+# enabling the toggles in the portal.
+ENABLE_PRESENCE_TRACKING = os.getenv(
+    "ENABLE_PRESENCE_TRACKING", "false"
+).lower() in ("1", "true", "yes", "y", "on")
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = False
-# Presence tracking (/track) needs the privileged presences + members
-# intents. Both must also be flipped on in the Discord Developer Portal
-# for the bot user; if they aren't, presence updates simply won't fire
-# and the /track schedule command will report "no data".
-intents.presences = True
-intents.members = True
+if ENABLE_PRESENCE_TRACKING:
+    intents.presences = True
+    intents.members = True
 bot = commands.Bot(command_prefix="!gym ", intents=intents)
 
 
@@ -819,6 +826,12 @@ async def on_ready() -> None:
         "Logged in as %s (id=%s) — gym-bot v%s",
         bot.user, bot.user.id if bot.user else "?", __version__,
     )
+    if ENABLE_PRESENCE_TRACKING:
+        LOG.info(
+            "Presence tracking ENABLED (privileged intents in use). "
+            "Make sure Presence + Server Members intents are toggled on "
+            "in the Discord Developer Portal."
+        )
     try:
         if DEV_GUILD is not None:
             bot.tree.copy_global_to(guild=DEV_GUILD)
@@ -5427,6 +5440,8 @@ async def on_presence_update(
     before: discord.Member, after: discord.Member,
 ) -> None:  # pragma: no cover - discord runtime path
     """Record status transitions for tracked users only."""
+    if not ENABLE_PRESENCE_TRACKING:
+        return
     try:
         if after.guild is None:
             return
@@ -5446,6 +5461,13 @@ track_group = app_commands.Group(
 )
 
 
+_PRESENCE_DISABLED_MSG = (
+    "Presence tracking is disabled. Set `ENABLE_PRESENCE_TRACKING=true` and "
+    "enable the **Presence Intent** + **Server Members Intent** toggles in "
+    "the Discord Developer Portal, then restart the bot."
+)
+
+
 @track_group.command(
     name="start", description="(Owner) Begin recording a user's online/offline status.",
 )
@@ -5453,6 +5475,11 @@ track_group = app_commands.Group(
 async def track_start_cmd(
     interaction: discord.Interaction, user: discord.Member,
 ) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
             "Only bot owners can start presence tracking.", ephemeral=True,
@@ -5493,6 +5520,11 @@ async def track_stop_cmd(
     user: discord.Member,
     purge: bool = False,
 ) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
             "Only bot owners can stop presence tracking.", ephemeral=True,
@@ -5515,6 +5547,11 @@ async def track_stop_cmd(
     name="list", description="(Owner) Show who is currently being tracked.",
 )
 async def track_list_cmd(interaction: discord.Interaction) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
             "Only bot owners can view the tracking list.", ephemeral=True,
@@ -5613,6 +5650,11 @@ async def track_schedule_cmd(
     user: discord.Member,
     days: int = 7,
 ) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
     if days < 1 or days > 90:
         await interaction.response.send_message(
             "`days` must be between 1 and 90.", ephemeral=True,
