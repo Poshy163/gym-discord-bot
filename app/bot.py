@@ -5063,9 +5063,8 @@ async def revo_calendar_cmd(
         return
 
     today = datetime.now()
-    is_current_month = (m == today.month and y == today.year)
-    today_day = today.day if is_current_month else None
-    grid = _render_revo_calendar(m, y, result, today_day=today_day)
+    today_day = today.day if (m == today.month and y == today.year) else None
+    grid = _render_revo_calendar(m, y, result)
     month_name = datetime(y, m, 1).strftime("%B %Y")
     attended_count = sum(1 for v in result.values() if v)
     _, days_in_month = monthrange(y, m)
@@ -5079,8 +5078,7 @@ async def revo_calendar_cmd(
         f"🔥 Streak: **{current_streak}** day{'s' if current_streak != 1 else ''} "
         f"· Best: **{best_streak}** day{'s' if best_streak != 1 else ''}"
     )
-    today_legend = "🟡 today (attended) · 🔲 today (not yet) · " if is_current_month else ""
-    legend = f"{today_legend}🔥 attended · ⬜ missed · ⬛ out of month"
+    legend = "🔥 attended · ⬜ missed · ⬛ out of month"
     body = f"{header}\n{grid}\n{streak_line}\n-# {legend}"
     await interaction.followup.send(
         body,
@@ -5169,8 +5167,7 @@ async def revo_calendar_compare_cmd(
     results.sort(key=lambda t: _count(t[1]), reverse=True)
 
     today = datetime.now()
-    is_current_month = (m == today.month and y == today.year)
-    today_day = today.day if is_current_month else None
+    today_day = today.day if (m == today.month and y == today.year) else None
     _, days_in_month = monthrange(y, m)
 
     month_name = datetime(y, m, 1).strftime("%B %Y")
@@ -5188,15 +5185,14 @@ async def revo_calendar_compare_cmd(
         lines.append(f"**{name}** — {count_str}")
         if cal is not None:
             cur_streak, best_streak = _calc_streaks(cal, days_in_month, today_day)
-            lines.append(_render_revo_calendar(m, y, cal, today_day=today_day))
+            lines.append(_render_revo_calendar(m, y, cal))
             lines.append(
                 f"-# 🔥 Streak: {cur_streak} · Best: {best_streak}"
             )
         else:
             lines.append("*Could not fetch calendar.*")
 
-    today_legend = "🟡 today · " if is_current_month else ""
-    legend = f"-# {today_legend}🔥 attended · ⬜ missed · ⬛ out of month"
+    legend = "-# 🔥 attended · ⬜ missed · ⬛ out of month"
     body = "\n".join(lines)
     if len(body) + len(legend) + 1 > 1990:
         body = body[:1900] + "\n*…truncated (too many members to fit)*"
@@ -5213,34 +5209,32 @@ def _render_revo_calendar(
     month: int,
     year: int,
     attended: "dict[int, bool]",
-    today_day: int | None = None,
 ) -> str:
-    """Render a Mon-Sun emoji grid inside a triple-backtick code block.
-
-    Wrapping the weekday header and emoji rows in the same code block keeps
-    them in the same font-metric context, so columns stay aligned across
-    Discord desktop and mobile clients.
+    """Render a weekday-labelled emoji calendar.
 
     🔥 = attended, ⬜ = missed, ⬛ = out-of-month padding.
-    🟡 = today (attended), 🔲 = today (not attended / future).
+
+    Discord renders text and emoji with different widths, so a traditional
+    text header above emoji columns drifts out of alignment. Labelling each
+    weekday row keeps the relationship clear while preserving the original
+    emoji style.
     """
     first_weekday, days_in_month = monthrange(year, month)  # Monday=0
     FIRE = "🔥"
     BLANK = "⬜"
     PAD = "⬛"
-    TODAY_ATTENDED = "🟡"
-    TODAY_MISSED = "🔲"
     cells: list[str] = [PAD] * first_weekday
     for day in range(1, days_in_month + 1):
-        if day == today_day:
-            cells.append(TODAY_ATTENDED if attended.get(day) else TODAY_MISSED)
-        else:
-            cells.append(FIRE if attended.get(day) else BLANK)
+        cells.append(FIRE if attended.get(day) else BLANK)
     while len(cells) % 7 != 0:
         cells.append(PAD)
-    rows = [" ".join(cells[r : r + 7]) for r in range(0, len(cells), 7)]
-    grid = "\n".join(rows)
-    return f"```\nMo Tu We Th Fr Sa Su\n{grid}\n```"
+    weeks = [cells[r : r + 7] for r in range(0, len(cells), 7)]
+    weekday_labels = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+    rows = [
+        f"`{label}` " + " ".join(week[weekday] for week in weeks)
+        for weekday, label in enumerate(weekday_labels)
+    ]
+    return "\n".join(rows)
 
 
 def _calc_streaks(
