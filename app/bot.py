@@ -5062,18 +5062,26 @@ async def revo_calendar_cmd(
         await interaction.followup.send(msg, ephemeral=True)
         return
 
-    grid = _render_revo_calendar(m, y, result)
+    today = datetime.now()
+    is_current_month = (m == today.month and y == today.year)
+    today_day = today.day if is_current_month else None
+    grid = _render_revo_calendar(m, y, result, today_day=today_day)
     month_name = datetime(y, m, 1).strftime("%B %Y")
     attended_count = sum(1 for v in result.values() if v)
+    _, days_in_month = monthrange(y, m)
+    current_streak, best_streak = _calc_streaks(result, days_in_month, today_day)
     display = _bot_name(target.id, target.display_name)
     header = (
         f"🔥 **{display}** — Revo check-ins for **{month_name}** "
         f"({attended_count} day{'s' if attended_count != 1 else ''})"
     )
-    legend = "🔥 attended · ⬜ missed · ⬛ out of month"
-    # Weekday header — monospace via code-free bold isn't reliable, so we
-    # sandwich the grid in a small code block just for the header row.
-    body = f"{header}\n`Mo Tu We Th Fr Sa Su`\n{grid}\n-# {legend}"
+    streak_line = (
+        f"🔥 Streak: **{current_streak}** day{'s' if current_streak != 1 else ''} "
+        f"· Best: **{best_streak}** day{'s' if best_streak != 1 else ''}"
+    )
+    today_legend = "🟡 today (attended) · 🔲 today (not yet) · " if is_current_month else ""
+    legend = f"{today_legend}🔥 attended · ⬜ missed · ⬛ out of month"
+    body = f"{header}\n{grid}\n{streak_line}\n-# {legend}"
     await interaction.followup.send(
         body,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -5160,11 +5168,15 @@ async def revo_calendar_compare_cmd(
 
     results.sort(key=lambda t: _count(t[1]), reverse=True)
 
+    today = datetime.now()
+    is_current_month = (m == today.month and y == today.year)
+    today_day = today.day if is_current_month else None
+    _, days_in_month = monthrange(y, m)
+
     month_name = datetime(y, m, 1).strftime("%B %Y")
     n = len(results)
     lines = [
         f"**🔥 Revo Check-ins — {month_name}** ({n} member{'s' if n != 1 else ''})",
-        "`Mo Tu We Th Fr Sa Su`",
     ]
     for uid, cal in results:
         count = _count(cal)
@@ -5175,11 +5187,16 @@ async def revo_calendar_compare_cmd(
         lines.append("")
         lines.append(f"**{name}** — {count_str}")
         if cal is not None:
-            lines.append(_render_revo_calendar(m, y, cal))
+            cur_streak, best_streak = _calc_streaks(cal, days_in_month, today_day)
+            lines.append(_render_revo_calendar(m, y, cal, today_day=today_day))
+            lines.append(
+                f"-# 🔥 Streak: {cur_streak} · Best: {best_streak}"
+            )
         else:
             lines.append("*Could not fetch calendar.*")
 
-    legend = "-# 🔥 attended · ⬜ missed · ⬛ out of month"
+    today_legend = "🟡 today · " if is_current_month else ""
+    legend = f"-# {today_legend}🔥 attended · ⬜ missed · ⬛ out of month"
     body = "\n".join(lines)
     if len(body) + len(legend) + 1 > 1990:
         body = body[:1900] + "\n*…truncated (too many members to fit)*"
@@ -5192,25 +5209,63 @@ async def revo_calendar_compare_cmd(
     )
 
 
-def _render_revo_calendar(month: int, year: int, attended: "dict[int, bool]") -> str:
-    """Render a Mon-Sun emoji grid.
+def _render_revo_calendar(
+    month: int,
+    year: int,
+    attended: "dict[int, bool]",
+    today_day: int | None = None,
+) -> str:
+    """Render a Mon-Sun emoji grid inside a triple-backtick code block.
 
-    🔥 = attended day, ⬜ = missed day, ⬛ = out-of-month padding.
-    Each row is one week; no code-block needed.
+    Wrapping the weekday header and emoji rows in the same code block keeps
+    them in the same font-metric context, so columns stay aligned across
+    Discord desktop and mobile clients.
+
+    🔥 = attended, ⬜ = missed, ⬛ = out-of-month padding.
+    🟡 = today (attended), 🔲 = today (not attended / future).
     """
     first_weekday, days_in_month = monthrange(year, month)  # Monday=0
-    # Header row uses thin-space separated day initials
-    header = "Mo Tu We Th Fr Sa Su"
     FIRE = "🔥"
     BLANK = "⬜"
     PAD = "⬛"
+    TODAY_ATTENDED = "🟡"
+    TODAY_MISSED = "🔲"
     cells: list[str] = [PAD] * first_weekday
     for day in range(1, days_in_month + 1):
-        cells.append(FIRE if attended.get(day) else BLANK)
+        if day == today_day:
+            cells.append(TODAY_ATTENDED if attended.get(day) else TODAY_MISSED)
+        else:
+            cells.append(FIRE if attended.get(day) else BLANK)
     while len(cells) % 7 != 0:
         cells.append(PAD)
     rows = [" ".join(cells[r : r + 7]) for r in range(0, len(cells), 7)]
-    return "\n".join(rows)
+    grid = "\n".join(rows)
+    return f"```\nMo Tu We Th Fr Sa Su\n{grid}\n```"
+
+
+def _calc_streaks(
+    attended: "dict[int, bool]",
+    days_in_month: int,
+    today_day: int | None = None,
+) -> tuple[int, int]:
+    """Return (current_streak, best_streak) for the month.
+
+    *current_streak* is the consecutive-attended run ending on ``today_day``
+    (or the last day of the month when ``today_day`` is ``None``).
+    *best_streak* is the longest such run anywhere in the month up to that day.
+    """
+    end = today_day if today_day is not None else days_in_month
+    current = 0
+    best = 0
+    run = 0
+    for d in range(1, end + 1):
+        if attended.get(d):
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    current = run
+    return current, best
 
 
 def _bot_name(user_id: int, discord_fallback: str) -> str:
