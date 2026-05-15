@@ -872,6 +872,9 @@ async def on_ready() -> None:
             DISPLAY_TZ, DAILY_UPDATE_CHANNEL_ID,
         )
 
+    if ENABLE_PRESENCE_TRACKING:
+        _seed_tracked_presence_snapshots()
+
     if (
         not REVO_DISABLED
         and revo_client.available()
@@ -5210,31 +5213,31 @@ def _render_revo_calendar(
     year: int,
     attended: "dict[int, bool]",
 ) -> str:
-    """Render a weekday-labelled emoji calendar.
+    """Render a Mon-Sun emoji grid in a code block.
 
     🔥 = attended, ⬜ = missed, ⬛ = out-of-month padding.
 
-    Discord renders text and emoji with different widths, so a traditional
-    text header above emoji columns drifts out of alignment. Labelling each
-    weekday row keeps the relationship clear while preserving the original
-    emoji style.
+    The weekday header and each emoji row use the same separator inside one
+    code block. Two spaces gives the emoji cells enough visual room in
+    Discord, where emoji glyphs are wider than plain text characters.
     """
     first_weekday, days_in_month = monthrange(year, month)  # Monday=0
     FIRE = "🔥"
     BLANK = "⬜"
     PAD = "⬛"
+    CELL_SEP = "  "
     cells: list[str] = [PAD] * first_weekday
     for day in range(1, days_in_month + 1):
         cells.append(FIRE if attended.get(day) else BLANK)
     while len(cells) % 7 != 0:
         cells.append(PAD)
-    weeks = [cells[r : r + 7] for r in range(0, len(cells), 7)]
-    weekday_labels = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
     rows = [
-        f"`{label}` " + " ".join(week[weekday] for week in weeks)
-        for weekday, label in enumerate(weekday_labels)
+        CELL_SEP.join(cells[row_start : row_start + 7])
+        for row_start in range(0, len(cells), 7)
     ]
-    return "\n".join(rows)
+    header = CELL_SEP.join(("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"))
+    grid = "\n".join(rows)
+    return f"```\n{header}\n{grid}\n```"
 
 
 def _calc_streaks(
@@ -5498,8 +5501,8 @@ def _discord_status_to_str(status: discord.Status) -> str:
 def _get_main_activity(member: discord.Member) -> str | None:
     """Return the primary game/app name from a member's activities, or None.
 
-    Ignores Spotify, custom statuses, and streaming — we only care about
-    games and generic app activities.
+    Ignores Spotify and custom statuses; we only care about games and generic
+    app activities.
     """
     for act in member.activities:
         if isinstance(act, discord.Spotify):
@@ -5511,6 +5514,33 @@ def _get_main_activity(member: discord.Member) -> str | None:
             if name:
                 return str(name)
     return None
+
+
+def _seed_presence_snapshot(guild_id: int, member: discord.Member) -> None:
+    """Persist the member's current status and primary activity.
+
+    Presence updates are transition-based. Seeding a snapshot means /track can
+    show a game/app that was already active when tracking started, or when the
+    bot came back online after a restart.
+    """
+    db.presence_log_event(guild_id, member.id, _discord_status_to_str(member.status))
+    db.activity_log_event(guild_id, member.id, _get_main_activity(member))
+
+
+def _seed_tracked_presence_snapshots() -> None:
+    """Refresh current status/activity for tracked users visible in cache."""
+    for guild in bot.guilds:
+        for row in db.presence_track_list(guild.id):
+            member = guild.get_member(int(row["user_id"]))
+            if member is None:
+                continue
+            try:
+                _seed_presence_snapshot(guild.id, member)
+            except Exception:
+                LOG.exception(
+                    "Failed to seed tracked presence snapshot for user %s in guild %s",
+                    row["user_id"], guild.id,
+                )
 
 
 @bot.event
@@ -5575,15 +5605,12 @@ async def track_start_cmd(
         return
     guild_id = interaction.guild_id or 0
     inserted = db.presence_track_add(guild_id, user.id, interaction.user.id)
-    # Seed the log with the user's current status so /track schedule has
-    # something useful to report immediately rather than waiting for the
-    # next transition.
+    # Seed status + activity so /track has something useful immediately,
+    # even if the user was already playing a game before tracking started.
     try:
-        db.presence_log_event(
-            guild_id, user.id, _discord_status_to_str(user.status),
-        )
+        _seed_presence_snapshot(guild_id, user)
     except Exception:
-        LOG.exception("Failed to seed initial presence event")
+        LOG.exception("Failed to seed initial presence snapshot")
     msg = (
         f"Now tracking {user.mention}'s presence." if inserted
         else f"{user.mention} was already being tracked."

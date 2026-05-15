@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import os
 
+import discord
+
 # Ensure the bot doesn't try to connect on import — DISCORD_TOKEN isn't
 # read until run() so we mainly need a stable DB path.
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
+    _get_main_activity,
     _parse_bodyweight_message,
     _rejected_lifts_note,
+    _render_revo_calendar,
     _safe_label,
     _true_weight_kg,
     _true_weight_suffix,
@@ -70,6 +74,27 @@ def test_rejected_lifts_note_sanitizes_equipment():
 
 def test_rejected_lifts_note_empty_returns_blank():
     assert _rejected_lifts_note([]) == ""
+
+
+def test_render_revo_calendar_keeps_header_and_emoji_columns_aligned():
+    attended = {8: True, 11: True, 12: True, 14: True, 15: True}
+    assert _render_revo_calendar(5, 2026, attended) == (
+        "```\n"
+        "Mo  Tu  We  Th  Fr  Sa  Su\n"
+        "⬛  ⬛  ⬛  ⬛  ⬜  ⬜  ⬜\n"
+        "⬜  ⬜  ⬜  ⬜  🔥  ⬜  ⬜\n"
+        "🔥  🔥  ⬜  🔥  🔥  ⬜  ⬜\n"
+        "⬜  ⬜  ⬜  ⬜  ⬜  ⬜  ⬜\n"
+        "⬜  ⬜  ⬜  ⬜  ⬜  ⬜  ⬜\n"
+        "```"
+    )
+
+
+def test_get_main_activity_recognizes_discord_game():
+    class MemberStub:
+        activities = [discord.Game("Rust")]
+
+    assert _get_main_activity(MemberStub()) == "Rust"
 
 
 # --- True-weight helper ---------------------------------------------------

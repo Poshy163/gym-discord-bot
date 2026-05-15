@@ -88,3 +88,27 @@ def test_remove_without_purge_keeps_history(db):
     rows = db.presence_events_for(1, 100)
     assert len(rows) == 1
     assert rows[0]["status"] == "online"
+
+
+def test_activity_log_event_ignores_initial_empty_activity(db):
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+    assert db.activity_log_event(1, 100, None, at=base) is False
+
+    rows = db.activity_events_for(1, 100)
+    assert rows == []
+
+
+def test_activity_log_event_records_games_and_stops(db):
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+    assert db.activity_log_event(1, 100, "Rust", at=base) is True
+    assert db.activity_log_event(
+        1, 100, "Rust", at=base + timedelta(minutes=5),
+    ) is False
+    assert db.activity_log_event(
+        1, 100, None, at=base + timedelta(minutes=10),
+    ) is True
+
+    rows = db.activity_events_for(1, 100)
+    assert [r["activity"] for r in rows] == ["Rust", None]

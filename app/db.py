@@ -2030,6 +2030,8 @@ class Database:
                 "ORDER BY at DESC, id DESC LIMIT 1",
                 (guild_id, user_id),
             ).fetchone()
+            if last is None and activity is None:
+                return False
             if last is not None and last["activity"] == activity:
                 return False
             c.execute(
