@@ -5219,46 +5219,64 @@ async def revo_calendar_compare_cmd(
 
     if image_entries:
         try:
-            files: list[discord.File] = []
-            for uid, display_name, count, cur_streak, best_streak, cal in image_entries:
-                image = _render_revo_calendar_image(
-                    m,
-                    y,
-                    cal,
-                    display=display_name,
-                    attended_count=count,
-                    current_streak=cur_streak,
-                    best_streak=best_streak,
-                )
-                files.append(
-                    discord.File(
-                        image,
-                        filename=f"revo_calendar_{uid}_{y}_{m:02d}.png",
-                    )
-                )
+            first_uid, first_display, first_count, first_cur, first_best, first_cal = image_entries[0]
+            first_image = _render_revo_calendar_image(
+                m,
+                y,
+                first_cal,
+                display=first_display,
+                attended_count=first_count,
+                current_streak=first_cur,
+                best_streak=first_best,
+            )
         except ImportError:
-            files = []
+            first_image = None
         except Exception:
             LOG.exception("Failed to render Revo calendar compare images")
-            files = []
-        if files:
+            first_image = None
+        if first_image is not None:
             body = (
                 f"**🔥 Revo Check-ins — {month_name}** "
                 f"({n} member{'s' if n != 1 else ''})\n"
-                "-# 🔥 attended · ⬜ missed · ⬛ out of month"
+                "-# Each calendar is posted separately so Discord shows it full-size. "
+                "🔥 attended · ⬜ missed · ⬛ out of month"
             )
             if unavailable:
                 body += f" · {unavailable} unavailable"
-            chunk_size = 10
             await interaction.followup.send(
                 body,
-                files=files[:chunk_size],
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            for start in range(chunk_size, len(files), chunk_size):
+
+            await interaction.followup.send(
+                file=discord.File(
+                    first_image,
+                    filename=f"revo_calendar_{first_uid}_{y}_{m:02d}.png",
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+            for uid, display_name, count, cur_streak, best_streak, cal in image_entries[1:]:
+                try:
+                    image = _render_revo_calendar_image(
+                        m,
+                        y,
+                        cal,
+                        display=display_name,
+                        attended_count=count,
+                        current_streak=cur_streak,
+                        best_streak=best_streak,
+                    )
+                except Exception:
+                    LOG.exception(
+                        "Failed to render Revo calendar compare image for user %s", uid,
+                    )
+                    continue
                 await interaction.followup.send(
-                    f"**🔥 Revo Check-ins — {month_name}** (continued)",
-                    files=files[start : start + chunk_size],
+                    file=discord.File(
+                        image,
+                        filename=f"revo_calendar_{uid}_{y}_{m:02d}.png",
+                    ),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             return
