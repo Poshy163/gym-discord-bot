@@ -4938,6 +4938,7 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
     # get_member() is cache-only; with members intent disabled the cache is
     # sparse, so fall back to fetch_member() (a live API call) on a cache miss.
     guild_member_ids: set[int] = set()
+    guild_member_names: dict[int, str] = {}
     for r in accounts:
         uid = int(r["user_id"])
         member = interaction.guild.get_member(uid)
@@ -4948,6 +4949,7 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
                 member = None
         if member is not None:
             guild_member_ids.add(uid)
+            guild_member_names[uid] = member.display_name
     guild_accounts = [r for r in accounts if int(r["user_id"]) in guild_member_ids]
 
     if not guild_accounts:
@@ -5154,6 +5156,7 @@ async def revo_calendar_compare_cmd(
     # Resolve which linked accounts belong to this guild.
     accounts = db.list_revo_accounts()
     guild_member_ids: set[int] = set()
+    guild_member_names: dict[int, str] = {}
     for r in accounts:
         uid = int(r["user_id"])
         member = interaction.guild.get_member(uid)
@@ -5164,6 +5167,7 @@ async def revo_calendar_compare_cmd(
                 member = None
         if member is not None:
             guild_member_ids.add(uid)
+            guild_member_names[uid] = member.display_name
     guild_accounts = [r for r in accounts if int(r["user_id"]) in guild_member_ids]
 
     if not guild_accounts:
@@ -5201,6 +5205,41 @@ async def revo_calendar_compare_cmd(
 
     month_name = datetime(y, m, 1).strftime("%B %Y")
     n = len(results)
+
+    image_entries: list[tuple[str, int, int, int, "dict[int, bool]"]] = []
+    unavailable = 0
+    for uid, cal in results:
+        if cal is None:
+            unavailable += 1
+            continue
+        count = _count(cal)
+        cur_streak, best_streak = _calc_streaks(cal, days_in_month, today_day)
+        display_name = _bot_name(uid, guild_member_names.get(uid, f"User {uid}"))
+        image_entries.append((display_name, count, cur_streak, best_streak, cal))
+
+    if image_entries:
+        try:
+            image = _render_revo_calendar_compare_image(m, y, image_entries)
+        except ImportError:
+            image = None
+        except Exception:
+            LOG.exception("Failed to render Revo calendar compare image")
+            image = None
+        if image is not None:
+            body = (
+                f"**🔥 Revo Check-ins — {month_name}** "
+                f"({n} member{'s' if n != 1 else ''})\n"
+                "-# 🔥 attended · ⬜ missed · ⬛ out of month"
+            )
+            if unavailable:
+                body += f" · {unavailable} unavailable"
+            await interaction.followup.send(
+                body,
+                file=discord.File(image, filename=f"revo_calendar_compare_{y}_{m:02d}.png"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
     lines = [
         f"**🔥 Revo Check-ins — {month_name}** ({n} member{'s' if n != 1 else ''})",
     ]
@@ -5286,7 +5325,6 @@ def _render_revo_calendar_image(
     matplotlib.use("Agg")
     plt = importlib.import_module("matplotlib.pyplot")
     patches = importlib.import_module("matplotlib.patches")
-    path_mod = importlib.import_module("matplotlib.path")
 
     first_weekday, days_in_month = monthrange(year, month)  # Monday=0
     cells: list[int | None] = [None] * first_weekday
@@ -5306,7 +5344,7 @@ def _render_revo_calendar_image(
     attended_fill = "#ff8a1d"
     attended_text = "#1e1205"
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=120)
     fig.patch.set_facecolor(bg)
     ax.set_facecolor(bg)
     ax.set_xlim(0, 1)
@@ -5415,7 +5453,6 @@ def _render_revo_calendar_image(
                 _draw_revo_flame(
                     ax,
                     patches,
-                    path_mod.Path,
                     x + cell_w / 2,
                     y + cell_h / 2 - 0.002,
                     min(cell_w, cell_h) * 0.72,
@@ -5427,7 +5464,7 @@ def _render_revo_calendar_image(
     ):
         x = 0.08 + idx * 0.17
         if label == "attended":
-            _draw_revo_flame(ax, patches, path_mod.Path, x, legend_y, 0.030)
+            _draw_revo_flame(ax, patches, x, legend_y, 0.030)
         else:
             ax.add_patch(
                 patches.Circle((x, legend_y), 0.012, facecolor=colour, edgecolor=colour)
@@ -5451,86 +5488,200 @@ def _render_revo_calendar_image(
     return buf
 
 
+def _render_revo_calendar_compare_image(
+    month: int,
+    year: int,
+    entries: "list[tuple[str, int, int, int, dict[int, bool]]]",
+) -> io.BytesIO:
+    """Render a stacked Revo calendar comparison PNG."""
+    matplotlib = importlib.import_module("matplotlib")
+    matplotlib.use("Agg")
+    plt = importlib.import_module("matplotlib.pyplot")
+    patches = importlib.import_module("matplotlib.patches")
+
+    first_weekday, days_in_month = monthrange(year, month)  # Monday=0
+    cells: list[int | None] = [None] * first_weekday
+    cells.extend(range(1, days_in_month + 1))
+    while len(cells) % 7 != 0:
+        cells.append(None)
+    weeks = [cells[i : i + 7] for i in range(0, len(cells), 7)]
+
+    bg = "#1f2028"
+    panel = "#2b2630"
+    panel_edge = "#423847"
+    text = "#f5f0f6"
+    muted = "#a9a0ad"
+    out_month = "#45424b"
+    missed = "#e4d2ff"
+    attended_fill = "#ff8a1d"
+
+    row_h = 0.78
+    fig_h = max(3.0, 1.2 + row_h * len(entries))
+    fig, ax = plt.subplots(figsize=(8.4, fig_h), dpi=120)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    ax.add_patch(
+        patches.FancyBboxPatch(
+            (0.035, 0.045),
+            0.93,
+            0.91,
+            boxstyle="round,pad=0.012,rounding_size=0.025",
+            facecolor=panel,
+            edgecolor=panel_edge,
+            linewidth=1.2,
+        )
+    )
+
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+    ax.text(
+        0.07,
+        0.90,
+        f"Revo Check-ins — {month_name}",
+        color=text,
+        fontsize=14,
+        fontweight="bold",
+        va="center",
+    )
+
+    grid_left, grid_right = 0.38, 0.92
+    header_y = 0.82
+    cell_gap = 0.006
+    cell_w = (grid_right - grid_left - cell_gap * 6) / 7
+    weekday_labels = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+    for col, label in enumerate(weekday_labels):
+        x = grid_left + col * (cell_w + cell_gap) + cell_w / 2
+        ax.text(
+            x,
+            header_y,
+            label,
+            color=muted,
+            fontsize=7,
+            fontweight="bold",
+            ha="center",
+            va="center",
+        )
+
+    start_y = 0.76
+    step = min(0.16, 0.70 / max(1, len(entries)))
+    cell_h = min(0.026, step / (len(weeks) + 1.1))
+    row_gap = cell_h * 0.24
+
+    for idx, (display, count, cur_streak, best_streak, attended) in enumerate(entries):
+        y0 = start_y - idx * step
+        short_display = display if len(display) <= 24 else f"{display[:21]}..."
+        ax.text(
+            0.07,
+            y0 - cell_h * 1.9,
+            short_display,
+            color=text,
+            fontsize=8.5,
+            fontweight="bold",
+            va="center",
+        )
+        ax.text(
+            0.31,
+            y0 - cell_h * 1.9,
+            f"{count}d · S{cur_streak} · B{best_streak}",
+            color=attended_fill,
+            fontsize=7.5,
+            fontweight="bold",
+            ha="right",
+            va="center",
+        )
+        for row, week in enumerate(weeks):
+            for col, day in enumerate(week):
+                x = grid_left + col * (cell_w + cell_gap)
+                y = y0 - row * (cell_h + row_gap)
+                if day is None:
+                    fill = out_month
+                elif attended.get(day):
+                    fill = attended_fill
+                else:
+                    fill = missed
+                ax.add_patch(
+                    patches.FancyBboxPatch(
+                        (x, y),
+                        cell_w,
+                        cell_h,
+                        boxstyle="round,pad=0.0015,rounding_size=0.004",
+                        facecolor=fill,
+                        edgecolor=fill,
+                        linewidth=0,
+                    )
+                )
+                if day is not None and attended.get(day):
+                    _draw_revo_flame(
+                        ax,
+                        patches,
+                        x + cell_w / 2,
+                        y + cell_h / 2,
+                        min(cell_w, cell_h) * 0.62,
+                        linewidth=0.55,
+                    )
+
+    buf = io.BytesIO()
+    fig.savefig(
+        buf,
+        format="png",
+        facecolor=fig.get_facecolor(),
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def _draw_revo_flame(
     ax,
     patches,
-    path_cls,
     center_x: float,
     center_y: float,
     size: float,
+    *,
+    linewidth: float = 1.4,
 ) -> None:
     """Draw a small app-style flame without relying on emoji fonts."""
 
     def scaled(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
         return [(center_x + px * size, center_y + py * size) for px, py in points]
 
-    codes = [
-        path_cls.MOVETO,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CLOSEPOLY,
-    ]
     outer_points = scaled([
-        (0.06, 0.56),
-        (0.36, 0.28),
-        (0.43, -0.03),
-        (0.22, -0.30),
-        (0.06, -0.52),
-        (-0.28, -0.44),
-        (-0.38, -0.18),
-        (-0.49, 0.09),
-        (-0.22, 0.30),
-        (-0.08, 0.18),
-        (-0.12, 0.36),
-        (0.02, 0.50),
-        (0.06, 0.56),
+        (0.04, 0.58),
+        (0.34, 0.24),
+        (0.40, -0.08),
+        (0.16, -0.48),
+        (-0.22, -0.42),
+        (-0.42, -0.12),
+        (-0.20, 0.20),
+        (-0.06, 0.08),
     ])
     ax.add_patch(
-        patches.PathPatch(
-            path_cls(outer_points, codes),
+        patches.Polygon(
+            outer_points,
+            closed=True,
             facecolor="#ffd23c",
             edgecolor="#2a1a0a",
-            linewidth=1.4,
+            linewidth=linewidth,
             joinstyle="round",
         )
     )
 
-    inner_codes = [
-        path_cls.MOVETO,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CURVE4,
-        path_cls.CLOSEPOLY,
-    ]
     inner_points = scaled([
-        (0.12, 0.20),
-        (0.28, 0.02),
-        (0.22, -0.23),
-        (0.03, -0.40),
-        (-0.16, -0.31),
-        (-0.25, -0.10),
-        (-0.10, 0.05),
-        (-0.01, -0.04),
-        (0.12, 0.20),
-        (0.12, 0.20),
+        (0.10, 0.16),
+        (0.24, -0.08),
+        (0.04, -0.36),
+        (-0.17, -0.16),
+        (-0.04, 0.02),
     ])
     ax.add_patch(
-        patches.PathPatch(
-            path_cls(inner_points, inner_codes),
+        patches.Polygon(
+            inner_points,
+            closed=True,
             facecolor="#ff5a1f",
             edgecolor="none",
         )
