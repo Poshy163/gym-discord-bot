@@ -5744,8 +5744,19 @@ async def track_raw_cmd(
     rows = db.presence_events_for(
         guild_id, user.id, since=window_start, until=now,
     )
-    # Filter to only events strictly inside the window (not the carry-in).
-    inner = [r for r in rows if r["at"] >= window_start.isoformat()]
+    # Filter to only events strictly inside the window (not the carry-in),
+    # then normalize stored status strings (old rows may still have "idle"/
+    # "dnd"/"invisible") and collapse consecutive duplicates that result.
+    _STATUS_NORM = {"idle": "online", "dnd": "online", "invisible": "offline"}
+    normalized: list[dict] = []
+    for r in rows:
+        if r["at"] < window_start.isoformat():
+            continue
+        normed = dict(r, status=_STATUS_NORM.get(r["status"], r["status"]))
+        if normalized and normalized[-1]["status"] == normed["status"]:
+            continue  # drop consecutive duplicate after normalization
+        normalized.append(normed)
+    inner = normalized
     if not inner:
         if not db.presence_is_tracked(guild_id, user.id):
             await interaction.response.send_message(
@@ -5777,15 +5788,16 @@ async def track_raw_cmd(
         unix = int(ts_dt.timestamp())
         dot = "🟢" if _presence_is_online(status) else "⚫"
 
-        # Duration since previous event.
-        if idx == 0:
-            dur_str = ""
+        # Duration this status was held (until the next event, or "current").
+        is_last = idx == len(shown) - 1
+        if is_last:
+            dur_str = "  ·  **current**"
         else:
-            prev_ts = datetime.fromisoformat(shown[idx - 1]["at"])
-            if prev_ts.tzinfo is None:
-                prev_ts = prev_ts.replace(tzinfo=timezone.utc)
-            diff = ts_dt - prev_ts
-            dur_str = f"  ·  after {format_duration(diff.total_seconds())}"
+            next_ts = datetime.fromisoformat(shown[idx + 1]["at"])
+            if next_ts.tzinfo is None:
+                next_ts = next_ts.replace(tzinfo=timezone.utc)
+            diff = next_ts - ts_dt
+            dur_str = f"  ·  for {format_duration(diff.total_seconds())}"
 
         lines.append(f"{dot} **{status}**  <t:{unix}:f>{dur_str}")
 
