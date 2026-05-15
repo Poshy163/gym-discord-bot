@@ -154,6 +154,19 @@ CREATE TABLE IF NOT EXISTS presence_events (
 
 CREATE INDEX IF NOT EXISTS idx_presence_events_user
     ON presence_events (guild_id, user_id, at);
+
+-- Activity tracking. ``activity`` is the game/app name, or NULL when the
+-- user stops playing. We de-dupe consecutive identical values.
+CREATE TABLE IF NOT EXISTS activity_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    activity  TEXT,
+    at        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_events_user
+    ON activity_events (guild_id, user_id, at);
 """
 
 
@@ -1993,6 +2006,69 @@ class Database:
                 params.append(_normalize_iso(until))
             rows.extend(c.execute(
                 f"SELECT status, at FROM presence_events WHERE {where} "
+                "ORDER BY at ASC, id ASC",
+                params,
+            ).fetchall())
+            return rows
+
+    # ------------------------------------------------------------------
+    # Activity helpers
+    # ------------------------------------------------------------------
+
+    def activity_log_event(
+        self, guild_id: int, user_id: int, activity: str | None,
+        at: datetime | None = None,
+    ) -> bool:
+        """Append an activity event (game/app name or None = stopped).
+        De-duplicates against the most recent stored value. Returns True
+        if a row was inserted."""
+        ts = _normalize_iso(at)
+        with self._conn() as c:
+            last = c.execute(
+                "SELECT activity FROM activity_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY at DESC, id DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+            if last is not None and last["activity"] == activity:
+                return False
+            c.execute(
+                "INSERT INTO activity_events (guild_id, user_id, activity, at) "
+                "VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, activity, ts),
+            )
+            return True
+
+    def activity_events_for(
+        self, guild_id: int, user_id: int,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return activity events in chronological order, including the most
+        recent event before ``since`` as a carry-in (same pattern as
+        ``presence_events_for``)."""
+        with self._conn() as c:
+            rows: list[sqlite3.Row] = []
+            if since is not None:
+                start_iso = _normalize_iso(since)
+                prior = c.execute(
+                    "SELECT activity, at FROM activity_events "
+                    "WHERE guild_id = ? AND user_id = ? AND at < ? "
+                    "ORDER BY at DESC, id DESC LIMIT 1",
+                    (guild_id, user_id, start_iso),
+                ).fetchone()
+                if prior is not None:
+                    rows.append(prior)
+                params: list = [guild_id, user_id, start_iso]
+                where = "guild_id = ? AND user_id = ? AND at >= ?"
+            else:
+                params = [guild_id, user_id]
+                where = "guild_id = ? AND user_id = ?"
+            if until is not None:
+                where += " AND at <= ?"
+                params.append(_normalize_iso(until))
+            rows.extend(c.execute(
+                f"SELECT activity, at FROM activity_events WHERE {where} "
                 "ORDER BY at ASC, id ASC",
                 params,
             ).fetchall())

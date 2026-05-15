@@ -194,6 +194,53 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
+def summarize_activities(
+    events: list[tuple[str | None, str]],
+    window_start: "datetime",
+    window_end: "datetime",
+) -> dict[str, float]:
+    """Aggregate activity events into ``{activity_name: total_seconds}``.
+
+    ``events`` is an ordered list of ``(activity_name_or_None, iso_timestamp)``
+    tuples (same carry-in convention as ``summarize_presence``).  Returns a
+    dict mapping each non-None activity name to the total seconds spent in it
+    within the window, sorted descending by time.
+    """
+    if window_end <= window_start:
+        return {}
+
+    if window_start.tzinfo is None:
+        window_start = window_start.replace(tzinfo=timezone.utc)
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+    window_start = window_start.astimezone(timezone.utc)
+    window_end = window_end.astimezone(timezone.utc)
+
+    totals: dict[str, float] = {}
+    current_activity: str | None = None
+    current_start = window_start
+
+    for activity, ts_str in events:
+        ts = _parse_iso(ts_str)
+        if ts < window_start:
+            current_activity = activity
+            continue
+        if ts >= window_end:
+            break
+        if current_activity is not None and ts > current_start:
+            secs = (ts - current_start).total_seconds()
+            totals[current_activity] = totals.get(current_activity, 0.0) + secs
+        current_activity = activity
+        current_start = ts
+
+    # Tail segment
+    if current_activity is not None and window_end > current_start:
+        secs = (window_end - current_start).total_seconds()
+        totals[current_activity] = totals.get(current_activity, 0.0) + secs
+
+    return dict(sorted(totals.items(), key=lambda kv: kv[1], reverse=True))
+
+
 def estimate_sleep_window(
     by_hour: dict[int, float],
     days: int,

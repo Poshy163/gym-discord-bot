@@ -50,6 +50,7 @@ from .presence import (
     estimate_sleep_window,
     format_duration,
     is_online as _presence_is_online,
+    summarize_activities,
     summarize_presence,
 )
 from . import __version__
@@ -5433,34 +5434,57 @@ def _is_owner(user_id: int) -> bool:
 def _discord_status_to_str(status: discord.Status) -> str:
     """Map discord.Status enum -> the short string we persist.
 
-    Idle and DnD are collapsed into "online"; invisible is collapsed into
-    "offline". This means a transition from online→idle (or vice versa)
-    won't create a new log entry and won't count as a separate period.
+    DnD is collapsed into "online" (still active, just busy).
+    Invisible is collapsed into "offline".
+    Idle is kept separate so we can see it in the logs.
     """
     raw = str(status.value)
-    if raw in ("idle", "dnd"):
+    if raw == "dnd":
         return "online"
     if raw == "invisible":
         return "offline"
-    return raw  # "online" or "offline"
+    return raw  # "online", "idle", or "offline"
+
+
+def _get_main_activity(member: discord.Member) -> str | None:
+    """Return the primary game/app name from a member's activities, or None.
+
+    Ignores Spotify, custom statuses, and streaming — we only care about
+    games and generic app activities.
+    """
+    for act in member.activities:
+        if isinstance(act, discord.Spotify):
+            continue
+        if isinstance(act, discord.CustomActivity):
+            continue
+        if isinstance(act, (discord.Game, discord.Activity, discord.Streaming)):
+            name = getattr(act, "name", None) or getattr(act, "title", None)
+            if name:
+                return str(name)
+    return None
 
 
 @bot.event
 async def on_presence_update(
     before: discord.Member, after: discord.Member,
 ) -> None:  # pragma: no cover - discord runtime path
-    """Record status transitions for tracked users only."""
+    """Record status and activity transitions for tracked users only."""
     if not ENABLE_PRESENCE_TRACKING:
         return
     try:
         if after.guild is None:
             return
-        if before.status == after.status:
-            return
         if not db.presence_is_tracked(after.guild.id, after.id):
             return
-        status = _discord_status_to_str(after.status)
-        db.presence_log_event(after.guild.id, after.id, status)
+        # Status tracking
+        if before.status != after.status:
+            status = _discord_status_to_str(after.status)
+            db.presence_log_event(after.guild.id, after.id, status)
+        # Activity tracking
+        before_act = _get_main_activity(before)
+        after_act = _get_main_activity(after)
+        if before_act != after_act:
+            db.activity_log_event(after.guild.id, after.id, after_act)
     except Exception:
         LOG.exception("Failed to record presence update")
 
@@ -5587,10 +5611,20 @@ async def track_list_cmd(interaction: discord.Interaction) -> None:
     )
 
 
+def _status_dot(status: str) -> str:
+    """Return a coloured dot emoji for a given status string."""
+    if status == "idle":
+        return "🟡"
+    if _presence_is_online(status):
+        return "🟢"
+    return "⚫"
+
+
 def _render_schedule_embed(
     user: discord.abc.User,
     summary: PresenceSummary,
     days: int,
+    activity_totals: dict[str, float] | None = None,
 ) -> discord.Embed:
     """Build the /track schedule embed from a PresenceSummary."""
     embed = discord.Embed(
@@ -5603,7 +5637,7 @@ def _render_schedule_embed(
     embed.add_field(name="🟢 Online", value=online, inline=True)
     embed.add_field(name="⚫ Offline", value=offline, inline=True)
     if summary.final_status:
-        dot = "🟢" if _presence_is_online(summary.final_status) else "⚫"
+        dot = _status_dot(summary.final_status)
         embed.add_field(
             name="Now", value=f"{dot} {summary.final_status}", inline=True,
         )
@@ -5651,6 +5685,16 @@ def _render_schedule_embed(
             name=f"💤 Est. sleep ({DISPLAY_TZ})",
             value=f"`{s_start:02d}:00` – `{s_end:02d}:59`",
             inline=False,
+        )
+    # Top activities
+    if activity_totals:
+        top = list(activity_totals.items())[:5]
+        act_lines = [
+            f"🎮 **{name}** — {format_duration(secs)}"
+            for name, secs in top
+        ]
+        embed.add_field(
+            name="Top activities", value="\n".join(act_lines), inline=False,
         )
     embed.set_footer(text=f"{summary.transitions} status changes recorded")
     return embed
@@ -5705,7 +5749,13 @@ async def track_schedule_cmd(
     summary = summarize_presence(
         events, window_start, now, display_tz=DISPLAY_TZ,
     )
-    embed = _render_schedule_embed(user, summary, days)
+    act_rows = db.activity_events_for(
+        guild_id, user.id, since=window_start, until=now,
+    )
+    activity_totals = summarize_activities(
+        [(r["activity"], r["at"]) for r in act_rows], window_start, now,
+    ) if act_rows else {}
+    embed = _render_schedule_embed(user, summary, days, activity_totals or None)
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -5745,9 +5795,8 @@ async def track_raw_cmd(
         guild_id, user.id, since=window_start, until=now,
     )
     # Filter to only events strictly inside the window (not the carry-in),
-    # then normalize stored status strings (old rows may still have "idle"/
-    # "dnd"/"invisible") and collapse consecutive duplicates that result.
-    _STATUS_NORM = {"idle": "online", "dnd": "online", "invisible": "offline"}
+    # then normalize only dnd/invisible (old rows) — keep idle separate.
+    _STATUS_NORM = {"dnd": "online", "invisible": "offline"}
     normalized: list[dict] = []
     for r in rows:
         if r["at"] < window_start.isoformat():
@@ -5757,7 +5806,15 @@ async def track_raw_cmd(
             continue  # drop consecutive duplicate after normalization
         normalized.append(normed)
     inner = normalized
-    if not inner:
+
+    # Activity events within the window (strictly inside, no carry-in needed
+    # for display).
+    act_rows = db.activity_events_for(
+        guild_id, user.id, since=window_start, until=now,
+    )
+    act_inner = [r for r in act_rows if r["at"] >= window_start.isoformat()]
+
+    if not inner and not act_inner:
         if not db.presence_is_tracked(guild_id, user.id):
             await interaction.response.send_message(
                 f"No presence data for {user.mention} — an owner needs to "
@@ -5774,39 +5831,60 @@ async def track_raw_cmd(
             )
         return
 
-    # Take the most-recent _RAW_EVENT_LIMIT events, oldest first.
-    shown = inner[-_RAW_EVENT_LIMIT:]
-    truncated = len(inner) > _RAW_EVENT_LIMIT
+    # Merge presence + activity events into a single timeline, sorted by time.
+    # Each entry: {"kind": "status"|"activity", "at": iso_str, ...fields}
+    timeline: list[dict] = []
+    for r in inner:
+        timeline.append({"kind": "status", "status": r["status"], "at": r["at"]})
+    for r in act_inner:
+        timeline.append({"kind": "activity", "activity": r["activity"], "at": r["at"]})
+    timeline.sort(key=lambda e: e["at"])
+
+    # Take the most-recent _RAW_EVENT_LIMIT entries.
+    shown = timeline[-_RAW_EVENT_LIMIT:]
+    truncated = len(timeline) > _RAW_EVENT_LIMIT
+
+    # Pre-build a flat list of just the status entries so we can compute
+    # "for X" duration: each status is held until the next status change.
+    status_only = [e for e in timeline if e["kind"] == "status"]
 
     lines: list[str] = []
-    for idx, row in enumerate(shown):
-        status = row["status"]
-        ts_str: str = row["at"]
-        ts_dt = datetime.fromisoformat(ts_str)
+    status_idx = 0  # cursor into status_only for duration lookup
+    for entry in shown:
+        ts_dt = datetime.fromisoformat(entry["at"])
         if ts_dt.tzinfo is None:
             ts_dt = ts_dt.replace(tzinfo=timezone.utc)
         unix = int(ts_dt.timestamp())
-        dot = "🟢" if _presence_is_online(status) else "⚫"
 
-        # Duration this status was held (until the next event, or "current").
-        is_last = idx == len(shown) - 1
-        if is_last:
-            dur_str = "  ·  **current**"
+        if entry["kind"] == "status":
+            status = entry["status"]
+            dot = _status_dot(status)
+            # Find where this entry sits in status_only to get next status ts.
+            while status_idx < len(status_only) - 1 and status_only[status_idx]["at"] != entry["at"]:
+                status_idx += 1
+            is_last_status = status_idx >= len(status_only) - 1
+            if is_last_status:
+                dur_str = "  ·  **current**"
+            else:
+                next_ts = datetime.fromisoformat(status_only[status_idx + 1]["at"])
+                if next_ts.tzinfo is None:
+                    next_ts = next_ts.replace(tzinfo=timezone.utc)
+                dur_str = f"  ·  for {format_duration((next_ts - ts_dt).total_seconds())}"
+            lines.append(f"{dot} **{status}**  <t:{unix}:f>{dur_str}")
         else:
-            next_ts = datetime.fromisoformat(shown[idx + 1]["at"])
-            if next_ts.tzinfo is None:
-                next_ts = next_ts.replace(tzinfo=timezone.utc)
-            diff = next_ts - ts_dt
-            dur_str = f"  ·  for {format_duration(diff.total_seconds())}"
+            activity = entry["activity"]
+            if activity:
+                lines.append(f"  🎮 *started* **{activity}**  <t:{unix}:f>")
+            else:
+                lines.append(f"  🎮 *stopped*  <t:{unix}:f>")
 
-        lines.append(f"{dot} **{status}**  <t:{unix}:f>{dur_str}")
-
+    total_events = len(inner) + len(act_inner)
     header = (
         f"**{user.display_name}** — last **{days}** day{'s' if days != 1 else ''}"
-        f" ({len(inner)} event{'s' if len(inner) != 1 else ''})"
+        f" ({len(inner)} status · {len(act_inner)} activity)"
     )
     if truncated:
-        header += f"\n*Showing most recent {_RAW_EVENT_LIMIT} events only.*"
+        header += f"\n*Showing most recent {_RAW_EVENT_LIMIT} entries only.*"
 
     embed = discord.Embed(
         title=f"📋 Raw presence log — {user.display_name}",
