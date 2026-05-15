@@ -5219,66 +5219,29 @@ async def revo_calendar_compare_cmd(
 
     if image_entries:
         try:
-            first_uid, first_display, first_count, first_cur, first_best, first_cal = image_entries[0]
-            first_image = _render_revo_calendar_image(
-                m,
-                y,
-                first_cal,
-                display=first_display,
-                attended_count=first_count,
-                current_streak=first_cur,
-                best_streak=first_best,
-            )
+            image = _render_revo_calendar_compare_long_image(m, y, image_entries)
         except ImportError:
-            first_image = None
+            image = None
         except Exception:
-            LOG.exception("Failed to render Revo calendar compare images")
-            first_image = None
-        if first_image is not None:
+            LOG.exception("Failed to render Revo calendar compare image")
+            image = None
+        if image is not None:
             body = (
                 f"**🔥 Revo Check-ins — {month_name}** "
                 f"({n} member{'s' if n != 1 else ''})\n"
-                "-# Each calendar is posted separately so Discord shows it full-size. "
+                "-# Full calendars stacked into one image. "
                 "🔥 attended · ⬜ missed · ⬛ out of month"
             )
             if unavailable:
                 body += f" · {unavailable} unavailable"
             await interaction.followup.send(
                 body,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-            await interaction.followup.send(
                 file=discord.File(
-                    first_image,
-                    filename=f"revo_calendar_{first_uid}_{y}_{m:02d}.png",
+                    image,
+                    filename=f"revo_calendar_compare_{y}_{m:02d}.png",
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-
-            for uid, display_name, count, cur_streak, best_streak, cal in image_entries[1:]:
-                try:
-                    image = _render_revo_calendar_image(
-                        m,
-                        y,
-                        cal,
-                        display=display_name,
-                        attended_count=count,
-                        current_streak=cur_streak,
-                        best_streak=best_streak,
-                    )
-                except Exception:
-                    LOG.exception(
-                        "Failed to render Revo calendar compare image for user %s", uid,
-                    )
-                    continue
-                await interaction.followup.send(
-                    file=discord.File(
-                        image,
-                        filename=f"revo_calendar_{uid}_{y}_{m:02d}.png",
-                    ),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
             return
 
     lines = [
@@ -5524,6 +5487,64 @@ def _render_revo_calendar_image(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _render_revo_calendar_compare_long_image(
+    month: int,
+    year: int,
+    entries: "list[tuple[int, str, int, int, int, dict[int, bool]]]",
+) -> io.BytesIO:
+    """Render full-size member calendars stacked vertically in one PNG."""
+    matplotlib = importlib.import_module("matplotlib")
+    matplotlib.use("Agg")
+    plt = importlib.import_module("matplotlib.pyplot")
+
+    card_images = []
+    for _uid, display, count, cur_streak, best_streak, attended in entries:
+        card = _render_revo_calendar_image(
+            month,
+            year,
+            attended,
+            display=display,
+            attended_count=count,
+            current_streak=cur_streak,
+            best_streak=best_streak,
+        )
+        card.seek(0)
+        card_images.append(plt.imread(card, format="png"))
+
+    if not card_images:
+        raise ValueError("No calendars to render")
+
+    dpi = 120
+    width_px = max(img.shape[1] for img in card_images)
+    height_px = sum(img.shape[0] for img in card_images)
+    gap_px = 18
+    height_px += gap_px * (len(card_images) - 1)
+
+    fig, axes = plt.subplots(
+        len(card_images),
+        1,
+        figsize=(width_px / dpi, height_px / dpi),
+        dpi=dpi,
+        gridspec_kw={
+            "height_ratios": [img.shape[0] for img in card_images],
+            "hspace": gap_px / max(1, height_px),
+        },
+    )
+    fig.patch.set_facecolor("#1f2028")
+    if len(card_images) == 1:
+        axes = [axes]
+    for ax, img in zip(axes, card_images):
+        ax.imshow(img)
+        ax.axis("off")
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), pad_inches=0)
     plt.close(fig)
     buf.seek(0)
     return buf
