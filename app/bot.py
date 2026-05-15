@@ -5431,9 +5431,18 @@ def _is_owner(user_id: int) -> bool:
 
 
 def _discord_status_to_str(status: discord.Status) -> str:
-    """Map discord.Status enum -> the short string we persist."""
-    # discord.Status.value is already 'online'/'idle'/'dnd'/'offline'/'invisible'
-    return str(status.value)
+    """Map discord.Status enum -> the short string we persist.
+
+    Idle and DnD are collapsed into "online"; invisible is collapsed into
+    "offline". This means a transition from online→idle (or vice versa)
+    won't create a new log entry and won't count as a separate period.
+    """
+    raw = str(status.value)
+    if raw in ("idle", "dnd"):
+        return "online"
+    if raw == "invisible":
+        return "offline"
+    return raw  # "online" or "offline"
 
 
 @bot.event
