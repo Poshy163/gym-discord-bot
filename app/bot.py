@@ -6243,7 +6243,29 @@ async def track_raw_cmd(
         if normalized and normalized[-1]["status"] == normed["status"]:
             continue  # drop consecutive duplicate after normalization
         normalized.append(normed)
-    inner = normalized
+
+    # Discord's gateway is noisy: multi-client status merge, AFK timer
+    # flapping, and brief reconnects produce sub-minute flips that don't
+    # reflect real availability. Discord's own AFK threshold is 5 min, so
+    # anything held <4 min is almost certainly a client artifact. Drop
+    # those and re-merge surrounding same-status segments.
+    _FLICKER_THRESHOLD_S = 240
+    filtered: list[dict] = []
+    for i, r in enumerate(normalized):
+        is_last = i == len(normalized) - 1
+        if not is_last:
+            this_at = datetime.fromisoformat(r["at"])
+            next_at = datetime.fromisoformat(normalized[i + 1]["at"])
+            if this_at.tzinfo is None:
+                this_at = this_at.replace(tzinfo=timezone.utc)
+            if next_at.tzinfo is None:
+                next_at = next_at.replace(tzinfo=timezone.utc)
+            if (next_at - this_at).total_seconds() < _FLICKER_THRESHOLD_S:
+                continue
+        if filtered and filtered[-1]["status"] == r["status"]:
+            continue  # re-merge after dropping short flickers
+        filtered.append(r)
+    inner = filtered
 
     # Activity events within the window (strictly inside, no carry-in needed
     # for display).
