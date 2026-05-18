@@ -5975,8 +5975,15 @@ async def track_start_cmd(
     inserted = db.presence_track_add(guild_id, user.id, interaction.user.id)
     # Seed status + activity so /track has something useful immediately,
     # even if the user was already playing a game before tracking started.
+    # Re-fetch from the guild cache: slash-command Member args come from
+    # interaction.resolved which lacks presence data, so user.status would
+    # always be offline and user.activities always empty here.
+    cached = (
+        interaction.guild.get_member(user.id)
+        if interaction.guild is not None else None
+    )
     try:
-        _seed_presence_snapshot(guild_id, user)
+        _seed_presence_snapshot(guild_id, cached or user)
     except Exception:
         LOG.exception("Failed to seed initial presence snapshot")
     msg = (
@@ -6387,12 +6394,25 @@ async def track_now_cmd(
         )
         return
 
-    status = _discord_status_to_str(user.status)
-    parsed = _get_main_activity(user)
-    raw_activities = list(user.activities)
+    # Slash-command Member args are resolved from interaction.resolved,
+    # which Discord's API does NOT populate with presence/activity. Always
+    # re-fetch from the guild cache or this diagnostic will lie.
+    cached = (
+        interaction.guild.get_member(user.id)
+        if interaction.guild is not None else None
+    )
+    member = cached or user
+    status = _discord_status_to_str(member.status)
+    parsed = _get_main_activity(member)
+    raw_activities = list(member.activities)
+    cache_note = (
+        "✅ resolved from guild cache" if cached is not None
+        else "⚠️ falling back to interaction payload (no presence data)"
+    )
 
     lines = [
-        f"**Status:** `{user.status}` → stored as `{status}`",
+        cache_note,
+        f"**Status:** `{member.status}` → stored as `{status}`",
         f"**Parsed activity:** `{parsed!r}`",
         f"**Raw `member.activities` ({len(raw_activities)}):**",
     ]
