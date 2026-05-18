@@ -5863,18 +5863,18 @@ def _discord_status_to_str(status: discord.Status) -> str:
 def _get_main_activity(member: discord.Member) -> str | None:
     """Return the primary game/app name from a member's activities, or None.
 
-    Ignores Spotify and custom statuses; we only care about games and generic
-    app activities.
+    Ignores Spotify and custom statuses; everything else with a name (games,
+    rich-presence apps, streams, embedded voice activities) is fair game.
+    Whitelisting specific classes is fragile — discord.py occasionally
+    delivers rich-presence payloads as subclasses we didn't list, and they
+    silently get dropped.
     """
     for act in member.activities:
-        if isinstance(act, discord.Spotify):
+        if isinstance(act, (discord.Spotify, discord.CustomActivity)):
             continue
-        if isinstance(act, discord.CustomActivity):
-            continue
-        if isinstance(act, (discord.Game, discord.Activity, discord.Streaming)):
-            name = getattr(act, "name", None) or getattr(act, "title", None)
-            if name:
-                return str(name)
+        name = getattr(act, "name", None) or getattr(act, "title", None)
+        if name:
+            return str(name)
     return None
 
 
@@ -5926,6 +5926,12 @@ async def on_presence_update(
         after_act = _get_main_activity(after)
         if before_act != after_act:
             db.activity_log_event(after.guild.id, after.id, after_act)
+            LOG.info(
+                "Activity change for %s in %s: %r -> %r (raw=%s)",
+                after.id, after.guild.id, before_act, after_act,
+                [type(a).__name__ + ":" + str(getattr(a, "name", "?"))
+                 for a in after.activities],
+            )
     except Exception:
         LOG.exception("Failed to record presence update")
 
@@ -6353,6 +6359,59 @@ async def track_raw_cmd(
     )
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@track_group.command(
+    name="now",
+    description="(Owner) Show the live presence Discord is currently reporting for a user.",
+)
+@app_commands.describe(user="The member to inspect.")
+async def track_now_cmd(
+    interaction: discord.Interaction, user: discord.Member,
+) -> None:
+    """Diagnostic: dumps the raw activity payload from Discord's cache.
+
+    Use when /track schedule shows no games — this tells you whether
+    Discord is sending activities at all (privacy/detection setting on
+    their end) versus the bot dropping them on the parse path.
+    """
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can use this diagnostic.", ephemeral=True,
+        )
+        return
+
+    status = _discord_status_to_str(user.status)
+    parsed = _get_main_activity(user)
+    raw_activities = list(user.activities)
+
+    lines = [
+        f"**Status:** `{user.status}` → stored as `{status}`",
+        f"**Parsed activity:** `{parsed!r}`",
+        f"**Raw `member.activities` ({len(raw_activities)}):**",
+    ]
+    if not raw_activities:
+        lines.append("  *(empty — Discord is not reporting any activity)*")
+    for act in raw_activities:
+        cls = type(act).__name__
+        name = getattr(act, "name", None) or getattr(act, "title", None)
+        act_type = getattr(act, "type", None)
+        lines.append(f"  • `{cls}` name={name!r} type={act_type!r}")
+
+    embed = discord.Embed(
+        title=f"🔍 Live presence — {user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
