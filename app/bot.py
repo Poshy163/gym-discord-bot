@@ -30,11 +30,22 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from .aliases import (
+    _ALIAS_GROUPS as _BUILTIN_ALIAS_GROUPS,  # noqa: PLC2701  (internal use)
     aliases_for,
     all_canonicals,
     canonicalize,
     normalize_token,
 )
+
+# Set of all alias phrases (canonical + aliases) the built-in table already
+# recognises, normalised. Used by /log to decide whether a logged equipment
+# label needs to be auto-registered as a custom alias so future free-form
+# messages like "sit stand squat 60kg" get picked up.
+_BUILTIN_KNOWN_PHRASES: set[str] = {
+    normalize_token(p)
+    for canon, aliases in _BUILTIN_ALIAS_GROUPS.items()
+    for p in (canon, *aliases)
+}
 from .db import Database
 from .graphing import daily_best_points, running_best_values
 from .message_targeting import strip_leading_user_mention
@@ -1841,6 +1852,19 @@ async def log_cmd(
         logged_at=logged_at,
     )
     if inserted_ids:
+        # If this is a brand-new equipment name (not in the built-in alias
+        # table and not already a custom alias), teach the parser about it
+        # so future free-form messages like "<name> 60kg" auto-log.
+        alias_key = normalize_token(equipment)
+        if (
+            alias_key
+            and alias_key not in _BUILTIN_KNOWN_PHRASES
+            and not db.alias_resolve(guild_id, alias_key)
+        ):
+            try:
+                db.alias_set(guild_id, alias_key, canon, interaction.user.id)
+            except Exception:  # pragma: no cover - defensive, never block /log
+                LOG.exception("Failed to auto-register alias for %s", equipment)
         suffix = _target_suffix(interaction.user, target)
         target_bw = _user_bodyweight(guild_id, target.id)
         true_suf = _true_weight_suffix(canon, weight_kg, bodyweight, target_bw)
