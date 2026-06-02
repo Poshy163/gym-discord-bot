@@ -6541,7 +6541,7 @@ _SLEEP_ANALYSIS_SYSTEM = (
 
 @track_group.command(
     name="analyze",
-    description="(Owner) Use Gemini to summarise trends in a user's sleep data.",
+    description="Use Gemini to summarise trends in a user's sleep data.",
 )
 @app_commands.describe(
     user="The member whose sleep data to analyse.",
@@ -6557,11 +6557,6 @@ async def track_analyze_cmd(
             _PRESENCE_DISABLED_MSG, ephemeral=True,
         )
         return
-    if not _is_owner(interaction.user.id):
-        await interaction.response.send_message(
-            "Only bot owners can analyse sleep data.", ephemeral=True,
-        )
-        return
     if days < 1 or days > 365:
         await interaction.response.send_message(
             "`days` must be between 1 and 365.", ephemeral=True,
@@ -6575,7 +6570,10 @@ async def track_analyze_cmd(
         )
         return
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    # Public like /track schedule and /track raw — the underlying presence
+    # data is already visible via those. Errors below stay ephemeral so a
+    # failed call doesn't clutter the channel.
+    await interaction.response.defer(thinking=True)
 
     guild_id = interaction.guild_id or 0
     sessions, raw_events, _, _ = _collect_sleep_export(guild_id, user.id, days)

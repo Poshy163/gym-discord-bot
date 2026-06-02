@@ -24,7 +24,9 @@ except Exception:  # pragma: no cover
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-2.5-flash"
-REQUEST_TIMEOUT = 60
+# Generation can be slow — 2.5 models "think" before answering, and the first
+# byte often doesn't arrive for a while. Allow an env override for slow links.
+REQUEST_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "120"))
 
 
 class GeminiError(RuntimeError):
@@ -65,9 +67,16 @@ def generate(
         raise GeminiError("GEMINI_API_KEY is not set.")
     mdl = model or model_name()
     url = f"{API_ROOT}/models/{mdl}:generateContent"
+    gen_config: dict = {"temperature": 0.4}
+    # 2.5 *flash* models default to an extended "thinking" pass that adds tens
+    # of seconds of latency (the usual cause of read timeouts here). A trend
+    # summary doesn't need it, so switch it off. Only flash/flash-lite accept a
+    # zero budget — pro rejects it — so gate on the model name.
+    if "flash" in mdl.lower():
+        gen_config["thinkingConfig"] = {"thinkingBudget": 0}
     body: dict = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4},
+        "generationConfig": gen_config,
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}

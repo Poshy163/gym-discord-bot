@@ -134,8 +134,9 @@ Presence & sleep (requires `ENABLE_PRESENCE_TRACKING=true`):
 - `/track export <user> [days] [fmt]` — (owner) DM yourself a member's derived
   sleep data. `fmt=csv` gives a nightly sleep table (bedtime, wake, hours);
   `fmt=json` gives the full raw presence dump plus sessions.
-- `/track analyze <user> [days]` — (owner) send the derived sleep sessions to
-  Google's Gemini API and get back plain-language trends. Requires
+- `/track analyze <user> [days]` — send the derived sleep sessions to
+  Google's Gemini API and get back plain-language trends (anyone can run it on
+  a tracked member). Requires
   `GEMINI_API_KEY` (see `.env.example`); `GEMINI_MODEL` defaults to
   `gemini-2.5-flash`.
 
