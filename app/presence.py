@@ -291,3 +291,102 @@ def estimate_sleep_window(
     start = best_start % 24
     end = (best_start + best_len - 1) % 24
     return (start, end)
+
+
+def _clamped_segments(
+    events: list[tuple[str, str]],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[tuple[bool, datetime, datetime]]:
+    """Turn presence events into contiguous (is_online, start, end) segments.
+
+    Uses the same carry-in convention as :func:`summarize_presence`: the last
+    event before ``window_start`` sets the opening status. All bounds are
+    returned in UTC. Segments are emitted only once an opening status is known.
+    """
+    segments: list[tuple[bool, datetime, datetime]] = []
+    current_status: str | None = None
+    current_start = window_start
+    for status, ts_str in events:
+        ts = _parse_iso(ts_str)
+        if ts < window_start:
+            current_status = status
+            continue
+        if ts >= window_end:
+            break
+        if current_status is not None and ts > current_start:
+            segments.append((is_online(current_status), current_start, ts))
+        current_status = status
+        current_start = ts
+    if current_status is not None and window_end > current_start:
+        segments.append((is_online(current_status), current_start, window_end))
+    return segments
+
+
+def nightly_sleep_sessions(
+    events: list[tuple[str, str]],
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    display_tz=timezone.utc,
+    min_sleep_hours: float = 3.0,
+    flicker_threshold_s: float = 240.0,
+) -> list[dict]:
+    """Extract per-night sleep sessions from a presence-event timeline.
+
+    A sleep session is a long offline stretch. Brief online flickers shorter
+    than ``flicker_threshold_s`` are folded into the surrounding offline time
+    (Discord's gateway flaps clients on/offline for a few seconds, which would
+    otherwise split one night into several). Offline runs lasting at least
+    ``min_sleep_hours`` are returned, attributed to the local calendar date of
+    the wake-up.
+
+    Each session is a dict with ISO-8601 UTC ``start``/``end`` plus
+    human-readable ``start_local``/``end_local`` (in ``display_tz``) and a
+    rounded ``duration_hours``. The list is ordered oldest-first.
+    """
+    if window_start.tzinfo is None:
+        window_start = window_start.replace(tzinfo=timezone.utc)
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+    window_start = window_start.astimezone(timezone.utc)
+    window_end = window_end.astimezone(timezone.utc)
+    if window_end <= window_start:
+        return []
+
+    segments = _clamped_segments(events, window_start, window_end)
+
+    # Flip brief "online" blips to offline so a momentary reconnect doesn't
+    # carve a single night into two short (sub-threshold) sleep blocks.
+    adjusted: list[tuple[bool, datetime, datetime]] = []
+    for online, start, end in segments:
+        if online and (end - start).total_seconds() < flicker_threshold_s:
+            online = False
+        adjusted.append((online, start, end))
+
+    # Coalesce neighbouring segments that now share a state.
+    merged: list[list] = []
+    for online, start, end in adjusted:
+        if merged and merged[-1][0] == online:
+            merged[-1][2] = end
+        else:
+            merged.append([online, start, end])
+
+    sessions: list[dict] = []
+    for online, start, end in merged:
+        if online:
+            continue
+        duration_h = (end - start).total_seconds() / 3600.0
+        if duration_h < min_sleep_hours:
+            continue
+        start_local = start.astimezone(display_tz)
+        end_local = end.astimezone(display_tz)
+        sessions.append({
+            "date": end_local.strftime("%Y-%m-%d"),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "start_local": start_local.strftime("%Y-%m-%d %H:%M"),
+            "end_local": end_local.strftime("%Y-%m-%d %H:%M"),
+            "duration_hours": round(duration_h, 2),
+        })
+    return sessions

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from app.presence import (
     format_duration,
     is_online,
+    nightly_sleep_sessions,
     summarize_presence,
 )
 
@@ -118,3 +119,55 @@ def test_transitions_count_only_real_changes():
     # Real status changes within window: offline->online, online->idle,
     # idle->offline. The duplicate offline->offline is filtered.
     assert s.transitions == 3
+
+
+def test_nightly_sleep_sessions_basic():
+    # Online during the day, offline overnight for ~8h.
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    events = [
+        ("online", _iso(start)),
+        ("offline", _iso(datetime(2026, 5, 1, 23, 0, tzinfo=UTC))),
+        ("online", _iso(datetime(2026, 5, 2, 7, 0, tzinfo=UTC))),
+    ]
+    sessions = nightly_sleep_sessions(events, start, end)
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s["duration_hours"] == 8.0
+    assert s["start"] == datetime(2026, 5, 1, 23, 0, tzinfo=UTC).isoformat()
+    assert s["end"] == datetime(2026, 5, 2, 7, 0, tzinfo=UTC).isoformat()
+    # Attributed to the local wake date.
+    assert s["date"] == "2026-05-02"
+
+
+def test_nightly_sleep_sessions_ignores_short_offline():
+    start = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    events = [
+        ("online", _iso(start)),
+        ("offline", _iso(datetime(2026, 5, 1, 3, 0, tzinfo=UTC))),
+        ("online", _iso(datetime(2026, 5, 1, 4, 0, tzinfo=UTC))),  # only 1h
+    ]
+    # Below the 3h minimum -> not a sleep session.
+    assert nightly_sleep_sessions(events, start, end) == []
+
+
+def test_nightly_sleep_sessions_merges_brief_online_flicker():
+    # An 8h offline block split by a 1-minute reconnect should stay one night.
+    start = datetime(2026, 5, 1, 20, 0, tzinfo=UTC)
+    end = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    events = [
+        ("online", _iso(start)),
+        ("offline", _iso(datetime(2026, 5, 1, 22, 0, tzinfo=UTC))),
+        ("online", _iso(datetime(2026, 5, 2, 2, 0, tzinfo=UTC))),
+        ("offline", _iso(datetime(2026, 5, 2, 2, 1, tzinfo=UTC))),  # 1-min blip
+        ("online", _iso(datetime(2026, 5, 2, 6, 0, tzinfo=UTC))),
+    ]
+    sessions = nightly_sleep_sessions(events, start, end)
+    assert len(sessions) == 1
+    assert sessions[0]["duration_hours"] == 8.0
+
+
+def test_nightly_sleep_sessions_empty_window():
+    start = datetime(2026, 5, 1, tzinfo=UTC)
+    assert nightly_sleep_sessions([], start, start) == []

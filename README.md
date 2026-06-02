@@ -124,6 +124,24 @@ Long stat dumps are compacted in bot replies after `PARSE_REPLY_MAX_ITEMS`
 rows so check-ins don't flood the channel. The entries are still stored; the
 reply just hides the tail.
 
+Presence & sleep (requires `ENABLE_PRESENCE_TRACKING=true`):
+
+- `/track start <user>` · `/track stop <user>` — (owner) begin/stop recording a
+  member's online/offline transitions.
+- `/track schedule <user> [days]` — online/offline summary, per-weekday and
+  per-hour heatmap, and an estimated sleep window.
+- `/track raw <user> [days]` — raw status/activity timeline.
+- `/track export <user> [days] [fmt]` — (owner) DM yourself a member's derived
+  sleep data. `fmt=csv` gives a nightly sleep table (bedtime, wake, hours);
+  `fmt=json` gives the full raw presence dump plus sessions.
+- `/track analyze <user> [days]` — (owner) send the derived sleep sessions to
+  Google's Gemini API and get back plain-language trends. Requires
+  `GEMINI_API_KEY` (see `.env.example`); `GEMINI_MODEL` defaults to
+  `gemini-2.5-flash`.
+
+Sleep data here is *inferred* from Discord presence (long offline stretches),
+not a real sleep tracker — treat it as an approximation.
+
 ## Weekly check-in reminder
 
 Set `REMINDER_CHANNEL_ID` in `.env` to have the bot post a weekly prompt asking

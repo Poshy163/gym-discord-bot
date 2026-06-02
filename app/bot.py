@@ -7,9 +7,11 @@ leaderboards.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import importlib
+import json
 import logging
 import os
 import re
@@ -61,10 +63,12 @@ from .presence import (
     estimate_sleep_window,
     format_duration,
     is_online as _presence_is_online,
+    nightly_sleep_sessions,
     summarize_activities,
     summarize_presence,
 )
 from . import __version__
+from . import gemini_client
 from . import revo_client
 
 load_dotenv()
@@ -6389,6 +6393,233 @@ async def track_raw_cmd(
         colour=EMBED_COLOUR,
     )
     await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+def _collect_sleep_export(
+    guild_id: int, user_id: int, days: int,
+) -> tuple[list[dict], list[dict], datetime, datetime]:
+    """Pull presence events and derive nightly sleep sessions for a window.
+
+    Returns ``(sessions, raw_events, window_start, window_end)`` where
+    ``raw_events`` are the ``{status, at}`` rows inside the window (carry-in
+    dropped) and ``sessions`` come from :func:`nightly_sleep_sessions`.
+    """
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    rows = db.presence_events_for(
+        guild_id, user_id, since=window_start, until=now,
+    )
+    events = [(r["status"], r["at"]) for r in rows]
+    sessions = nightly_sleep_sessions(
+        events, window_start, now, display_tz=DISPLAY_TZ,
+    )
+    raw_events = [
+        {"status": r["status"], "at": r["at"]}
+        for r in rows
+        if r["at"] >= window_start.isoformat()
+    ]
+    return sessions, raw_events, window_start, now
+
+
+@track_group.command(
+    name="export",
+    description="(Owner) DM yourself a user's recorded sleep/presence data.",
+)
+@app_commands.describe(
+    user="The member whose sleep data to export.",
+    days="How many days back to include (1-365, default 30).",
+    fmt="File format: csv (nightly sleep table) or json (full raw dump).",
+)
+@app_commands.choices(fmt=[
+    app_commands.Choice(name="CSV (nightly sleep table)", value="csv"),
+    app_commands.Choice(name="JSON (full raw dump)", value="json"),
+])
+async def track_export_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    days: int = 30,
+    fmt: app_commands.Choice[str] | None = None,
+) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can export sleep data.", ephemeral=True,
+        )
+        return
+    if days < 1 or days > 365:
+        await interaction.response.send_message(
+            "`days` must be between 1 and 365.", ephemeral=True,
+        )
+        return
+
+    fmt_value = fmt.value if fmt is not None else "csv"
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    guild_id = interaction.guild_id or 0
+    sessions, raw_events, window_start, window_end = _collect_sleep_export(
+        guild_id, user.id, days,
+    )
+    if not raw_events:
+        await interaction.followup.send(
+            f"No presence data recorded for {user.mention} in the last "
+            f"{days} day{'s' if days != 1 else ''} — an owner needs to "
+            "`/track start` them first.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if fmt_value == "json":
+        payload = {
+            "user_id": user.id,
+            "display_name": user.display_name,
+            "guild_id": guild_id,
+            "timezone": str(DISPLAY_TZ),
+            "days": days,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "nightly_sessions": sessions,
+            "raw_presence_events": raw_events,
+        }
+        buf = io.BytesIO(
+            json.dumps(payload, indent=2).encode("utf-8")
+        )
+        suffix = "json"
+    else:
+        sio = io.StringIO()
+        writer = csv.writer(sio)
+        writer.writerow(
+            ["date", "sleep_start_local", "wake_local", "duration_hours"]
+        )
+        for s in sessions:
+            writer.writerow(
+                [s["date"], s["start_local"], s["end_local"], s["duration_hours"]]
+            )
+        buf = io.BytesIO(sio.getvalue().encode("utf-8"))
+        suffix = "csv"
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"sleep-{user.id}-{stamp}.{suffix}"
+    try:
+        dm = await interaction.user.create_dm()
+        await dm.send(
+            content=(
+                f"Sleep export for **{user.display_name}** — last {days} "
+                f"day{'s' if days != 1 else ''}, {len(sessions)} sleep "
+                f"session{'s' if len(sessions) != 1 else ''} from "
+                f"{len(raw_events)} status events ({DISPLAY_TZ})."
+            ),
+            file=discord.File(buf, filename=filename),
+        )
+        await interaction.followup.send(
+            f"Sent `{filename}` to your DMs.", ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I can't DM you — open your DMs for server members and try again.",
+            ephemeral=True,
+        )
+
+
+_SLEEP_ANALYSIS_SYSTEM = (
+    "You are a sleep-pattern analyst. You are given a person's sleep sessions "
+    "derived from their Discord online/offline presence (a proxy, not a sleep "
+    "tracker, so treat it as approximate). Identify concrete trends: typical "
+    "bedtime and wake time, average and variability of sleep duration, "
+    "weekday-vs-weekend differences, and any drift or notable changes over the "
+    "window. Be concise and use short bullet points. Note caveats only briefly. "
+    "Keep the whole reply under 1500 characters so it fits in a Discord embed."
+)
+
+
+@track_group.command(
+    name="analyze",
+    description="(Owner) Use Gemini to summarise trends in a user's sleep data.",
+)
+@app_commands.describe(
+    user="The member whose sleep data to analyse.",
+    days="How many days back to analyse (1-365, default 30).",
+)
+async def track_analyze_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    days: int = 30,
+) -> None:
+    if not ENABLE_PRESENCE_TRACKING:
+        await interaction.response.send_message(
+            _PRESENCE_DISABLED_MSG, ephemeral=True,
+        )
+        return
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "Only bot owners can analyse sleep data.", ephemeral=True,
+        )
+        return
+    if days < 1 or days > 365:
+        await interaction.response.send_message(
+            "`days` must be between 1 and 365.", ephemeral=True,
+        )
+        return
+    if not gemini_client.available():
+        await interaction.response.send_message(
+            "Gemini isn't configured. Set `GEMINI_API_KEY` (and optionally "
+            "`GEMINI_MODEL`) in the bot's environment and restart.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    guild_id = interaction.guild_id or 0
+    sessions, raw_events, _, _ = _collect_sleep_export(guild_id, user.id, days)
+    if not sessions:
+        await interaction.followup.send(
+            f"Not enough sleep data for {user.mention} in the last {days} "
+            f"day{'s' if days != 1 else ''} to analyse "
+            f"({len(raw_events)} status events recorded).",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    prompt = (
+        f"Timezone: {DISPLAY_TZ}. Window: last {days} days. "
+        f"{len(sessions)} sleep sessions follow as JSON "
+        "(times are local; duration_hours is the offline stretch):\n\n"
+        + json.dumps(sessions, indent=2)
+    )
+    try:
+        text = await asyncio.to_thread(
+            gemini_client.generate, prompt, system=_SLEEP_ANALYSIS_SYSTEM,
+        )
+    except gemini_client.GeminiError as exc:
+        LOG.warning("Gemini sleep analysis failed: %s", exc)
+        await interaction.followup.send(
+            f"Gemini request failed: {exc}", ephemeral=True,
+        )
+        return
+
+    # Embed descriptions cap at 4096 chars; we asked for <1500 but guard anyway.
+    description = text[:4000]
+    embed = discord.Embed(
+        title=f"💤 Sleep trends — {user.display_name}",
+        description=description,
+        colour=EMBED_COLOUR,
+    )
+    embed.set_footer(
+        text=(
+            f"{len(sessions)} sessions · last {days}d · "
+            f"{gemini_client.model_name()}"
+        )
+    )
+    await interaction.followup.send(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
 
