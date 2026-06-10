@@ -10,6 +10,7 @@ from app.calories import (
     format_kcal,
     kcal_to_kj,
     kj_to_kcal,
+    parse_chat_message,
     parse_energy,
     progress_bar,
 )
@@ -68,6 +69,41 @@ def test_parse_energy_kj_forms(text, kj):
 ])
 def test_parse_energy_rejects_garbage(text):
     assert parse_energy(text) is None
+
+
+# ---- parse_chat_message ----------------------------------------------------
+
+@pytest.mark.parametrize("text,kcal,unit,note", [
+    ("650kcal", 650.0, "kcal", None),
+    ("650 cal", 650.0, "kcal", None),
+    ("650 cals", 650.0, "kcal", None),
+    ("650 calories", 650.0, "kcal", None),
+    ("650kcal burrito", 650.0, "kcal", "burrito"),
+    ("650 cal - big mac meal", 650.0, "kcal", "big mac meal"),
+    ("2700kj", 2700.0 / 4.184, "kj", None),
+    ("2,700 kJ maccas run", 2700.0 / 4.184, "kj", "maccas run"),
+    ("418.4 kilojoules", 100.0, "kj", None),
+])
+def test_parse_chat_message_accepts(text, kcal, unit, note):
+    result = parse_chat_message(text)
+    assert result is not None
+    got_kcal, got_unit, got_note = result
+    assert got_kcal == pytest.approx(kcal)
+    assert got_unit == unit
+    assert got_note == note
+
+
+@pytest.mark.parametrize("text", [
+    "650",            # bare number = could be a lift, must not match
+    "650c",           # bare "c" too loose for chat (slash command takes it)
+    "bench 80kg",
+    "650kg",
+    "ate a lot today",
+    "650kcal\nbench press 80kg",  # multi-line dumps go to the lift parser
+    "",
+])
+def test_parse_chat_message_rejects(text):
+    assert parse_chat_message(text) is None
 
 
 def test_format_kcal_rounds_and_groups():

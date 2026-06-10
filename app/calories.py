@@ -56,6 +56,43 @@ def parse_energy(text: str) -> tuple[float, str] | None:
     return num, "kcal"
 
 
+# Chat auto-logging is stricter than /calories add: a bare number like "650"
+# must never match (it would collide with lift posts), and bare "c" is too
+# loose for free-form chat. The unit has to be spelled kcal/cal/kj. An
+# optional trailing note is allowed ("650kcal burrito"), but only on a
+# single-line message so multi-line gym dumps fall through to the lift parser.
+_CHAT_ENERGY_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)
+    \s*
+    (?P<unit>kcal|cals?|calories?|kj|kilojoules?)
+    \b
+    [ \t]*
+    (?P<note>[^\n]{0,120})?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
+    """If ``text`` is a bare calorie statement, return ``(kcal, unit, note)``.
+
+    Returns ``None`` for anything else so the caller can fall through to
+    the regular lift parser. ``unit`` is ``"kj"`` or ``"kcal"`` (as typed);
+    ``note`` is any trailing description, or None.
+    """
+    m = _CHAT_ENERGY_RE.match(text or "")
+    if m is None:
+        return None
+    num = float(m.group("num").replace(",", ""))
+    unit = "kj" if m.group("unit").lower().rstrip("s") in _KJ_UNITS else "kcal"
+    kcal = kj_to_kcal(num) if unit == "kj" else num
+    note = (m.group("note") or "").strip(" \t-–—:·") or None
+    return kcal, unit, note
+
+
 def format_kcal(kcal: float) -> str:
     """Render a kcal amount the way the bot displays it (whole numbers)."""
     return f"{round(kcal):,} cal"

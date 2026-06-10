@@ -852,6 +852,59 @@ async def _handle_bodyweight_message(
     )
 
 
+async def _handle_calorie_message(
+    message: discord.Message, target: object,
+    kcal: float, unit: str, note: str | None,
+) -> None:
+    """Persist a chat-message calorie entry (`650kcal`, `2700kj maccas`).
+
+    Mirrors `/calories add`: the target must have run `/calories setup`
+    first, and the per-entry typo cap applies. Success is acknowledged with
+    a ✅ reaction like auto-parsed lifts; `/calories undo` reverses it.
+    """
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    goal = db.calorie_goal_get(guild_id, target_id)
+    if goal is None:
+        suffix = _target_suffix(message.author, target)
+        try:
+            await message.reply(
+                f"No calorie target set{suffix} yet — run `/calories setup` "
+                "with a daily target first (e.g. `2500` or `8700kj`).",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+        try:
+            await message.reply(
+                f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks "
+                "like a typo, so I didn't log it.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    try:
+        db.calorie_add(
+            guild_id, target_id, _display_name(target), kcal,
+            note=note, raw=message.content.strip()[:80],
+        )
+    except Exception:
+        LOG.exception("Failed to store calorie entry for user %s", target_id)
+        return
+
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    LOG.info(
+        "Stored %.0f kcal for %s in #%s", kcal, target, message.channel,
+    )
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -1536,6 +1589,15 @@ async def on_message(message: discord.Message) -> None:
     bw_kg = _parse_bodyweight_message(content)
     if bw_kg is not None:
         await _handle_bodyweight_message(message, target, bw_kg)
+        await bot.process_commands(message)
+        return
+
+    # Quick calorie logging path: `650kcal`, `200 cal toastie`, `2700kj`,
+    # or `@user 650kcal` to log for someone else. The unit is mandatory
+    # (kcal/cal/kj) so plain lift numbers never match this branch.
+    cal_hit = calories.parse_chat_message(content)
+    if cal_hit is not None:
+        await _handle_calorie_message(message, target, *cal_hit)
         await bot.process_commands(message)
         return
 
@@ -3210,6 +3272,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
             "`/calories add <amount> [note]` — log intake "
             "(`650`, `650c`, `2700kj` — kJ converts automatically)\n"
+            "Or just type `650kcal` / `2700kj maccas` in chat — "
+            "I'll react ✅ and log it\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories undo` — remove your last entry\n"
             "`/calories stop` — stop tracking (history kept)\n"
