@@ -167,6 +167,34 @@ CREATE TABLE IF NOT EXISTS activity_events (
 
 CREATE INDEX IF NOT EXISTS idx_activity_events_user
     ON activity_events (guild_id, user_id, at);
+
+-- Calorie tracking. ``calorie_goals`` holds each user's daily intake target
+-- (stored in kcal — the bot converts kJ on the way in). Having a row here is
+-- what marks a user as "doing" calorie tracking for the weekly AI summary.
+CREATE TABLE IF NOT EXISTS calorie_goals (
+    guild_id          INTEGER NOT NULL,
+    user_id           INTEGER NOT NULL,
+    username          TEXT    NOT NULL,
+    daily_target_kcal REAL    NOT NULL,
+    set_at            TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+-- One row per logged intake. kcal is always kilocalories; ``raw`` keeps the
+-- original user input (e.g. "3550kj") for display/debugging.
+CREATE TABLE IF NOT EXISTS calorie_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    username   TEXT    NOT NULL,
+    kcal       REAL    NOT NULL,
+    note       TEXT,
+    raw        TEXT,
+    logged_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_calorie_entries_user
+    ON calorie_entries (guild_id, user_id, logged_at);
 """
 
 
@@ -2075,3 +2103,134 @@ class Database:
                 params,
             ).fetchall())
             return rows
+
+    # ------------------------------------------------------------------
+    # Calorie tracking
+    # ------------------------------------------------------------------
+
+    def calorie_goal_set(
+        self, guild_id: int, user_id: int, username: str,
+        daily_target_kcal: float,
+    ) -> None:
+        """Create or update a user's daily calorie target (kcal)."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO calorie_goals
+                    (guild_id, user_id, username, daily_target_kcal, set_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    username          = excluded.username,
+                    daily_target_kcal = excluded.daily_target_kcal,
+                    set_at            = excluded.set_at
+                """,
+                (
+                    guild_id, user_id, username,
+                    float(daily_target_kcal), _normalize_iso(None),
+                ),
+            )
+
+    def calorie_goal_get(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT username, daily_target_kcal, set_at "
+                "FROM calorie_goals WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+
+    def calorie_goal_remove(self, guild_id: int, user_id: int) -> bool:
+        """Stop tracking. Entry history is kept so re-enabling later still
+        has the back data; only the goal row (the opt-in marker) goes."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_goals WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def calorie_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
+        """Everyone with a calorie goal in this guild — the weekly AI
+        summary iterates this list."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, username, daily_target_kcal "
+                "FROM calorie_goals WHERE guild_id = ? ORDER BY username",
+                (guild_id,),
+            ))
+
+    def calorie_add(
+        self, guild_id: int, user_id: int, username: str, kcal: float,
+        note: str | None = None, raw: str | None = None,
+        logged_at: datetime | None = None,
+    ) -> int:
+        """Insert one intake entry. Returns the new row id."""
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO calorie_entries
+                    (guild_id, user_id, username, kcal, note, raw, logged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id, user_id, username, float(kcal),
+                    note, raw, _normalize_iso(logged_at),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def calorie_pop_last(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        """Delete the user's most recent intake entry and return it."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, kcal, note, raw, logged_at
+                FROM calorie_entries
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM calorie_entries WHERE id = ?", (row["id"],))
+            return row
+
+    def calorie_entries_between(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> list[sqlite3.Row]:
+        """All intake entries in [start_iso, end_iso), oldest first. Day
+        bucketing happens in the caller against DISPLAY_TIMEZONE — the
+        stored timestamps are UTC and the local day boundary isn't
+        substr-able here."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT id, kcal, note, raw, logged_at
+                FROM calorie_entries
+                WHERE guild_id = ? AND user_id = ?
+                  AND logged_at >= ? AND logged_at < ?
+                ORDER BY logged_at ASC, id ASC
+                """,
+                (guild_id, user_id, start_iso, end_iso),
+            ))
+
+    def calorie_total_between(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> tuple[float, int]:
+        """Sum of kcal and entry count in [start_iso, end_iso)."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COALESCE(SUM(kcal), 0) AS total, COUNT(*) AS n
+                FROM calorie_entries
+                WHERE guild_id = ? AND user_id = ?
+                  AND logged_at >= ? AND logged_at < ?
+                """,
+                (guild_id, user_id, start_iso, end_iso),
+            ).fetchone()
+            return float(row["total"] or 0.0), int(row["n"] or 0)

@@ -73,6 +73,20 @@ Goals:
 When a logged lift reaches a goal, the bot celebrates with 🎯 in its reply and
 clears the goal automatically.
 
+Calories:
+
+- `/calories setup <target>` — set your daily intake target. Accepts kcal or
+  kJ (`2500`, `2500c`, `8700kj` — kJ is converted at 4.184 kJ/kcal).
+- `/calories add <amount> [note]` — log something you ate, again in kcal or
+  kJ. The reply shows a progress bar against your daily target.
+- `/calories today [user]` — today's entries and total vs target.
+- `/calories week [user]` — per-day totals for the last 7 days.
+- `/calories undo` — remove your most recent entry.
+- `/calories stop` — stop tracking (history is kept; `setup` re-enables).
+
+Everyone with a calorie target gets a personal AI summary in the weekly
+report (see below).
+
 Logging & editing:
 
 - `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally
@@ -167,6 +181,20 @@ yesterday's activity: total lifts, active lifters, popular lifts, and PRs.
 Defaults are **08:00** in `DISPLAY_TIMEZONE`. Tune with `DAILY_UPDATE_HOUR` and
 `DAILY_UPDATE_MINUTE`. Empty days are skipped by default; set
 `DAILY_UPDATE_POST_EMPTY=true` if you want a quiet "no lifts" update too.
+
+## Weekly report (Sunday)
+
+Every Sunday evening the bot posts a 7-day recap: total lifts, PRs, most
+active members, popular lifts — plus a **🍎 weekly calorie check-in** with a
+short Gemini-written summary for each member tracking via `/calories`
+(adherence to target, consistency, one encouraging note). Without
+`GEMINI_API_KEY` the calorie section falls back to plain stats lines.
+
+The channel comes from `WEEKLY_REPORT_CHANNEL_ID`, falling back to
+`DAILY_UPDATE_CHANNEL_ID` then `REMINDER_CHANNEL_ID`. Defaults are **Sunday
+18:00** in `DISPLAY_TIMEZONE`; tune with `WEEKLY_REPORT_WEEKDAY`,
+`WEEKLY_REPORT_HOUR`, and `WEEKLY_REPORT_MINUTE`. `/weekly_report` posts the
+same report on demand.
 
 ## Setup
 

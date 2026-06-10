@@ -6,8 +6,6 @@ back ``/revo_link`` / ``/revo_unlink`` / the attendance poller.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from app import revo_client

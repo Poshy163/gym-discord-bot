@@ -39,15 +39,6 @@ from .aliases import (
     normalize_token,
 )
 
-# Set of all alias phrases (canonical + aliases) the built-in table already
-# recognises, normalised. Used by /log to decide whether a logged equipment
-# label needs to be auto-registered as a custom alias so future free-form
-# messages like "sit stand squat 60kg" get picked up.
-_BUILTIN_KNOWN_PHRASES: set[str] = {
-    normalize_token(p)
-    for canon, aliases in _BUILTIN_ALIAS_GROUPS.items()
-    for p in (canon, *aliases)
-}
 from .db import Database
 from .graphing import daily_best_points, running_best_values
 from .message_targeting import strip_leading_user_mention
@@ -68,8 +59,19 @@ from .presence import (
     summarize_presence,
 )
 from . import __version__
+from . import calories
 from . import gemini_client
 from . import revo_client
+
+# Set of all alias phrases (canonical + aliases) the built-in table already
+# recognises, normalised. Used by /log to decide whether a logged equipment
+# label needs to be auto-registered as a custom alias so future free-form
+# messages like "sit stand squat 60kg" get picked up.
+_BUILTIN_KNOWN_PHRASES: set[str] = {
+    normalize_token(p)
+    for canon, aliases in _BUILTIN_ALIAS_GROUPS.items()
+    for p in (canon, *aliases)
+}
 
 load_dotenv()
 
@@ -82,7 +84,6 @@ class _JsonFormatter(logging.Formatter):
     (Loki, Datadog, etc.) generally prefer one JSON object per line."""
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: D401
-        import json
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
@@ -210,6 +211,20 @@ DAILY_UPDATE_MINUTE = int(os.getenv("DAILY_UPDATE_MINUTE", "0"))
 DAILY_UPDATE_POST_EMPTY = os.getenv("DAILY_UPDATE_POST_EMPTY", "false").lower() in (
     "1", "true", "yes", "y", "on",
 )
+
+# Weekly report: posts a 7-day gym recap plus an AI calorie summary for every
+# member tracking via /calories. WEEKLY_REPORT_CHANNEL_ID falls back to
+# DAILY_UPDATE_CHANNEL_ID then REMINDER_CHANNEL_ID so existing setups get the
+# report without new config; leave all three blank to disable. Defaults to
+# Sunday 18:00 in DISPLAY_TIMEZONE.
+_weekly_rid = os.getenv("WEEKLY_REPORT_CHANNEL_ID", "").strip()
+WEEKLY_REPORT_CHANNEL_ID: int | None = (
+    int(_weekly_rid) if _weekly_rid.isdigit()
+    else (DAILY_UPDATE_CHANNEL_ID or REMINDER_CHANNEL_ID)
+)
+WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "6"))
+WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
+WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
 
 # Bot "accent" colour for embeds.
 EMBED_COLOUR = discord.Colour.from_str("#f26522")
@@ -887,6 +902,15 @@ async def on_ready() -> None:
             DISPLAY_TZ, DAILY_UPDATE_CHANNEL_ID,
         )
 
+    if WEEKLY_REPORT_CHANNEL_ID and not weekly_report.is_running():
+        weekly_report.start()
+        LOG.info(
+            "Weekly report scheduled for %s %02d:%02d (%s) in channel %s",
+            _WEEKDAY_NAMES[WEEKLY_REPORT_WEEKDAY % 7],
+            WEEKLY_REPORT_HOUR, WEEKLY_REPORT_MINUTE,
+            DISPLAY_TZ, WEEKLY_REPORT_CHANNEL_ID,
+        )
+
     if ENABLE_PRESENCE_TRACKING:
         _seed_tracked_presence_snapshots()
 
@@ -1166,6 +1190,252 @@ async def daily_update() -> None:
 @daily_update.before_loop
 async def _before_daily_update() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
+
+
+def _weekly_report_time() -> dtime:
+    return _scheduled_time(WEEKLY_REPORT_HOUR, WEEKLY_REPORT_MINUTE)
+
+
+def _week_window() -> tuple[str, str, str]:
+    """``(label, start_iso, end_iso)`` covering the 7 local days ending today.
+
+    Sunday's report therefore spans Monday 00:00 through Sunday 24:00 in
+    DISPLAY_TIMEZONE, converted to UTC for querying.
+    """
+    today = datetime.now(DISPLAY_TZ).date()
+    start_day = today - timedelta(days=6)
+    start_local = datetime.combine(start_day, dtime.min, tzinfo=DISPLAY_TZ)
+    end_local = datetime.combine(
+        today + timedelta(days=1), dtime.min, tzinfo=DISPLAY_TZ,
+    )
+    label = f"{start_day.strftime('%d %b')} – {today.strftime('%d %b')}"
+    return (
+        label,
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _weekly_gym_text(
+    guild_id: int, label: str, start_iso: str, end_iso: str,
+) -> str:
+    """7-day gym recap. Unlike the daily update, an empty week still posts —
+    the silence *is* the report."""
+    activity = db.daily_activity(guild_id, start_iso, end_iso, limit=5)
+    totals = activity["totals"]
+    total_lifts = int(totals["total_lifts"] or 0)
+    lines = [f"📈 **Weekly gym report — {label}**"]
+    if total_lifts == 0:
+        lines.append("No lifts logged this week. New week, new chances. 💪")
+        return "\n".join(lines)
+
+    lines.append(
+        f"{_plural(total_lifts, 'lift')} logged by "
+        f"{_plural(int(totals['lifters'] or 0), 'lifter')} across "
+        f"{_plural(int(totals['unique_equip'] or 0), 'exercise')} from "
+        f"{_plural(int(totals['sessions'] or 0), 'session')}."
+    )
+
+    prs = activity["prs"]
+    if prs:
+        lines.append("\n🎉 **PRs this week**")
+        for row in prs:
+            previous = row["prev_best"]
+            tail = (
+                "first logged" if previous is None
+                else f"+{row['weight_kg'] - previous:g}kg"
+            )
+            lines.append(
+                f"• **{row['username']}** — {row['equipment']}: "
+                f"{_format_weight(row['weight_kg'], bool(row['bw']))} ({tail})"
+            )
+
+    top_users = activity["top_users"]
+    if top_users:
+        lines.append("\n🏅 **Most active**")
+        for row in top_users:
+            lines.append(
+                f"• **{row['username']}** — {_plural(int(row['n']), 'lift')}, "
+                f"{_plural(int(row['equip']), 'exercise')}"
+            )
+
+    popular = activity["popular_equipment"]
+    if popular:
+        lines.append("\n🏋️ **Popular lifts**")
+        for row in popular:
+            lines.append(
+                f"• **{row['equipment']}** — "
+                f"{_plural(int(row['n']), 'entry', 'entries')}, "
+                f"{_plural(int(row['users']), 'lifter')}"
+            )
+    return "\n".join(lines)
+
+
+def _calorie_week_days(
+    guild_id: int, user_id: int, start_iso: str, end_iso: str,
+) -> dict[str, float]:
+    """Per-local-day kcal totals within the window, keyed YYYY-MM-DD."""
+    days: dict[str, float] = {}
+    for row in db.calorie_entries_between(guild_id, user_id, start_iso, end_iso):
+        dt = datetime.fromisoformat(row["logged_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        day = dt.astimezone(DISPLAY_TZ).date().isoformat()
+        days[day] = days.get(day, 0.0) + float(row["kcal"])
+    return days
+
+
+_CALORIE_SUMMARY_SYSTEM = (
+    "You are a friendly nutrition coach writing one short blurb per person "
+    "for a Discord gym server's weekly report. You get JSON with the "
+    "person's daily calorie target and per-day intake totals for the week "
+    "(kcal; missing days mean nothing was logged). Comment on adherence to "
+    "the target and consistency, and end with one encouraging or actionable "
+    "note. No medical advice, no shaming. 2-3 sentences, under 350 "
+    "characters, plain text, no headings or bullet points."
+)
+
+
+async def _calorie_ai_summaries(
+    guild_id: int, start_iso: str, end_iso: str,
+) -> list[str]:
+    """One summary block per calorie-tracking member.
+
+    Uses Gemini when configured; otherwise (or when a call fails) falls back
+    to a plain stats line so the report never silently drops someone.
+    """
+    blocks: list[str] = []
+    for row in db.calorie_tracked_users(guild_id):
+        user_id = int(row["user_id"])
+        name = db.get_user_nickname(user_id) or row["username"]
+        target = float(row["daily_target_kcal"])
+        days = _calorie_week_days(guild_id, user_id, start_iso, end_iso)
+        if not days:
+            blocks.append(f"**{name}** — no intake logged this week.")
+            continue
+        avg = sum(days.values()) / len(days)
+        stats = (
+            f"{len(days)}/7 days logged · avg "
+            f"{calories.format_kcal(avg)}/day · target "
+            f"{calories.format_kcal(target)}/day"
+        )
+        blurb: str | None = None
+        if gemini_client.available():
+            payload = json.dumps({
+                "name": name,
+                "daily_target_kcal": round(target),
+                "per_day_kcal": {
+                    d: round(v) for d, v in sorted(days.items())
+                },
+            })
+            try:
+                blurb = await asyncio.to_thread(
+                    gemini_client.generate,
+                    f"Weekly calorie data:\n{payload}",
+                    system=_CALORIE_SUMMARY_SYSTEM,
+                )
+            except gemini_client.GeminiError as exc:
+                LOG.warning(
+                    "Gemini calorie summary failed for %s: %s", name, exc,
+                )
+        if blurb:
+            blocks.append(f"**{name}** ({stats})\n{blurb.strip()[:600]}")
+        else:
+            blocks.append(f"**{name}** — {stats}")
+    return blocks
+
+
+async def _post_weekly_report(
+    channel: discord.abc.Messageable, guild_id: int,
+) -> None:
+    """Send the gym recap, then the calorie check-in embed if anyone's
+    tracking. Shared by the scheduled task and /weekly_report."""
+    label, start_iso, end_iso = _week_window()
+    text = _weekly_gym_text(guild_id, label, start_iso, end_iso)
+    await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    cal_blocks = await _calorie_ai_summaries(guild_id, start_iso, end_iso)
+    if not cal_blocks:
+        return
+    embed = discord.Embed(
+        title=f"🍎 Weekly calorie check-in — {label}",
+        description="\n\n".join(cal_blocks)[:4000],
+        colour=EMBED_COLOUR,
+    )
+    if gemini_client.available():
+        embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
+    await channel.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tasks.loop(time=_weekly_report_time())
+async def weekly_report() -> None:
+    if WEEKLY_REPORT_CHANNEL_ID is None:
+        return
+    now_local = datetime.now(DISPLAY_TZ)
+    if now_local.weekday() != WEEKLY_REPORT_WEEKDAY % 7:
+        return
+    channel = bot.get_channel(WEEKLY_REPORT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(WEEKLY_REPORT_CHANNEL_ID)
+        except discord.HTTPException:
+            LOG.warning(
+                "Weekly report: cannot access channel %s",
+                WEEKLY_REPORT_CHANNEL_ID,
+            )
+            return
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        LOG.warning(
+            "Weekly report channel %s is not in a guild",
+            WEEKLY_REPORT_CHANNEL_ID,
+        )
+        return
+    try:
+        await _post_weekly_report(channel, guild.id)
+        LOG.info("Weekly report posted to #%s", channel)
+    except discord.HTTPException:
+        LOG.exception("Failed to post weekly report")
+
+
+@weekly_report.before_loop
+async def _before_weekly_report() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(
+    name="weekly_report",
+    description="Post the weekly gym + calorie report for the past 7 days.",
+)
+async def weekly_report_cmd(interaction: discord.Interaction) -> None:
+    if interaction.guild_id is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "This command only works in a server channel.", ephemeral=True,
+        )
+        return
+    # Gemini round-trips (one per tracked member) can take a while.
+    await interaction.response.defer(thinking=True)
+    label, start_iso, end_iso = _week_window()
+    text = _weekly_gym_text(interaction.guild_id, label, start_iso, end_iso)
+    await interaction.followup.send(
+        text, allowed_mentions=discord.AllowedMentions.none(),
+    )
+    cal_blocks = await _calorie_ai_summaries(
+        interaction.guild_id, start_iso, end_iso,
+    )
+    if not cal_blocks:
+        return
+    embed = discord.Embed(
+        title=f"🍎 Weekly calorie check-in — {label}",
+        description="\n\n".join(cal_blocks)[:4000],
+        colour=EMBED_COLOUR,
+    )
+    if gemini_client.available():
+        embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
+    await interaction.channel.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 async def _backfill_channel(
@@ -2934,6 +3204,21 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
+        name="🍎 Calories",
+        value=(
+            "`/calories setup <target>` — set a daily target "
+            "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
+            "`/calories add <amount> [note]` — log intake "
+            "(`650`, `650c`, `2700kj` — kJ converts automatically)\n"
+            "`/calories today [user]` · `/calories week [user]`\n"
+            "`/calories undo` — remove your last entry\n"
+            "`/calories stop` — stop tracking (history kept)\n"
+            "Tracked members get an AI summary in the Sunday "
+            "`/weekly_report`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="✏️ Logging & editing",
         value=(
             "`/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry\n"
@@ -2963,6 +3248,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/equipment_list` — what the bot knows about\n"
             "`/aliases <equipment>` — spellings I accept\n"
             "`/daily_update [days_ago]` — post a daily recap\n"
+            "`/weekly_report` — post the 7-day gym + calorie report\n"
             "`/export [user]` — download lifts as CSV\n"
             "`/ping` · `/version`"
         ),
@@ -4957,7 +5243,6 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(thinking=True)
 
-    guild_id = interaction.guild.id
     accounts = db.list_revo_accounts()
     # Filter to accounts whose Discord user is actually a member of this guild.
     # We intentionally do NOT filter by notify_guild_id because a user may have
@@ -6379,7 +6664,6 @@ async def track_raw_cmd(
             else:
                 lines.append(f"  🎮 *stopped*  <t:{unix}:f>")
 
-    total_events = len(inner) + len(act_inner)
     header = (
         f"**{user.display_name}** — last **{days}** day{'s' if days != 1 else ''}"
         f" ({len(inner)} status · {len(act_inner)} activity)"
@@ -6689,6 +6973,292 @@ async def track_now_cmd(
 
 
 bot.tree.add_command(track_group)
+
+
+# ---------------------------------------------------------------------------
+# Calorie tracking (/calories)
+# ---------------------------------------------------------------------------
+
+calories_group = app_commands.Group(
+    name="calories",
+    description="Track daily calorie intake against a personal target.",
+)
+
+# Sanity caps so a fat-fingered "25000" target or "65000kj" entry doesn't
+# wreck someone's stats. Entries are per-item, targets are per-day.
+_MAX_TARGET_KCAL = 20_000
+_MAX_ENTRY_KCAL = 10_000
+
+_CALORIES_NOT_SET_MSG = (
+    "You're not tracking calories yet — run `/calories setup` with your "
+    "daily target first (e.g. `2500` or `8700kj`)."
+)
+
+
+def _today_window() -> tuple[str, str]:
+    """UTC ISO bounds of the current local (DISPLAY_TIMEZONE) day."""
+    today = datetime.now(DISPLAY_TZ).date()
+    start_local = datetime.combine(today, dtime.min, tzinfo=DISPLAY_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _calorie_status_line(total: float, target: float) -> str:
+    bar = calories.progress_bar(total, target)
+    remaining = target - total
+    if remaining >= 0:
+        tail = f"**{calories.format_kcal(remaining)}** left today"
+    else:
+        tail = f"**{calories.format_kcal(-remaining)}** over target"
+    return (
+        f"`{bar}` {calories.format_kcal(total)} / "
+        f"{calories.format_kcal(target)} · {tail}"
+    )
+
+
+@calories_group.command(
+    name="setup",
+    description="Set your daily calorie target — accepts kcal or kJ.",
+)
+@app_commands.describe(
+    target='Daily target, e.g. "2500", "2500c", or "8700kj".',
+)
+async def calories_setup_cmd(
+    interaction: discord.Interaction, target: str,
+) -> None:
+    parsed = calories.parse_energy(target)
+    if parsed is None or parsed[0] <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that amount — try `2500`, `2500c`, or `8700kj`.",
+            ephemeral=True,
+        )
+        return
+    kcal, unit = parsed
+    if kcal > _MAX_TARGET_KCAL:
+        await interaction.response.send_message(
+            f"That's over {_MAX_TARGET_KCAL:,} cal/day — looks like a typo. "
+            "If you meant kilojoules, write it as e.g. `8700kj`.",
+            ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    db.calorie_goal_set(
+        guild_id, interaction.user.id, _display_name(interaction.user), kcal,
+    )
+    converted = (
+        f" (converted from {target.strip()})" if unit == "kj" else ""
+    )
+    await interaction.response.send_message(
+        f"🍎 Daily calorie target set to "
+        f"**{calories.format_kcal(kcal)}**{converted}.\n"
+        "Log what you eat with `/calories add` (kcal or kJ — I'll convert), "
+        "check in with `/calories today`, and you'll be included in the "
+        "Sunday weekly report."
+    )
+
+
+@calories_group.command(
+    name="add",
+    description="Log calories you just ate — kcal or kJ, I'll convert.",
+)
+@app_commands.describe(
+    amount='Energy amount, e.g. "650", "650c", or "2700kj".',
+    note="What it was (optional, shows in /calories today).",
+)
+async def calories_add_cmd(
+    interaction: discord.Interaction,
+    amount: str,
+    note: str | None = None,
+) -> None:
+    parsed = calories.parse_energy(amount)
+    if parsed is None or parsed[0] <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that amount — try `650`, `650c`, or `2700kj`.",
+            ephemeral=True,
+        )
+        return
+    kcal, unit = parsed
+    if kcal > _MAX_ENTRY_KCAL:
+        await interaction.response.send_message(
+            f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks like "
+            "a typo. If you meant kilojoules, write it as e.g. `2700kj`.",
+            ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    goal = db.calorie_goal_get(guild_id, interaction.user.id)
+    if goal is None:
+        await interaction.response.send_message(
+            _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    db.calorie_add(
+        guild_id, interaction.user.id, _display_name(interaction.user),
+        kcal, note=note, raw=amount.strip(),
+    )
+    total, _n = db.calorie_total_between(
+        guild_id, interaction.user.id, *_today_window(),
+    )
+    converted = f" = {calories.format_kcal(kcal)}" if unit == "kj" else ""
+    note_part = f" — {note}" if note else ""
+    await interaction.response.send_message(
+        f"🍽️ Logged **{amount.strip()}**{converted}{note_part}\n"
+        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+    )
+
+
+@calories_group.command(
+    name="today",
+    description="Show today's calorie intake vs the daily target.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def calories_today_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    goal = db.calorie_goal_get(guild_id, target_user.id)
+    if goal is None:
+        msg = (
+            _CALORIES_NOT_SET_MSG if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking calories."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    entries = db.calorie_entries_between(
+        guild_id, target_user.id, *_today_window(),
+    )
+    total = sum(float(r["kcal"]) for r in entries)
+    lines = [
+        _calorie_status_line(total, float(goal["daily_target_kcal"])),
+    ]
+    if entries:
+        lines.append("")
+        for r in entries:
+            dt = datetime.fromisoformat(r["logged_at"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            when = dt.astimezone(DISPLAY_TZ).strftime("%H:%M")
+            note_part = f" — {r['note']}" if r["note"] else ""
+            lines.append(
+                f"`{when}` {calories.format_kcal(float(r['kcal']))}{note_part}"
+            )
+    else:
+        lines.append("\nNothing logged yet today.")
+    embed = discord.Embed(
+        title=f"🍎 Calories today — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@calories_group.command(
+    name="week",
+    description="Per-day calorie totals for the last 7 days.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def calories_week_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    goal = db.calorie_goal_get(guild_id, target_user.id)
+    if goal is None:
+        msg = (
+            _CALORIES_NOT_SET_MSG if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking calories."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    _label, start_iso, end_iso = _week_window()
+    day_totals = _calorie_week_days(guild_id, target_user.id, start_iso, end_iso)
+    target_kcal = float(goal["daily_target_kcal"])
+    today = datetime.now(DISPLAY_TZ).date()
+    lines = []
+    logged_days = 0
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        key = day.isoformat()
+        day_name = _WEEKDAY_NAMES[day.weekday()][:3]
+        total = day_totals.get(key)
+        if total is None:
+            lines.append(f"`{day_name}` — nothing logged")
+            continue
+        logged_days += 1
+        bar = calories.progress_bar(total, target_kcal)
+        lines.append(
+            f"`{day_name}` `{bar}` {calories.format_kcal(total)}"
+        )
+    if logged_days:
+        avg = sum(day_totals.values()) / logged_days
+        lines.append(
+            f"\nAvg on logged days: **{calories.format_kcal(avg)}** vs "
+            f"target {calories.format_kcal(target_kcal)}"
+        )
+    embed = discord.Embed(
+        title=f"🍎 Calories this week — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@calories_group.command(
+    name="undo",
+    description="Remove your most recent calorie entry.",
+)
+async def calories_undo_cmd(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild_id or 0
+    row = db.calorie_pop_last(guild_id, interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "No calorie entries to undo.", ephemeral=True,
+        )
+        return
+    note_part = f" — {row['note']}" if row["note"] else ""
+    goal = db.calorie_goal_get(guild_id, interaction.user.id)
+    lines = [
+        f"↩️ Removed **{calories.format_kcal(float(row['kcal']))}**{note_part}",
+    ]
+    if goal is not None:
+        total, _n = db.calorie_total_between(
+            guild_id, interaction.user.id, *_today_window(),
+        )
+        lines.append(
+            _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        )
+    await interaction.response.send_message("\n".join(lines))
+
+
+@calories_group.command(
+    name="stop",
+    description="Stop tracking calories (your logged history is kept).",
+)
+async def calories_stop_cmd(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild_id or 0
+    removed = db.calorie_goal_remove(guild_id, interaction.user.id)
+    if not removed:
+        await interaction.response.send_message(
+            "You weren't tracking calories.", ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        "🍎 Calorie tracking stopped — your history is kept, and "
+        "`/calories setup` re-enables it any time."
+    )
+
+
+bot.tree.add_command(calories_group)
 
 
 def main() -> None:
