@@ -89,8 +89,8 @@ barGraphData = [
 favoriteClubId = 25;   // the logged-in member's preferred club
 ```
 
-- `in_club` is a **zero-padded string** of the *current* head-count (refresh to update).
-- `barGraphData[i]["<hour>"]` is an integer headcount estimate per hour 1-24, same order as the visible list of clubs on the page (which mirrors `clubCounterLists`). Useful for "busyness" charts.
+- `in_club` is a **zero-padded string** of the *current* head-count (refresh to update). **This is the only real, live, per-club signal** — `/busy` uses it.
+- `barGraphData[i]["<hour>"]` is *not* real per-club data. Re-checked 2026-06-12 with the live portal: across **76 clubs there are only 2 distinct `hourly` values — 69 clubs return `null` and the other 7 all share one identical hard-coded template** (`{1:10, …, 6:100, 7:100, 8:100, …, 20:110, …}`). It's a vestigial/placeholder busyness curve, **not** an hour-by-hour headcount. Do **not** build a per-club "peak today @ Xpm" or heatmap off it — it would be fabricated. (This invalidates the original feature-D idea in §5.)
 - Page does **not** auto-refresh in the background; we must re-`GET` to update.
 
 ### 3.2 Streaks — `/portal/rewards/streaks.php`
@@ -154,8 +154,14 @@ Tickets Available: 10
 ```
 - "Tickets Available" is the headline number (digit-grouped — concatenate the four `<digit>` cells).
 - Each row = `(delta_int, source_string, date_dd/mm/yyyy)`.
-- **Attendance rows = effective check-in log.** This is the closest thing to per-user
-  visit history available at level 1.
+- ⚠️ **`Attendance` rows are NOT a per-visit check-in log.** Verified 2026-06-12:
+  the per-day streaks calendar (§3.2.1) showed check-ins on June 1, 10, 11, while
+  ticket-tally's newest `Attendance` row was June 7 — days 10 and 11 never appeared.
+  The `Attendance` ticket is a roughly-**weekly reward grant**, dated to *issuance*,
+  not to the day the member trained. It lags real visits by days and misses most of
+  them. **Use the streaks calendar (§3.2.1) for per-day check-in detection** — that's
+  what the attendance poller now does. Ticket-tally is still the source for the
+  *ticket balance* and earning history (`/revo_tickets`, `/revo_raffle`).
 
 ### 3.4 Raffle / Prize pool
 
@@ -174,6 +180,25 @@ and a 30-second cache so we never hammer Revo.
 
 ## 5. Possible bot additions
 
+> **Status (2026-06-12):** A/B/C/E/F are now **implemented** in `app/bot.py`. D is
+> **not viable** (see §3.1 — `barGraphData` is a shared placeholder template, not
+> per-club data). The L2 re-confirmation below means H is still blocked.
+>
+> Implemented slash commands: `/busy`, `/revo_link`, `/help_revo_link`,
+> `/revo_unlink`, `/revo_streak`, `/revo_streak_compare`, `/revo_calendar`,
+> `/revo_calendar_compare`, `/revo_summary` (combined dashboard), `/revo_tickets`
+> (balance + earning history), `/revo_raffle` (tickets + draw countdowns).
+> The attendance poller now also fires a one-off **streak-milestone** celebration
+> (4/8/12/26/52 weeks) via `revo_client.streak_milestone()`.
+>
+> **L2 re-confirmation (2026-06-12):** the research account is now genuinely
+> `membershipLevel == 2`. Re-probing every gated route (`check-ins`, `visits`,
+> `history`, `dashboard`, `profile`, `streaks-data`, per-club counters, all
+> `/api/*`) — they **still 302 to `/portal/level-two-feature.php`** even with a
+> real L2 session. §1.1's conclusion holds: per-visit / per-club / per-timestamp
+> data is mobile-app-only. The `Attendance` rows in `ticket-tally.php` (date only)
+> remain the finest check-in signal on the web portal at any tier.
+
 Scoped to data we can actually read at **level 1**. (Things requiring L2 are noted.)
 
 ### A. Live "who's at the gym?" command — high value, easy
@@ -182,11 +207,17 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
 - Uses `clubCounterLists` + `barGraphData`.
 - Auto-suggest the user's `favoriteClubId`.
 
-### B. Personal check-in feed — high value, requires inferred check-ins
-- Poll `ticket-tally.php` every ~15 minutes per linked user.
-- On a new `Attendance` row, post to a configured Discord channel:
-  `"@user just checked into the gym (streak: 7 weeks) 💪"`.
-- Store last-seen ticket date per user in `db.py` to dedupe.
+### B. Personal check-in feed — high value
+- **Done:** `revo_attendance_poll` (every `REVO_POLL_MINUTES`, default 10) reads the
+  per-day streaks calendar (§3.2.1) for each linked user, tracks the most recent
+  attended day in `revo_account.last_checkin_date`, and posts to the configured
+  notify channel when a newer day appears:
+  `"🏋️ @user just checked in at Revo! — streak: 7 weeks 🔥"`.
+- ⚠️ **Originally specced against `ticket-tally.php` — that was wrong** (see §3.3):
+  ticket rows are a weekly reward grant, not per-visit, so the feed lagged days and
+  dropped most check-ins. Driving it off the calendar fixed the "delayed/missed"
+  symptom (a June-11 visit that ticket-tally never surfaced is now announced).
+- First poll after linking records a silent baseline (no backfill spam).
 - (We don't get *which* club without L2, only the date.)
 
 ### C. Streak tracker / leaderboard
@@ -199,14 +230,24 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
   - `!leaderboard streaks` \u2192 server-wide weekly ranking.
   - `!calendar [month]` \u2192 render a per-day attendance grid (uses the JSON variant).
   - Auto-celebrate when someone hits a milestone (4/8/12/26/52 weeks).
+- **Done:** `/revo_streak`, `/revo_streak_compare`, `/revo_calendar`,
+  `/revo_calendar_compare`, plus a milestone celebration appended to the
+  attendance-poll ping (`revo_client.streak_milestone()`).
 
-### D. Heat-map graph integration
-- Reuse `app/graphing.py` to render a 24×7 heatmap from `barGraphData` for any club.
-- `!heatmap Modbury` → posts an image.
+### D. ~~Heat-map graph integration~~ — not viable
+- Originally proposed rendering a 24h heatmap from `barGraphData`. **Abandoned:**
+  re-checking the live portal (§3.1) showed `barGraphData` is a single shared
+  placeholder template (69/76 clubs return `null`, the rest share one identical
+  curve), so any per-club heatmap would be fabricated, not real busyness.
 
 ### E. Raffle / draw reminders
 - Read `Monthly Draw N days` from `raffle.php`.
-- Schedule pings: "Major draw closes in 24h — you have N tickets".
+- **Done (on-demand):** `/revo_raffle` shows the member's ticket balance plus the
+  monthly + major draw countdowns; `/revo_tickets` shows the balance and recent
+  earning history; both feed into `/revo_summary`.
+- **Still open (push):** a scheduled "Major draw closes in 24h — you have N
+  tickets" ping. Would need a dedup cursor (e.g. a `last_raffle_reminder` column
+  via the idempotent `Database._migrate()` ALTER pattern) so it fires once per draw.
 
 ### F. Multi-account / household linking
 - `!link revo <email> <password>` (DM-only, encrypted-at-rest).

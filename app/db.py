@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS revo_account (
     favorite_club_id       INTEGER,
     last_ticket_signature  TEXT,
     last_streak_weeks      INTEGER,
+    last_checkin_date      TEXT,
     notify_guild_id        INTEGER,
     notify_channel_id      INTEGER,
     linked_at              TEXT    NOT NULL,
@@ -271,6 +272,17 @@ class Database:
                 self._connection.execute(
                     "UPDATE reply_tracking SET target_user_id = user_id "
                     "WHERE target_user_id IS NULL"
+                )
+            # The attendance poller moved from a ticket-tally signature cursor to
+            # a per-day calendar cursor (last_checkin_date, ISO YYYY-MM-DD). Older
+            # DBs predate the column.
+            revo_cols = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(revo_account)")
+            }
+            if revo_cols and "last_checkin_date" not in revo_cols:
+                self._connection.execute(
+                    "ALTER TABLE revo_account ADD COLUMN last_checkin_date TEXT"
                 )
             self._recanonicalize_equipment()
 
@@ -1788,7 +1800,11 @@ class Database:
         last_ticket_signature: str | None,
         last_streak_weeks: int | None,
     ) -> None:
-        """Persist the cursor + cached streak after a poll cycle."""
+        """Persist the ticket-tally cursor + cached streak after a poll cycle.
+
+        Retained for the ticket-signature cursor; the attendance poller now
+        tracks check-ins via :meth:`update_revo_checkin_state` instead.
+        """
         ts = _normalize_iso(None)
         with self._conn() as c:
             c.execute(
@@ -1800,6 +1816,31 @@ class Database:
                  WHERE user_id = ?
                 """,
                 (last_ticket_signature, last_streak_weeks, ts, user_id),
+            )
+
+    def update_revo_checkin_state(
+        self,
+        user_id: int,
+        last_checkin_date: str | None,
+        last_streak_weeks: int | None,
+    ) -> None:
+        """Persist the per-day check-in cursor + cached streak after a poll.
+
+        ``last_checkin_date`` is the most recent attended day as an ISO
+        ``YYYY-MM-DD`` string (derived from the streaks calendar), used by the
+        attendance poller to detect a *new* check-in since the last cycle.
+        """
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE revo_account
+                   SET last_checkin_date = ?,
+                       last_streak_weeks = ?,
+                       last_polled_at    = ?
+                 WHERE user_id = ?
+                """,
+                (last_checkin_date, last_streak_weeks, ts, user_id),
             )
 
     def lifts_for_message(

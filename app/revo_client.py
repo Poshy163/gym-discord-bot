@@ -281,6 +281,42 @@ def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
     return avail, rows
 
 
+def latest_attended_day(calendar: dict[int, bool]) -> Optional[int]:
+    """Return the highest day-of-month with a check-in in *calendar*, or None.
+
+    ``calendar`` is the ``{day_of_month: attended}`` mapping returned by
+    :meth:`RevoClient.get_streak_calendar`. The attendance poller uses this as
+    the *real* per-visit check-in signal — far more timely and granular than
+    ``ticket-tally.php``, whose "Attendance" rows are only a roughly-weekly
+    reward grant (dated to issuance, not to the day the member trained).
+    """
+    days = [d for d, attended in calendar.items() if attended]
+    return max(days) if days else None
+
+
+# Weekly-streak milestones worth celebrating in the attendance feed.
+STREAK_MILESTONES: tuple[int, ...] = (4, 8, 12, 26, 52)
+
+
+def streak_milestone(prev: Optional[int], new: Optional[int]) -> Optional[int]:
+    """Return the milestone newly reached when a streak grows ``prev`` → ``new``.
+
+    Used by the attendance poller to fire a one-off celebration the first time
+    a member's weekly streak crosses one of :data:`STREAK_MILESTONES`. Returns
+    the *highest* milestone in the half-open interval ``(prev, new]`` (so a jump
+    that skips several only celebrates the biggest), or ``None`` when no
+    milestone was crossed.
+
+    A ``None`` ``prev`` (we've never recorded a streak for this member yet)
+    yields ``None`` so a freshly-linked account doesn't get spammed with a
+    milestone for its backfilled streak.
+    """
+    if new is None or prev is None:
+        return None
+    crossed = [m for m in STREAK_MILESTONES if prev < m <= new]
+    return max(crossed) if crossed else None
+
+
 def parse_raffle(html: str) -> dict[str, Optional[int]]:
     """Extract monthly + major draw countdowns (in days)."""
     text = re.sub(r"<[^>]+>", " ", html)

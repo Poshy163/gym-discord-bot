@@ -3338,7 +3338,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/revo_streak` — your weekly check-in streak\n"
             "`/revo_streak_compare` — streak leaderboard for all linked members\n"
             "`/revo_calendar` — monthly check-in calendar\n"
-            "`/revo_calendar_compare` — side-by-side calendars for all linked members"
+            "`/revo_calendar_compare` — side-by-side calendars for all linked members\n"
+            "`/revo_summary` — streak, check-ins, tickets & next draw in one\n"
+            "`/revo_tickets` — ticket balance & recent earning history\n"
+            "`/revo_raffle` — your tickets + monthly/major draw countdowns"
         ),
         inline=False,
     )
@@ -4860,14 +4863,14 @@ REVO_DISABLED = os.getenv("REVO_DISABLED", "0").lower() in (
     "1", "true", "yes", "y", "on",
 )
 
-# How often to poll linked accounts for new attendance entries. The portal's
-# ticket-tally only updates after a check-in; 15 minutes is conservative
-# enough to stay well under any plausible rate limit while still feeling
-# "live" to a Discord channel.
+# How often to poll linked accounts for new check-ins. We read the per-day
+# streaks calendar (the real attendance signal); 10 minutes keeps the feed
+# feeling "live" while staying at the portal's documented ≥10-min politeness
+# floor (see docs/REVO_PORTAL.md §6). Override with REVO_POLL_MINUTES.
 try:
-    REVO_POLL_MINUTES = max(5, int(os.getenv("REVO_POLL_MINUTES", "15")))
+    REVO_POLL_MINUTES = max(5, int(os.getenv("REVO_POLL_MINUTES", "10")))
 except ValueError:
-    REVO_POLL_MINUTES = 15
+    REVO_POLL_MINUTES = 10
 
 # Optional global default channel for attendance notifications. Each linked
 # account can also pin its own notify_channel_id; this is just the fallback
@@ -4881,14 +4884,6 @@ REVO_DEFAULT_NOTIFY_CHANNEL_ID: int | None = (
 # fresh session on every cycle.
 _revo_user_clients: dict[int, "revo_client.RevoClient"] = {}
 _revo_clients_lock = __import__("threading").Lock()
-
-
-def _ticket_signature(rows: list["revo_client.TicketRow"]) -> str | None:
-    """Stable signature of the most-recent ticket-tally entry."""
-    if not rows:
-        return None
-    head = rows[0]
-    return f"{head.date}|{head.delta}|{head.source}"
 
 
 def _client_for_user(row) -> "revo_client.RevoClient":
@@ -5654,6 +5649,270 @@ async def revo_calendar_compare_cmd(
     )
 
 
+# ---------------------------------------------------------------------------
+# Revo tickets / raffle / summary (read-only, real per-account data)
+# ---------------------------------------------------------------------------
+
+def _format_draw_countdown(days: int | None, label: str) -> str:
+    """Render one raffle-countdown line, e.g. ``Monthly draw: in 3 days``."""
+    if days is None:
+        return f"{label} draw: *unknown*"
+    if days <= 0:
+        return f"{label} draw: **today / imminent** 🎉"
+    return f"{label} draw: in **{days} day{'s' if days != 1 else ''}**"
+
+
+@bot.tree.command(
+    name="revo_tickets",
+    description="Show a Revo Fitness ticket balance and recent earning history.",
+)
+@app_commands.describe(member="The server member to look up. Defaults to yourself.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_tickets_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+
+    target = member or interaction.user
+    row = db.get_revo_account(target.id)
+    if row is None:
+        if target == interaction.user:
+            await interaction.response.send_message(
+                "Link your account first with `/revo_link`.", ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.mention} hasn't linked a Revo account yet.",
+                ephemeral=True,
+            )
+        return
+    await interaction.response.defer(thinking=True)
+
+    def _do() -> "tuple[int | None, list[revo_client.TicketRow]] | str":
+        try:
+            client = _client_for_user(row)
+            return client.get_tickets()
+        except revo_client.RevoAuthError as exc:
+            _drop_cached_client(int(row["user_id"]))
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo tickets fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        msg = (
+            f"Couldn't fetch your tickets ({result})."
+            if target == interaction.user
+            else f"Couldn't fetch {target.mention}'s tickets ({result})."
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    avail, rows = result
+    display = _bot_name(target.id, target.display_name)
+    avail_txt = f"**{avail}**" if avail is not None else "*unknown*"
+    lines = [f"🎟️ **{display}** — Revo tickets available: {avail_txt}"]
+    if rows:
+        lines.append("-# Recent activity:")
+        for r in rows[:8]:
+            lines.append(f"• `{r.date}`  +{r.delta}  {r.source}")
+    else:
+        lines.append("-# No recent ticket activity found.")
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="revo_raffle",
+    description="Show your Revo ticket balance and the monthly + major draw countdowns.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # Draw countdowns are global (same for everyone), but the ticket balance is
+    # per-account. Prefer the invoking user's linked account so we can show
+    # their own tickets; fall back to the shared env account for countdowns.
+    row = db.get_revo_account(interaction.user.id)
+    personal = row is not None
+
+    def _do() -> "tuple[int | None, dict[str, int | None]] | str":
+        try:
+            if row is not None:
+                client = _client_for_user(row)
+            else:
+                client = revo_client.shared_client_from_env()
+            raffle = client.get_raffle()
+            tickets = None
+            try:
+                tickets, _rows = client.get_tickets()
+            except Exception:  # pragma: no cover - non-fatal
+                LOG.warning("Revo raffle: ticket fetch failed", exc_info=True)
+            return tickets, raffle
+        except revo_client.RevoUnavailable as exc:
+            return f"no-credentials: {exc}"
+        except revo_client.RevoAuthError as exc:
+            if row is not None:
+                _drop_cached_client(int(row["user_id"]))
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo raffle fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        if result.startswith("no-credentials"):
+            await interaction.followup.send(
+                "🔒 The raffle countdown needs a logged-in session. Link your "
+                "account with `/revo_link` (or ask the host to set a shared "
+                "account) and try again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"Couldn't fetch the raffle info ({result}).", ephemeral=True,
+        )
+        return
+
+    tickets, raffle = result
+    lines = ["🎰 **Revo Raffle**"]
+    if personal and tickets is not None:
+        display = _bot_name(interaction.user.id, interaction.user.display_name)
+        lines.append(
+            f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''} "
+            "in the draw"
+        )
+    lines.append(_format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"))
+    lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
+    if not personal:
+        lines.append("-# Link your account with `/revo_link` to show *your* ticket count.")
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="revo_summary",
+    description="A combined Revo dashboard: streak, this month's check-ins, tickets and next draw.",
+)
+@app_commands.describe(member="The server member to look up. Defaults to yourself.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_summary_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled.", ephemeral=True,
+        )
+        return
+    if not revo_client.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    target = member or interaction.user
+    row = db.get_revo_account(target.id)
+    if row is None:
+        if target == interaction.user:
+            await interaction.response.send_message(
+                "Link your account first with `/revo_link`.", ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.mention} hasn't linked a Revo account yet.",
+                ephemeral=True,
+            )
+        return
+    await interaction.response.defer(thinking=True)
+
+    today = datetime.now()
+    m, y = today.month, today.year
+
+    def _do() -> "dict[str, object] | str":
+        try:
+            client = _client_for_user(row)
+            streak = client.get_streak_weeks()
+            avail, _rows = client.get_tickets()
+            raffle = client.get_raffle()
+            calendar = client.get_streak_calendar(m, y)
+            return {
+                "streak": streak,
+                "tickets": avail,
+                "raffle": raffle,
+                "calendar": calendar,
+            }
+        except revo_client.RevoAuthError as exc:
+            _drop_cached_client(int(row["user_id"]))
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("Revo summary fetch failed")
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        msg = (
+            f"Couldn't build your summary ({result})."
+            if target == interaction.user
+            else f"Couldn't build {target.mention}'s summary ({result})."
+        )
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    streak = result["streak"]
+    tickets = result["tickets"]
+    raffle = result["raffle"]
+    calendar = result["calendar"] or {}
+    month_checkins = sum(1 for v in calendar.values() if v)
+    month_name = today.strftime("%B")
+    display = _bot_name(target.id, target.display_name)
+
+    streak_txt = (
+        f"**{streak} week{'s' if streak != 1 else ''}**"
+        if streak is not None
+        else "*unknown*"
+    )
+    tickets_txt = f"**{tickets}**" if tickets is not None else "*unknown*"
+    lines = [
+        f"🏋️ **{display}** — Revo summary",
+        f"🔥 Weekly streak: {streak_txt}",
+        f"📅 {month_name} check-ins: **{month_checkins}**",
+        f"🎟️ Tickets available: {tickets_txt}",
+        _format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"),
+        _format_draw_countdown(raffle.get("major_draw_days"), "Major"),
+    ]
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 def _render_revo_calendar(
     month: int,
     year: int,
@@ -6091,11 +6350,16 @@ async def nicks_cmd(interaction: discord.Interaction) -> None:
 async def revo_attendance_poll() -> None:
     """Walk every linked Revo account and announce new check-ins.
 
-    Strategy: hit ticket-tally, take the newest history row, compare to
-    the row we last saw (``last_ticket_signature``). On change, post to the
-    user's configured notify channel and update the cursor. We deliberately
-    treat the *first* poll after linking as silent (no signature → record
-    baseline) so users don't get spammed with backfilled history.
+    Strategy: read the per-day streaks calendar (the real attendance signal)
+    and track the most recent attended day in ``last_checkin_date``. When a
+    newer day appears, post to the user's configured notify channel and advance
+    the cursor. The *first* poll after linking is silent (no cursor yet →
+    record baseline) so users aren't spammed with backfilled history.
+
+    Why the calendar and not ticket-tally: the "Attendance" rows in
+    ticket-tally are only a roughly-weekly *reward* grant, dated to issuance —
+    they lag the actual visit by days and miss most check-ins entirely. The
+    calendar lights up per training day, much closer to real time.
     """
     if REVO_DISABLED or not revo_client.available():
         return
@@ -6112,20 +6376,38 @@ async def revo_attendance_poll() -> None:
 async def _poll_one_account(row) -> None:
     user_id = int(row["user_id"])
     notify_channel_id = row["notify_channel_id"]
-    last_sig = row["last_ticket_signature"]
+    prev_checkin = row["last_checkin_date"]  # ISO YYYY-MM-DD or None
+    prev_streak = row["last_streak_weeks"]
 
-    def _fetch() -> tuple[str | None, int | None, "revo_client.TicketRow" | None] | str:
+    now_local = datetime.now(DISPLAY_TZ)
+
+    def _fetch() -> "tuple[str | None, int | None] | str":
+        """Return (latest_checkin_iso, streak_weeks) or an error string."""
         try:
             client = _client_for_user(row)
-            _avail, rows = client.get_tickets()
+            cal = client.get_streak_calendar(now_local.month, now_local.year)
+            latest_day = revo_client.latest_attended_day(cal)
+            latest_iso: str | None = (
+                datetime(now_local.year, now_local.month, latest_day).strftime("%Y-%m-%d")
+                if latest_day
+                else None
+            )
+            # Near a month boundary the current month may not yet hold the most
+            # recent visit — bridge by also checking the previous month.
+            if latest_iso is None and now_local.day <= 2:
+                prev_month = now_local.replace(day=1) - timedelta(days=1)
+                prev_cal = client.get_streak_calendar(prev_month.month, prev_month.year)
+                prev_day = revo_client.latest_attended_day(prev_cal)
+                if prev_day:
+                    latest_iso = datetime(
+                        prev_month.year, prev_month.month, prev_day
+                    ).strftime("%Y-%m-%d")
             streak = None
             try:
                 streak = client.get_streak_weeks()
             except Exception:  # pragma: no cover
                 LOG.warning("Revo streak fetch failed for user %s", user_id, exc_info=True)
-            sig = _ticket_signature(rows)
-            head = rows[0] if rows else None
-            return sig, streak, head
+            return latest_iso, streak
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(user_id)
             return f"auth-failed: {exc}"
@@ -6136,18 +6418,22 @@ async def _poll_one_account(row) -> None:
     if isinstance(result, str):
         LOG.warning("Revo poll skipped user %s: %s", user_id, result)
         return
-    sig, streak, head = result
+    latest_iso, streak = result
 
-    # Persist the cursor first so a notify-failure doesn't replay forever.
-    db.update_revo_polling_state(user_id, sig, streak)
+    # Advance the cursor to the newest date we know about, then persist first so
+    # a notify-failure doesn't replay forever. ISO dates sort lexicographically.
+    cursor = max(d for d in (prev_checkin, latest_iso) if d) if (prev_checkin or latest_iso) else None
+    db.update_revo_checkin_state(user_id, cursor, streak)
 
-    if sig is None or sig == last_sig:
+    if latest_iso is None:
         return
-    if last_sig is None:
+    if prev_checkin is None:
         # First poll after link — establish baseline silently.
-        LOG.info("Revo baseline established for user %s (sig=%s)", user_id, sig)
+        LOG.info("Revo baseline established for user %s (date=%s)", user_id, latest_iso)
         return
-    if notify_channel_id is None or head is None:
+    if latest_iso <= prev_checkin:
+        return
+    if notify_channel_id is None:
         return
 
     channel = bot.get_channel(int(notify_channel_id))
@@ -6165,10 +6451,24 @@ async def _poll_one_account(row) -> None:
         f" — streak: **{streak} week{'s' if streak != 1 else ''}** 🔥"
         if streak else ""
     )
-    text = (
-        f"🏋️ <@{user_id}> just checked in at Revo "
-        f"({head.source}, {head.date}){streak_tail}"
-    )
+    checkin_date = datetime.strptime(latest_iso, "%Y-%m-%d").date()
+    today = now_local.date()
+    if checkin_date == today:
+        text = f"🏋️ <@{user_id}> just checked in at Revo!{streak_tail}"
+    else:
+        when = "yesterday" if checkin_date == today - timedelta(days=1) else (
+            f"{checkin_date.strftime('%a')} {checkin_date.day} {checkin_date.strftime('%b')}"
+        )
+        text = f"🏋️ <@{user_id}> checked in at Revo ({when}){streak_tail}"
+
+    # Celebrate the first check-in that pushes the weekly streak past a
+    # milestone (4/8/12/26/52 weeks).
+    milestone = revo_client.streak_milestone(prev_streak, streak)
+    if milestone is not None:
+        text += (
+            f"\n🎉 **Milestone!** That's a **{milestone}-week** Revo streak. "
+            "Keep it going! 💪"
+        )
 
     # Append a streak leaderboard if there are other linked accounts in the
     # same notify guild (using the cached streak values — no extra HTTP calls).

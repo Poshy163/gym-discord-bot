@@ -132,6 +132,32 @@ def test_parse_raffle_extracts_countdowns():
     assert out == {"monthly_draw_days": 12, "major_draw_days": 145}
 
 
+def test_latest_attended_day():
+    # Picks the highest attended day, ignoring missed days.
+    assert revo_client.latest_attended_day({1: True, 10: True, 11: True, 12: False}) == 11
+    assert revo_client.latest_attended_day({1: False, 2: False}) is None
+    assert revo_client.latest_attended_day({}) is None
+    assert revo_client.latest_attended_day({5: True}) == 5
+
+
+def test_streak_milestone_crossing():
+    # No previous streak recorded yet → never celebrate (avoids backfill spam).
+    assert revo_client.streak_milestone(None, 8) is None
+    # No movement past a milestone.
+    assert revo_client.streak_milestone(4, 5) is None
+    assert revo_client.streak_milestone(8, 8) is None
+    # Crossing exactly onto a milestone.
+    assert revo_client.streak_milestone(3, 4) == 4
+    assert revo_client.streak_milestone(11, 12) == 12
+    # A jump that skips several only celebrates the highest reached.
+    assert revo_client.streak_milestone(2, 13) == 12
+    # Beyond the top milestone, nothing new to celebrate.
+    assert revo_client.streak_milestone(52, 60) is None
+    assert revo_client.streak_milestone(51, 52) == 52
+    # Defensive: a None current streak yields nothing.
+    assert revo_client.streak_milestone(4, None) is None
+
+
 def test_find_club_substring_match():
     clubs, _ = revo_client.parse_club_counter(
         'var clubCounterLists = {"Modbury":{"id":25,"in_club":42},'

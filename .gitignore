@@ -13,6 +13,9 @@ venv/
 *.db
 data/
 
+# Revo portal research scratch dumps (may contain personal account HTML)
+scripts/_revo_probe_out/
+
 # Editors / OS
 .vscode/
 .idea/
