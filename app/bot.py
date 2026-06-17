@@ -922,6 +922,66 @@ async def _handle_calorie_message(
     )
 
 
+def _match_calorie_food(
+    message: discord.Message, target: object, content: str,
+) -> tuple[sqlite3.Row, int] | None:
+    """If ``content`` is exactly one of ``target``'s saved foods (optionally
+    with a serving count), return ``(food_row, servings)``. Requires the user
+    to be calorie-tracking; returns None otherwise so the message falls
+    through to the lift parser."""
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    if db.calorie_goal_get(guild_id, target_id) is None:
+        return None
+    parsed = calories.parse_food_phrase(content)
+    if parsed is None:
+        return None
+    servings, name = parsed
+    row = db.calorie_food_get(guild_id, target_id, name)
+    if row is None:
+        return None
+    return row, servings
+
+
+async def _handle_calorie_food_message(
+    message: discord.Message, target: object,
+    food_row: sqlite3.Row, servings: int,
+) -> None:
+    """Log a saved-food chat shortcut (`coffee`, `2 protein shake`). Tick-only
+    confirmation, like the other chat calorie path."""
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    kcal = float(food_row["kcal"]) * servings
+    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+        try:
+            await message.reply(
+                f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — skipped.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    display = food_row["display"]
+    note = display if servings == 1 else f"{display} ×{servings}"
+    try:
+        db.calorie_add(
+            guild_id, target_id, _display_name(target), kcal,
+            note=note, raw=message.content.strip()[:80],
+            message_id=message.id,
+        )
+    except Exception:
+        LOG.exception("Failed to store food entry for user %s", target_id)
+        return
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    LOG.info(
+        "Stored food '%s' ×%d (%.0f kcal) for %s in #%s",
+        display, servings, kcal, target, message.channel,
+    )
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -1649,6 +1709,16 @@ async def on_message(message: discord.Message) -> None:
     cal_hit = calories.parse_chat_message(content)
     if cal_hit is not None:
         await _handle_calorie_message(message, target, *cal_hit)
+        await bot.process_commands(message)
+        return
+
+    # Saved-food shortcut: a message that's exactly one of the target's saved
+    # foods ("coffee", "2 protein shake") logs that food's calories. Gated on
+    # the user actually tracking + the name being defined, so normal chatter
+    # falls through to the lift parser.
+    food_hit = _match_calorie_food(message, target, content)
+    if food_hit is not None:
+        await _handle_calorie_food_message(message, target, *food_hit)
         await bot.process_commands(message)
         return
 
@@ -3325,9 +3395,12 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/calories setup <target>` — set a daily target "
             "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
             "`/calories add <amount> [note]` — log intake "
-            "(`650`, `650c`, `2700kj` — kJ converts automatically)\n"
+            "(`650`, `650c`, `2700kj`, or a saved food like `coffee`)\n"
             "Or just type `650kcal` / `200c` / `2700kj maccas` in chat — "
             "I'll react ✅ and log it\n"
+            "`/calories food_set <name> <amount>` — save a food shortcut, "
+            "then log it by typing `coffee` or `2 coffee` in chat\n"
+            "`/calories food_list` · `/calories food_remove <name>`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories undo` — remove your last entry\n"
             "`/calories stop` — stop tracking (history kept)\n"
@@ -7569,7 +7642,7 @@ async def calories_setup_cmd(
     description="Log calories you just ate — kcal or kJ, I'll convert.",
 )
 @app_commands.describe(
-    amount='Energy amount, e.g. "650", "650c", or "2700kj".',
+    amount='Energy ("650", "650c", "2700kj") or a saved food ("coffee", "2 coffee").',
     note="What it was (optional, shows in /calories today).",
 )
 async def calories_add_cmd(
@@ -7577,26 +7650,46 @@ async def calories_add_cmd(
     amount: str,
     note: str | None = None,
 ) -> None:
-    parsed = calories.parse_energy(amount)
-    if parsed is None or parsed[0] <= 0:
-        await interaction.response.send_message(
-            "Couldn't read that amount — try `650`, `650c`, or `2700kj`.",
-            ephemeral=True,
-        )
-        return
-    kcal, unit = parsed
-    if kcal > _MAX_ENTRY_KCAL:
-        await interaction.response.send_message(
-            f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks like "
-            "a typo. If you meant kilojoules, write it as e.g. `2700kj`.",
-            ephemeral=True,
-        )
-        return
     guild_id = interaction.guild_id or 0
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
             _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+
+    # Energy amount first ("650", "2700kj"); fall back to a saved-food name.
+    parsed = calories.parse_energy(amount)
+    if parsed is not None and parsed[0] > 0:
+        kcal, unit = parsed
+        logged_label = amount.strip()
+        converted = f" = {calories.format_kcal(kcal)}" if unit == "kj" else ""
+    else:
+        food = calories.parse_food_phrase(amount)
+        row = (
+            db.calorie_food_get(guild_id, interaction.user.id, food[1])
+            if food is not None else None
+        )
+        if row is None:
+            await interaction.response.send_message(
+                "Couldn't read that — try `650`, `2700kj`, or a saved food "
+                "name like `coffee` (define one with `/calories food_set`).",
+                ephemeral=True,
+            )
+            return
+        servings = food[0]
+        kcal = float(row["kcal"]) * servings
+        base = row["display"]
+        logged_label = base if servings == 1 else f"{base} ×{servings}"
+        converted = f" = {calories.format_kcal(kcal)}"
+        if note is None:
+            note = logged_label
+
+    if kcal > _MAX_ENTRY_KCAL:
+        await interaction.response.send_message(
+            f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks like "
+            "a typo. If you meant kilojoules, write it as e.g. `2700kj`.",
+            ephemeral=True,
         )
         return
     db.calorie_add(
@@ -7606,10 +7699,10 @@ async def calories_add_cmd(
     total, _n = db.calorie_total_between(
         guild_id, interaction.user.id, *_today_window(),
     )
-    converted = f" = {calories.format_kcal(kcal)}" if unit == "kj" else ""
-    note_part = f" — {note}" if note else ""
+    # Skip the note suffix when it just repeats the food name we already show.
+    note_part = f" — {note}" if note and note != logged_label else ""
     await interaction.response.send_message(
-        f"🍽️ Logged **{amount.strip()}**{converted}{note_part}\n"
+        f"🍽️ Logged **{logged_label}**{converted}{note_part}\n"
         + _calorie_status_line(total, float(goal["daily_target_kcal"]))
     )
 
@@ -7760,6 +7853,99 @@ async def calories_stop_cmd(interaction: discord.Interaction) -> None:
         "🍎 Calorie tracking stopped — your history is kept, and "
         "`/calories setup` re-enables it any time."
     )
+
+
+@calories_group.command(
+    name="food_set",
+    description="Save a food → calorie shortcut you can log by name.",
+)
+@app_commands.describe(
+    name="Food name, e.g. coffee or protein shake.",
+    amount='Calories per serving — kcal or kJ ("120", "120c", "500kj").',
+)
+async def calories_food_set_cmd(
+    interaction: discord.Interaction, name: str, amount: str,
+) -> None:
+    norm = calories.normalize_food(name)
+    if not norm:
+        await interaction.response.send_message(
+            "Give the food a name, e.g. `/calories food_set coffee 5`.",
+            ephemeral=True,
+        )
+        return
+    parsed = calories.parse_energy(amount)
+    if parsed is None or parsed[0] <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that amount — try `120`, `120c`, or `500kj`.",
+            ephemeral=True,
+        )
+        return
+    kcal, _unit = parsed
+    if kcal > _MAX_ENTRY_KCAL:
+        await interaction.response.send_message(
+            f"That's over {_MAX_ENTRY_KCAL:,} cal per serving — looks like a "
+            "typo. If you meant kilojoules, write it as e.g. `500kj`.",
+            ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    db.calorie_food_set(
+        guild_id, interaction.user.id, norm, name.strip(), kcal,
+    )
+    tracking = db.calorie_goal_get(guild_id, interaction.user.id) is not None
+    tail = (
+        f"Log it by typing `{norm}` (or `2 {norm}`) in chat, or "
+        f"`/calories add {norm}`."
+        if tracking
+        else "Run `/calories setup` to start tracking, then log it by name."
+    )
+    await interaction.response.send_message(
+        f"🍴 Saved **{name.strip()}** = {calories.format_kcal(kcal)}. {tail}"
+    )
+
+
+@calories_group.command(
+    name="food_list", description="List your saved food shortcuts.",
+)
+async def calories_food_list_cmd(interaction: discord.Interaction) -> None:
+    rows = db.calorie_food_list(interaction.guild_id or 0, interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(
+            "You haven't saved any foods yet. Add one with "
+            "`/calories food_set <name> <amount>`.",
+            ephemeral=True,
+        )
+        return
+    lines = [
+        f"• **{r['display']}** — {calories.format_kcal(float(r['kcal']))}"
+        for r in rows
+    ]
+    embed = discord.Embed(
+        title="🍴 Your saved foods",
+        description="\n".join(lines)[:4000],
+        colour=EMBED_COLOUR,
+    )
+    embed.set_footer(text="Log one by typing its name in chat, e.g. coffee")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@calories_group.command(
+    name="food_remove", description="Delete one of your saved food shortcuts.",
+)
+@app_commands.describe(name="The saved food to remove.")
+async def calories_food_remove_cmd(
+    interaction: discord.Interaction, name: str,
+) -> None:
+    norm = calories.normalize_food(name)
+    removed = db.calorie_food_remove(
+        interaction.guild_id or 0, interaction.user.id, norm,
+    )
+    msg = (
+        f"🗑️ Removed **{name.strip()}**." if removed
+        else f"No saved food called **{name.strip()}**. "
+        "See `/calories food_list`."
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 bot.tree.add_command(calories_group)

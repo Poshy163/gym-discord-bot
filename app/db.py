@@ -199,6 +199,20 @@ CREATE TABLE IF NOT EXISTS calorie_entries (
 
 CREATE INDEX IF NOT EXISTS idx_calorie_entries_user
     ON calorie_entries (guild_id, user_id, logged_at);
+
+-- Per-user saved foods: a name → calorie shortcut so typing "coffee" logs a
+-- known amount. Scoped per (guild, user). ``name`` is stored normalized
+-- (lowercased, whitespace-collapsed) for lookups; ``display`` keeps the
+-- original casing for output.
+CREATE TABLE IF NOT EXISTS calorie_foods (
+    guild_id INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    name     TEXT    NOT NULL,
+    display  TEXT    NOT NULL,
+    kcal     REAL    NOT NULL,
+    set_at   TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id, name)
+);
 """
 
 
@@ -2332,3 +2346,60 @@ class Database:
                 (guild_id, user_id, start_iso, end_iso),
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
+
+    # ---- saved foods -----------------------------------------------------
+
+    def calorie_food_set(
+        self, guild_id: int, user_id: int, name: str, display: str,
+        kcal: float,
+    ) -> None:
+        """Create or update a saved food shortcut. ``name`` must already be
+        normalized (lowercased/whitespace-collapsed)."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO calorie_foods
+                    (guild_id, user_id, name, display, kcal, set_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (guild_id, user_id, name) DO UPDATE SET
+                    display = excluded.display,
+                    kcal    = excluded.kcal,
+                    set_at  = excluded.set_at
+                """,
+                (
+                    guild_id, user_id, name, display, float(kcal),
+                    _normalize_iso(None),
+                ),
+            )
+
+    def calorie_food_get(
+        self, guild_id: int, user_id: int, name: str,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT name, display, kcal FROM calorie_foods "
+                "WHERE guild_id = ? AND user_id = ? AND name = ?",
+                (guild_id, user_id, name),
+            ).fetchone()
+
+    def calorie_food_remove(
+        self, guild_id: int, user_id: int, name: str,
+    ) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_foods "
+                "WHERE guild_id = ? AND user_id = ? AND name = ?",
+                (guild_id, user_id, name),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def calorie_food_list(
+        self, guild_id: int, user_id: int,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT name, display, kcal FROM calorie_foods "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY display COLLATE NOCASE",
+                (guild_id, user_id),
+            ))

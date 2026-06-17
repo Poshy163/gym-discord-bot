@@ -11,8 +11,10 @@ from app.calories import (
     format_kcal,
     kcal_to_kj,
     kj_to_kcal,
+    normalize_food,
     parse_chat_message,
     parse_energy,
+    parse_food_phrase,
     progress_bar,
 )
 from app.db import Database
@@ -112,6 +114,43 @@ def test_parse_chat_message_accepts(text, kcal, unit, note):
 ])
 def test_parse_chat_message_rejects(text):
     assert parse_chat_message(text) is None
+
+
+# ---- saved-food phrase parsing --------------------------------------------
+
+@pytest.mark.parametrize("text,servings,name", [
+    ("coffee", 1, "coffee"),
+    ("Coffee", 1, "coffee"),
+    ("  protein   shake ", 1, "protein shake"),
+    ("2 coffee", 2, "coffee"),
+    ("2x coffee", 2, "coffee"),
+    ("2 x coffee", 2, "coffee"),
+    ("coffee x2", 2, "coffee"),
+    ("coffee x 2", 2, "coffee"),
+    ("3 protein shake", 3, "protein shake"),
+])
+def test_parse_food_phrase_accepts(text, servings, name):
+    result = parse_food_phrase(text)
+    assert result == (servings, name)
+
+
+def test_parse_food_phrase_clamps_servings():
+    assert parse_food_phrase("999 coffee") == (50, "coffee")
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "coffee\nbench press 80kg",   # multi-line never a food shortcut
+    "x" * 65,                      # too long
+])
+def test_parse_food_phrase_rejects(text):
+    assert parse_food_phrase(text) is None
+
+
+def test_normalize_food():
+    assert normalize_food("  Protein   Shake ") == "protein shake"
+    assert normalize_food("COFFEE") == "coffee"
+    assert normalize_food("") == ""
 
 
 def test_format_kcal_rounds_and_groups():
@@ -267,6 +306,34 @@ def test_calorie_add_without_message_id_never_dedupes(db):
         1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
     )
     assert n == 2
+
+
+def test_calorie_food_set_get_update_remove(db):
+    db.calorie_food_set(1, 100, "coffee", "Coffee", 5)
+    row = db.calorie_food_get(1, 100, "coffee")
+    assert row is not None
+    assert row["display"] == "Coffee"
+    assert row["kcal"] == 5
+    # Upsert updates kcal + display, keeps the same key.
+    db.calorie_food_set(1, 100, "coffee", "coffee", 8)
+    assert db.calorie_food_get(1, 100, "coffee")["kcal"] == 8
+    # Remove.
+    assert db.calorie_food_remove(1, 100, "coffee") is True
+    assert db.calorie_food_get(1, 100, "coffee") is None
+    assert db.calorie_food_remove(1, 100, "coffee") is False
+
+
+def test_calorie_food_scoped_per_user_and_guild(db):
+    db.calorie_food_set(1, 100, "coffee", "Coffee", 5)
+    db.calorie_food_set(1, 200, "coffee", "Coffee", 9)
+    db.calorie_food_set(2, 100, "coffee", "Coffee", 1)
+    assert db.calorie_food_get(1, 100, "coffee")["kcal"] == 5
+    assert db.calorie_food_get(1, 200, "coffee")["kcal"] == 9
+    assert db.calorie_food_get(2, 100, "coffee")["kcal"] == 1
+    # food_list is scoped to one (guild, user).
+    db.calorie_food_set(1, 100, "protein shake", "Protein Shake", 250)
+    names = [r["display"] for r in db.calorie_food_list(1, 100)]
+    assert names == ["Coffee", "Protein Shake"]  # ordered by display
 
 
 def test_calorie_pop_last_removes_newest(db):

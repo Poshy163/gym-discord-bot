@@ -92,6 +92,22 @@ Calories:
 - `/calories undo` — remove your most recent entry.
 - `/calories stop` — stop tracking (history is kept; `setup` re-enables).
 
+Saved foods (personal name → calorie shortcuts):
+
+- `/calories food_set <name> <amount>` — save a food, e.g.
+  `/calories food_set coffee 5` or `/calories food_set "protein shake" 250kj`.
+- Then log it by **just typing the name** in chat — `coffee`, or `2 coffee` /
+  `coffee x2` for multiple servings — and the bot reacts ✅. `/calories add
+  coffee` works too.
+- `/calories food_list` — show your saved foods.
+- `/calories food_remove <name>` — delete one.
+
+Saved foods are per-user, so your `coffee` and someone else's can be different
+amounts. Chat shortcuts only fire on an exact full-message match of a food
+you've defined (optionally with a serving count), so normal chatter is never
+mistaken for food. They're matched live only — unlike `650kcal`-style posts,
+plain food words aren't picked up by the history backfill.
+
 Everyone with a calorie target gets a personal AI summary in the weekly
 report (see below).
 

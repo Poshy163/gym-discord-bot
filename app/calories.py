@@ -104,6 +104,48 @@ def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
     return kcal, unit, note
 
 
+def normalize_food(name: str) -> str:
+    """Canonical key for a saved food: lowercased, whitespace-collapsed."""
+    return " ".join((name or "").strip().lower().split())
+
+
+# A food shortcut phrase: an optional serving count (leading "2"/"2x" or
+# trailing "x2") wrapped around a name. The name itself is matched loosely —
+# the caller decides whether it's a *defined* food via a DB lookup, so this
+# only needs to extract the count and the candidate name.
+_FOOD_PHRASE_RE = re.compile(
+    r"""
+    ^\s*
+    (?:(?P<lead>\d{1,3})\s*[x*×]?\s+)?
+    (?P<name>.+?)
+    (?:\s*[x*×]\s*(?P<trail>\d{1,3}))?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+
+def parse_food_phrase(text: str) -> tuple[int, str] | None:
+    """Split a food shortcut into ``(servings, normalized_name)``.
+
+    Handles ``coffee``, ``2 coffee``, ``2x coffee`` and ``coffee x2``.
+    Returns None for multi-line or over-long text (never a food shortcut).
+    Servings are clamped to 1..50. The name is *not* validated here — callers
+    must confirm it's a saved food.
+    """
+    if not text or "\n" in text or len(text) > 64:
+        return None
+    m = _FOOD_PHRASE_RE.match(text)
+    if m is None:  # pragma: no cover - the pattern matches any single line
+        return None
+    name = normalize_food(m.group("name"))
+    if not name:
+        return None
+    qty_raw = m.group("lead") or m.group("trail")
+    servings = int(qty_raw) if qty_raw else 1
+    return max(1, min(servings, 50)), name
+
+
 def format_kcal(kcal: float) -> str:
     """Render a kcal amount the way the bot displays it (whole numbers)."""
     return f"{round(kcal):,} cal"
