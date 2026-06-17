@@ -171,3 +171,51 @@ def test_local_log_dates_buckets_in_display_timezone():
         logged_at=local_dt,
     )
     assert _local_log_dates(guild_id, user_id) == [date(2026, 6, 17)]
+
+
+# --- Revo attendance-streak date collection -------------------------------
+
+class _FakeRevoClient:
+    """Stub for RevoClient.get_streak_calendar driven by a canned mapping of
+    (month, year) -> {day: attended}. Records the months fetched."""
+
+    def __init__(self, months):
+        self._months = months
+        self.calls = []
+
+    def get_streak_calendar(self, m, y):
+        self.calls.append((m, y))
+        return self._months.get((m, y), {})
+
+
+def test_revo_attended_dates_crosses_month_boundary():
+    from datetime import date, datetime
+
+    from app.bot import DISPLAY_TZ, _revo_attended_dates
+
+    client = _FakeRevoClient({
+        # June: attended 1-3, and day 1 is attended → look back into May.
+        (6, 2026): {1: True, 2: True, 3: True},
+        # May: a run at the end; day 1 not attended → stop here.
+        (5, 2026): {29: False, 30: True, 31: True},
+    })
+    now_local = datetime(2026, 6, 3, 10, 0, tzinfo=DISPLAY_TZ)
+    attended = _revo_attended_dates(client, now_local)
+    assert date(2026, 6, 1) in attended
+    assert date(2026, 5, 31) in attended
+    assert date(2026, 5, 29) not in attended  # not attended
+    # Stopped after May (its day 1 wasn't attended): April never fetched.
+    assert (4, 2026) not in client.calls
+
+
+def test_revo_attended_dates_always_fetches_previous_month():
+    from datetime import datetime
+
+    from app.bot import DISPLAY_TZ, _revo_attended_dates
+
+    client = _FakeRevoClient({})  # nothing attended anywhere
+    now_local = datetime(2026, 6, 15, 9, 0, tzinfo=DISPLAY_TZ)
+    attended = _revo_attended_dates(client, now_local)
+    assert attended == set()
+    # Current + previous month, then stop (no boundary to cross).
+    assert client.calls == [(6, 2026), (5, 2026)]

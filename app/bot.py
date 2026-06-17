@@ -3299,7 +3299,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/history <equipment> [user]` — your timeline\n"
             "`/recent [user]` — your last 10 entries\n"
             "`/session [user]` — full breakdown of last session\n"
-            "`/streak [user]` — daily & weekly training streaks\n"
+            "`/streak [user]` — streaks (daily = Revo gym attendance)\n"
             "`/tonnage [user] [days]` — total kg moved in a window\n"
             "`/projection <equipment> [target_kg] [user]` — ETA to a goal\n"
             "`/plates <target_kg> [bar_kg]` — plate-loading helper\n"
@@ -3614,9 +3614,63 @@ async def plates_cmd(
     await interaction.response.send_message(msg)
 
 
+# How many months of Revo attendance to walk back when tracing a daily
+# attendance streak. Bounds the network calls for someone with an absurdly
+# long run; the typical case fetches just the current + previous month.
+_MAX_ATTENDANCE_MONTHS = 13
+
+
+def _revo_attended_dates(client, now_local: datetime) -> set[date]:
+    """Set of local dates the user checked in to Revo, walking back month by
+    month from ``now_local`` while a streak could still cross the boundary.
+
+    Always fetches the current + previous month (so a run ending yesterday
+    near a month boundary is caught), then keeps going back only while the
+    1st of the month just fetched was attended — i.e. while the run might
+    extend further. Capped at :data:`_MAX_ATTENDANCE_MONTHS`.
+    """
+    attended: set[date] = set()
+    y, m = now_local.year, now_local.month
+    for i in range(_MAX_ATTENDANCE_MONTHS):
+        cal = client.get_streak_calendar(m, y)  # {day_of_month: attended}
+        for d, did in cal.items():
+            if did:
+                try:
+                    attended.add(date(y, m, d))
+                except ValueError:  # pragma: no cover - defensive
+                    continue
+        crosses_boundary = cal.get(1) is True
+        # i==0 is the current month; always grab the previous one too. After
+        # that, only continue when the run still touches the 1st.
+        if i >= 1 and not crosses_boundary:
+            break
+        first_of_month = date(y, m, 1)
+        prev = first_of_month - timedelta(days=1)
+        y, m = prev.year, prev.month
+    return attended
+
+
+def _compute_attendance_streak(row) -> tuple[int, int] | None:
+    """``(current, longest)`` daily gym-attendance streak from Revo, or None
+    on auth/network failure (caller falls back to log-based). Blocking — run
+    it in an executor."""
+    from .training_math import daily_streak
+    now_local = datetime.now(DISPLAY_TZ)
+    try:
+        client = _client_for_user(row)
+        attended = _revo_attended_dates(client, now_local)
+    except revo_client.RevoAuthError:
+        _drop_cached_client(int(row["user_id"]))
+        return None
+    except Exception:  # pragma: no cover - network
+        LOG.exception("Revo attendance streak fetch failed")
+        return None
+    return daily_streak(attended, now_local.date())
+
+
 @bot.tree.command(
     name="streak",
-    description="Show a user's current and longest training streaks.",
+    description="Show a user's training streaks (daily = Revo gym attendance).",
 )
 @app_commands.describe(
     user="The user to look up (defaults to you).",
@@ -3628,26 +3682,57 @@ async def streak_cmd(
     from .training_math import daily_streak, weekly_streak
     target = user or interaction.user
     guild_id = interaction.guild_id or 0
-    parsed = _local_log_dates(guild_id, target.id)
-    if not parsed:
-        await interaction.response.send_message(
+    log_dates = _local_log_dates(guild_id, target.id)
+
+    # Daily streak is gym attendance from Revo when the target has linked an
+    # account; that needs a (blocking) network fetch, so defer first. Falls
+    # back to log-based days if Revo is off, unlinked, or unreachable.
+    revo_row = None if REVO_DISABLED else db.get_revo_account(target.id)
+    attendance: tuple[int, int] | None = None
+    if revo_row is not None and revo_client.available():
+        await interaction.response.defer(thinking=True)
+        attendance = await bot.loop.run_in_executor(
+            None, _compute_attendance_streak, revo_row,
+        )
+        respond = interaction.followup.send
+    else:
+        respond = interaction.response.send_message
+
+    if not log_dates and attendance is None:
+        await respond(
             f"No training history yet for {target.display_name}.",
             ephemeral=True,
         )
         return
+
     today = datetime.now(DISPLAY_TZ).date()
-    cur_d, long_d = daily_streak(parsed, today)
-    cur_w, long_w = weekly_streak(parsed, today)
+    cur_w, long_w = weekly_streak(log_dates, today) if log_dates else (0, 0)
+    if attendance is not None:
+        cur_d, long_d = attendance
+        daily_line = (
+            f"• 🏋️ Daily gym attendance: **{cur_d}** "
+            f"day{'s' if cur_d != 1 else ''} in a row (longest **{long_d}**)"
+        )
+    else:
+        cur_d, long_d = daily_streak(log_dates, today) if log_dates else (0, 0)
+        suffix = (
+            "" if revo_row is not None
+            else "  ·  *link Revo with `/revo_link` for real gym attendance*"
+        )
+        daily_line = (
+            f"• Daily (from logs): **{cur_d}** "
+            f"day{'s' if cur_d != 1 else ''} in a row (longest **{long_d}**)"
+            f"{suffix}"
+        )
     fire = "🔥" if cur_d >= 3 or cur_w >= 3 else ""
     lines = [
         f"**{target.display_name} — training streaks** {fire}".rstrip(),
         f"• Weekly: **{cur_w}** week{'s' if cur_w != 1 else ''} in a row "
         f"(longest **{long_w}**)",
-        f"• Daily: **{cur_d}** day{'s' if cur_d != 1 else ''} in a row "
-        f"(longest **{long_d}**)",
-        f"• Total active days logged: **{len(parsed)}**",
+        daily_line,
+        f"• Total active days logged: **{len(log_dates)}**",
     ]
-    await interaction.response.send_message("\n".join(lines))
+    await respond("\n".join(lines))
 
 
 @bot.tree.command(
