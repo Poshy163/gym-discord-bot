@@ -16,12 +16,14 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
     _get_main_activity,
+    _local_log_dates,
     _parse_bodyweight_message,
     _rejected_lifts_note,
     _render_revo_calendar,
     _safe_label,
     _true_weight_kg,
     _true_weight_suffix,
+    db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
 
@@ -146,3 +148,26 @@ def test_parse_bodyweight_message_rejects_non_bodyweight():
     assert _parse_bodyweight_message("bench 80kg bodyweight 100") is None
     assert _parse_bodyweight_message("") is None
     assert _parse_bodyweight_message("BW") is None
+
+
+# --- Streak date bucketing (timezone regression) -------------------------
+
+def test_local_log_dates_buckets_in_display_timezone():
+    """An early-morning session in a +HH:MM tz must count on the local day,
+    not slip into the previous UTC day (the old substr-based bug)."""
+    from datetime import date, datetime
+
+    from app.bot import DISPLAY_TZ
+
+    guild_id, user_id = 970001, 424242
+    # 08:30 on the 17th, local time. In Adelaide (UTC+9:30) this is 23:00 on
+    # the 16th UTC — exactly the case the UTC date prefix mis-bucketed.
+    local_dt = datetime(2026, 6, 17, 8, 30, tzinfo=DISPLAY_TZ)
+    _bot_db.add_lifts(
+        guild_id=guild_id,
+        user_id=user_id,
+        username="tzuser",
+        lifts=[Lift(equipment="bench press", weight_kg=80.0, raw="bench 80kg")],
+        logged_at=local_dt,
+    )
+    assert _local_log_dates(guild_id, user_id) == [date(2026, 6, 17)]

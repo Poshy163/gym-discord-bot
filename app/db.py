@@ -182,7 +182,9 @@ CREATE TABLE IF NOT EXISTS calorie_goals (
 );
 
 -- One row per logged intake. kcal is always kilocalories; ``raw`` keeps the
--- original user input (e.g. "3550kj") for display/debugging.
+-- original user input (e.g. "3550kj") for display/debugging. ``message_id``
+-- is set for chat-logged entries so the startup backfill can de-duplicate
+-- (one calorie entry per source message); slash-command entries leave it NULL.
 CREATE TABLE IF NOT EXISTS calorie_entries (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id   INTEGER NOT NULL,
@@ -191,6 +193,7 @@ CREATE TABLE IF NOT EXISTS calorie_entries (
     kcal       REAL    NOT NULL,
     note       TEXT,
     raw        TEXT,
+    message_id INTEGER,
     logged_at  TEXT    NOT NULL
 );
 
@@ -272,6 +275,27 @@ class Database:
                 self._connection.execute(
                     "UPDATE reply_tracking SET target_user_id = user_id "
                     "WHERE target_user_id IS NULL"
+                )
+            # Calorie chat-logging dedupe: older DBs created calorie_entries
+            # without message_id. Add it, then build the partial unique index
+            # here (it can't live in SCHEMA because executescript runs before
+            # this ALTER on an upgrade). The index makes the backfill re-scan
+            # idempotent — one calorie entry per source message.
+            cal_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(calorie_entries)"
+                )
+            }
+            if cal_cols and "message_id" not in cal_cols:
+                self._connection.execute(
+                    "ALTER TABLE calorie_entries ADD COLUMN message_id INTEGER"
+                )
+            if cal_cols:
+                self._connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_calorie_entries_dedupe ON calorie_entries (message_id) "
+                    "WHERE message_id IS NOT NULL"
                 )
             # The attendance poller moved from a ticket-tally signature cursor to
             # a per-day calendar cursor (last_checkin_date, ISO YYYY-MM-DD). Older
@@ -1363,8 +1387,15 @@ class Database:
     def user_log_dates(
         self, guild_id: int, user_id: int
     ) -> list[str]:
-        """All distinct YYYY-MM-DD dates on which the user logged at least
-        one lift, ordered ascending."""
+        """All distinct YYYY-MM-DD dates (UTC) on which the user logged at
+        least one lift, ordered ascending.
+
+        Note: this buckets by the *UTC* calendar date. For streaks and any
+        other "what local day was this?" use, prefer
+        :meth:`user_log_timestamps` and bucket in the display timezone —
+        otherwise early-morning sessions in a +HH:MM timezone land on the
+        previous day.
+        """
         with self._conn() as c:
             return [r[0] for r in c.execute(
                 """
@@ -1372,6 +1403,23 @@ class Database:
                 FROM lifts
                 WHERE guild_id = ? AND user_id = ?
                 ORDER BY 1
+                """,
+                (guild_id, user_id),
+            )]
+
+    def user_log_timestamps(
+        self, guild_id: int, user_id: int
+    ) -> list[str]:
+        """All raw ``logged_at`` timestamps (UTC ISO-8601) for the user,
+        ordered ascending. Callers convert to local dates themselves so
+        day/week bucketing respects the display timezone (incl. DST)."""
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                """
+                SELECT logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at
                 """,
                 (guild_id, user_id),
             )]
@@ -2205,20 +2253,29 @@ class Database:
         self, guild_id: int, user_id: int, username: str, kcal: float,
         note: str | None = None, raw: str | None = None,
         logged_at: datetime | None = None,
+        message_id: int | None = None,
     ) -> int:
-        """Insert one intake entry. Returns the new row id."""
+        """Insert one intake entry. Returns the new row id, or 0 if a row for
+        this ``message_id`` already exists (dedupe, so backfill re-scans are
+        safe). ``message_id`` is None for slash-command entries, which never
+        dedupe."""
         with self._conn() as c:
-            cur = c.execute(
-                """
-                INSERT INTO calorie_entries
-                    (guild_id, user_id, username, kcal, note, raw, logged_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id, user_id, username, float(kcal),
-                    note, raw, _normalize_iso(logged_at),
-                ),
-            )
+            try:
+                cur = c.execute(
+                    """
+                    INSERT INTO calorie_entries
+                        (guild_id, user_id, username, kcal, note, raw,
+                         message_id, logged_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id, user_id, username, float(kcal),
+                        note, raw, message_id, _normalize_iso(logged_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Duplicate (message_id) — already logged this message.
+                return 0
             return int(cur.lastrowid or 0)
 
     def calorie_pop_last(

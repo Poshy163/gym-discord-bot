@@ -83,6 +83,10 @@ Calories:
   gets logged automatically and the bot reacts ✅ (like lift posts). A unit
   (`c`, `cal`, `kcal`, `kj`, …) is required in chat so plain lift numbers are
   never mistaken for food, and `@user 650kcal` logs it for someone else.
+  Chat calorie posts are also picked up by the startup/`/backfill` history
+  scan (deduped per message, dated to the original post), so messages sent
+  while the bot was offline — or before you set a target — get imported once
+  you've run `/calories setup`.
 - `/calories today [user]` — today's entries and total vs target.
 - `/calories week [user]` — per-day totals for the last 7 days.
 - `/calories undo` — remove your most recent entry.

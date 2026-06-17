@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -195,6 +196,77 @@ def test_calorie_entries_between_excludes_other_users(db):
     )
     assert len(rows) == 1
     assert rows[0]["kcal"] == 500
+
+
+def test_migration_adds_message_id_to_legacy_calorie_entries(tmp_path):
+    """An older DB created before the dedupe work has a calorie_entries table
+    without message_id. Opening it must add the column + dedupe index without
+    losing existing rows."""
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE calorie_entries (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id  INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            username  TEXT    NOT NULL,
+            kcal      REAL    NOT NULL,
+            note      TEXT,
+            raw       TEXT,
+            logged_at TEXT    NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO calorie_entries (guild_id, user_id, username, kcal, logged_at) "
+        "VALUES (1, 100, 'alice', 500, '2026-06-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    d = Database(path)
+    try:
+        cols = {
+            r["name"]
+            for r in d._connection.execute("PRAGMA table_info(calorie_entries)")
+        }
+        assert "message_id" in cols
+        # Existing row survived the migration.
+        total, n = d.calorie_total_between(
+            1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+        )
+        assert n == 1 and total == 500
+        # Dedupe index is live after migration.
+        assert d.calorie_add(1, 100, "alice", 200, message_id=9) > 0
+        assert d.calorie_add(1, 100, "alice", 200, message_id=9) == 0
+    finally:
+        d.close()
+
+
+def test_calorie_add_dedupes_on_message_id(db):
+    """Backfill re-scans must not double-count: a second insert for the same
+    message_id is a no-op."""
+    first = db.calorie_add(1, 100, "alice", 650, message_id=555)
+    assert first > 0
+    dup = db.calorie_add(1, 100, "alice", 650, message_id=555)
+    assert dup == 0
+    total, n = db.calorie_total_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert n == 1 and total == 650
+
+
+def test_calorie_add_without_message_id_never_dedupes(db):
+    """Slash-command entries (no message_id) are always distinct, even when
+    identical."""
+    a = db.calorie_add(1, 100, "alice", 200)
+    b = db.calorie_add(1, 100, "alice", 200)
+    assert a > 0 and b > 0 and a != b
+    _total, n = db.calorie_total_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert n == 2
 
 
 def test_calorie_pop_last_removes_newest(db):

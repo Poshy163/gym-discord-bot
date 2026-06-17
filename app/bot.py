@@ -18,7 +18,7 @@ import re
 import sqlite3
 import tempfile
 from calendar import monthrange
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -716,22 +716,38 @@ async def _equipment_autocomplete(
     return [app_commands.Choice(name=p, value=p) for p in results]
 
 
-def _compute_streak_weeks(dates: list[str]) -> int:
-    """Given a sorted ascending list of YYYY-MM-DD strings, return the number
-    of consecutive ISO weeks up to the most recent logged week that contain
-    at least one lift. Returns 0 for an empty list or if the user hasn't
-    logged in the current or previous ISO week."""
+def _local_log_dates(guild_id: int, user_id: int) -> list[date]:
+    """Distinct local-day dates the user logged a lift on, ascending.
+
+    Buckets each stored UTC timestamp into ``DISPLAY_TZ`` *before* taking the
+    calendar date, so a 7am session in Adelaide (UTC+9:30) counts on the day
+    it actually happened rather than slipping into the previous UTC day.
+    This is the correct input for the daily/weekly streak helpers.
+    """
+    seen: set[date] = set()
+    for ts in db.user_log_timestamps(guild_id, user_id):
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seen.add(dt.astimezone(DISPLAY_TZ).date())
+    return sorted(seen)
+
+
+def _compute_streak_weeks(dates: list[date]) -> int:
+    """Number of consecutive ISO weeks up to the most recent logged week that
+    contain at least one lift. ``dates`` are local-day :class:`date` objects
+    (see :func:`_local_log_dates`). Returns 0 for an empty list or if the user
+    hasn't logged in the current or previous ISO week."""
     if not dates:
         return 0
     today_local = datetime.now(DISPLAY_TZ).date()
     today_year, today_week, _ = today_local.isocalendar()
 
     weeks: set[tuple[int, int]] = set()
-    for d in dates:
-        try:
-            parsed = datetime.fromisoformat(d).date()
-        except ValueError:
-            continue
+    for parsed in dates:
         yr, wk, _ = parsed.isocalendar()
         weeks.add((yr, wk))
     if not weeks:
@@ -891,6 +907,7 @@ async def _handle_calorie_message(
         db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=message.content.strip()[:80],
+            message_id=message.id,
         )
     except Exception:
         LOG.exception("Failed to store calorie entry for user %s", target_id)
@@ -1491,16 +1508,45 @@ async def weekly_report_cmd(interaction: discord.Interaction) -> None:
     )
 
 
+def _backfill_calorie_entry(msg: discord.Message, target: object, content: str) -> bool:
+    """If ``content`` is a chat calorie statement and ``target`` is tracking
+    calories, store it (deduped by message id, dated to the message). Returns
+    True if a new entry was inserted. Used only by the history backfill — the
+    live path is :func:`_handle_calorie_message`."""
+    hit = calories.parse_chat_message(content)
+    if hit is None:
+        return False
+    kcal, _unit, note = hit
+    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+        return False
+    guild_id = msg.guild.id if msg.guild else 0
+    target_id = int(getattr(target, "id"))
+    if db.calorie_goal_get(guild_id, target_id) is None:
+        return False
+    try:
+        inserted = db.calorie_add(
+            guild_id, target_id, _display_name(target), kcal,
+            note=note, raw=msg.content.strip()[:80],
+            logged_at=msg.created_at.astimezone(timezone.utc),
+            message_id=msg.id,
+        )
+    except Exception:
+        LOG.exception("Backfill: failed to store calorie entry for %s", target_id)
+        return False
+    return inserted > 0
+
+
 async def _backfill_channel(
     channel: discord.abc.Messageable, limit: int | None
-) -> tuple[int, int, int, int]:
-    """Scan a channel's history and store any detected lifts.
+) -> tuple[int, int, int, int, int]:
+    """Scan a channel's history and store any detected lifts or calorie logs.
 
     Returns (messages_scanned, messages_with_lifts, lifts_inserted,
-    skipped_suppressed). Dedupe on (message_id, equipment) means re-runs
-    are safe.
+    skipped_suppressed, calorie_entries_inserted). Lifts dedupe on
+    (message_id, equipment); calorie entries dedupe on message_id — so
+    re-runs are safe.
     """
-    scanned = matched = inserted = skipped = 0
+    scanned = matched = inserted = skipped = cal_inserted = 0
     async for msg in channel.history(limit=limit, oldest_first=True):
         if msg.author.bot or not msg.guild:
             continue
@@ -1520,6 +1566,11 @@ async def _backfill_channel(
             )
             if nick_target is not None:
                 target, content = nick_target, nick_content
+        # Calorie logs ("650kcal", "200c", "@user 2700kj") never contain a
+        # lift, so check them first and move on when one matches.
+        if _backfill_calorie_entry(msg, target, content):
+            cal_inserted += 1
+            continue
         lifts = parse_message(content, custom_aliases=guild_aliases)
         lifts, _rejected = _split_reasonable_lifts(lifts)
         if not lifts:
@@ -1535,7 +1586,7 @@ async def _backfill_channel(
         if n:
             matched += 1
             inserted += n
-    return scanned, matched, inserted, skipped
+    return scanned, matched, inserted, skipped, cal_inserted
 
 
 async def _run_startup_backfill() -> None:
@@ -1550,16 +1601,16 @@ async def _run_startup_backfill() -> None:
                 continue
         LOG.info("Backfill: scanning #%s (limit=%s)", channel, limit)
         try:
-            scanned, matched, inserted, skipped = await _backfill_channel(
-                channel, limit,
+            scanned, matched, inserted, skipped, cal_inserted = (
+                await _backfill_channel(channel, limit)
             )
         except discord.Forbidden:
             LOG.warning("Backfill: missing permission to read #%s", channel)
             continue
         LOG.info(
             "Backfill done for #%s: scanned=%d, posts_with_lifts=%d, "
-            "new_lifts=%d, skipped_suppressed=%d",
-            channel, scanned, matched, inserted, skipped,
+            "new_lifts=%d, skipped_suppressed=%d, new_calorie_entries=%d",
+            channel, scanned, matched, inserted, skipped, cal_inserted,
         )
 
 
@@ -2457,8 +2508,8 @@ async def backfill_cmd(
     await interaction.response.defer(thinking=True, ephemeral=True)
     lim = limit if limit and limit > 0 else None
     try:
-        scanned, matched, inserted, skipped = await _backfill_channel(
-            interaction.channel, lim
+        scanned, matched, inserted, skipped, cal_inserted = (
+            await _backfill_channel(interaction.channel, lim)
         )
     except discord.Forbidden:
         await interaction.followup.send(
@@ -2466,10 +2517,13 @@ async def backfill_cmd(
             ephemeral=True,
         )
         return
+    cal_part = (
+        f", {cal_inserted} new calorie entries" if cal_inserted else ""
+    )
     await interaction.followup.send(
         f"Backfill complete — scanned {scanned} messages, "
         f"{matched} had lifts, {inserted} new lifts stored, "
-        f"{skipped} skipped (suppressed).",
+        f"{skipped} skipped (suppressed){cal_part}.",
         ephemeral=True,
     )
 
@@ -3369,7 +3423,7 @@ async def summary_cmd(
     top = db.user_top_prs(guild_id, target.id, limit=5)
     trained = db.user_most_trained(guild_id, target.id, limit=5)
     gains = db.user_biggest_gains(guild_id, target.id, limit=5)
-    streak = _compute_streak_weeks(db.user_log_dates(guild_id, target.id))
+    streak = _compute_streak_weeks(_local_log_dates(guild_id, target.id))
 
     embed = discord.Embed(
         title=f"📋 {target.display_name} — gym summary",
@@ -3574,22 +3628,23 @@ async def streak_cmd(
     from .training_math import daily_streak, weekly_streak
     target = user or interaction.user
     guild_id = interaction.guild_id or 0
-    raw_dates = db.user_log_dates(guild_id, target.id)
-    if not raw_dates:
+    parsed = _local_log_dates(guild_id, target.id)
+    if not parsed:
         await interaction.response.send_message(
             f"No training history yet for {target.display_name}.",
             ephemeral=True,
         )
         return
-    parsed = [datetime.fromisoformat(d).date() for d in raw_dates]
     today = datetime.now(DISPLAY_TZ).date()
     cur_d, long_d = daily_streak(parsed, today)
     cur_w, long_w = weekly_streak(parsed, today)
     fire = "🔥" if cur_d >= 3 or cur_w >= 3 else ""
     lines = [
         f"**{target.display_name} — training streaks** {fire}".rstrip(),
-        f"• Daily: **{cur_d}** in a row (longest **{long_d}**)",
-        f"• Weekly: **{cur_w}** in a row (longest **{long_w}**)",
+        f"• Weekly: **{cur_w}** week{'s' if cur_w != 1 else ''} in a row "
+        f"(longest **{long_w}**)",
+        f"• Daily: **{cur_d}** day{'s' if cur_d != 1 else ''} in a row "
+        f"(longest **{long_d}**)",
         f"• Total active days logged: **{len(parsed)}**",
     ]
     await interaction.response.send_message("\n".join(lines))
