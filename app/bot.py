@@ -868,6 +868,33 @@ async def _handle_bodyweight_message(
     )
 
 
+async def _reply_calorie_logged(
+    message: discord.Message, target: object, goal: sqlite3.Row,
+    added_kcal: float, label: str | None,
+) -> None:
+    """React ✅ and reply with what was added + today's running total.
+
+    Shared by both chat calorie paths so a `200 calories` post and a saved-food
+    shortcut give the same `/calories add`-style feedback."""
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
+    label_part = f" — {label}" if label else ""
+    suffix = _target_suffix(message.author, target)
+    try:
+        await message.reply(
+            f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}\n"
+            + _calorie_status_line(total, float(goal["daily_target_kcal"])),
+            mention_author=False,
+        )
+    except discord.HTTPException:
+        pass
+
+
 async def _handle_calorie_message(
     message: discord.Message, target: object,
     kcal: float, unit: str, note: str | None,
@@ -875,8 +902,8 @@ async def _handle_calorie_message(
     """Persist a chat-message calorie entry (`650kcal`, `2700kj maccas`).
 
     Mirrors `/calories add`: the target must have run `/calories setup`
-    first, and the per-entry typo cap applies. Success is acknowledged with
-    a ✅ reaction like auto-parsed lifts; `/calories undo` reverses it.
+    first, and the per-entry typo cap applies. Replies with a ✅ reaction and
+    today's running total; `/calories undo` reverses it.
     """
     guild_id = message.guild.id if message.guild else 0
     target_id = int(getattr(target, "id"))
@@ -913,13 +940,10 @@ async def _handle_calorie_message(
         LOG.exception("Failed to store calorie entry for user %s", target_id)
         return
 
-    try:
-        await message.add_reaction("✅")
-    except discord.HTTPException:
-        pass
     LOG.info(
         "Stored %.0f kcal for %s in #%s", kcal, target, message.channel,
     )
+    await _reply_calorie_logged(message, target, goal, kcal, note)
 
 
 def _match_calorie_food(
@@ -963,6 +987,9 @@ async def _handle_calorie_food_message(
         return
     display = food_row["display"]
     note = display if servings == 1 else f"{display} ×{servings}"
+    goal = db.calorie_goal_get(guild_id, target_id)
+    if goal is None:  # pragma: no cover - _match_calorie_food already checked
+        return
     try:
         db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
@@ -972,14 +999,11 @@ async def _handle_calorie_food_message(
     except Exception:
         LOG.exception("Failed to store food entry for user %s", target_id)
         return
-    try:
-        await message.add_reaction("✅")
-    except discord.HTTPException:
-        pass
     LOG.info(
         "Stored food '%s' ×%d (%.0f kcal) for %s in #%s",
         display, servings, kcal, target, message.channel,
     )
+    await _reply_calorie_logged(message, target, goal, kcal, note)
 
 
 @bot.event
