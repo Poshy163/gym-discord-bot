@@ -79,10 +79,10 @@ Calories:
   kJ (`2500`, `2500c`, `8700kj` — kJ is converted at 4.184 kJ/kcal).
 - `/calories add <amount> [note]` — log something you ate, again in kcal or
   kJ. The reply shows a progress bar against your daily target.
-- Or just type it in chat: `650kcal`, `200 cal toastie`, or `2700kj` gets
-  logged automatically and the bot reacts ✅ (like lift posts). The unit is
-  required in chat so lift numbers are never mistaken for food, and
-  `@user 650kcal` logs it for someone else.
+- Or just type it in chat: `650kcal`, `200c`, `200 cal toastie`, or `2700kj`
+  gets logged automatically and the bot reacts ✅ (like lift posts). A unit
+  (`c`, `cal`, `kcal`, `kj`, …) is required in chat so plain lift numbers are
+  never mistaken for food, and `@user 650kcal` logs it for someone else.
 - `/calories today [user]` — today's entries and total vs target.
 - `/calories week [user]` — per-day totals for the last 7 days.
 - `/calories undo` — remove your most recent entry.

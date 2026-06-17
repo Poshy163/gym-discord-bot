@@ -3272,7 +3272,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
             "`/calories add <amount> [note]` — log intake "
             "(`650`, `650c`, `2700kj` — kJ converts automatically)\n"
-            "Or just type `650kcal` / `2700kj maccas` in chat — "
+            "Or just type `650kcal` / `200c` / `2700kj maccas` in chat — "
             "I'll react ✅ and log it\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories undo` — remove your last entry\n"

@@ -83,6 +83,11 @@ def test_parse_energy_rejects_garbage(text):
     ("2700kj", 2700.0 / 4.184, "kj", None),
     ("2,700 kJ maccas run", 2700.0 / 4.184, "kj", "maccas run"),
     ("418.4 kilojoules", 100.0, "kj", None),
+    # Bare "c" shorthand — standalone only, with or without a separator.
+    ("200 c", 200.0, "kcal", None),
+    ("200c", 200.0, "kcal", None),
+    ("500.c", 500.0, "kcal", None),
+    ("650c", 650.0, "kcal", None),
 ])
 def test_parse_chat_message_accepts(text, kcal, unit, note):
     result = parse_chat_message(text)
@@ -95,11 +100,13 @@ def test_parse_chat_message_accepts(text, kcal, unit, note):
 
 @pytest.mark.parametrize("text", [
     "650",            # bare number = could be a lift, must not match
-    "650c",           # bare "c" too loose for chat (slash command takes it)
     "bench 80kg",
     "650kg",
     "ate a lot today",
     "650kcal\nbench press 80kg",  # multi-line dumps go to the lift parser
+    "5 c u later",    # bare "c" must be standalone, no trailing note
+    "200 cm",         # not a calorie unit
+    "200 cookies",    # word starting with c isn't the c unit
     "",
 ])
 def test_parse_chat_message_rejects(text):
