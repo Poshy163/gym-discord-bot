@@ -56,52 +56,42 @@ def parse_energy(text: str) -> tuple[float, str] | None:
     return num, "kcal"
 
 
-# Chat auto-logging is stricter than /calories add: a bare number like "650"
-# must never match (it would collide with lift posts), and bare "c" is too
-# loose for free-form chat. The unit has to be spelled kcal/cal/kj. An
-# A spelled-out unit (kcal/cal/cals/calories/kj/kilojoules) may carry an
-# optional trailing note ("650kcal burrito"). A bare "c" is also accepted —
-# people type "200 c" / "200.c" — but only when it's the whole message (no
-# note), so casual text like "5 c u later" can't be mistaken for food.
-# Either way it must be a single line so multi-line gym dumps fall through to
-# the lift parser. The "[ \t.]*" separator lets "200c", "200 c" and "200.c"
-# all work.
+# Chat auto-logging is deliberately strict: the message must be ONLY the
+# amount — a number plus a unit (kcal/cal/cals/calories/kj/kilojoules, or a
+# bare "c") and nothing else but trailing whitespace/punctuation. That rejects
+# sentences like "1500cal is crazy work" so casual chatter is never logged;
+# descriptions go through "/calories add ... note" instead. A bare number
+# never matches (it would collide with lift posts). The "[ \t.]*" separator
+# lets "200c", "200 c" and "200.c" all work.
 _CHAT_ENERGY_RE = re.compile(
     r"""
     ^\s*
     (?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)
     [ \t.]*
-    (?:
-        (?P<unit>kcal|cals?|calories?|kj|kilojoules?)
-        \b
-        [ \t]*
-        (?P<note>[^\n]{0,120})?
-      |
-        (?P<unit_c>c)
-        [ \t]*
-    )
-    \s*$
+    (?P<unit>kcal|cals?|calories?|kj|kilojoules?|c)
+    [\s.!?]*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
 
 def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
-    """If ``text`` is a bare calorie statement, return ``(kcal, unit, note)``.
+    """If ``text`` is *only* a calorie amount, return ``(kcal, unit, None)``.
 
-    Returns ``None`` for anything else so the caller can fall through to
-    the regular lift parser. ``unit`` is ``"kj"`` or ``"kcal"`` (normalised
-    from what was typed); ``note`` is any trailing description, or None.
+    Returns ``None`` for anything else (including amounts buried in a
+    sentence) so the caller can fall through to the regular lift parser.
+    ``unit`` is ``"kj"`` or ``"kcal"`` (normalised from what was typed). The
+    third element is always ``None`` — chat posts don't carry notes; use
+    ``/calories add`` for those.
     """
     m = _CHAT_ENERGY_RE.match(text or "")
     if m is None:
         return None
     num = float(m.group("num").replace(",", ""))
-    unit_raw = (m.group("unit") or m.group("unit_c") or "").lower()
+    unit_raw = m.group("unit").lower()
     unit = "kj" if unit_raw.rstrip("s") in _KJ_UNITS else "kcal"
     kcal = kj_to_kcal(num) if unit == "kj" else num
-    note = (m.group("note") or "").strip(" \t-–—:·") or None
-    return kcal, unit, note
+    return kcal, unit, None
 
 
 def normalize_food(name: str) -> str:

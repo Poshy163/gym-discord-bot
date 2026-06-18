@@ -79,10 +79,11 @@ Calories:
   kJ (`2500`, `2500c`, `8700kj` — kJ is converted at 4.184 kJ/kcal).
 - `/calories add <amount> [note]` — log something you ate, again in kcal or
   kJ. The reply shows a progress bar against your daily target.
-- Or just type it in chat: `650kcal`, `200c`, `200 cal toastie`, or `2700kj`
-  gets logged automatically and the bot reacts ✅ (like lift posts). A unit
-  (`c`, `cal`, `kcal`, `kj`, …) is required in chat so plain lift numbers are
-  never mistaken for food, and `@user 650kcal` logs it for someone else.
+- Or just type it in chat: a message that is **only** an amount — `650kcal`,
+  `200c`, or `2700kj` — gets logged automatically, the bot reacts ✅ and
+  replies with your running total. The message must be nothing but the amount
+  (so "1500cal is crazy work" is ignored); add a description with
+  `/calories add` instead. `@user 650kcal` logs it for someone else.
   Chat calorie posts are also picked up by the startup/`/backfill` history
   scan (deduped per message, dated to the original post), so messages sent
   while the bot was offline — or before you set a target — get imported once

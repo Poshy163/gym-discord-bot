@@ -76,29 +76,29 @@ def test_parse_energy_rejects_garbage(text):
 
 # ---- parse_chat_message ----------------------------------------------------
 
-@pytest.mark.parametrize("text,kcal,unit,note", [
-    ("650kcal", 650.0, "kcal", None),
-    ("650 cal", 650.0, "kcal", None),
-    ("650 cals", 650.0, "kcal", None),
-    ("650 calories", 650.0, "kcal", None),
-    ("650kcal burrito", 650.0, "kcal", "burrito"),
-    ("650 cal - big mac meal", 650.0, "kcal", "big mac meal"),
-    ("2700kj", 2700.0 / 4.184, "kj", None),
-    ("2,700 kJ maccas run", 2700.0 / 4.184, "kj", "maccas run"),
-    ("418.4 kilojoules", 100.0, "kj", None),
-    # Bare "c" shorthand — standalone only, with or without a separator.
-    ("200 c", 200.0, "kcal", None),
-    ("200c", 200.0, "kcal", None),
-    ("500.c", 500.0, "kcal", None),
-    ("650c", 650.0, "kcal", None),
+@pytest.mark.parametrize("text,kcal,unit", [
+    ("650kcal", 650.0, "kcal"),
+    ("650 cal", 650.0, "kcal"),
+    ("650 cals", 650.0, "kcal"),
+    ("650 calories", 650.0, "kcal"),
+    ("650 calories.", 650.0, "kcal"),   # trailing punctuation tolerated
+    ("650kcal!", 650.0, "kcal"),
+    ("2700kj", 2700.0 / 4.184, "kj"),
+    ("2,700 kJ", 2700.0 / 4.184, "kj"),
+    ("418.4 kilojoules", 100.0, "kj"),
+    # Bare "c" shorthand — with or without a separator.
+    ("200 c", 200.0, "kcal"),
+    ("200c", 200.0, "kcal"),
+    ("500.c", 500.0, "kcal"),
+    ("650c", 650.0, "kcal"),
 ])
-def test_parse_chat_message_accepts(text, kcal, unit, note):
+def test_parse_chat_message_accepts(text, kcal, unit):
     result = parse_chat_message(text)
     assert result is not None
     got_kcal, got_unit, got_note = result
     assert got_kcal == pytest.approx(kcal)
     assert got_unit == unit
-    assert got_note == note
+    assert got_note is None  # chat posts never carry a note now
 
 
 @pytest.mark.parametrize("text", [
@@ -107,9 +107,15 @@ def test_parse_chat_message_accepts(text, kcal, unit, note):
     "650kg",
     "ate a lot today",
     "650kcal\nbench press 80kg",  # multi-line dumps go to the lift parser
-    "5 c u later",    # bare "c" must be standalone, no trailing note
+    "5 c u later",    # trailing words → not a clean amount
     "200 cm",         # not a calorie unit
     "200 cookies",    # word starting with c isn't the c unit
+    # The whole point of the strictness: amounts inside a sentence are ignored.
+    "1500cal is crazy work",
+    "650kcal burrito",
+    "200 cal toastie",
+    "2,700 kJ maccas run",
+    "650 cal - big mac meal",
     "",
 ])
 def test_parse_chat_message_rejects(text):
