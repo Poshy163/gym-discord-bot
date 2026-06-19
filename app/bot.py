@@ -6833,13 +6833,25 @@ def _build_strava_embed(
     """Render a Strava activity as a Discord embed. Distance sports get
     pace/elevation; everything else is duration-first."""
     emoji = strava_client.sport_emoji(activity.sport_type)
+    when = strava_client.start_unix(activity)
+    desc = f"New **{activity.sport_type}** by {who}"
+    if when:
+        desc += f" · <t:{when}:R>"
+    if activity.description:
+        # The athlete's own caption, quoted and length-capped.
+        caption = activity.description.strip().replace("\n", "\n> ")
+        desc += f"\n> {caption[:500]}"
     embed = discord.Embed(
         title=f"{emoji} {activity.name}"[:256],
         url=activity.url or None,
         colour=STRAVA_COLOUR,
-        description=f"New **{activity.sport_type}** by {who}",
+        description=desc,
     )
-    if strava_client.is_distance_sport(activity.sport_type) and activity.distance_m > 0:
+    is_distance = (
+        strava_client.is_distance_sport(activity.sport_type)
+        and activity.distance_m > 0
+    )
+    if is_distance:
         embed.add_field(
             name="Distance",
             value=strava_client.format_distance(activity.distance_m),
@@ -6854,6 +6866,9 @@ def _build_strava_embed(
             embed.add_field(name="Pace", value=pace)
         elif speed:
             embed.add_field(name="Speed", value=speed)
+        max_speed = strava_client.format_speed(activity.max_speed_ms)
+        if max_speed:
+            embed.add_field(name="Max speed", value=max_speed)
         if activity.total_elevation_gain_m:
             embed.add_field(
                 name="Elevation",
@@ -6871,9 +6886,33 @@ def _build_strava_embed(
         if activity.max_heartrate:
             hr += f" (max {activity.max_heartrate:.0f})"
         embed.add_field(name="Heart rate", value=hr)
+    if activity.average_watts:
+        power = f"{activity.average_watts:.0f} W"
+        if activity.kilojoules:
+            power += f" · {activity.kilojoules:.0f} kJ"
+        embed.add_field(name="Power", value=power)
+    if activity.average_cadence:
+        # Strava reports running cadence per leg — double it for steps/min.
+        is_run = activity.sport_type in ("Run", "TrailRun", "VirtualRun")
+        cad = activity.average_cadence * (2 if is_run else 1)
+        embed.add_field(
+            name="Cadence", value=f"{cad:.0f} {'spm' if is_run else 'rpm'}",
+        )
     if activity.calories:
         embed.add_field(name="Calories", value=f"{activity.calories:.0f} kcal")
-    embed.set_footer(text="via Strava")
+    if activity.suffer_score:
+        embed.add_field(name="Relative effort", value=f"{activity.suffer_score:.0f}")
+    if activity.average_temp is not None:
+        embed.add_field(name="Temp", value=f"{activity.average_temp:.0f}°C")
+    achievements = []
+    if activity.pr_count:
+        achievements.append(f"🏅 {activity.pr_count} PR{'s' if activity.pr_count != 1 else ''}")
+    if activity.achievement_count:
+        achievements.append(f"⭐ {activity.achievement_count}")
+    if achievements:
+        embed.add_field(name="Achievements", value="  ".join(achievements))
+    footer = f"via Strava · {activity.gear_name}" if activity.gear_name else "via Strava"
+    embed.set_footer(text=footer)
     return embed
 
 

@@ -28,6 +28,7 @@ import os
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 LOG = logging.getLogger("gymbot.strava")
@@ -308,6 +309,18 @@ class StravaActivity:
     url: str
     map_polyline: str          # Google-encoded route polyline ("" if none)
     photo_url: Optional[str]   # primary activity photo, if the athlete added one
+    # Richer detail (mostly present on the detailed/webhook payload only).
+    start_date: str = ""       # UTC ISO-8601, used for a "when" timestamp
+    description: Optional[str] = None    # the athlete's own caption text
+    gear_name: Optional[str] = None      # bike/shoes name
+    max_speed_ms: float = 0.0
+    average_watts: Optional[float] = None
+    kilojoules: Optional[float] = None
+    average_cadence: Optional[float] = None
+    average_temp: Optional[float] = None  # °C
+    pr_count: int = 0
+    achievement_count: int = 0
+    kudos_count: int = 0
 
 
 def _extract_photo_url(data: dict[str, Any]) -> Optional[str]:
@@ -358,6 +371,29 @@ def decode_polyline(encoded: str) -> list[tuple[float, float]]:
     return coords
 
 
+def _opt_float(value: Any) -> Optional[float]:
+    """Coerce a value to float, or None if absent/non-numeric."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def start_unix(activity: "StravaActivity") -> Optional[int]:
+    """Epoch seconds for the activity start, for a Discord ``<t:..>`` stamp."""
+    raw = activity.start_date or activity.start_date_local
+    if not raw:
+        return None
+    try:
+        # Strava uses a trailing "Z"; fromisoformat needs an explicit offset.
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp())
+
+
 def parse_activity(data: dict[str, Any]) -> StravaActivity:
     """Build a :class:`StravaActivity` from a Strava activity JSON object."""
     aid = int(data.get("id", 0) or 0)
@@ -396,6 +432,17 @@ def parse_activity(data: dict[str, Any]) -> StravaActivity:
         url=f"https://www.strava.com/activities/{aid}" if aid else "",
         map_polyline=str(amap.get("polyline") or amap.get("summary_polyline") or ""),
         photo_url=_extract_photo_url(data),
+        start_date=str(data.get("start_date") or ""),
+        description=(str(data["description"]) if data.get("description") else None),
+        gear_name=((data.get("gear") or {}).get("name") or None),
+        max_speed_ms=float(data.get("max_speed") or 0.0),
+        average_watts=_opt_float(data.get("average_watts")),
+        kilojoules=_opt_float(data.get("kilojoules")),
+        average_cadence=_opt_float(data.get("average_cadence")),
+        average_temp=_opt_float(data.get("average_temp")),
+        pr_count=int(data.get("pr_count") or 0),
+        achievement_count=int(data.get("achievement_count") or 0),
+        kudos_count=int(data.get("kudos_count") or 0),
     )
 
 

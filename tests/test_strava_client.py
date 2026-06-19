@@ -89,6 +89,49 @@ def test_parse_activity_no_map_or_photo():
     assert act.photo_url is None
 
 
+def test_parse_activity_rich_fields():
+    act = strava_client.parse_activity(
+        {
+            "id": 5,
+            "type": "Ride",
+            "sport_type": "Ride",
+            "start_date": "2026-06-19T03:11:00Z",
+            "description": "windy out there",
+            "gear": {"name": "Canyon Endurace"},
+            "max_speed": 12.5,
+            "average_watts": 180.4,
+            "kilojoules": 642.0,
+            "average_cadence": 84.0,
+            "average_temp": 19.0,
+            "pr_count": 2,
+            "achievement_count": 5,
+            "kudos_count": 7,
+        }
+    )
+    assert act.gear_name == "Canyon Endurace"
+    assert act.average_watts == pytest.approx(180.4)
+    assert act.kilojoules == pytest.approx(642.0)
+    assert act.average_cadence == pytest.approx(84.0)
+    assert act.average_temp == pytest.approx(19.0)
+    assert act.max_speed_ms == pytest.approx(12.5)
+    assert act.pr_count == 2
+    assert act.achievement_count == 5
+    assert act.description == "windy out there"
+    # start_unix → epoch for 2026-06-19T03:11:00Z.
+    assert strava_client.start_unix(act) == 1781838660
+
+
+def test_parse_activity_rich_fields_absent_default_safely():
+    act = strava_client.parse_activity({"id": 6, "name": "Gym"})
+    assert act.average_watts is None
+    assert act.average_cadence is None
+    assert act.average_temp is None
+    assert act.gear_name is None
+    assert act.pr_count == 0
+    assert act.max_speed_ms == 0.0
+    assert strava_client.start_unix(act) is None
+
+
 def test_decode_polyline_known_vector():
     # Canonical Google example → three coordinates.
     pts = strava_client.decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@")
