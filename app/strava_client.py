@@ -655,31 +655,62 @@ MAPBOX_STATIC_BASE = "https://api.mapbox.com/styles/v1/mapbox"
 _MAPBOX_URL_LIMIT = 8000
 
 
+# Marker colours (start = green, finish = red), matching the local renderer.
+_START_PIN = "19d36b"
+_FINISH_PIN = "e02020"
+
+
+def _mapbox_url(
+    overlays: list[str], style: str, width: int, height: int, token: str,
+) -> str:
+    overlay_str = ",".join(overlays)
+    return (
+        f"{MAPBOX_STATIC_BASE}/{style}/static/{overlay_str}/auto/"
+        f"{width}x{height}@2x?padding=40&access_token={token}"
+    )
+
+
 def mapbox_route_url(
     polyline: str,
     token: str,
     *,
     style: str = "outdoors-v12",
-    width: int = 600,
-    height: int = 400,
+    width: int = 640,
+    height: int = 440,
     color: str = "fc4c02",
     stroke: int = 5,
+    markers: bool = True,
 ) -> Optional[str]:
     """Build a Mapbox Static Images URL overlaying *polyline* on a real map.
 
     The encoded polyline is passed straight through as a path overlay (Mapbox
-    decodes precision-5 polylines natively), and ``auto`` fits the viewport to
-    the route. Returns None when there's no route or the resulting URL would
-    exceed Mapbox's length limit (caller should fall back to a local render).
+    decodes precision-5 polylines natively); ``auto`` fits the viewport to the
+    route, rendered at ``@2x`` for retina sharpness. When *markers* is set, a
+    green start pin and red finish pin are added at the route endpoints.
+
+    Returns None when there's no route or the URL would exceed Mapbox's length
+    limit even after dropping the markers (caller should fall back to a local
+    render). The bounded ``width``/``height`` (≤1280) keep the ``@2x`` output
+    inside Mapbox's image-size cap.
     """
     if not polyline or not token:
         return None
     encoded = urllib.parse.quote(polyline, safe="")
     path = f"path-{stroke}+{color}({encoded})"
-    url = (
-        f"{MAPBOX_STATIC_BASE}/{style}/static/{path}/auto/"
-        f"{width}x{height}@2x?padding=30&access_token={token}"
-    )
+
+    overlays = [path]
+    if markers:
+        pts = decode_polyline(polyline)
+        if len(pts) >= 2:
+            (slat, slon), (elat, elon) = pts[0], pts[-1]
+            # Pins are drawn after the path so they sit on top; lon precedes lat.
+            overlays.append(f"pin-s+{_START_PIN}({slon:.5f},{slat:.5f})")
+            overlays.append(f"pin-s+{_FINISH_PIN}({elon:.5f},{elat:.5f})")
+
+    url = _mapbox_url(overlays, style, width, height, token)
+    if len(url) > _MAPBOX_URL_LIMIT and len(overlays) > 1:
+        # Markers pushed us over — retry with just the path.
+        url = _mapbox_url([path], style, width, height, token)
     if len(url) > _MAPBOX_URL_LIMIT:
         return None
     return url

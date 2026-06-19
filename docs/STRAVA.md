@@ -122,7 +122,14 @@ STRAVA_MAPBOX_TOKEN=pk.xxxx…
 
 Get a free token at <https://account.mapbox.com/access-tokens/>. With it set,
 maps are rendered via Mapbox's Static Images API (Discord fetches the URL
-directly). Without it, the local silhouette is used.
+directly) with a green start pin, red finish pin, and retina (`@2x`) output.
+Without it, the local silhouette is used.
+
+Pick the basemap style with `STRAVA_MAP_STYLE` (default `outdoors-v12`):
+
+```dotenv
+STRAVA_MAP_STYLE=satellite-streets-v12   # or streets-v12, outdoors-v12
+```
 
 > **"Hidden" route segments:** if you use Strava **privacy zones**, Strava strips
 > those portions from the polyline *before* sending it to any third-party app —

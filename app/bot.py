@@ -6782,6 +6782,9 @@ STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
 # (streets/terrain) via Mapbox's Static Images API instead of the local
 # bare-line silhouette. Free tier covers far more than a hobby server needs.
 STRAVA_MAPBOX_TOKEN = os.getenv("STRAVA_MAPBOX_TOKEN", "").strip()
+# Mapbox style for route maps. Common picks: outdoors-v12 (trails/terrain),
+# streets-v12 (road map), satellite-streets-v12 (aerial + labels).
+STRAVA_MAP_STYLE = os.getenv("STRAVA_MAP_STYLE", "outdoors-v12").strip() or "outdoors-v12"
 
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
@@ -6979,6 +6982,7 @@ def _strava_embed_and_file(
         if STRAVA_MAPBOX_TOKEN:
             map_url = strava_client.mapbox_route_url(
                 activity.map_polyline, STRAVA_MAPBOX_TOKEN,
+                style=STRAVA_MAP_STYLE,
             )
             if map_url:
                 embed.set_image(url=map_url)

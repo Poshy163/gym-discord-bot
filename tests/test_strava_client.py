@@ -159,6 +159,21 @@ def test_mapbox_route_url():
     assert "path-5+fc4c02" in url
 
 
+def test_mapbox_route_url_adds_start_finish_pins():
+    # A real (decodable) polyline → green start + red finish pins appended.
+    url = strava_client.mapbox_route_url("_p~iF~ps|U_ulLnnqC_mqNvxq`@", "pk.test")
+    assert url is not None
+    assert "pin-s+19d36b(" in url   # start (green)
+    assert "pin-s+e02020(" in url   # finish (red)
+
+
+def test_mapbox_route_url_custom_style():
+    url = strava_client.mapbox_route_url(
+        "abc", "pk.test", style="satellite-streets-v12",
+    )
+    assert "/mapbox/satellite-streets-v12/static/" in url
+
+
 def test_mapbox_route_url_none_cases():
     assert strava_client.mapbox_route_url("", "pk.test") is None
     assert strava_client.mapbox_route_url("abc", "") is None
