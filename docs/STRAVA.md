@@ -100,6 +100,8 @@ tokens and DMs a confirmation. From then on, new activities post automatically.
 Other commands:
 
 - `/strava_status` — check whether you're linked.
+- `/strava_latest [member]` — post the most recent activity on demand (yours by
+  default, or another linked member's).
 - `/strava_unlink` — revoke access and delete the stored tokens.
 
 ## 6. Behaviour notes

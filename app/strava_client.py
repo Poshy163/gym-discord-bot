@@ -364,6 +364,30 @@ def get_activity(access_token: str, activity_id: int) -> StravaActivity:
     return parse_activity(r.json())
 
 
+def get_latest_activity(access_token: str) -> "StravaActivity | None":
+    """Fetch the athlete's single most recent activity, or None if they have
+    none. Returns the *summary* representation (no calories/suffer score), which
+    is enough for the embed.
+    """
+    _require_requests()
+    r = requests.get(
+        f"{API_BASE}/athlete/activities",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        },
+        params={"per_page": 1},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code == 401:
+        raise StravaAuthError("Access token rejected listing activities (401).")
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        return None
+    return parse_activity(data[0])
+
+
 def get_athlete(access_token: str) -> dict[str, Any]:
     """Fetch the authenticated athlete (used to capture a display name)."""
     _require_requests()

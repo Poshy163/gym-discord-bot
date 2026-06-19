@@ -7147,6 +7147,76 @@ async def strava_status_cmd(interaction: discord.Interaction) -> None:
     )
 
 
+@bot.tree.command(
+    name="strava_latest",
+    description="Show the most recent Strava activity (yours, or another member's).",
+)
+@app_commands.describe(member="Whose latest workout to show. Defaults to you.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_latest_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if STRAVA_DISABLED:
+        await interaction.response.send_message(
+            "Strava integration is disabled.", ephemeral=True,
+        )
+        return
+    target = member or interaction.user
+    row = db.get_strava_account(target.id)
+    if row is None:
+        if target.id == interaction.user.id:
+            msg = "You haven't linked Strava yet. Use `/strava_link`."
+        else:
+            msg = f"{target.mention} hasn't linked a Strava account."
+        await interaction.response.send_message(
+            msg, ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    def _fetch() -> "strava_client.StravaActivity | None | str":
+        try:
+            token = _strava_access_token(row)
+            return strava_client.get_latest_activity(token)
+        except strava_client.StravaAuthError as exc:
+            return f"auth: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _fetch)
+    if isinstance(result, str):
+        LOG.warning("Strava latest fetch failed for %s: %s", target.id, result)
+        await interaction.followup.send(
+            "Couldn't reach Strava just now — try again shortly.",
+            ephemeral=True,
+        )
+        return
+    if result is None:
+        await interaction.followup.send(
+            f"No Strava activities found for {target.display_name}.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    # Don't reveal someone else's private activity (our scope normally filters
+    # these out, but guard defensively).
+    if result.private and target.id != interaction.user.id:
+        await interaction.followup.send(
+            f"{target.display_name}'s most recent activity is private.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    embed = _build_strava_embed(result, target.mention)
+    await interaction.followup.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 # ---- owner-only webhook subscription management ---------------------------
 
 @bot.tree.command(

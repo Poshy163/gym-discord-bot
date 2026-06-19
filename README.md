@@ -235,8 +235,9 @@ Quick version: register a Strava API app, set `STRAVA_CLIENT_ID`,
 walkthrough — including the reverse-proxy setup — is in
 [docs/STRAVA.md](docs/STRAVA.md). Set `STRAVA_DISABLED=1` to turn it off.
 
-Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, and owner-only
-`/strava_subscribe`, `/strava_subscription`, `/strava_unsubscribe`.
+Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, `/strava_latest`
+(show the most recent activity on demand), and owner-only `/strava_subscribe`,
+`/strava_subscription`, `/strava_unsubscribe`.
 
 ## Setup
 
