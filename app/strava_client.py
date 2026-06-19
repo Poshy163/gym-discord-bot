@@ -595,3 +595,44 @@ def format_speed(average_speed_ms: float) -> Optional[str]:
     if average_speed_ms <= 0:
         return None
     return f"{average_speed_ms * 3.6:.1f} km/h"
+
+
+# ---------------------------------------------------------------------------
+# Map rendering (optional Mapbox static-map overlay)
+# ---------------------------------------------------------------------------
+
+MAPBOX_STATIC_BASE = "https://api.mapbox.com/styles/v1/mapbox"
+
+# Mapbox caps static-image request URLs; long routes can blow past it, in which
+# case we signal the caller to fall back to the local silhouette.
+_MAPBOX_URL_LIMIT = 8000
+
+
+def mapbox_route_url(
+    polyline: str,
+    token: str,
+    *,
+    style: str = "outdoors-v12",
+    width: int = 600,
+    height: int = 400,
+    color: str = "fc4c02",
+    stroke: int = 5,
+) -> Optional[str]:
+    """Build a Mapbox Static Images URL overlaying *polyline* on a real map.
+
+    The encoded polyline is passed straight through as a path overlay (Mapbox
+    decodes precision-5 polylines natively), and ``auto`` fits the viewport to
+    the route. Returns None when there's no route or the resulting URL would
+    exceed Mapbox's length limit (caller should fall back to a local render).
+    """
+    if not polyline or not token:
+        return None
+    encoded = urllib.parse.quote(polyline, safe="")
+    path = f"path-{stroke}+{color}({encoded})"
+    url = (
+        f"{MAPBOX_STATIC_BASE}/{style}/static/{path}/auto/"
+        f"{width}x{height}@2x?padding=30&access_token={token}"
+    )
+    if len(url) > _MAPBOX_URL_LIMIT:
+        return None
+    return url

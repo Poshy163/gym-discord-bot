@@ -106,6 +106,23 @@ def test_decode_polyline_empty_and_garbled():
     assert isinstance(strava_client.decode_polyline("_p~iF~ps|U_"), list)
 
 
+def test_mapbox_route_url():
+    url = strava_client.mapbox_route_url("abc`@def", "pk.test")
+    assert url is not None
+    assert url.startswith("https://api.mapbox.com/styles/v1/mapbox/outdoors-v12/static/")
+    assert "access_token=pk.test" in url
+    # Polyline is URL-encoded inside the path overlay (no raw backtick/@).
+    assert "abc%60%40def" in url
+    assert "path-5+fc4c02" in url
+
+
+def test_mapbox_route_url_none_cases():
+    assert strava_client.mapbox_route_url("", "pk.test") is None
+    assert strava_client.mapbox_route_url("abc", "") is None
+    # An absurdly long polyline overflows the URL limit → fall back signal.
+    assert strava_client.mapbox_route_url("x" * 9000, "pk.test") is None
+
+
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------

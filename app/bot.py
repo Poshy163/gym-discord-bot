@@ -6778,6 +6778,11 @@ except ValueError:
 
 STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
 
+# Optional Mapbox token. When set, route maps are rendered over a real basemap
+# (streets/terrain) via Mapbox's Static Images API instead of the local
+# bare-line silhouette. Free tier covers far more than a hobby server needs.
+STRAVA_MAPBOX_TOKEN = os.getenv("STRAVA_MAPBOX_TOKEN", "").strip()
+
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
 _strava_runner = None
@@ -6930,6 +6935,15 @@ def _strava_embed_and_file(
         embed.set_image(url=activity.photo_url)
         return embed, None
     if activity.map_polyline:
+        # Prefer a real basemap via Mapbox (Discord fetches the URL directly);
+        # otherwise render the bare-line silhouette locally.
+        if STRAVA_MAPBOX_TOKEN:
+            map_url = strava_client.mapbox_route_url(
+                activity.map_polyline, STRAVA_MAPBOX_TOKEN,
+            )
+            if map_url:
+                embed.set_image(url=map_url)
+                return embed, None
         buf = _render_strava_route_png(activity.map_polyline)
         if buf is not None:
             embed.set_image(url="attachment://route.png")

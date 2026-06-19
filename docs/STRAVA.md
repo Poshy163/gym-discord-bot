@@ -104,6 +104,31 @@ Other commands:
   default, or another linked member's).
 - `/strava_unlink` — revoke access and delete the stored tokens.
 
+## 5a. Route maps (optional Mapbox basemap)
+
+Each posted activity includes an image:
+
+1. the athlete's **photo** if they attached one, else
+2. a **route map** if the activity has GPS, else
+3. just the stat embed (strength/indoor workouts).
+
+By default the route map is a bare orange line on a dark background (rendered
+locally with matplotlib — no API key). For a map that looks like the Strava
+website (streets/terrain under the route), set a **Mapbox** token:
+
+```dotenv
+STRAVA_MAPBOX_TOKEN=pk.xxxx…
+```
+
+Get a free token at <https://account.mapbox.com/access-tokens/>. With it set,
+maps are rendered via Mapbox's Static Images API (Discord fetches the URL
+directly). Without it, the local silhouette is used.
+
+> **"Hidden" route segments:** if you use Strava **privacy zones**, Strava strips
+> those portions from the polyline *before* sending it to any third-party app —
+> the bot never receives them, so they can't be drawn (with or without Mapbox).
+> Adjust your privacy zones in Strava settings if you want the full track shown.
+
 ## 6. Behaviour notes
 
 - **Scope:** `read,activity:read`. Private activities are fetched but **not
