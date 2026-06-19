@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 from calendar import monthrange
@@ -62,6 +63,8 @@ from . import __version__
 from . import calories
 from . import gemini_client
 from . import revo_client
+from . import strava_client
+from . import strava_web
 
 # Set of all alias phrases (canonical + aliases) the built-in table already
 # recognises, normalised. Used by /log to decide whether a logged equipment
@@ -6742,6 +6745,513 @@ async def _poll_one_account(row) -> None:
 @revo_attendance_poll.before_loop
 async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# Strava integration. See docs/STRAVA.md.
+# ---------------------------------------------------------------------------
+# Unlike Revo (HTML scraping + polling), Strava uses OAuth2 + real-time webhook
+# push. We run a small aiohttp server (app/strava_web.py) on the bot's event
+# loop to receive the OAuth redirect and the webhook events; on a new activity
+# we fetch the full details and post an embed to a single shared feed channel.
+
+STRAVA_DISABLED = os.getenv("STRAVA_DISABLED", "0").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+
+# Shared channel every linked athlete's new workouts post into.
+_strava_ch = os.getenv("STRAVA_FEED_CHANNEL_ID", "").strip()
+STRAVA_FEED_CHANNEL_ID: int | None = (
+    int(_strava_ch) if _strava_ch.lstrip("-").isdigit() else None
+)
+
+# Host/port the embedded web server binds to *inside* the container. The
+# externally reachable URL (used in the OAuth redirect + webhook callback) is
+# configured separately via STRAVA_PUBLIC_URL and read inside
+# strava_client.config_from_env() — they differ whenever a reverse proxy or
+# port mapping sits in front of the bot.
+STRAVA_BIND_HOST = os.getenv("STRAVA_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+try:
+    STRAVA_PORT = int(os.getenv("STRAVA_PORT", "8080"))
+except ValueError:
+    STRAVA_PORT = 8080
+
+STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
+
+# aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
+# clean it up.
+_strava_runner = None
+
+
+def _strava_cfg() -> "strava_client.StravaConfig":
+    return strava_client.config_from_env()
+
+
+def _strava_enabled() -> bool:
+    """True when Strava is switched on, deps are present, and the host app
+    credentials are configured."""
+    return (
+        not STRAVA_DISABLED
+        and strava_client.available()
+        and _strava_cfg().configured
+    )
+
+
+def _strava_access_token(row) -> str:
+    """Return a currently-valid access token for a linked-account row.
+
+    Refreshes via the stored refresh token when the cached access token has
+    expired, persisting the rotated pair (Strava rotates refresh tokens too).
+    Synchronous (uses ``requests``) — always call via ``run_in_executor``.
+    """
+    cfg = _strava_cfg()
+    tokens = strava_client.TokenSet(
+        access_token=strava_client.decrypt_token(row["access_token_enc"]),
+        refresh_token=strava_client.decrypt_token(row["refresh_token_enc"]),
+        expires_at=int(row["expires_at"]),
+    )
+    if not tokens.is_expired():
+        return tokens.access_token
+    fresh = strava_client.refresh_tokens(cfg, tokens.refresh_token)
+    db.update_strava_tokens(
+        int(row["user_id"]),
+        strava_client.encrypt_token(fresh.access_token),
+        strava_client.encrypt_token(fresh.refresh_token),
+        fresh.expires_at,
+    )
+    return fresh.access_token
+
+
+def _build_strava_embed(
+    activity: "strava_client.StravaActivity", who: str,
+) -> discord.Embed:
+    """Render a Strava activity as a Discord embed. Distance sports get
+    pace/elevation; everything else is duration-first."""
+    emoji = strava_client.sport_emoji(activity.sport_type)
+    embed = discord.Embed(
+        title=f"{emoji} {activity.name}"[:256],
+        url=activity.url or None,
+        colour=STRAVA_COLOUR,
+        description=f"New **{activity.sport_type}** by {who}",
+    )
+    if strava_client.is_distance_sport(activity.sport_type) and activity.distance_m > 0:
+        embed.add_field(
+            name="Distance",
+            value=strava_client.format_distance(activity.distance_m),
+        )
+        embed.add_field(
+            name="Time",
+            value=strava_client.format_duration(activity.moving_time_s),
+        )
+        pace = strava_client.format_pace(activity.distance_m, activity.moving_time_s)
+        speed = strava_client.format_speed(activity.average_speed_ms)
+        if pace:
+            embed.add_field(name="Pace", value=pace)
+        elif speed:
+            embed.add_field(name="Speed", value=speed)
+        if activity.total_elevation_gain_m:
+            embed.add_field(
+                name="Elevation",
+                value=f"{activity.total_elevation_gain_m:.0f} m",
+            )
+    else:
+        embed.add_field(
+            name="Duration",
+            value=strava_client.format_duration(
+                activity.moving_time_s or activity.elapsed_time_s
+            ),
+        )
+    if activity.average_heartrate:
+        hr = f"{activity.average_heartrate:.0f} bpm"
+        if activity.max_heartrate:
+            hr += f" (max {activity.max_heartrate:.0f})"
+        embed.add_field(name="Heart rate", value=hr)
+    if activity.calories:
+        embed.add_field(name="Calories", value=f"{activity.calories:.0f} kcal")
+    embed.set_footer(text="via Strava")
+    return embed
+
+
+async def _strava_on_callback(
+    code: str | None, state: str | None, error: str | None,
+) -> str:
+    """Handle the OAuth redirect — exchange the code, persist tokens, confirm.
+
+    Returns the HTML body shown in the user's browser.
+    """
+    if error:
+        return strava_web.error_page(f"Strava reported: {error}")
+    if not code or not state:
+        return strava_web.error_page("Missing authorization code in the redirect.")
+    user_id = db.pop_strava_pending(state)
+    if user_id is None:
+        return strava_web.error_page(
+            "This link has expired or was already used. Run /strava_link again."
+        )
+    cfg = _strava_cfg()
+
+    def _exchange() -> "tuple[strava_client.TokenSet, int | None, str] | str":
+        try:
+            tokens, athlete = strava_client.exchange_code(cfg, code)
+            name = strava_client.athlete_display_name(athlete)
+            athlete_id = (
+                int(athlete["id"]) if athlete.get("id") is not None else None
+            )
+            return tokens, athlete_id, name
+        except strava_client.StravaAuthError as exc:
+            return f"auth: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _exchange)
+    if isinstance(result, str):
+        LOG.warning("Strava code exchange failed for user %s: %s", user_id, result)
+        return strava_web.error_page("Token exchange failed. Please try again.")
+    tokens, athlete_id, name = result
+    try:
+        db.link_strava_account(
+            user_id=user_id,
+            athlete_id=athlete_id,
+            access_token_enc=strava_client.encrypt_token(tokens.access_token),
+            refresh_token_enc=strava_client.encrypt_token(tokens.refresh_token),
+            expires_at=tokens.expires_at,
+            scope=strava_client.DEFAULT_SCOPE,
+            athlete_name=name,
+        )
+    except Exception:
+        LOG.exception("Strava link db write failed for user %s", user_id)
+        return strava_web.error_page("Couldn't save your link. Please try again.")
+
+    LOG.info("Strava linked user=%s athlete=%s (%s)", user_id, athlete_id, name)
+    try:  # best-effort DM confirmation
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        if user is not None:
+            tail = (
+                f" New workouts will post to <#{STRAVA_FEED_CHANNEL_ID}>."
+                if STRAVA_FEED_CHANNEL_ID else ""
+            )
+            await user.send(
+                f"✅ Your Strava account (**{name}**) is now linked!{tail}"
+            )
+    except discord.HTTPException:
+        pass
+    return strava_web.success_page(name)
+
+
+async def _strava_on_event(payload: dict) -> None:
+    """Process one webhook event — announce newly-created public activities."""
+    if STRAVA_DISABLED:
+        return
+    if payload.get("object_type") != "activity":
+        return  # athlete deauthorization / profile updates — ignore
+    if payload.get("aspect_type") != "create":
+        return  # only announce brand-new activities, not edits/deletes
+    try:
+        athlete_id = int(payload.get("owner_id"))
+        activity_id = int(payload.get("object_id"))
+    except (TypeError, ValueError):
+        return
+    row = db.get_strava_account_by_athlete(athlete_id)
+    if row is None:
+        LOG.info("Strava event for unlinked athlete %s — ignoring", athlete_id)
+        return
+    if STRAVA_FEED_CHANNEL_ID is None:
+        LOG.warning("Strava event received but STRAVA_FEED_CHANNEL_ID is unset")
+        return
+    if (
+        row["last_activity_id"] is not None
+        and int(row["last_activity_id"]) == activity_id
+    ):
+        return  # duplicate webhook delivery
+
+    user_id = int(row["user_id"])
+
+    def _fetch() -> "strava_client.StravaActivity | str":
+        try:
+            token = _strava_access_token(row)
+            return strava_client.get_activity(token, activity_id)
+        except strava_client.StravaAuthError as exc:
+            return f"auth: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _fetch)
+    if isinstance(result, str):
+        LOG.warning(
+            "Strava activity fetch failed (athlete=%s activity=%s): %s",
+            athlete_id, activity_id, result,
+        )
+        return
+    activity = result
+    # Advance the de-dupe cursor regardless of whether we post, so a private
+    # activity (deliberately skipped) doesn't get re-evaluated on a retry.
+    db.update_strava_last_activity(user_id, activity_id)
+    if activity.private:
+        LOG.info("Strava activity %s is private — not posting", activity_id)
+        return
+
+    channel = bot.get_channel(STRAVA_FEED_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(STRAVA_FEED_CHANNEL_ID)
+        except discord.HTTPException:
+            LOG.warning(
+                "Strava: cannot reach feed channel %s", STRAVA_FEED_CHANNEL_ID
+            )
+            return
+    who = f"<@{user_id}>"
+    embed = _build_strava_embed(activity, who)
+    try:
+        await channel.send(
+            content=f"{strava_client.sport_emoji(activity.sport_type)} "
+            f"{who} just logged a workout on Strava!",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException:
+        LOG.exception("Strava: failed to post activity %s", activity_id)
+
+
+@bot.event
+async def setup_hook() -> None:  # pragma: no cover - discord runtime
+    """Start the Strava web server on the bot's event loop before connecting.
+
+    No-op (logs a hint) when Strava is disabled or unconfigured, so the bot
+    still boots cleanly for users who don't want the integration.
+    """
+    global _strava_runner
+    if not _strava_enabled():
+        if not STRAVA_DISABLED and strava_client.available() and not _strava_cfg().configured:
+            LOG.info(
+                "Strava idle — set STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET and "
+                "STRAVA_PUBLIC_URL to enable workout posting."
+            )
+        return
+    cfg = _strava_cfg()
+    app = strava_web.build_app(
+        verify_token=cfg.verify_token,
+        on_callback=_strava_on_callback,
+        on_event=_strava_on_event,
+        schedule=lambda coro: bot.loop.create_task(coro),
+    )
+    try:
+        _strava_runner = await strava_web.start_server(
+            app, STRAVA_BIND_HOST, STRAVA_PORT,
+        )
+        LOG.info(
+            "Strava enabled — feed channel=%s callback=%s",
+            STRAVA_FEED_CHANNEL_ID, cfg.redirect_uri,
+        )
+        if STRAVA_FEED_CHANNEL_ID is None:
+            LOG.warning(
+                "STRAVA_FEED_CHANNEL_ID is unset — workouts will be received "
+                "but not posted anywhere."
+            )
+    except Exception:
+        LOG.exception("Failed to start Strava web server")
+
+
+@bot.tree.command(
+    name="strava_link",
+    description="Link your Strava account so your new workouts post to the feed.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_link_cmd(interaction: discord.Interaction) -> None:
+    if STRAVA_DISABLED:
+        await interaction.response.send_message(
+            "Strava integration is disabled (STRAVA_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not strava_client.available():
+        await interaction.response.send_message(
+            "Strava client unavailable — install `requests` and `cryptography`.",
+            ephemeral=True,
+        )
+        return
+    cfg = _strava_cfg()
+    if not cfg.configured or not cfg.redirect_uri:
+        await interaction.response.send_message(
+            "Strava isn't configured on the host yet (the bot owner needs to "
+            "set `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET` and "
+            "`STRAVA_PUBLIC_URL`).",
+            ephemeral=True,
+        )
+        return
+    state = secrets.token_urlsafe(24)
+    db.create_strava_pending(state, interaction.user.id)
+    url = strava_client.build_authorize_url(cfg, state)
+    await interaction.response.send_message(
+        "🔗 **Link your Strava account**\n"
+        f"1. Open this link and approve access: {url}\n"
+        "2. You'll get a confirmation here once it's done.\n\n"
+        "Your tokens are stored **encrypted**. Revoke any time with "
+        "`/strava_unlink`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="strava_unlink",
+    description="Unlink your Strava account and revoke the bot's access.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_unlink_cmd(interaction: discord.Interaction) -> None:
+    row = db.get_strava_account(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You don't have a linked Strava account.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _revoke() -> None:
+        try:
+            token = _strava_access_token(row)
+            strava_client.deauthorize(token)
+        except Exception:  # pragma: no cover - best effort
+            LOG.info("Strava deauthorize on unlink failed", exc_info=True)
+
+    await bot.loop.run_in_executor(None, _revoke)
+    db.unlink_strava_account(interaction.user.id)
+    await interaction.followup.send(
+        "🗑️ Strava unlinked and access revoked. Encrypted tokens removed.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="strava_status",
+    description="Show whether your Strava account is linked.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_status_cmd(interaction: discord.Interaction) -> None:
+    row = db.get_strava_account(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "No Strava account linked. Use `/strava_link` to connect one.",
+            ephemeral=True,
+        )
+        return
+    name = row["athlete_name"] or "your account"
+    feed = (
+        f"\nNew workouts post to <#{STRAVA_FEED_CHANNEL_ID}>."
+        if STRAVA_FEED_CHANNEL_ID else
+        "\n⚠️ No feed channel configured — workouts won't post yet."
+    )
+    await interaction.response.send_message(
+        f"✅ Linked as **{name}** (athlete id `{row['athlete_id']}`).{feed}",
+        ephemeral=True,
+    )
+
+
+# ---- owner-only webhook subscription management ---------------------------
+
+@bot.tree.command(
+    name="strava_subscribe",
+    description="(Owner) Create the Strava webhook push subscription.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "This command is owner-only.", ephemeral=True,
+        )
+        return
+    cfg = _strava_cfg()
+    if not cfg.configured or not cfg.webhook_callback_url:
+        await interaction.response.send_message(
+            "Strava isn't configured (need client id/secret + STRAVA_PUBLIC_URL).",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _do() -> str:
+        try:
+            existing = strava_client.view_subscriptions(cfg)
+            if existing:
+                return f"ℹ️ A subscription already exists: `{existing}`."
+            sid = strava_client.create_subscription(cfg)
+            return (
+                f"✅ Created subscription `{sid}` → "
+                f"`{cfg.webhook_callback_url}`."
+            )
+        except Exception as exc:  # pragma: no cover - network
+            return f"⚠️ Failed: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(
+    name="strava_subscription",
+    description="(Owner) Show the current Strava webhook subscription.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_subscription_cmd(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "This command is owner-only.", ephemeral=True,
+        )
+        return
+    cfg = _strava_cfg()
+    if not cfg.configured:
+        await interaction.response.send_message(
+            "Strava isn't configured.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _do() -> str:
+        try:
+            subs = strava_client.view_subscriptions(cfg)
+            return f"Current subscriptions: `{subs}`" if subs else (
+                "No active subscription. Run `/strava_subscribe`."
+            )
+        except Exception as exc:  # pragma: no cover - network
+            return f"⚠️ Failed: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(
+    name="strava_unsubscribe",
+    description="(Owner) Delete the Strava webhook push subscription.",
+)
+@app_commands.describe(subscription_id="The subscription id to delete.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_unsubscribe_cmd(
+    interaction: discord.Interaction, subscription_id: int,
+) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "This command is owner-only.", ephemeral=True,
+        )
+        return
+    cfg = _strava_cfg()
+    if not cfg.configured:
+        await interaction.response.send_message(
+            "Strava isn't configured.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _do() -> str:
+        try:
+            strava_client.delete_subscription(cfg, subscription_id)
+            return f"🗑️ Deleted subscription `{subscription_id}`."
+        except Exception as exc:  # pragma: no cover - network
+            return f"⚠️ Failed: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    await interaction.followup.send(result, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------

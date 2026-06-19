@@ -2,8 +2,12 @@ discord.py==2.4.0
 python-dotenv==1.0.1
 matplotlib==3.9.2
 tzdata==2024.1
-# Optional — only required when the Revo Fitness portal integration is
-# enabled (see docs/REVO_PORTAL.md). The bot still boots without them; the
-# /busy and /revo_* commands will just report "unavailable".
+# Optional — only required when the Revo Fitness portal or Strava integration
+# is enabled (see docs/REVO_PORTAL.md, docs/STRAVA.md). The bot still boots
+# without them; the /busy, /revo_* and /strava_* commands report "unavailable".
 requests==2.32.3
 cryptography==43.0.1
+# aiohttp is already pulled in transitively by discord.py (which requires
+# >=3.7.4,<4). The Strava webhook server (app/strava_web.py) imports it
+# directly, so pin it explicitly.
+aiohttp==3.10.10

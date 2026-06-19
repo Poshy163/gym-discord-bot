@@ -213,6 +213,33 @@ CREATE TABLE IF NOT EXISTS calorie_foods (
     set_at   TEXT    NOT NULL,
     PRIMARY KEY (guild_id, user_id, name)
 );
+
+-- Linked Strava accounts (see app/strava_client.py). access/refresh tokens are
+-- Fernet-encrypted — the plaintext is never persisted. ``expires_at`` is epoch
+-- seconds (Strava's own) so the refresh path can tell when the access token is
+-- stale. ``athlete_id`` is Strava's numeric id; it's how an inbound webhook
+-- event (which only carries owner_id) is routed back to the Discord user.
+-- ``last_activity_id`` de-dupes repeated webhook deliveries for one activity.
+CREATE TABLE IF NOT EXISTS strava_account (
+    user_id            INTEGER PRIMARY KEY,
+    athlete_id         INTEGER UNIQUE,
+    access_token_enc   TEXT    NOT NULL,
+    refresh_token_enc  TEXT    NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    scope              TEXT,
+    athlete_name       TEXT,
+    last_activity_id   INTEGER,
+    linked_at          TEXT    NOT NULL
+);
+
+-- Pending OAuth handshakes: maps the opaque ``state`` we embed in the authorize
+-- URL back to the Discord user who ran /strava_link, so the browser redirect
+-- can be attributed to them. Rows are consumed on callback and swept by age.
+CREATE TABLE IF NOT EXISTS strava_pending_auth (
+    state      TEXT    PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    created_at TEXT    NOT NULL
+);
 """
 
 
@@ -1810,6 +1837,133 @@ class Database:
         """All linked accounts. Used by the attendance poller."""
         with self._conn() as c:
             return list(c.execute("SELECT * FROM revo_account"))
+
+    # ------------------------------------------------------------------
+    # Strava account linking (see app/strava_client.py)
+    # ------------------------------------------------------------------
+
+    def create_strava_pending(self, state: str, user_id: int) -> None:
+        """Record a pending OAuth handshake so the redirect can be attributed.
+
+        Also opportunistically sweeps handshakes older than an hour — they're
+        abandoned link attempts the user never completed in the browser.
+        """
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM strava_pending_auth "
+                "WHERE created_at < datetime('now', '-1 hour')"
+            )
+            c.execute(
+                """
+                INSERT OR REPLACE INTO strava_pending_auth
+                    (state, user_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (state, user_id, _normalize_iso(None)),
+            )
+
+    def pop_strava_pending(self, state: str) -> int | None:
+        """Consume a pending handshake, returning the Discord user id or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id FROM strava_pending_auth WHERE state = ?",
+                (state,),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute(
+                "DELETE FROM strava_pending_auth WHERE state = ?", (state,)
+            )
+            return int(row["user_id"])
+
+    def link_strava_account(
+        self,
+        user_id: int,
+        athlete_id: int | None,
+        access_token_enc: str,
+        refresh_token_enc: str,
+        expires_at: int,
+        scope: str | None,
+        athlete_name: str | None,
+    ) -> None:
+        """Insert or replace a user's encrypted Strava tokens.
+
+        Both token columns must already be Fernet tokens — this layer never
+        sees plaintext. Re-linking (re-running ``/strava_link``) cleanly
+        overwrites the previous link.
+        """
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO strava_account (
+                    user_id, athlete_id, access_token_enc, refresh_token_enc,
+                    expires_at, scope, athlete_name, last_activity_id, linked_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    (SELECT last_activity_id FROM strava_account WHERE user_id = ?),
+                    ?
+                )
+                """,
+                (
+                    user_id, athlete_id, access_token_enc, refresh_token_enc,
+                    expires_at, scope, athlete_name, user_id, _normalize_iso(None),
+                ),
+            )
+
+    def update_strava_tokens(
+        self,
+        user_id: int,
+        access_token_enc: str,
+        refresh_token_enc: str,
+        expires_at: int,
+    ) -> None:
+        """Persist rotated tokens after a refresh."""
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE strava_account
+                   SET access_token_enc  = ?,
+                       refresh_token_enc  = ?,
+                       expires_at         = ?
+                 WHERE user_id = ?
+                """,
+                (access_token_enc, refresh_token_enc, expires_at, user_id),
+            )
+
+    def update_strava_last_activity(self, user_id: int, activity_id: int) -> None:
+        """Advance the de-dupe cursor to the most recently announced activity."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE strava_account SET last_activity_id = ? WHERE user_id = ?",
+                (activity_id, user_id),
+            )
+
+    def unlink_strava_account(self, user_id: int) -> bool:
+        """Remove a user's Strava link. Returns True if a row existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM strava_account WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def get_strava_account(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM strava_account WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+    def get_strava_account_by_athlete(
+        self, athlete_id: int
+    ) -> sqlite3.Row | None:
+        """Look up a link by Strava athlete id — the only id a webhook carries."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM strava_account WHERE athlete_id = ?", (athlete_id,)
+            ).fetchone()
+
+    def list_strava_accounts(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute("SELECT * FROM strava_account"))
 
     # ------------------------------------------------------------------
     # Bot-wide user nicknames

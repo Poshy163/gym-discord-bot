@@ -6,6 +6,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Strava OAuth callback + webhook server (app/strava_web.py). Only needed
+    # when the Strava integration is enabled; front it with a reverse proxy for
+    # public HTTPS so STRAVA_PUBLIC_URL resolves to it. Adjust the host port to
+    # match STRAVA_PORT if you change it.
+    ports:
+      - "8080:8080"
     volumes:
       - gym-data:/data
     # The bot has no HTTP surface, so health is "can we still open the SQLite

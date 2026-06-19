@@ -221,6 +221,23 @@ The channel comes from `WEEKLY_REPORT_CHANNEL_ID`, falling back to
 `WEEKLY_REPORT_HOUR`, and `WEEKLY_REPORT_MINUTE`. `/weekly_report` posts the
 same report on demand.
 
+## Strava workout feed
+
+Link members' Strava accounts and the bot posts an embed to
+`STRAVA_FEED_CHANNEL_ID` the moment they finish an activity (run, ride, lift,
+etc.) — distance, time, pace, heart rate, and a link back to Strava. It uses
+OAuth2 + Strava's real-time webhook push, so the bot runs a small web server
+that must be reachable over public HTTPS.
+
+Quick version: register a Strava API app, set `STRAVA_CLIENT_ID`,
+`STRAVA_CLIENT_SECRET`, `STRAVA_PUBLIC_URL` and `STRAVA_FEED_CHANNEL_ID`, run
+`/strava_subscribe` once (owner), then members run `/strava_link`. Full
+walkthrough — including the reverse-proxy setup — is in
+[docs/STRAVA.md](docs/STRAVA.md). Set `STRAVA_DISABLED=1` to turn it off.
+
+Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, and owner-only
+`/strava_subscribe`, `/strava_subscription`, `/strava_unsubscribe`.
+
 ## Setup
 
 1. Create a Discord application + bot at <https://discord.com/developers/applications>.

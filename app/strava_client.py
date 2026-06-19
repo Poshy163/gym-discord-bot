@@ -1,0 +1,520 @@
+"""Strava API client used by the bot.
+
+Unlike the Revo portal (HTML scraping with a username/password), Strava exposes
+a real OAuth2 JSON API. The flow is:
+
+1. The user authorises the bot in the browser (``/strava_link`` hands them an
+   authorize URL). Strava redirects back to our callback with a short-lived
+   ``code``.
+2. We exchange that ``code`` for an ``access_token`` (≈6h lifetime) and a
+   long-lived ``refresh_token``. Both are stored **encrypted at rest** (Fernet),
+   mirroring :mod:`app.revo_client`.
+3. New-activity notifications arrive in real time via Strava's *webhook* push
+   subscription — Strava POSTs a tiny event to our public callback the instant a
+   workout is saved. We then fetch the full activity and post it to Discord.
+
+This module is import-safe even if ``requests`` / ``cryptography`` aren't
+installed — the bot boots without Strava and the commands/webhook just report
+"unavailable". It deliberately imports **no** ``discord`` symbols: it returns
+plain dataclasses and the bot layer builds the embeds.
+
+See ``docs/STRAVA.md`` for the host-side setup (registering the API app,
+configuring the public callback URL, creating the push subscription).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+import urllib.parse
+from dataclasses import dataclass
+from typing import Any, Optional
+
+LOG = logging.getLogger("gymbot.strava")
+
+AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+TOKEN_URL = "https://www.strava.com/oauth/token"
+DEAUTHORIZE_URL = "https://www.strava.com/oauth/deauthorize"
+API_BASE = "https://www.strava.com/api/v3"
+SUBSCRIPTION_URL = f"{API_BASE}/push_subscriptions"
+
+# read = public profile; activity:read = the athlete's activities (incl. the
+# ones webhooks fire for). activity:read_all would also expose private/followers
+# -only activities — we keep to the narrower scope by default.
+DEFAULT_SCOPE = "read,activity:read"
+
+USER_AGENT = "gym-discord-bot/0.1 (+https://github.com/Poshy163/gym-discord-bot)"
+REQUEST_TIMEOUT = 20
+
+# Refresh a little before the real expiry so an in-flight request never races
+# the boundary.
+_EXPIRY_SKEW_SECONDS = 120
+
+
+class StravaUnavailable(RuntimeError):
+    """Raised when an optional dependency is missing or config is incomplete."""
+
+
+class StravaAuthError(RuntimeError):
+    """Raised when an OAuth exchange/refresh fails (revoked, bad code, etc.)."""
+
+
+# Optional deps — imported lazily so the bot can boot without them.
+try:  # pragma: no cover - trivial import guard
+    import requests  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - trivial import guard
+    from cryptography.fernet import Fernet, InvalidToken  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    Fernet = None  # type: ignore[assignment]
+    InvalidToken = Exception  # type: ignore[assignment]
+
+
+def available() -> bool:
+    """True when the optional ``requests`` dep is importable."""
+    return requests is not None
+
+
+# ---------------------------------------------------------------------------
+# Config / credential encryption
+# ---------------------------------------------------------------------------
+
+# A single Fernet key can serve both integrations: prefer a Strava-specific key
+# but fall back to the Revo one so hosts only have to manage one secret.
+_FERNET_ENVS = ("STRAVA_FERNET_KEY", "REVO_FERNET_KEY")
+
+
+def _fernet() -> "Fernet":
+    if Fernet is None:
+        raise StravaUnavailable(
+            "The 'cryptography' package is required to store Strava tokens."
+        )
+    key = ""
+    for env in _FERNET_ENVS:
+        key = os.environ.get(env, "").strip()
+        if key:
+            break
+    if not key:
+        raise StravaUnavailable(
+            "Set $STRAVA_FERNET_KEY (or $REVO_FERNET_KEY) to a Fernet key "
+            "(generate one with `python -c 'from cryptography.fernet import "
+            "Fernet; print(Fernet.generate_key().decode())'`)."
+        )
+    try:
+        return Fernet(key.encode())
+    except Exception as exc:  # pragma: no cover - bad key shape
+        raise StravaUnavailable(f"Invalid Fernet key: {exc}") from exc
+
+
+def encrypt_token(plaintext: str) -> str:
+    """Encrypt an OAuth token for at-rest storage. Returns a urlsafe string."""
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_token(token: str) -> str:
+    """Inverse of :func:`encrypt_token`."""
+    try:
+        return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:  # pragma: no cover - corrupted DB row
+        raise StravaUnavailable("Stored Strava token is unreadable.") from exc
+
+
+@dataclass(frozen=True)
+class StravaConfig:
+    """Host-supplied Strava app credentials + public callback base."""
+
+    client_id: str
+    client_secret: str
+    redirect_uri: str          # public https URL of /strava/callback
+    webhook_callback_url: str  # public https URL of /strava/webhook
+    verify_token: str          # shared secret echoed during subscription setup
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+
+def config_from_env() -> StravaConfig:
+    """Build a :class:`StravaConfig` from the ``STRAVA_*`` env vars.
+
+    ``STRAVA_PUBLIC_URL`` is the externally reachable base (e.g.
+    ``https://bot.example.com``); the callback/webhook paths are derived from
+    it. The redirect/webhook URLs can also be overridden explicitly.
+    """
+    base = os.environ.get("STRAVA_PUBLIC_URL", "").strip().rstrip("/")
+    redirect = os.environ.get("STRAVA_REDIRECT_URI", "").strip() or (
+        f"{base}/strava/callback" if base else ""
+    )
+    webhook = os.environ.get("STRAVA_WEBHOOK_CALLBACK_URL", "").strip() or (
+        f"{base}/strava/webhook" if base else ""
+    )
+    return StravaConfig(
+        client_id=os.environ.get("STRAVA_CLIENT_ID", "").strip(),
+        client_secret=os.environ.get("STRAVA_CLIENT_SECRET", "").strip(),
+        redirect_uri=redirect,
+        webhook_callback_url=webhook,
+        verify_token=os.environ.get("STRAVA_WEBHOOK_VERIFY_TOKEN", "gymbot").strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# OAuth
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TokenSet:
+    """An OAuth token triple. ``expires_at`` is epoch seconds (Strava's own)."""
+
+    access_token: str
+    refresh_token: str
+    expires_at: int
+
+    def is_expired(self, *, skew: int = _EXPIRY_SKEW_SECONDS) -> bool:
+        return time.time() >= (self.expires_at - skew)
+
+
+def build_authorize_url(
+    cfg: StravaConfig, state: str, scope: str = DEFAULT_SCOPE
+) -> str:
+    """Return the Strava authorize URL the user clicks to grant access.
+
+    ``state`` is an opaque value we round-trip to tie the redirect back to the
+    Discord user who initiated the link (see the pending-auth table).
+    """
+    params = {
+        "client_id": cfg.client_id,
+        "redirect_uri": cfg.redirect_uri,
+        "response_type": "code",
+        "approval_prompt": "auto",
+        "scope": scope,
+        "state": state,
+    }
+    return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _require_requests() -> None:
+    if requests is None:
+        raise StravaUnavailable(
+            "The 'requests' package is required for the Strava client."
+        )
+
+
+def _token_request(data: dict[str, Any]) -> TokenSet:
+    _require_requests()
+    r = requests.post(TOKEN_URL, data=data, timeout=REQUEST_TIMEOUT)
+    if r.status_code != 200:
+        raise StravaAuthError(
+            f"Strava token endpoint returned {r.status_code}: {r.text[:200]}"
+        )
+    body = r.json()
+    try:
+        return TokenSet(
+            access_token=body["access_token"],
+            refresh_token=body["refresh_token"],
+            expires_at=int(body["expires_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StravaAuthError(f"Malformed token response: {body!r}") from exc
+
+
+def exchange_code(cfg: StravaConfig, code: str) -> tuple[TokenSet, dict[str, Any]]:
+    """Exchange an authorization ``code`` for tokens.
+
+    Returns ``(tokens, athlete)`` — Strava includes a summary athlete object on
+    the initial exchange, which we use to capture the athlete id + display name
+    without a second call.
+    """
+    _require_requests()
+    r = requests.post(
+        TOKEN_URL,
+        data={
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code != 200:
+        raise StravaAuthError(
+            f"Code exchange failed ({r.status_code}): {r.text[:200]}"
+        )
+    body = r.json()
+    try:
+        tokens = TokenSet(
+            access_token=body["access_token"],
+            refresh_token=body["refresh_token"],
+            expires_at=int(body["expires_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StravaAuthError(f"Malformed exchange response: {body!r}") from exc
+    athlete = body.get("athlete") or {}
+    return tokens, athlete
+
+
+def refresh_tokens(cfg: StravaConfig, refresh_token: str) -> TokenSet:
+    """Use a refresh token to mint a fresh access token.
+
+    Strava *rotates* refresh tokens, so callers must persist the returned
+    ``refresh_token`` (it may differ from the one passed in).
+    """
+    return _token_request(
+        {
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+    )
+
+
+def deauthorize(access_token: str) -> None:
+    """Best-effort revoke of an access token (used on /strava_unlink)."""
+    if requests is None:
+        return
+    try:
+        requests.post(
+            DEAUTHORIZE_URL,
+            data={"access_token": access_token},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception:  # pragma: no cover - best effort
+        LOG.warning("Strava deauthorize failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Activity fetch + parsing
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StravaActivity:
+    id: int
+    athlete_id: Optional[int]
+    name: str
+    sport_type: str            # e.g. "Run", "Ride", "WeightTraining"
+    distance_m: float
+    moving_time_s: int
+    elapsed_time_s: int
+    total_elevation_gain_m: float
+    average_speed_ms: float    # metres/second
+    average_heartrate: Optional[float]
+    max_heartrate: Optional[float]
+    calories: Optional[float]
+    suffer_score: Optional[float]
+    start_date_local: str      # ISO-8601 as Strava reports it
+    private: bool
+    url: str
+
+
+def parse_activity(data: dict[str, Any]) -> StravaActivity:
+    """Build a :class:`StravaActivity` from a Strava activity JSON object."""
+    aid = int(data.get("id", 0) or 0)
+    athlete = data.get("athlete") or {}
+    return StravaActivity(
+        id=aid,
+        athlete_id=int(athlete["id"]) if athlete.get("id") is not None else None,
+        name=str(data.get("name") or "Workout"),
+        sport_type=str(data.get("sport_type") or data.get("type") or "Workout"),
+        distance_m=float(data.get("distance") or 0.0),
+        moving_time_s=int(data.get("moving_time") or 0),
+        elapsed_time_s=int(data.get("elapsed_time") or 0),
+        total_elevation_gain_m=float(data.get("total_elevation_gain") or 0.0),
+        average_speed_ms=float(data.get("average_speed") or 0.0),
+        average_heartrate=(
+            float(data["average_heartrate"])
+            if data.get("average_heartrate") is not None
+            else None
+        ),
+        max_heartrate=(
+            float(data["max_heartrate"])
+            if data.get("max_heartrate") is not None
+            else None
+        ),
+        calories=(
+            float(data["calories"]) if data.get("calories") is not None else None
+        ),
+        suffer_score=(
+            float(data["suffer_score"])
+            if data.get("suffer_score") is not None
+            else None
+        ),
+        start_date_local=str(data.get("start_date_local") or ""),
+        private=bool(data.get("private", False)),
+        url=f"https://www.strava.com/activities/{aid}" if aid else "",
+    )
+
+
+def get_activity(access_token: str, activity_id: int) -> StravaActivity:
+    """Fetch a single activity. ``access_token`` must be currently valid."""
+    _require_requests()
+    r = requests.get(
+        f"{API_BASE}/activities/{activity_id}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        },
+        params={"include_all_efforts": "false"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code == 401:
+        raise StravaAuthError("Access token rejected fetching activity (401).")
+    r.raise_for_status()
+    return parse_activity(r.json())
+
+
+def get_athlete(access_token: str) -> dict[str, Any]:
+    """Fetch the authenticated athlete (used to capture a display name)."""
+    _require_requests()
+    r = requests.get(
+        f"{API_BASE}/athlete",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code == 401:
+        raise StravaAuthError("Access token rejected fetching athlete (401).")
+    r.raise_for_status()
+    return r.json()
+
+
+def athlete_display_name(athlete: dict[str, Any]) -> str:
+    """Best-effort human name from a Strava athlete object."""
+    first = (athlete.get("firstname") or "").strip()
+    last = (athlete.get("lastname") or "").strip()
+    name = f"{first} {last}".strip()
+    return name or (athlete.get("username") or "Strava athlete")
+
+
+# ---------------------------------------------------------------------------
+# Webhook push-subscription management
+# ---------------------------------------------------------------------------
+
+def create_subscription(cfg: StravaConfig) -> int:
+    """Create the push subscription. Returns the subscription id.
+
+    Strava immediately GETs ``cfg.webhook_callback_url`` to validate the
+    ``verify_token`` before this POST returns, so the web server must already be
+    publicly reachable when this is called.
+    """
+    _require_requests()
+    r = requests.post(
+        SUBSCRIPTION_URL,
+        data={
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "callback_url": cfg.webhook_callback_url,
+            "verify_token": cfg.verify_token,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code not in (200, 201):
+        raise StravaAuthError(
+            f"Subscription create failed ({r.status_code}): {r.text[:300]}"
+        )
+    return int(r.json()["id"])
+
+
+def view_subscriptions(cfg: StravaConfig) -> list[dict[str, Any]]:
+    """List existing push subscriptions for this app."""
+    _require_requests()
+    r = requests.get(
+        SUBSCRIPTION_URL,
+        params={"client_id": cfg.client_id, "client_secret": cfg.client_secret},
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+def delete_subscription(cfg: StravaConfig, subscription_id: int) -> None:
+    """Delete a push subscription by id."""
+    _require_requests()
+    r = requests.delete(
+        f"{SUBSCRIPTION_URL}/{subscription_id}",
+        params={"client_id": cfg.client_id, "client_secret": cfg.client_secret},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code not in (200, 204):
+        raise StravaAuthError(
+            f"Subscription delete failed ({r.status_code}): {r.text[:200]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pure formatting helpers (easy to unit test; no discord types)
+# ---------------------------------------------------------------------------
+
+# Sport types that are distance-first (pace matters); everything else is
+# treated as a duration-first effort.
+_DISTANCE_SPORTS = frozenset(
+    {
+        "Run", "TrailRun", "VirtualRun",
+        "Ride", "VirtualRide", "MountainBikeRide", "GravelRide", "EBikeRide",
+        "Walk", "Hike", "Swim", "Kayaking", "Canoeing", "Rowing", "Velomobile",
+        "InlineSkate", "IceSkate", "NordicSki", "BackcountrySki", "RollerSki",
+        "Handcycle",
+    }
+)
+
+_SPORT_EMOJI = {
+    "Run": "🏃", "TrailRun": "🏃", "VirtualRun": "🏃",
+    "Ride": "🚴", "VirtualRide": "🚴", "MountainBikeRide": "🚵",
+    "GravelRide": "🚴", "EBikeRide": "🚴",
+    "Swim": "🏊",
+    "Walk": "🚶", "Hike": "🥾",
+    "WeightTraining": "🏋️", "Workout": "🏋️", "Crossfit": "🏋️",
+    "Yoga": "🧘", "Pilates": "🧘",
+    "Rowing": "🚣", "Kayaking": "🛶", "Canoeing": "🛶",
+    "Hiit": "🔥", "Elliptical": "🏃", "StairStepper": "🪜",
+    "AlpineSki": "⛷️", "NordicSki": "🎿", "Snowboard": "🏂",
+    "IceSkate": "⛸️", "InlineSkate": "🛼",
+    "Soccer": "⚽", "Tennis": "🎾", "Golf": "⛳",
+}
+
+
+def sport_emoji(sport_type: str) -> str:
+    return _SPORT_EMOJI.get(sport_type, "💪")
+
+
+def is_distance_sport(sport_type: str) -> bool:
+    return sport_type in _DISTANCE_SPORTS
+
+
+def format_distance(metres: float) -> str:
+    """Human distance. Sub-1km shown in metres, otherwise km to 2dp."""
+    if metres <= 0:
+        return "—"
+    if metres < 1000:
+        return f"{metres:.0f} m"
+    return f"{metres / 1000:.2f} km"
+
+
+def format_duration(seconds: int) -> str:
+    """``H:MM:SS`` (drops the hour when zero) — matches Strava's own style."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_pace(distance_m: float, moving_time_s: int) -> Optional[str]:
+    """Pace in min/km for distance sports, or None when not meaningful."""
+    if distance_m <= 0 or moving_time_s <= 0:
+        return None
+    secs_per_km = moving_time_s / (distance_m / 1000.0)
+    m, s = divmod(int(round(secs_per_km)), 60)
+    return f"{m}:{s:02d} /km"
+
+
+def format_speed(average_speed_ms: float) -> Optional[str]:
+    """Average speed in km/h, or None when zero."""
+    if average_speed_ms <= 0:
+        return None
+    return f"{average_speed_ms * 3.6:.1f} km/h"
