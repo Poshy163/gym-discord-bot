@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 from calendar import monthrange
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -6805,29 +6806,60 @@ def _strava_enabled() -> bool:
     )
 
 
+# Per-user locks serialising token refreshes. Strava *rotates* refresh tokens,
+# so two activities arriving together must not refresh in parallel — the second
+# refresh would invalidate the first's freshly-issued token (or vice versa).
+_strava_token_locks: dict[int, threading.Lock] = {}
+_strava_token_locks_guard = threading.Lock()
+
+
+def _strava_token_lock(user_id: int) -> threading.Lock:
+    with _strava_token_locks_guard:
+        lock = _strava_token_locks.get(user_id)
+        if lock is None:
+            lock = _strava_token_locks[user_id] = threading.Lock()
+        return lock
+
+
 def _strava_access_token(row) -> str:
     """Return a currently-valid access token for a linked-account row.
 
     Refreshes via the stored refresh token when the cached access token has
     expired, persisting the rotated pair (Strava rotates refresh tokens too).
     Synchronous (uses ``requests``) — always call via ``run_in_executor``.
+
+    Refreshes are serialised per user and re-read the latest persisted tokens
+    under the lock, so concurrent webhook deliveries don't double-refresh and
+    invalidate each other's rotated refresh token.
     """
-    cfg = _strava_cfg()
-    tokens = strava_client.TokenSet(
-        access_token=strava_client.decrypt_token(row["access_token_enc"]),
-        refresh_token=strava_client.decrypt_token(row["refresh_token_enc"]),
-        expires_at=int(row["expires_at"]),
-    )
+    user_id = int(row["user_id"])
+
+    def _tokens_from(r) -> "strava_client.TokenSet":
+        return strava_client.TokenSet(
+            access_token=strava_client.decrypt_token(r["access_token_enc"]),
+            refresh_token=strava_client.decrypt_token(r["refresh_token_enc"]),
+            expires_at=int(r["expires_at"]),
+        )
+
+    tokens = _tokens_from(row)
     if not tokens.is_expired():
         return tokens.access_token
-    fresh = strava_client.refresh_tokens(cfg, tokens.refresh_token)
-    db.update_strava_tokens(
-        int(row["user_id"]),
-        strava_client.encrypt_token(fresh.access_token),
-        strava_client.encrypt_token(fresh.refresh_token),
-        fresh.expires_at,
-    )
-    return fresh.access_token
+
+    cfg = _strava_cfg()
+    with _strava_token_lock(user_id):
+        # Another thread may have refreshed while we waited — re-read first.
+        latest = db.get_strava_account(user_id) or row
+        tokens = _tokens_from(latest)
+        if not tokens.is_expired():
+            return tokens.access_token
+        fresh = strava_client.refresh_tokens(cfg, tokens.refresh_token)
+        db.update_strava_tokens(
+            user_id,
+            strava_client.encrypt_token(fresh.access_token),
+            strava_client.encrypt_token(fresh.refresh_token),
+            fresh.expires_at,
+        )
+        return fresh.access_token
 
 
 def _build_strava_embed(
@@ -7060,12 +7092,39 @@ async def _strava_on_callback(
     return strava_web.success_page(name)
 
 
+def _strava_handle_deauth(payload: dict) -> None:
+    """Unlink an athlete who revoked the bot's access in Strava settings.
+
+    Strava sends ``object_type=athlete`` with ``updates={"authorized": "false"}``
+    on deauthorization; ``object_id`` is the athlete id. Without handling this we
+    keep stale encrypted tokens and fail every refresh forever.
+    """
+    updates = payload.get("updates") or {}
+    if str(updates.get("authorized", "")).lower() != "false":
+        return
+    try:
+        athlete_id = int(payload.get("object_id"))
+    except (TypeError, ValueError):
+        return
+    row = db.get_strava_account_by_athlete(athlete_id)
+    if row is not None:
+        db.unlink_strava_account(int(row["user_id"]))
+        LOG.info(
+            "Strava athlete %s deauthorized — unlinked user %s",
+            athlete_id, row["user_id"],
+        )
+
+
 async def _strava_on_event(payload: dict) -> None:
     """Process one webhook event — announce newly-created public activities."""
     if STRAVA_DISABLED:
         return
-    if payload.get("object_type") != "activity":
-        return  # athlete deauthorization / profile updates — ignore
+    object_type = payload.get("object_type")
+    if object_type == "athlete":
+        _strava_handle_deauth(payload)
+        return
+    if object_type != "activity":
+        return  # unknown object type — ignore
     if payload.get("aspect_type") != "create":
         return  # only announce brand-new activities, not edits/deletes
     try:
@@ -7306,7 +7365,16 @@ async def strava_latest_cmd(
     def _fetch() -> "strava_client.StravaActivity | None | str":
         try:
             token = _strava_access_token(row)
-            return strava_client.get_latest_activity(token)
+            summary = strava_client.get_latest_activity(token)
+            if summary is None:
+                return None
+            # Upgrade to the detailed activity for parity with the live feed
+            # (calories, gear, caption, full-res route). Fall back to the
+            # summary if that extra call fails.
+            try:
+                return strava_client.get_activity(token, summary.id)
+            except Exception:  # pragma: no cover - network
+                return summary
         except strava_client.StravaAuthError as exc:
             return f"auth: {exc}"
         except Exception as exc:  # pragma: no cover - network
