@@ -69,6 +69,43 @@ def test_parse_activity_prefers_sport_type_over_type():
     assert act.sport_type == "WeightTraining"
 
 
+def test_parse_activity_captures_map_and_photo():
+    act = strava_client.parse_activity(
+        {
+            "id": 3,
+            "map": {"summary_polyline": "abc", "polyline": "fulldetail"},
+            "photos": {"primary": {"urls": {"100": "small.jpg", "600": "big.jpg"}}},
+        }
+    )
+    # Full polyline preferred over the summary one.
+    assert act.map_polyline == "fulldetail"
+    # Largest photo size chosen.
+    assert act.photo_url == "big.jpg"
+
+
+def test_parse_activity_no_map_or_photo():
+    act = strava_client.parse_activity({"id": 4, "name": "Gym"})
+    assert act.map_polyline == ""
+    assert act.photo_url is None
+
+
+def test_decode_polyline_known_vector():
+    # Canonical Google example → three coordinates.
+    pts = strava_client.decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@")
+    assert len(pts) == 3
+    assert pts[0][0] == pytest.approx(38.5, abs=1e-4)
+    assert pts[0][1] == pytest.approx(-120.2, abs=1e-4)
+    assert pts[1][0] == pytest.approx(40.7, abs=1e-4)
+    assert pts[2][1] == pytest.approx(-126.453, abs=1e-4)
+
+
+def test_decode_polyline_empty_and_garbled():
+    assert strava_client.decode_polyline("") == []
+    assert strava_client.decode_polyline(None) == []
+    # Truncated input returns whatever decoded cleanly rather than raising.
+    assert isinstance(strava_client.decode_polyline("_p~iF~ps|U_"), list)
+
+
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------

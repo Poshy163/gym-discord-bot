@@ -6872,6 +6872,71 @@ def _build_strava_embed(
     return embed
 
 
+def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
+    """Render an activity's GPS route as a PNG (Strava-style silhouette).
+
+    Returns a seekable buffer, or None when there's no usable route or
+    matplotlib isn't available. Uses the headless Agg backend like the other
+    chart helpers, with a latitude-corrected aspect so the path isn't squashed.
+    """
+    points = strava_client.decode_polyline(polyline)
+    if len(points) < 2:
+        return None
+    try:
+        matplotlib = importlib.import_module("matplotlib")
+        matplotlib.use("Agg")
+        plt = importlib.import_module("matplotlib.pyplot")
+    except Exception:  # pragma: no cover - matplotlib not installed
+        return None
+    import math
+
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    bg = "#1f2028"
+    fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=120)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.axis("off")
+    ax.plot(
+        lons, lats, color="#fc4c02", linewidth=3.0,
+        solid_capstyle="round", solid_joinstyle="round",
+    )
+    # Start (green) / finish (red) markers.
+    ax.plot(lons[0], lats[0], marker="o", color="#19d36b", markersize=7, zorder=3)
+    ax.plot(lons[-1], lats[-1], marker="o", color="#ff3b30", markersize=7, zorder=3)
+    mean_lat = sum(lats) / len(lats)
+    ax.set_aspect(1.0 / max(0.1, math.cos(math.radians(mean_lat))))
+    ax.margins(0.08)
+    buf = io.BytesIO()
+    fig.savefig(
+        buf, format="png", facecolor=fig.get_facecolor(),
+        bbox_inches="tight", pad_inches=0.1,
+    )
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _strava_embed_and_file(
+    activity: "strava_client.StravaActivity", who: str,
+) -> "tuple[discord.Embed, discord.File | None]":
+    """Build the activity embed plus an optional attached image.
+
+    Prefers a real Strava photo (if the athlete added one); otherwise renders
+    the GPS route. Strength/indoor activities with neither just get the embed.
+    """
+    embed = _build_strava_embed(activity, who)
+    if activity.photo_url:
+        embed.set_image(url=activity.photo_url)
+        return embed, None
+    if activity.map_polyline:
+        buf = _render_strava_route_png(activity.map_polyline)
+        if buf is not None:
+            embed.set_image(url="attachment://route.png")
+            return embed, discord.File(buf, filename="route.png")
+    return embed, None
+
+
 async def _strava_on_callback(
     code: str | None, state: str | None, error: str | None,
 ) -> str:
@@ -7000,14 +7065,17 @@ async def _strava_on_event(payload: dict) -> None:
             )
             return
     who = f"<@{user_id}>"
-    embed = _build_strava_embed(activity, who)
+    embed, file = _strava_embed_and_file(activity, who)
+    kwargs: dict[str, object] = {
+        "content": f"{strava_client.sport_emoji(activity.sport_type)} "
+        f"{who} just logged a workout on Strava!",
+        "embed": embed,
+        "allowed_mentions": discord.AllowedMentions(users=True),
+    }
+    if file is not None:
+        kwargs["file"] = file
     try:
-        await channel.send(
-            content=f"{strava_client.sport_emoji(activity.sport_type)} "
-            f"{who} just logged a workout on Strava!",
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
+        await channel.send(**kwargs)
     except discord.HTTPException:
         LOG.exception("Strava: failed to post activity %s", activity_id)
 
@@ -7211,10 +7279,14 @@ async def strava_latest_cmd(
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
-    embed = _build_strava_embed(result, target.mention)
-    await interaction.followup.send(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-    )
+    embed, file = _strava_embed_and_file(result, target.mention)
+    kwargs: dict[str, object] = {
+        "embed": embed,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if file is not None:
+        kwargs["file"] = file
+    await interaction.followup.send(**kwargs)
 
 
 # ---- owner-only webhook subscription management ---------------------------

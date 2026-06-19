@@ -306,12 +306,63 @@ class StravaActivity:
     start_date_local: str      # ISO-8601 as Strava reports it
     private: bool
     url: str
+    map_polyline: str          # Google-encoded route polyline ("" if none)
+    photo_url: Optional[str]   # primary activity photo, if the athlete added one
+
+
+def _extract_photo_url(data: dict[str, Any]) -> Optional[str]:
+    """Largest available primary-photo URL, or None.
+
+    ``photos.primary.urls`` is a ``{size_str: url}`` map (e.g. ``{"100": ...,
+    "600": ...}``); we pick the biggest size.
+    """
+    primary = ((data.get("photos") or {}).get("primary")) or {}
+    urls = primary.get("urls") or {}
+    if not isinstance(urls, dict) or not urls:
+        return None
+    try:
+        return max(urls.items(), key=lambda kv: int(kv[0]))[1]
+    except (ValueError, TypeError):
+        return next(iter(urls.values()), None)
+
+
+def decode_polyline(encoded: str) -> list[tuple[float, float]]:
+    """Decode a Google-encoded polyline into ``[(lat, lon), ...]``.
+
+    Strava encodes activity routes with the standard Google polyline algorithm
+    (precision 5). Returns an empty list for falsy/garbled input.
+    """
+    coords: list[tuple[float, float]] = []
+    index = lat = lng = 0
+    length = len(encoded or "")
+    try:
+        while index < length:
+            for is_lng in (False, True):
+                result = 1
+                shift = 0
+                while True:
+                    b = ord(encoded[index]) - 63 - 1
+                    index += 1
+                    result += b << shift
+                    shift += 5
+                    if b < 0x1F:
+                        break
+                delta = (~result >> 1) if (result & 1) else (result >> 1)
+                if is_lng:
+                    lng += delta
+                else:
+                    lat += delta
+            coords.append((lat * 1e-5, lng * 1e-5))
+    except IndexError:  # truncated/garbled string — return what we decoded
+        return coords
+    return coords
 
 
 def parse_activity(data: dict[str, Any]) -> StravaActivity:
     """Build a :class:`StravaActivity` from a Strava activity JSON object."""
     aid = int(data.get("id", 0) or 0)
     athlete = data.get("athlete") or {}
+    amap = data.get("map") or {}
     return StravaActivity(
         id=aid,
         athlete_id=int(athlete["id"]) if athlete.get("id") is not None else None,
@@ -343,6 +394,8 @@ def parse_activity(data: dict[str, Any]) -> StravaActivity:
         start_date_local=str(data.get("start_date_local") or ""),
         private=bool(data.get("private", False)),
         url=f"https://www.strava.com/activities/{aid}" if aid else "",
+        map_polyline=str(amap.get("polyline") or amap.get("summary_polyline") or ""),
+        photo_url=_extract_photo_url(data),
     )
 
 
