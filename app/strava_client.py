@@ -488,6 +488,33 @@ def get_latest_activity(access_token: str) -> "StravaActivity | None":
     return parse_activity(data[0])
 
 
+def get_activities_since(
+    access_token: str, after_epoch: int, per_page: int = 100,
+) -> list["StravaActivity"]:
+    """List the athlete's activities started after ``after_epoch`` (one page).
+
+    Used for the weekly recap. ``per_page`` caps the count — a week of training
+    comfortably fits in one page for normal users.
+    """
+    _require_requests()
+    r = requests.get(
+        f"{API_BASE}/athlete/activities",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        },
+        params={"after": int(after_epoch), "per_page": per_page},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code == 401:
+        raise StravaAuthError("Access token rejected listing activities (401).")
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    return [parse_activity(d) for d in data]
+
+
 def get_athlete(access_token: str) -> dict[str, Any]:
     """Fetch the authenticated athlete (used to capture a display name)."""
     _require_requests()
@@ -609,10 +636,22 @@ def is_distance_sport(sport_type: str) -> bool:
     return sport_type in _DISTANCE_SPORTS
 
 
-def format_distance(metres: float) -> str:
-    """Human distance. Sub-1km shown in metres, otherwise km to 2dp."""
+# Unit conversion constants.
+_METRES_PER_MILE = 1609.344
+_FEET_PER_METRE = 3.28084
+_MPH_PER_MS = 2.236936
+
+
+def format_distance(metres: float, imperial: bool = False) -> str:
+    """Human distance. Metric: m under 1 km, else km. Imperial: ft under ~0.1
+    mi, else miles."""
     if metres <= 0:
         return "—"
+    if imperial:
+        miles = metres / _METRES_PER_MILE
+        if miles < 0.1:
+            return f"{metres * _FEET_PER_METRE:.0f} ft"
+        return f"{miles:.2f} mi"
     if metres < 1000:
         return f"{metres:.0f} m"
     return f"{metres / 1000:.2f} km"
@@ -628,20 +667,39 @@ def format_duration(seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 
-def format_pace(distance_m: float, moving_time_s: int) -> Optional[str]:
-    """Pace in min/km for distance sports, or None when not meaningful."""
+def format_pace(
+    distance_m: float, moving_time_s: int, imperial: bool = False
+) -> Optional[str]:
+    """Pace in min/km (or min/mi imperial), or None when not meaningful."""
     if distance_m <= 0 or moving_time_s <= 0:
         return None
-    secs_per_km = moving_time_s / (distance_m / 1000.0)
-    m, s = divmod(int(round(secs_per_km)), 60)
-    return f"{m}:{s:02d} /km"
+    unit = _METRES_PER_MILE if imperial else 1000.0
+    secs = moving_time_s / (distance_m / unit)
+    m, s = divmod(int(round(secs)), 60)
+    return f"{m}:{s:02d} {'/mi' if imperial else '/km'}"
 
 
-def format_speed(average_speed_ms: float) -> Optional[str]:
-    """Average speed in km/h, or None when zero."""
+def format_speed(average_speed_ms: float, imperial: bool = False) -> Optional[str]:
+    """Average speed in km/h (or mph imperial), or None when zero."""
     if average_speed_ms <= 0:
         return None
+    if imperial:
+        return f"{average_speed_ms * _MPH_PER_MS:.1f} mph"
     return f"{average_speed_ms * 3.6:.1f} km/h"
+
+
+def format_elevation(metres: float, imperial: bool = False) -> str:
+    """Elevation in metres (or feet imperial)."""
+    if imperial:
+        return f"{metres * _FEET_PER_METRE:.0f} ft"
+    return f"{metres:.0f} m"
+
+
+def format_temp(celsius: float, imperial: bool = False) -> str:
+    """Temperature in °C (or °F imperial)."""
+    if imperial:
+        return f"{celsius * 9 / 5 + 32:.0f}°F"
+    return f"{celsius:.0f}°C"
 
 
 # ---------------------------------------------------------------------------

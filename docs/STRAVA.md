@@ -136,18 +136,36 @@ STRAVA_MAP_STYLE=satellite-streets-v12   # or streets-v12, outdoors-v12
 > the bot never receives them, so they can't be drawn (with or without Mapbox).
 > Adjust your privacy zones in Strava settings if you want the full track shown.
 
+## 5b. Optional filters & units
+
+- **`STRAVA_SPORT_TYPES`** — comma-separated allow-list of Strava `sport_type`
+  values (e.g. `Run,Ride,WeightTraining`). Empty posts every type.
+- **`STRAVA_MIN_DISTANCE_M`** — skip distance-sport activities under N metres
+  (e.g. `1000` ignores sub-1 km walks). `0` disables.
+- **`STRAVA_MIN_DURATION_S`** — skip activities under N seconds. `0` disables.
+- **`STRAVA_IMPERIAL=1`** — show miles/feet/°F instead of km/m/°C.
+
 ## 6. Behaviour notes
 
 - **Scope:** `read,activity:read`. Private activities are fetched but **not
   posted** (we respect the privacy flag).
-- **Aspect filtering:** only `create` events post. Edits (`update`) and
-  `delete` events are ignored.
+- **Live edits:** when you **rename** an activity, the posted embed is edited to
+  match; if you flip it to **private** or **delete** it, the post is removed.
+  (Only the most recently posted activity per athlete is tracked.)
+- **Create events** are what trigger a new post; `update`/`delete` drive the
+  edits above.
+- **Deauthorization:** revoking the bot in Strava settings auto-unlinks you and
+  deletes the stored tokens.
 - **De-dupe:** the last announced activity id is stored per user, so Strava's
   retry deliveries don't double-post.
 - **Token refresh:** access tokens (~6h) are refreshed on demand via the stored
-  refresh token; Strava rotates refresh tokens, and the new pair is persisted.
+  refresh token (serialised per user); Strava rotates refresh tokens, and the
+  new pair is persisted.
 - **Tokens at rest:** both tokens are Fernet-encrypted in the `strava_account`
   SQLite table. The plaintext is never written to disk.
+- **Weekly recap:** if the weekly report is enabled (`WEEKLY_REPORT_CHANNEL_ID`),
+  it includes a per-athlete 7-day Strava summary (activities, distance, time,
+  elevation).
 
 ## 7. Troubleshooting
 

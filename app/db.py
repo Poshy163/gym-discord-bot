@@ -229,6 +229,8 @@ CREATE TABLE IF NOT EXISTS strava_account (
     scope              TEXT,
     athlete_name       TEXT,
     last_activity_id   INTEGER,
+    last_message_id    INTEGER,
+    last_channel_id    INTEGER,
     linked_at          TEXT    NOT NULL
 );
 
@@ -348,6 +350,22 @@ class Database:
             if revo_cols and "last_checkin_date" not in revo_cols:
                 self._connection.execute(
                     "ALTER TABLE revo_account ADD COLUMN last_checkin_date TEXT"
+                )
+            # Strava edit-on-rename: older DBs created strava_account before the
+            # posted-message bookkeeping columns existed.
+            strava_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(strava_account)"
+                )
+            }
+            if strava_cols and "last_message_id" not in strava_cols:
+                self._connection.execute(
+                    "ALTER TABLE strava_account ADD COLUMN last_message_id INTEGER"
+                )
+            if strava_cols and "last_channel_id" not in strava_cols:
+                self._connection.execute(
+                    "ALTER TABLE strava_account ADD COLUMN last_channel_id INTEGER"
                 )
             self._recanonicalize_equipment()
 
@@ -1930,12 +1948,28 @@ class Database:
                 (access_token_enc, refresh_token_enc, expires_at, user_id),
             )
 
-    def update_strava_last_activity(self, user_id: int, activity_id: int) -> None:
-        """Advance the de-dupe cursor to the most recently announced activity."""
+    def update_strava_last_activity(
+        self,
+        user_id: int,
+        activity_id: int,
+        message_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> None:
+        """Advance the de-dupe cursor to the most recently announced activity.
+
+        When ``message_id`` is given, also records where the announcement was
+        posted so a later rename/delete webhook can edit or remove it.
+        """
         with self._conn() as c:
             c.execute(
-                "UPDATE strava_account SET last_activity_id = ? WHERE user_id = ?",
-                (activity_id, user_id),
+                """
+                UPDATE strava_account
+                   SET last_activity_id = ?,
+                       last_message_id  = ?,
+                       last_channel_id  = ?
+                 WHERE user_id = ?
+                """,
+                (activity_id, message_id, channel_id, user_id),
             )
 
     def unlink_strava_account(self, user_id: int) -> bool:

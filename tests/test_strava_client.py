@@ -206,6 +206,18 @@ def test_format_pace_and_speed():
     assert strava_client.format_speed(0) is None
 
 
+def test_format_imperial_units():
+    # ~5 km / 25:00 → 3.11 mi and 8:03 /mi; 3.34 m/s ≈ 7.5 mph.
+    assert strava_client.format_distance(5000, imperial=True) == "3.11 mi"
+    assert strava_client.format_distance(80, imperial=True) == "262 ft"  # sub-0.1mi
+    assert strava_client.format_pace(5000, 1500, imperial=True) == "8:03 /mi"
+    assert strava_client.format_speed(3.34, imperial=True) == "7.5 mph"
+    assert strava_client.format_elevation(100, imperial=True) == "328 ft"
+    assert strava_client.format_elevation(100) == "100 m"
+    assert strava_client.format_temp(20, imperial=True) == "68°F"
+    assert strava_client.format_temp(20) == "20°C"
+
+
 def test_sport_emoji_and_distance_classification():
     assert strava_client.sport_emoji("Run") == "🏃"
     assert strava_client.sport_emoji("WeightTraining") == "🏋️"

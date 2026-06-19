@@ -1511,6 +1511,17 @@ async def _post_weekly_report(
     label, start_iso, end_iso = _week_window()
     text = _weekly_gym_text(guild_id, label, start_iso, end_iso)
     await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    strava_blocks = await _strava_weekly_blocks()
+    if strava_blocks:
+        strava_embed = discord.Embed(
+            title=f"🏃 Weekly Strava recap — {label}",
+            description="\n".join(strava_blocks)[:4000],
+            colour=STRAVA_COLOUR,
+        )
+        strava_embed.set_footer(text="via Strava")
+        await channel.send(
+            embed=strava_embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
     cal_blocks = await _calorie_ai_summaries(guild_id, start_iso, end_iso)
     if not cal_blocks:
         return
@@ -3500,6 +3511,17 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
+    if not STRAVA_DISABLED:
+        embed.add_field(
+            name="🏃 Strava",
+            value=(
+                "`/strava_link` — link your Strava (workouts auto-post to the feed)\n"
+                "`/strava_status` — check if you're linked\n"
+                "`/strava_latest [member]` — show the most recent activity\n"
+                "`/strava_unlink` — revoke access & remove your tokens"
+            ),
+            inline=False,
+        )
     embed.set_footer(text="Weights parsed as kg. Plates assumed 20kg each.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -6787,6 +6809,28 @@ STRAVA_MAPBOX_TOKEN = os.getenv("STRAVA_MAPBOX_TOKEN", "").strip()
 # streets-v12 (road map), satellite-streets-v12 (aerial + labels).
 STRAVA_MAP_STYLE = os.getenv("STRAVA_MAP_STYLE", "outdoors-v12").strip() or "outdoors-v12"
 
+# Optional posting filters. STRAVA_SPORT_TYPES is a comma-separated allow-list of
+# Strava sport_type values (e.g. "Run,Ride,WeightTraining"); empty = allow all.
+# Minimums skip trivially short activities (distance only applies to distance
+# sports). All optional — unset/0 disables the respective filter.
+_strava_sports = os.getenv("STRAVA_SPORT_TYPES", "").strip()
+STRAVA_SPORT_ALLOW: set[str] = {
+    s.strip().lower() for s in _strava_sports.split(",") if s.strip()
+}
+try:
+    STRAVA_MIN_DISTANCE_M = float(os.getenv("STRAVA_MIN_DISTANCE_M", "0") or 0)
+except ValueError:
+    STRAVA_MIN_DISTANCE_M = 0.0
+try:
+    STRAVA_MIN_DURATION_S = int(os.getenv("STRAVA_MIN_DURATION_S", "0") or 0)
+except ValueError:
+    STRAVA_MIN_DURATION_S = 0
+
+# Imperial display (miles/feet/°F) for Strava embeds. Defaults to metric.
+STRAVA_IMPERIAL = os.getenv("STRAVA_IMPERIAL", "0").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
 _strava_runner = None
@@ -6886,28 +6930,33 @@ def _build_strava_embed(
         strava_client.is_distance_sport(activity.sport_type)
         and activity.distance_m > 0
     )
+    imp = STRAVA_IMPERIAL
     if is_distance:
         embed.add_field(
             name="Distance",
-            value=strava_client.format_distance(activity.distance_m),
+            value=strava_client.format_distance(activity.distance_m, imp),
         )
         embed.add_field(
             name="Time",
             value=strava_client.format_duration(activity.moving_time_s),
         )
-        pace = strava_client.format_pace(activity.distance_m, activity.moving_time_s)
-        speed = strava_client.format_speed(activity.average_speed_ms)
+        pace = strava_client.format_pace(
+            activity.distance_m, activity.moving_time_s, imp,
+        )
+        speed = strava_client.format_speed(activity.average_speed_ms, imp)
         if pace:
             embed.add_field(name="Pace", value=pace)
         elif speed:
             embed.add_field(name="Speed", value=speed)
-        max_speed = strava_client.format_speed(activity.max_speed_ms)
+        max_speed = strava_client.format_speed(activity.max_speed_ms, imp)
         if max_speed:
             embed.add_field(name="Max speed", value=max_speed)
         if activity.total_elevation_gain_m:
             embed.add_field(
                 name="Elevation",
-                value=f"{activity.total_elevation_gain_m:.0f} m",
+                value=strava_client.format_elevation(
+                    activity.total_elevation_gain_m, imp,
+                ),
             )
     else:
         embed.add_field(
@@ -6938,7 +6987,10 @@ def _build_strava_embed(
     if activity.suffer_score:
         embed.add_field(name="Relative effort", value=f"{activity.suffer_score:.0f}")
     if activity.average_temp is not None:
-        embed.add_field(name="Temp", value=f"{activity.average_temp:.0f}°C")
+        embed.add_field(
+            name="Temp",
+            value=strava_client.format_temp(activity.average_temp, imp),
+        )
     achievements = []
     if activity.pr_count:
         achievements.append(f"🏅 {activity.pr_count} PR{'s' if activity.pr_count != 1 else ''}")
@@ -7115,38 +7167,40 @@ def _strava_handle_deauth(payload: dict) -> None:
         )
 
 
-async def _strava_on_event(payload: dict) -> None:
-    """Process one webhook event — announce newly-created public activities."""
-    if STRAVA_DISABLED:
-        return
-    object_type = payload.get("object_type")
-    if object_type == "athlete":
-        _strava_handle_deauth(payload)
-        return
-    if object_type != "activity":
-        return  # unknown object type — ignore
-    if payload.get("aspect_type") != "create":
-        return  # only announce brand-new activities, not edits/deletes
-    try:
-        athlete_id = int(payload.get("owner_id"))
-        activity_id = int(payload.get("object_id"))
-    except (TypeError, ValueError):
-        return
-    row = db.get_strava_account_by_athlete(athlete_id)
-    if row is None:
-        LOG.info("Strava event for unlinked athlete %s — ignoring", athlete_id)
-        return
-    if STRAVA_FEED_CHANNEL_ID is None:
-        LOG.warning("Strava event received but STRAVA_FEED_CHANNEL_ID is unset")
-        return
+def _strava_should_post(activity: "strava_client.StravaActivity") -> bool:
+    """Apply the optional sport-type / minimum-distance / duration filters."""
+    if STRAVA_SPORT_ALLOW and activity.sport_type.lower() not in STRAVA_SPORT_ALLOW:
+        return False
     if (
-        row["last_activity_id"] is not None
-        and int(row["last_activity_id"]) == activity_id
+        STRAVA_MIN_DISTANCE_M
+        and strava_client.is_distance_sport(activity.sport_type)
+        and activity.distance_m < STRAVA_MIN_DISTANCE_M
     ):
-        return  # duplicate webhook delivery
+        return False
+    if STRAVA_MIN_DURATION_S and (
+        activity.moving_time_s or activity.elapsed_time_s
+    ) < STRAVA_MIN_DURATION_S:
+        return False
+    return True
 
-    user_id = int(row["user_id"])
 
+async def _strava_feed_channel():
+    """Resolve the configured feed channel, or None if unreachable/unset."""
+    if STRAVA_FEED_CHANNEL_ID is None:
+        return None
+    channel = bot.get_channel(STRAVA_FEED_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(STRAVA_FEED_CHANNEL_ID)
+        except discord.HTTPException:
+            LOG.warning("Strava: cannot reach feed channel %s", STRAVA_FEED_CHANNEL_ID)
+            return None
+    return channel
+
+
+async def _strava_fetch_activity(
+    row, activity_id: int,
+) -> "strava_client.StravaActivity | str":
     def _fetch() -> "strava_client.StravaActivity | str":
         try:
             token = _strava_access_token(row)
@@ -7156,7 +7210,17 @@ async def _strava_on_event(payload: dict) -> None:
         except Exception as exc:  # pragma: no cover - network
             return f"error: {exc}"
 
-    result = await bot.loop.run_in_executor(None, _fetch)
+    return await bot.loop.run_in_executor(None, _fetch)
+
+
+async def _strava_handle_create(row, athlete_id: int, activity_id: int) -> None:
+    user_id = int(row["user_id"])
+    if (
+        row["last_activity_id"] is not None
+        and int(row["last_activity_id"]) == activity_id
+    ):
+        return  # duplicate webhook delivery
+    result = await _strava_fetch_activity(row, activity_id)
     if isinstance(result, str):
         LOG.warning(
             "Strava activity fetch failed (athlete=%s activity=%s): %s",
@@ -7164,22 +7228,18 @@ async def _strava_on_event(payload: dict) -> None:
         )
         return
     activity = result
-    # Advance the de-dupe cursor regardless of whether we post, so a private
-    # activity (deliberately skipped) doesn't get re-evaluated on a retry.
+    # Advance the de-dupe cursor first (no message yet) so a private/filtered
+    # activity isn't re-evaluated on a retry.
     db.update_strava_last_activity(user_id, activity_id)
     if activity.private:
         LOG.info("Strava activity %s is private — not posting", activity_id)
         return
-
-    channel = bot.get_channel(STRAVA_FEED_CHANNEL_ID)
+    if not _strava_should_post(activity):
+        LOG.info("Strava activity %s filtered out — not posting", activity_id)
+        return
+    channel = await _strava_feed_channel()
     if channel is None:
-        try:
-            channel = await bot.fetch_channel(STRAVA_FEED_CHANNEL_ID)
-        except discord.HTTPException:
-            LOG.warning(
-                "Strava: cannot reach feed channel %s", STRAVA_FEED_CHANNEL_ID
-            )
-            return
+        return
     who = f"<@{user_id}>"
     embed, file = _strava_embed_and_file(activity, who)
     kwargs: dict[str, object] = {
@@ -7191,9 +7251,157 @@ async def _strava_on_event(payload: dict) -> None:
     if file is not None:
         kwargs["file"] = file
     try:
-        await channel.send(**kwargs)
+        msg = await channel.send(**kwargs)
     except discord.HTTPException:
         LOG.exception("Strava: failed to post activity %s", activity_id)
+        return
+    # Remember where we posted so a later rename/delete can edit/remove it.
+    db.update_strava_last_activity(user_id, activity_id, msg.id, channel.id)
+
+
+async def _strava_posted_message(row, activity_id: int):
+    """Return the Discord Message we posted for *activity_id*, or None.
+
+    Only the most-recently-announced activity is tracked, so edits/deletes to
+    older posts are ignored (best-effort, keeps state tiny).
+    """
+    if row["last_activity_id"] is None or int(row["last_activity_id"]) != activity_id:
+        return None
+    msg_id, ch_id = row["last_message_id"], row["last_channel_id"]
+    if not msg_id or not ch_id:
+        return None
+    channel = bot.get_channel(int(ch_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(ch_id))
+        except discord.HTTPException:
+            return None
+    try:
+        return await channel.fetch_message(int(msg_id))
+    except discord.HTTPException:
+        return None
+
+
+async def _strava_handle_update(row, activity_id: int) -> None:
+    """Edit the posted embed when an activity is renamed (or remove it if it
+    was flipped to private)."""
+    msg = await _strava_posted_message(row, activity_id)
+    if msg is None:
+        return
+    result = await _strava_fetch_activity(row, activity_id)
+    if isinstance(result, str):
+        return
+    activity = result
+    if activity.private:
+        try:
+            await msg.delete()
+            LOG.info("Strava activity %s went private — removed post", activity_id)
+        except discord.HTTPException:
+            pass
+        return
+    who = f"<@{int(row['user_id'])}>"
+    embed, _file = _strava_embed_and_file(activity, who)
+    # Edit the embed only; the original image attachment (if any) is preserved
+    # and the route doesn't change on a rename.
+    try:
+        await msg.edit(embed=embed)
+        LOG.info("Strava activity %s updated — edited post", activity_id)
+    except discord.HTTPException:
+        LOG.warning("Strava: failed to edit post for activity %s", activity_id)
+
+
+async def _strava_handle_delete(row, activity_id: int) -> None:
+    msg = await _strava_posted_message(row, activity_id)
+    if msg is None:
+        return
+    try:
+        await msg.delete()
+        LOG.info("Strava activity %s deleted — removed post", activity_id)
+    except discord.HTTPException:
+        pass
+
+
+async def _strava_weekly_blocks() -> list[str]:
+    """One summary line per linked athlete with activity in the last 7 days.
+
+    Returns ``[]`` when Strava is off/unconfigured or nobody trained — the
+    weekly report then simply omits the section.
+    """
+    if not _strava_enabled():
+        return []
+    accounts = db.list_strava_accounts()
+    if not accounts:
+        return []
+    after = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp())
+
+    def _gather() -> list[tuple[int, int, float, int, float]]:
+        out: list[tuple[int, int, float, int, float]] = []
+        for row in accounts:
+            try:
+                token = _strava_access_token(row)
+                acts = strava_client.get_activities_since(token, after)
+            except Exception:  # pragma: no cover - network
+                LOG.warning(
+                    "Strava weekly fetch failed for user %s",
+                    row["user_id"], exc_info=True,
+                )
+                continue
+            acts = [a for a in acts if not a.private]
+            if not acts:
+                continue
+            out.append((
+                int(row["user_id"]),
+                len(acts),
+                sum(a.distance_m for a in acts),
+                sum(a.moving_time_s for a in acts),
+                sum(a.total_elevation_gain_m for a in acts),
+            ))
+        return out
+
+    rows = await bot.loop.run_in_executor(None, _gather)
+    if not rows:
+        return []
+    rows.sort(key=lambda r: (r[2], r[3]), reverse=True)  # distance, then time
+    imp = STRAVA_IMPERIAL
+    lines: list[str] = []
+    for uid, n, dist, secs, elev in rows:
+        parts = [f"**{n}** activit{'y' if n == 1 else 'ies'}"]
+        if dist > 0:
+            parts.append(strava_client.format_distance(dist, imp))
+        parts.append(strava_client.format_duration(secs))
+        if elev > 0:
+            parts.append(strava_client.format_elevation(elev, imp) + " climb")
+        lines.append(f"<@{uid}> — " + " · ".join(parts))
+    return lines
+
+
+async def _strava_on_event(payload: dict) -> None:
+    """Process one webhook event — create/update/delete + deauthorization."""
+    if STRAVA_DISABLED:
+        return
+    object_type = payload.get("object_type")
+    if object_type == "athlete":
+        _strava_handle_deauth(payload)
+        return
+    if object_type != "activity":
+        return  # unknown object type — ignore
+    try:
+        athlete_id = int(payload.get("owner_id"))
+        activity_id = int(payload.get("object_id"))
+    except (TypeError, ValueError):
+        return
+    row = db.get_strava_account_by_athlete(athlete_id)
+    if row is None:
+        LOG.info("Strava event for unlinked athlete %s — ignoring", athlete_id)
+        return
+
+    aspect = payload.get("aspect_type")
+    if aspect == "create":
+        await _strava_handle_create(row, athlete_id, activity_id)
+    elif aspect == "update":
+        await _strava_handle_update(row, activity_id)
+    elif aspect == "delete":
+        await _strava_handle_delete(row, activity_id)
 
 
 @bot.event
@@ -7233,6 +7441,24 @@ async def setup_hook() -> None:  # pragma: no cover - discord runtime
             )
     except Exception:
         LOG.exception("Failed to start Strava web server")
+
+
+# Tear the Strava web server down cleanly on shutdown by wrapping Client.close.
+_strava_orig_close = bot.close
+
+
+async def _close_with_strava() -> None:  # pragma: no cover - discord runtime
+    global _strava_runner
+    if _strava_runner is not None:
+        try:
+            await _strava_runner.cleanup()
+        except Exception:
+            LOG.warning("Strava web server cleanup failed", exc_info=True)
+        _strava_runner = None
+    await _strava_orig_close()
+
+
+bot.close = _close_with_strava  # type: ignore[method-assign]
 
 
 @bot.tree.command(
