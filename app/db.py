@@ -214,6 +214,20 @@ CREATE TABLE IF NOT EXISTS calorie_foods (
     PRIMARY KEY (guild_id, user_id, name)
 );
 
+-- Maps the bot's calorie-log reply to the entry it created, so a ❌ reaction on
+-- that reply removes exactly that entry (per-entry undo, mirroring lifts).
+-- original_message_id is the chat message that triggered the log — suppressed on
+-- undo so a restart backfill doesn't re-import it.
+CREATE TABLE IF NOT EXISTS calorie_reply_tracking (
+    reply_message_id    INTEGER PRIMARY KEY,
+    guild_id            INTEGER NOT NULL,
+    user_id             INTEGER NOT NULL,
+    target_user_id      INTEGER NOT NULL,
+    calorie_id          INTEGER NOT NULL,
+    original_message_id INTEGER,
+    created_at          TEXT    NOT NULL
+);
+
 -- Linked Strava accounts (see app/strava_client.py). access/refresh tokens are
 -- Fernet-encrypted — the plaintext is never persisted. ``expires_at`` is epoch
 -- seconds (Strava's own) so the refresh path can tell when the access token is
@@ -2498,6 +2512,64 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM calorie_entries WHERE id = ?", (row["id"],))
+            return row
+
+    def track_calorie_reply(
+        self,
+        reply_message_id: int,
+        guild_id: int,
+        user_id: int,
+        target_user_id: int,
+        calorie_id: int,
+        original_message_id: int | None = None,
+    ) -> None:
+        """Record that ``reply_message_id`` is the bot reply for one calorie
+        entry, so a ❌ reaction on it can remove that specific entry."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO calorie_reply_tracking
+                    (reply_message_id, guild_id, user_id, target_user_id,
+                     calorie_id, original_message_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reply_message_id, guild_id, user_id, target_user_id,
+                    calorie_id, original_message_id, _normalize_iso(None),
+                ),
+            )
+
+    def get_calorie_reply(self, reply_message_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM calorie_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            ).fetchone()
+
+    def delete_calorie_reply(self, reply_message_id: int) -> int:
+        """Delete a calorie reply-tracking row. Returns rowcount so concurrent
+        ❌ reactions race-protect (only the first delete returns 1)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            )
+            return cur.rowcount or 0
+
+    def delete_calorie_entry(
+        self, guild_id: int, target_user_id: int, calorie_id: int,
+    ) -> sqlite3.Row | None:
+        """Delete one intake entry by id, scoped to (guild, user) for safety.
+        Returns the deleted row (kcal/note) or None if it was already gone."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, kcal, note FROM calorie_entries "
+                "WHERE id = ? AND guild_id = ? AND user_id = ?",
+                (calorie_id, guild_id, target_user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM calorie_entries WHERE id = ?", (calorie_id,))
             return row
 
     def calorie_entries_between(

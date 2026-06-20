@@ -874,12 +874,14 @@ async def _handle_bodyweight_message(
 
 async def _reply_calorie_logged(
     message: discord.Message, target: object, goal: sqlite3.Row,
-    added_kcal: float, label: str | None,
+    added_kcal: float, label: str | None, *, entry_id: int = 0,
 ) -> None:
     """React ✅ and reply with what was added + today's running total.
 
     Shared by both chat calorie paths so a `200 calories` post and a saved-food
-    shortcut give the same `/calories add`-style feedback."""
+    shortcut give the same `/calories add`-style feedback. When ``entry_id`` is
+    given, the reply is tracked + gets a ❌ affordance so reacting removes that
+    specific entry."""
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
@@ -890,13 +892,23 @@ async def _reply_calorie_logged(
     label_part = f" — {label}" if label else ""
     suffix = _target_suffix(message.author, target)
     try:
-        await message.reply(
+        reply = await message.reply(
             f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}\n"
             + _calorie_status_line(total, float(goal["daily_target_kcal"])),
             mention_author=False,
         )
     except discord.HTTPException:
-        pass
+        return
+    if entry_id:
+        # Track so a ❌ on this reply removes exactly this entry, and add the
+        # ❌ as a one-tap affordance.
+        db.track_calorie_reply(
+            reply.id, guild_id, message.author.id, target_id, entry_id, message.id,
+        )
+        try:
+            await reply.add_reaction("❌")
+        except discord.HTTPException:
+            pass
 
 
 async def _handle_calorie_message(
@@ -935,7 +947,7 @@ async def _handle_calorie_message(
         return
 
     try:
-        db.calorie_add(
+        entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=message.content.strip()[:80],
             message_id=message.id,
@@ -947,7 +959,7 @@ async def _handle_calorie_message(
     LOG.info(
         "Stored %.0f kcal for %s in #%s", kcal, target, message.channel,
     )
-    await _reply_calorie_logged(message, target, goal, kcal, note)
+    await _reply_calorie_logged(message, target, goal, kcal, note, entry_id=entry_id)
 
 
 def _match_calorie_food(
@@ -995,7 +1007,7 @@ async def _handle_calorie_food_message(
     if goal is None:  # pragma: no cover - _match_calorie_food already checked
         return
     try:
-        db.calorie_add(
+        entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=message.content.strip()[:80],
             message_id=message.id,
@@ -1007,7 +1019,7 @@ async def _handle_calorie_food_message(
         "Stored food '%s' ×%d (%.0f kcal) for %s in #%s",
         display, servings, kcal, target, message.channel,
     )
-    await _reply_calorie_logged(message, target, goal, kcal, note)
+    await _reply_calorie_logged(message, target, goal, kcal, note, entry_id=entry_id)
 
 
 @bot.event
@@ -2042,6 +2054,73 @@ def _check_goal_hits(
     return cleared
 
 
+async def _handle_calorie_reaction_undo(
+    payload: discord.RawReactionActionEvent,
+) -> None:
+    """Remove a single calorie entry when its logger/target/admin reacts ❌ on
+    the bot's `🍽️ +N cal` reply. Mirrors the lift reaction-undo."""
+    crec = db.get_calorie_reply(payload.message_id)
+    if crec is None:
+        return
+    target_user_id = int(crec["target_user_id"])
+    allowed = {int(crec["user_id"]), target_user_id} | ADMIN_USER_IDS
+    if payload.user_id not in allowed:
+        return  # Someone else tried to undo — ignore silently.
+
+    # Race protection: claim the reply by deleting its tracking row first.
+    if db.delete_calorie_reply(payload.message_id) == 0:
+        return
+
+    guild_id = int(crec["guild_id"])
+    removed = db.delete_calorie_entry(
+        guild_id, target_user_id, int(crec["calorie_id"]),
+    )
+    # Suppress the source message so a restart backfill won't re-import it.
+    original_id = crec["original_message_id"]
+    if original_id is not None:
+        db.suppress_message(guild_id, int(original_id))
+
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except discord.HTTPException:
+            return
+    try:
+        reply_msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+    by_admin = (
+        payload.user_id in ADMIN_USER_IDS
+        and payload.user_id not in {int(crec["user_id"]), target_user_id}
+    )
+    actor = "an admin" if by_admin else "the user"
+    if removed is not None:
+        total, _n = db.calorie_total_between(
+            guild_id, target_user_id, *_today_window(),
+        )
+        note = (
+            f"↩️ Removed **{calories.format_kcal(float(removed['kcal']))}** at "
+            f"{actor}'s request. Today's total is now "
+            f"{calories.format_kcal(total)}."
+        )
+    else:
+        note = "↩️ Nothing to undo (already removed)."
+    # Strip the original line(s) of bold so the removal reads clearly, then
+    # append the note.
+    try:
+        await reply_msg.edit(content=f"{reply_msg.content}\n\n{note}")
+    except discord.HTTPException:
+        pass
+    # Drop the ✅ on the user's original message so the visual state matches.
+    if original_id:
+        try:
+            original = await channel.fetch_message(int(original_id))
+            await original.remove_reaction("✅", bot.user)  # type: ignore[arg-type]
+        except discord.HTTPException:
+            pass
+
+
 @bot.event
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
@@ -2053,6 +2132,8 @@ async def on_raw_reaction_add(
         return
     rec = db.get_reply(payload.message_id)
     if rec is None:
+        # Not a lift reply — maybe a calorie reply.
+        await _handle_calorie_reaction_undo(payload)
         return
     target_user_id = int(rec["target_user_id"])
     allowed = {int(rec["user_id"]), target_user_id} | ADMIN_USER_IDS
@@ -3441,7 +3522,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "then log it by typing `coffee` or `2 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
-            "`/calories undo` — remove your last entry\n"
+            "`/calories undo` — remove your last entry, or react ❌ on the "
+            "bot's reply to remove that specific one\n"
             "`/calories stop` — stop tracking (history kept)\n"
             "Tracked members get an AI summary in the Sunday "
             "`/weekly_report`"

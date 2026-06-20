@@ -90,7 +90,9 @@ Calories:
   you've run `/calories setup`.
 - `/calories today [user]` — today's entries and total vs target.
 - `/calories week [user]` — per-day totals for the last 7 days.
-- `/calories undo` — remove your most recent entry.
+- `/calories undo` — remove your most recent entry. To remove a *specific*
+  entry instead, react ❌ on the bot's `🍽️ +N cal` reply for it (the logger,
+  the target, or an admin can do this).
 - `/calories stop` — stop tracking (history is kept; `setup` re-enables).
 
 Saved foods (personal name → calorie shortcuts):

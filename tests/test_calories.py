@@ -342,6 +342,37 @@ def test_calorie_food_scoped_per_user_and_guild(db):
     assert names == ["Coffee", "Protein Shake"]  # ordered by display
 
 
+def test_calorie_reply_tracking_roundtrip(db):
+    eid = db.calorie_add(1, 100, "alice", 1730, note="oops", message_id=555)
+    db.track_calorie_reply(
+        reply_message_id=999, guild_id=1, user_id=100, target_user_id=100,
+        calorie_id=eid, original_message_id=555,
+    )
+    rec = db.get_calorie_reply(999)
+    assert rec is not None
+    assert rec["calorie_id"] == eid
+    assert rec["original_message_id"] == 555
+    # First delete claims it (race protection); second is a no-op.
+    assert db.delete_calorie_reply(999) == 1
+    assert db.delete_calorie_reply(999) == 0
+    assert db.get_calorie_reply(999) is None
+
+
+def test_delete_calorie_entry_scoped(db):
+    eid = db.calorie_add(1, 100, "alice", 1730, note="oops")
+    # Wrong user can't delete it.
+    assert db.delete_calorie_entry(1, 999, eid) is None
+    # Correct (guild, user) removes it and returns the row.
+    removed = db.delete_calorie_entry(1, 100, eid)
+    assert removed is not None and removed["kcal"] == 1730
+    # Already gone.
+    assert db.delete_calorie_entry(1, 100, eid) is None
+    remaining = db.calorie_entries_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert remaining == []
+
+
 def test_calorie_pop_last_removes_newest(db):
     db.calorie_add(
         1, 100, "alice", 500, note="breakfast",
