@@ -2571,6 +2571,31 @@ class Database:
                 (guild_id, message_id),
             ).fetchone()
 
+    def update_calorie_entry(
+        self, calorie_id: int, kcal: float,
+        note: str | None = None, raw: str | None = None,
+    ) -> None:
+        """Update an entry in place — used when the source message is edited
+        (e.g. a `1730c` typo corrected to `1730kj`)."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE calorie_entries SET kcal = ?, note = ?, raw = ? "
+                "WHERE id = ?",
+                (float(kcal), note, raw, calorie_id),
+            )
+
+    def get_calorie_reply_by_original(
+        self, original_message_id: int,
+    ) -> sqlite3.Row | None:
+        """Find the bot's reply-tracking row for a given source message, so an
+        edit can refresh the reply text it posted."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM calorie_reply_tracking "
+                "WHERE original_message_id = ?",
+                (original_message_id,),
+            ).fetchone()
+
     def delete_calorie_entry(
         self, guild_id: int, target_user_id: int, calorie_id: int,
     ) -> sqlite3.Row | None:

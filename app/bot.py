@@ -1917,6 +1917,109 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
+async def _refresh_calorie_reply(
+    after: discord.Message, target: object, goal: sqlite3.Row,
+    kcal: float, note: str | None,
+) -> None:
+    """Edit the bot's tracked reply for an edited calorie message to show the
+    new amount + recomputed total. Best-effort; no-op if it wasn't tracked."""
+    crec = db.get_calorie_reply_by_original(after.id)
+    if crec is None:
+        return
+    try:
+        reply_msg = await after.channel.fetch_message(int(crec["reply_message_id"]))
+    except discord.HTTPException:
+        return
+    guild_id = after.guild.id if after.guild else 0
+    target_id = int(getattr(target, "id"))
+    total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
+    label_part = f" — {note}" if note else ""
+    suffix = _target_suffix(after.author, target)
+    body = (
+        f"🍽️ **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
+        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        + "\n✏️ *(updated from an edit)*"
+    )
+    try:
+        await reply_msg.edit(content=body)
+    except discord.HTTPException:
+        pass
+
+
+async def _handle_calorie_edit(
+    after: discord.Message, target: object, content: str,
+) -> bool:
+    """Reconcile a calorie entry when its source chat message is edited.
+
+    Returns True when the message is (or was) a calorie log so the caller skips
+    the lift-edit path. Handles a unit/amount change (update — e.g. `1730c` →
+    `1730kj`), the calorie text being edited away (delete), and a plain message
+    becoming a calorie log (add).
+    """
+    guild_id = after.guild.id if after.guild else 0
+    target_id = int(getattr(target, "id"))
+    existing = db.get_calorie_entry_by_message(guild_id, after.id)
+    new_hit = calories.parse_chat_message(content)
+    if existing is None and new_hit is None:
+        return False  # not a calorie message before or after
+
+    goal = db.calorie_goal_get(guild_id, target_id)
+
+    # Edited the calorie text away → remove the entry + tidy the reply.
+    if existing is not None and new_hit is None:
+        db.delete_calorie_entry(
+            guild_id, int(existing["user_id"]), int(existing["id"]),
+        )
+        crec = db.get_calorie_reply_by_original(after.id)
+        if crec is not None:
+            db.delete_calorie_reply(int(crec["reply_message_id"]))
+            try:
+                rm = await after.channel.fetch_message(
+                    int(crec["reply_message_id"])
+                )
+                await rm.edit(content="↩️ Entry removed (message edited).")
+                await rm.clear_reaction("❌")
+            except discord.HTTPException:
+                pass
+        try:
+            await after.add_reaction("✏️")
+        except discord.HTTPException:
+            pass
+        return True
+
+    kcal, _unit, note = new_hit  # type: ignore[misc]
+    if goal is None:
+        return existing is not None  # can't log without a target
+    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+        return True  # ignore implausible edits
+
+    if existing is None:
+        # A non-calorie message was edited into one → log it fresh.
+        entry_id = db.calorie_add(
+            guild_id, target_id, _display_name(target), kcal,
+            note=note, raw=after.content.strip()[:80], message_id=after.id,
+        )
+        await _reply_calorie_logged(
+            after, target, goal, kcal, note, entry_id=entry_id,
+        )
+        return True
+
+    # Update the existing entry when the amount/note changed.
+    if (
+        abs(float(existing["kcal"]) - kcal) > 1e-6
+        or (existing["note"] or None) != note
+    ):
+        db.update_calorie_entry(
+            int(existing["id"]), kcal, note, after.content.strip()[:80],
+        )
+        await _refresh_calorie_reply(after, target, goal, kcal, note)
+        try:
+            await after.add_reaction("✏️")
+        except discord.HTTPException:
+            pass
+    return True
+
+
 @bot.event
 async def on_message_edit(
     before: discord.Message, after: discord.Message,
@@ -1943,6 +2046,9 @@ async def on_message_edit(
     # Editing a post is a fresh signal of intent — clear any prior
     # backfill suppression so the corrected version can be re-imported.
     db.unsuppress_message(guild_id, after.id)
+    # Calorie logs reconcile separately (units/totals), before the lift path.
+    if await _handle_calorie_edit(after, target, content):
+        return
     db.retarget_replies_for_message(guild_id, after.id, target_user_id)
     new_lifts = parse_message(content, custom_aliases=aliases)
     new_lifts, _rejected = _split_reasonable_lifts(new_lifts)

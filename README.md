@@ -93,6 +93,9 @@ Calories:
 - `/calories undo` — remove your most recent entry. To remove a *specific*
   entry instead, react ❌ on the bot's `🍽️ +N cal` reply for it (the logger,
   the target, or an admin can do this).
+- **Edit to fix:** editing the original chat message updates the stored entry —
+  e.g. correcting `1730c` to `1730kj` recomputes the calories; deleting the
+  amount removes it.
 - `/calories stop` — stop tracking (history is kept; `setup` re-enables).
 
 Saved foods (personal name → calorie shortcuts):

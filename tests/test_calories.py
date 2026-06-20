@@ -358,6 +358,30 @@ def test_calorie_reply_tracking_roundtrip(db):
     assert db.get_calorie_reply(999) is None
 
 
+def test_update_calorie_entry(db):
+    # Mirrors a `1730c` → `1730kj` correction: 1730 kcal becomes ~413.
+    eid = db.calorie_add(1, 100, "alice", 1730, note="oops", message_id=42)
+    db.update_calorie_entry(eid, 413.0, note=None, raw="1730kj")
+    row = db.get_calorie_entry_by_message(1, 42)
+    assert row["kcal"] == 413.0
+    # Note cleared too.
+    full = db.calorie_entries_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert full[0]["note"] is None
+
+
+def test_get_calorie_reply_by_original(db):
+    eid = db.calorie_add(1, 100, "alice", 500, message_id=42)
+    db.track_calorie_reply(
+        reply_message_id=900, guild_id=1, user_id=100, target_user_id=100,
+        calorie_id=eid, original_message_id=42,
+    )
+    rec = db.get_calorie_reply_by_original(42)
+    assert rec is not None and rec["reply_message_id"] == 900
+    assert db.get_calorie_reply_by_original(999) is None
+
+
 def test_get_calorie_entry_by_message(db):
     # Legacy ❌-undo resolves the entry from the source message id.
     eid = db.calorie_add(1, 100, "alice", 1730, note="oops", message_id=777)
