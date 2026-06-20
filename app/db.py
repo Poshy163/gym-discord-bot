@@ -2556,6 +2556,21 @@ class Database:
             )
             return cur.rowcount or 0
 
+    def get_calorie_entry_by_message(
+        self, guild_id: int, message_id: int,
+    ) -> sqlite3.Row | None:
+        """The intake entry created from a given source chat message, or None.
+
+        Lets ❌ reaction-undo work on *legacy* logs (made before reply-tracking
+        existed) by following the bot reply's reference back to the original
+        message. message_id is unique per entry (partial unique index)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT id, user_id, kcal, note FROM calorie_entries "
+                "WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            ).fetchone()
+
     def delete_calorie_entry(
         self, guild_id: int, target_user_id: int, calorie_id: int,
     ) -> sqlite3.Row | None:

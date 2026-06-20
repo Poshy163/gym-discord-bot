@@ -358,6 +358,17 @@ def test_calorie_reply_tracking_roundtrip(db):
     assert db.get_calorie_reply(999) is None
 
 
+def test_get_calorie_entry_by_message(db):
+    # Legacy ❌-undo resolves the entry from the source message id.
+    eid = db.calorie_add(1, 100, "alice", 1730, note="oops", message_id=777)
+    row = db.get_calorie_entry_by_message(1, 777)
+    assert row is not None and row["id"] == eid and row["user_id"] == 100
+    assert db.get_calorie_entry_by_message(1, 999) is None
+    # Slash-command entries (no message_id) aren't resolvable this way.
+    db.calorie_add(1, 100, "alice", 200)
+    assert db.get_calorie_entry_by_message(1, 0) is None
+
+
 def test_delete_calorie_entry_scoped(db):
     eid = db.calorie_add(1, 100, "alice", 1730, note="oops")
     # Wrong user can't delete it.

@@ -2058,28 +2058,12 @@ async def _handle_calorie_reaction_undo(
     payload: discord.RawReactionActionEvent,
 ) -> None:
     """Remove a single calorie entry when its logger/target/admin reacts ❌ on
-    the bot's `🍽️ +N cal` reply. Mirrors the lift reaction-undo."""
-    crec = db.get_calorie_reply(payload.message_id)
-    if crec is None:
-        return
-    target_user_id = int(crec["target_user_id"])
-    allowed = {int(crec["user_id"]), target_user_id} | ADMIN_USER_IDS
-    if payload.user_id not in allowed:
-        return  # Someone else tried to undo — ignore silently.
+    the bot's `🍽️ +N cal` reply.
 
-    # Race protection: claim the reply by deleting its tracking row first.
-    if db.delete_calorie_reply(payload.message_id) == 0:
-        return
-
-    guild_id = int(crec["guild_id"])
-    removed = db.delete_calorie_entry(
-        guild_id, target_user_id, int(crec["calorie_id"]),
-    )
-    # Suppress the source message so a restart backfill won't re-import it.
-    original_id = crec["original_message_id"]
-    if original_id is not None:
-        db.suppress_message(guild_id, int(original_id))
-
+    Works for tracked replies (new logs) *and* legacy ones: when there's no
+    tracking row, we follow the bot reply's reference back to the original chat
+    message and look the entry up by that message id.
+    """
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
         try:
@@ -2090,9 +2074,58 @@ async def _handle_calorie_reaction_undo(
         reply_msg = await channel.fetch_message(payload.message_id)
     except discord.HTTPException:
         return
+    # Only act on our own calorie-log replies (skip lift replies, already-undone
+    # ones whose text now starts with "~~", etc.).
+    if reply_msg.author.id != (bot.user.id if bot.user else 0):
+        return
+    if not reply_msg.content.startswith("🍽️"):
+        return
+
+    guild_id = payload.guild_id or 0
+    logger_id: int | None = None
+    crec = db.get_calorie_reply(payload.message_id)
+    if crec is not None:
+        target_user_id = int(crec["target_user_id"])
+        logger_id = int(crec["user_id"])
+        if payload.user_id not in ({logger_id, target_user_id} | ADMIN_USER_IDS):
+            return
+        # Race protection: claim the reply by deleting its tracking row first.
+        if db.delete_calorie_reply(payload.message_id) == 0:
+            return
+        calorie_id = int(crec["calorie_id"])
+        original_id = crec["original_message_id"]
+    else:
+        # Legacy fallback: resolve the entry via the reply's referenced message.
+        ref = reply_msg.reference
+        original_id = ref.message_id if ref else None
+        if original_id is None:
+            return
+        entry = db.get_calorie_entry_by_message(guild_id, int(original_id))
+        if entry is None:
+            return  # already removed, or not a tracked calorie message
+        target_user_id = int(entry["user_id"])
+        calorie_id = int(entry["id"])
+        allowed = {target_user_id} | ADMIN_USER_IDS
+        if payload.user_id not in allowed:
+            # We don't know the logger from the DB here — check the source
+            # message's author before refusing.
+            try:
+                original = await channel.fetch_message(int(original_id))
+                logger_id = original.author.id
+            except discord.HTTPException:
+                logger_id = None
+            if payload.user_id != logger_id:
+                return
+
+    removed = db.delete_calorie_entry(guild_id, target_user_id, calorie_id)
+    # Suppress the source message so a restart backfill won't re-import it.
+    if original_id is not None:
+        db.suppress_message(guild_id, int(original_id))
+
     by_admin = (
         payload.user_id in ADMIN_USER_IDS
-        and payload.user_id not in {int(crec["user_id"]), target_user_id}
+        and payload.user_id != target_user_id
+        and payload.user_id != logger_id
     )
     actor = "an admin" if by_admin else "the user"
     if removed is not None:
