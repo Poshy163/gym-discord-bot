@@ -2106,12 +2106,24 @@ async def _handle_calorie_reaction_undo(
         )
     else:
         note = "↩️ Nothing to undo (already removed)."
-    # Strip the original line(s) of bold so the removal reads clearly, then
-    # append the note.
+    # Strike through the original log so the edited message clearly reads as
+    # "removed", then append the confirmation note.
+    struck = "\n".join(
+        f"~~{line}~~" if line.strip() else line
+        for line in reply_msg.content.split("\n")
+    )
     try:
-        await reply_msg.edit(content=f"{reply_msg.content}\n\n{note}")
+        await reply_msg.edit(content=f"{struck}\n\n{note}")
     except discord.HTTPException:
         pass
+    # Clear the ❌ affordance now that it's done (best-effort).
+    try:
+        await reply_msg.clear_reaction("❌")
+    except discord.HTTPException:
+        try:
+            await reply_msg.remove_reaction("❌", bot.user)  # type: ignore[arg-type]
+        except discord.HTTPException:
+            pass
     # Drop the ✅ on the user's original message so the visual state matches.
     if original_id:
         try:
