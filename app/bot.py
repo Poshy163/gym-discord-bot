@@ -6831,6 +6831,13 @@ STRAVA_IMPERIAL = os.getenv("STRAVA_IMPERIAL", "0").lower() in (
     "1", "true", "yes", "y", "on",
 )
 
+# Auto-create the webhook push subscription (one per app) on startup and when a
+# user links, so nobody has to run /strava_subscribe by hand. Requires the
+# callback URL to be publicly reachable at the time it runs. Default on.
+STRAVA_AUTO_SUBSCRIBE = os.getenv("STRAVA_AUTO_SUBSCRIBE", "1").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
 _strava_runner = None
@@ -7129,6 +7136,10 @@ async def _strava_on_callback(
         return strava_web.error_page("Couldn't save your link. Please try again.")
 
     LOG.info("Strava linked user=%s athlete=%s (%s)", user_id, athlete_id, name)
+    # Make sure the app-wide webhook subscription exists so this athlete's
+    # future activities actually push (no manual /strava_subscribe needed).
+    if STRAVA_AUTO_SUBSCRIBE:
+        bot.loop.create_task(_strava_ensure_subscription())
     try:  # best-effort DM confirmation
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
         if user is not None:
@@ -7404,6 +7415,58 @@ async def _strava_on_event(payload: dict) -> None:
         await _strava_handle_delete(row, activity_id)
 
 
+async def _strava_ensure_subscription() -> str:
+    """Make sure the app's single webhook subscription exists and points at our
+    callback. Idempotent — safe to call on startup and on every link.
+
+    Returns a short status string ("exists" / "created:<id>" / "error:…" /
+    "unconfigured"). If a subscription exists with a *different* callback URL
+    (e.g. the public URL changed), it's deleted and recreated, since Strava
+    only allows one per application.
+    """
+    cfg = _strava_cfg()
+    if not cfg.configured or not cfg.webhook_callback_url:
+        return "unconfigured"
+
+    def _do() -> str:
+        subs = strava_client.view_subscriptions(cfg)
+        for s in subs:
+            if s.get("callback_url") == cfg.webhook_callback_url:
+                return "exists"
+        # Wrong/stale callback — clear it so we can create the right one.
+        for s in subs:
+            try:
+                strava_client.delete_subscription(cfg, int(s["id"]))
+            except Exception:  # pragma: no cover - best effort
+                LOG.warning("Strava: failed to drop stale subscription", exc_info=True)
+        return f"created:{strava_client.create_subscription(cfg)}"
+
+    try:
+        return await bot.loop.run_in_executor(None, _do)
+    except Exception as exc:  # pragma: no cover - network
+        return f"error:{exc}"
+
+
+async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
+    """Ensure the subscription a few seconds after boot, retrying so a tunnel
+    that isn't quite up yet doesn't permanently skip setup."""
+    for attempt in range(4):
+        await asyncio.sleep(8 if attempt else 4)
+        result = await _strava_ensure_subscription()
+        if result.startswith(("exists", "created")):
+            LOG.info("Strava webhook subscription ready (%s)", result)
+            return
+        if result == "unconfigured":
+            return
+        LOG.warning(
+            "Strava auto-subscribe attempt %d/4 failed: %s", attempt + 1, result,
+        )
+    LOG.warning(
+        "Strava auto-subscribe gave up — check the public callback is reachable, "
+        "then run /strava_subscribe once."
+    )
+
+
 @bot.event
 async def setup_hook() -> None:  # pragma: no cover - discord runtime
     """Start the Strava web server on the bot's event loop before connecting.
@@ -7439,6 +7502,8 @@ async def setup_hook() -> None:  # pragma: no cover - discord runtime
                 "STRAVA_FEED_CHANNEL_ID is unset — workouts will be received "
                 "but not posted anywhere."
             )
+        if STRAVA_AUTO_SUBSCRIBE:
+            bot.loop.create_task(_strava_autosubscribe_startup())
     except Exception:
         LOG.exception("Failed to start Strava web server")
 

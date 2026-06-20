@@ -67,23 +67,26 @@ The integration is **idle** (boots fine, does nothing) until `STRAVA_CLIENT_ID`,
 `STRAVA_CLIENT_SECRET` and `STRAVA_PUBLIC_URL` are all set. Set `STRAVA_DISABLED=1`
 to force it off.
 
-## 4. Create the webhook subscription (once)
+## 4. Webhook subscription (automatic)
 
-After the bot is running and publicly reachable, the **owner** runs:
+With `STRAVA_AUTO_SUBSCRIBE=1` (the default), the bot **creates the webhook
+subscription itself** — a few seconds after startup (retrying so a tunnel that's
+still coming up doesn't miss it) and again whenever someone links. You normally
+don't have to do anything here.
+
+There's exactly **one subscription per Strava app**, shared by every linked
+athlete (it's not per-user or per-channel). If the public callback URL changes,
+the bot deletes the stale subscription and recreates it automatically.
+
+Manual controls are still available (owner-only):
 
 ```
-/strava_subscribe
-```
-
-Strava immediately calls back to `/strava/webhook` to validate the
-`verify_token`, then starts pushing events. Check/clear it with:
-
-```
+/strava_subscribe             # force-create it now
 /strava_subscription          # show the active subscription
 /strava_unsubscribe <id>      # delete it
 ```
 
-Only one subscription per app is allowed.
+Set `STRAVA_AUTO_SUBSCRIBE=0` if you'd rather manage it by hand.
 
 ## 5. Members link their accounts
 
