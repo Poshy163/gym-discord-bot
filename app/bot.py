@@ -1456,14 +1456,75 @@ def _calorie_week_days(
 
 
 _CALORIE_SUMMARY_SYSTEM = (
-    "You are a friendly nutrition coach writing one short blurb per person "
-    "for a Discord gym server's weekly report. You get JSON with the "
-    "person's daily calorie target and per-day intake totals for the week "
-    "(kcal; missing days mean nothing was logged). Comment on adherence to "
-    "the target and consistency, and end with one encouraging or actionable "
-    "note. No medical advice, no shaming. 2-3 sentences, under 350 "
-    "characters, plain text, no headings or bullet points."
+    "You are an upbeat, knowledgeable nutrition coach writing a short, personal "
+    "weekly recap for ONE member of a Discord gym community.\n\n"
+    "You receive JSON describing their week:\n"
+    "- daily_target_kcal: their goal per day\n"
+    "- per_day: each logged day with its weekday, intake (kcal) and vs_target "
+    "(intake minus target; negative = under, positive = over)\n"
+    "- days_logged: how many of the 7 days they recorded anything\n"
+    "- week_avg_kcal / week_total_kcal: averages and totals across logged days\n"
+    "- days_over_target / days_under_target\n"
+    "- highest_day / lowest_day: their biggest and smallest days\n"
+    "- previous_week_avg_kcal: last week's average for trend comparison "
+    "(null if they didn't log last week)\n\n"
+    "Write a recap that:\n"
+    "1. Addresses them by name in a warm, motivating opener.\n"
+    "2. Calls out 2-3 CONCRETE patterns using the real numbers — logging "
+    "consistency, how close they ran to target, weekday-vs-weekend swings, any "
+    "standout high or low day, and the trend vs last week when available.\n"
+    "3. Ends with ONE specific, actionable tip tailored to exactly what you "
+    "saw this week (not generic advice).\n\n"
+    "Tone: friendly, encouraging, a little playful — a coach genuinely rooting "
+    "for them. Never shame them, never give medical advice or rigid rules. "
+    "3-4 sentences, plain text only (no headings, bullets, or markdown), under "
+    "550 characters."
 )
+
+
+def _weekday_full(iso_date: str) -> str:
+    """Full weekday name (e.g. 'Monday') for a YYYY-MM-DD string."""
+    try:
+        return date.fromisoformat(iso_date).strftime("%A")
+    except ValueError:
+        return iso_date
+
+
+def _build_calorie_ai_payload(
+    name: str, target: float, days: dict[str, float],
+    prev_days: dict[str, float],
+) -> str:
+    """Assemble the rich JSON describing one member's week for Gemini."""
+    sorted_days = sorted(days.items())
+    values = list(days.values())
+    avg = sum(values) / len(values)
+    hi_date, hi_kcal = max(sorted_days, key=lambda kv: kv[1])
+    lo_date, lo_kcal = min(sorted_days, key=lambda kv: kv[1])
+    prev_avg = (
+        round(sum(prev_days.values()) / len(prev_days)) if prev_days else None
+    )
+    return json.dumps({
+        "name": name,
+        "daily_target_kcal": round(target),
+        "days_logged": len(days),
+        "days_in_week": 7,
+        "week_avg_kcal": round(avg),
+        "week_total_kcal": round(sum(values)),
+        "days_over_target": sum(1 for v in values if v > target),
+        "days_under_target": sum(1 for v in values if v < target),
+        "highest_day": {"weekday": _weekday_full(hi_date), "kcal": round(hi_kcal)},
+        "lowest_day": {"weekday": _weekday_full(lo_date), "kcal": round(lo_kcal)},
+        "previous_week_avg_kcal": prev_avg,
+        "per_day": [
+            {
+                "weekday": _weekday_full(d),
+                "date": d,
+                "kcal": round(v),
+                "vs_target": round(v - target),
+            }
+            for d, v in sorted_days
+        ],
+    })
 
 
 async def _calorie_ai_summaries(
@@ -1474,14 +1535,24 @@ async def _calorie_ai_summaries(
     Uses Gemini when configured; otherwise (or when a call fails) falls back
     to a plain stats line so the report never silently drops someone.
     """
+    # Previous 7-day window, for a week-over-week trend signal in the prompt.
+    try:
+        prev_start_iso = (
+            datetime.fromisoformat(start_iso) - timedelta(days=7)
+        ).isoformat()
+    except ValueError:
+        prev_start_iso = start_iso
+
     blocks: list[str] = []
     for row in db.calorie_tracked_users(guild_id):
         user_id = int(row["user_id"])
         name = db.get_user_nickname(user_id) or row["username"]
+        # "Joshua @poshy" — friendly name plus the (non-pinging) mention.
+        who = f"**{name}** <@{user_id}>"
         target = float(row["daily_target_kcal"])
         days = _calorie_week_days(guild_id, user_id, start_iso, end_iso)
         if not days:
-            blocks.append(f"**{name}** — no intake logged this week.")
+            blocks.append(f"{who} — no intake logged this week.")
             continue
         avg = sum(days.values()) / len(days)
         stats = (
@@ -1491,17 +1562,14 @@ async def _calorie_ai_summaries(
         )
         blurb: str | None = None
         if gemini_client.available():
-            payload = json.dumps({
-                "name": name,
-                "daily_target_kcal": round(target),
-                "per_day_kcal": {
-                    d: round(v) for d, v in sorted(days.items())
-                },
-            })
+            prev_days = _calorie_week_days(
+                guild_id, user_id, prev_start_iso, start_iso,
+            )
+            payload = _build_calorie_ai_payload(name, target, days, prev_days)
             try:
                 blurb = await asyncio.to_thread(
                     gemini_client.generate,
-                    f"Weekly calorie data:\n{payload}",
+                    f"Weekly calorie data for {name}:\n{payload}",
                     system=_CALORIE_SUMMARY_SYSTEM,
                 )
             except gemini_client.GeminiError as exc:
@@ -1509,9 +1577,9 @@ async def _calorie_ai_summaries(
                     "Gemini calorie summary failed for %s: %s", name, exc,
                 )
         if blurb:
-            blocks.append(f"**{name}** ({stats})\n{blurb.strip()[:600]}")
+            blocks.append(f"{who} ({stats})\n{blurb.strip()[:800]}")
         else:
-            blocks.append(f"**{name}** — {stats}")
+            blocks.append(f"{who} — {stats}")
     return blocks
 
 
