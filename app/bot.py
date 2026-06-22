@@ -7143,6 +7143,11 @@ STRAVA_AUTO_SUBSCRIBE = os.getenv("STRAVA_AUTO_SUBSCRIBE", "1").lower() in (
 # clean it up.
 _strava_runner = None
 
+# Live webhook subscription id (set once known via ensure/subscribe). The event
+# handler uses it to reject deliveries from any other subscription. None means
+# "not yet known" → fail open so valid events during startup aren't dropped.
+_strava_subscription_id: int | None = None
+
 
 def _strava_cfg() -> "strava_client.StravaConfig":
     return strava_client.config_from_env()
@@ -7673,23 +7678,54 @@ async def _strava_weekly_blocks() -> list[str]:
     rows = await bot.loop.run_in_executor(None, _gather)
     if not rows:
         return []
-    rows.sort(key=lambda r: (r[2], r[3]), reverse=True)  # distance, then time
-    imp = STRAVA_IMPERIAL
+    return _strava_weekly_lines(rows, STRAVA_IMPERIAL)
+
+
+def _strava_weekly_lines(
+    rows: list[tuple[int, int, float, int, float]], imperial: bool,
+) -> list[str]:
+    """Format aggregated ``(user_id, count, distance_m, secs, elev_m)`` rows
+    into one Discord line each, ordered by distance then time. Pure — split out
+    from the network gather so it's unit-testable."""
+    ordered = sorted(rows, key=lambda r: (r[2], r[3]), reverse=True)
     lines: list[str] = []
-    for uid, n, dist, secs, elev in rows:
+    for uid, n, dist, secs, elev in ordered:
         parts = [f"**{n}** activit{'y' if n == 1 else 'ies'}"]
         if dist > 0:
-            parts.append(strava_client.format_distance(dist, imp))
+            parts.append(strava_client.format_distance(dist, imperial))
         parts.append(strava_client.format_duration(secs))
         if elev > 0:
-            parts.append(strava_client.format_elevation(elev, imp) + " climb")
+            parts.append(strava_client.format_elevation(elev, imperial) + " climb")
         lines.append(f"<@{uid}> — " + " · ".join(parts))
     return lines
+
+
+def _strava_event_subscription_ok(payload: dict) -> bool:
+    """Reject events from a subscription id other than ours, once we know it.
+
+    Fails open when our id isn't known yet (startup) or the payload omits one,
+    so genuine events are never dropped — it only filters clearly-foreign ones.
+    """
+    if _strava_subscription_id is None:
+        return True
+    raw = payload.get("subscription_id")
+    if raw is None:
+        return True
+    try:
+        return int(raw) == _strava_subscription_id
+    except (TypeError, ValueError):
+        return True
 
 
 async def _strava_on_event(payload: dict) -> None:
     """Process one webhook event — create/update/delete + deauthorization."""
     if STRAVA_DISABLED:
+        return
+    if not _strava_event_subscription_ok(payload):
+        LOG.warning(
+            "Strava event from unexpected subscription_id %s (expected %s) — ignoring",
+            payload.get("subscription_id"), _strava_subscription_id,
+        )
         return
     object_type = payload.get("object_type")
     if object_type == "athlete":
@@ -7725,6 +7761,7 @@ async def _strava_ensure_subscription() -> str:
     (e.g. the public URL changed), it's deleted and recreated, since Strava
     only allows one per application.
     """
+    global _strava_subscription_id
     cfg = _strava_cfg()
     if not cfg.configured or not cfg.webhook_callback_url:
         return "unconfigured"
@@ -7733,7 +7770,7 @@ async def _strava_ensure_subscription() -> str:
         subs = strava_client.view_subscriptions(cfg)
         for s in subs:
             if s.get("callback_url") == cfg.webhook_callback_url:
-                return "exists"
+                return f"exists:{s['id']}"
         # Wrong/stale callback — clear it so we can create the right one.
         for s in subs:
             try:
@@ -7743,9 +7780,17 @@ async def _strava_ensure_subscription() -> str:
         return f"created:{strava_client.create_subscription(cfg)}"
 
     try:
-        return await bot.loop.run_in_executor(None, _do)
+        result = await bot.loop.run_in_executor(None, _do)
     except Exception as exc:  # pragma: no cover - network
         return f"error:{exc}"
+    # Cache the live subscription id so the webhook handler can reject events
+    # from any other (stale/spoofed) subscription.
+    if ":" in result:
+        try:
+            _strava_subscription_id = int(result.split(":", 1)[1])
+        except ValueError:
+            pass
+    return result
 
 
 async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
@@ -8028,27 +8073,26 @@ async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
         )
         return
     await interaction.response.defer(thinking=True, ephemeral=True)
-
-    def _do() -> str:
-        try:
-            existing = strava_client.view_subscriptions(cfg)
-            if existing:
-                return f"ℹ️ A subscription already exists: `{existing}`."
-            sid = strava_client.create_subscription(cfg)
-            return (
-                f"✅ Created subscription `{sid}` → "
-                f"`{cfg.webhook_callback_url}`."
-            )
-        except Exception as exc:  # pragma: no cover - network
-            return f"⚠️ Failed: {exc}"
-
-    result = await bot.loop.run_in_executor(None, _do)
-    await interaction.followup.send(result, ephemeral=True)
+    # Reuse the idempotent ensure path so the cached subscription id stays in
+    # sync and a stale-callback subscription is recreated correctly.
+    result = await _strava_ensure_subscription()
+    if result.startswith("created"):
+        msg = (
+            f"✅ Created subscription `{result.split(':', 1)[1]}` → "
+            f"`{cfg.webhook_callback_url}`."
+        )
+    elif result.startswith("exists"):
+        msg = f"ℹ️ Subscription already active: `{result.split(':', 1)[1]}`."
+    elif result == "unconfigured":
+        msg = "Strava isn't configured (need client id/secret + STRAVA_PUBLIC_URL)."
+    else:
+        msg = f"⚠️ Failed: {result}"
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(
     name="strava_subscription",
-    description="(Owner) Show the current Strava webhook subscription.",
+    description="(Owner) Strava health: subscription, linked athletes, feed channel.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -8067,13 +8111,34 @@ async def strava_subscription_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     def _do() -> str:
+        lines = ["**🏃 Strava health**"]
         try:
             subs = strava_client.view_subscriptions(cfg)
-            return f"Current subscriptions: `{subs}`" if subs else (
-                "No active subscription. Run `/strava_subscribe`."
-            )
         except Exception as exc:  # pragma: no cover - network
-            return f"⚠️ Failed: {exc}"
+            subs = None
+            lines.append(f"• Subscription: ⚠️ check failed ({exc})")
+        if subs is not None:
+            if subs:
+                for s in subs:
+                    ok = (
+                        "✅"
+                        if s.get("callback_url") == cfg.webhook_callback_url
+                        else "⚠️ callback mismatch"
+                    )
+                    lines.append(
+                        f"• Subscription `{s.get('id')}` → "
+                        f"`{s.get('callback_url')}` {ok}"
+                    )
+            else:
+                lines.append("• Subscription: ❌ none — run `/strava_subscribe`")
+        linked = len(db.list_strava_accounts())
+        feed = (
+            f"<#{STRAVA_FEED_CHANNEL_ID}>" if STRAVA_FEED_CHANNEL_ID else "*(unset)*"
+        )
+        lines.append(f"• Linked athletes: **{linked}**")
+        lines.append(f"• Feed channel: {feed}")
+        lines.append(f"• Callback: `{cfg.webhook_callback_url}`")
+        return "\n".join(lines)
 
     result = await bot.loop.run_in_executor(None, _do)
     await interaction.followup.send(result, ephemeral=True)
