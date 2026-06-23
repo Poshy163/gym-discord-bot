@@ -63,6 +63,7 @@ from .presence import (
 from . import __version__
 from . import calories
 from . import gemini_client
+from . import protein as protein_mod
 from . import revo_client
 from . import strava_client
 from . import strava_web
@@ -1022,6 +1023,83 @@ async def _handle_calorie_food_message(
     await _reply_calorie_logged(message, target, goal, kcal, note, entry_id=entry_id)
 
 
+def _protein_status_line(total: float, ceiling: float) -> str:
+    """Status line for protein vs the daily ceiling. Emphasises going *over*,
+    since the tracker exists to avoid overeating protein."""
+    bar = calories.progress_bar(total, ceiling)
+    remaining = ceiling - total
+    if remaining >= 0:
+        tail = f"**{protein_mod.format_grams(remaining)}** under your max"
+    else:
+        tail = f"⚠️ **{protein_mod.format_grams(-remaining)}** over your max"
+    return (
+        f"`{bar}` {protein_mod.format_grams(total)} / "
+        f"{protein_mod.format_grams(ceiling)} · {tail}"
+    )
+
+
+async def _handle_protein_message(
+    message: discord.Message, target: object, grams: float,
+) -> None:
+    """Persist a chat-message protein entry (`40p`, `40g protein`)."""
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    goal = db.protein_goal_get(guild_id, target_id)
+    if goal is None:
+        suffix = _target_suffix(message.author, target)
+        try:
+            await message.reply(
+                f"No protein target set{suffix} yet — run "
+                "`/protein setup <grams>` first (e.g. `180`).",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if grams <= 0 or grams > _MAX_PROTEIN_ENTRY_G:
+        try:
+            await message.reply(
+                f"That's over {_MAX_PROTEIN_ENTRY_G}g of protein in one entry — "
+                "looks like a typo, so I didn't log it.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    try:
+        db.protein_add(
+            guild_id, target_id, _display_name(target), grams,
+            raw=message.content.strip()[:80], message_id=message.id,
+        )
+    except Exception:
+        LOG.exception("Failed to store protein entry for user %s", target_id)
+        return
+    LOG.info("Stored %.0fg protein for %s in #%s", grams, target, message.channel)
+    await _reply_protein_logged(message, target, goal, grams)
+
+
+async def _reply_protein_logged(
+    message: discord.Message, target: object, goal: sqlite3.Row, grams: float,
+) -> None:
+    """React ✅ and reply with what was added + today's running total vs max."""
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    total, _n = db.protein_total_between(guild_id, target_id, *_today_window())
+    suffix = _target_suffix(message.author, target)
+    try:
+        await message.reply(
+            f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}\n"
+            + _protein_status_line(total, float(goal["daily_target_g"])),
+            mention_author=False,
+        )
+    except discord.HTTPException:
+        pass
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -1838,6 +1916,14 @@ async def on_message(message: discord.Message) -> None:
     food_hit = _match_calorie_food(message, target, content)
     if food_hit is not None:
         await _handle_calorie_food_message(message, target, *food_hit)
+        await bot.process_commands(message)
+        return
+
+    # Protein chat shortcut: `40p`, `40g protein`, `protein 40`. Requires an
+    # explicit protein marker so a bare number/weight never matches.
+    protein_grams = protein_mod.parse_protein_chat_message(content)
+    if protein_grams is not None:
+        await _handle_protein_message(message, target, protein_grams)
         await bot.process_commands(message)
         return
 
@@ -3746,6 +3832,19 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/calories stop` — stop tracking (history kept)\n"
             "Tracked members get an AI summary in the Sunday "
             "`/weekly_report`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🥩 Protein",
+        value=(
+            "Optional daily-max tracker — flags when you go *over*.\n"
+            "`/protein setup <grams>` — set your daily max (e.g. `180`)\n"
+            "`/protein add <grams> [note]` — log protein\n"
+            "Or just type `40p` / `40g protein` in chat\n"
+            "`/protein today [user]` · `/protein week [user]`\n"
+            "`/protein undo` — remove your last entry\n"
+            "`/protein stop` — stop tracking (history kept)"
         ),
         inline=False,
     )
@@ -9407,6 +9506,256 @@ async def calories_food_remove_cmd(
 
 
 bot.tree.add_command(calories_group)
+
+
+# ---------------------------------------------------------------------------
+# Protein tracking (/protein ...) — optional daily-ceiling tracker.
+# ---------------------------------------------------------------------------
+
+protein_group = app_commands.Group(
+    name="protein",
+    description="Track daily protein (grams) against a personal daily max.",
+)
+
+_MAX_PROTEIN_TARGET_G = 500
+_MAX_PROTEIN_ENTRY_G = 400
+
+_PROTEIN_NOT_SET_MSG = (
+    "You're not tracking protein yet — run `/protein setup <grams>` with your "
+    "daily max first (e.g. `180`)."
+)
+
+
+def _protein_week_days(
+    guild_id: int, user_id: int, start_iso: str, end_iso: str,
+) -> dict[str, float]:
+    """Per-local-day gram totals within the window, keyed YYYY-MM-DD."""
+    days: dict[str, float] = {}
+    for row in db.protein_entries_between(guild_id, user_id, start_iso, end_iso):
+        dt = datetime.fromisoformat(row["logged_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        day = dt.astimezone(DISPLAY_TZ).date().isoformat()
+        days[day] = days.get(day, 0.0) + float(row["grams"])
+    return days
+
+
+@protein_group.command(
+    name="setup", description="Set your daily protein max (grams).",
+)
+@app_commands.describe(target='Daily max in grams, e.g. "180".')
+async def protein_setup_cmd(
+    interaction: discord.Interaction, target: str,
+) -> None:
+    grams = protein_mod.parse_protein_amount(target)
+    if grams is None or grams <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that — give a number of grams, e.g. `180`.",
+            ephemeral=True,
+        )
+        return
+    if grams > _MAX_PROTEIN_TARGET_G:
+        await interaction.response.send_message(
+            f"That's over {_MAX_PROTEIN_TARGET_G}g/day — looks like a typo.",
+            ephemeral=True,
+        )
+        return
+    guild_id = interaction.guild_id or 0
+    db.protein_goal_set(
+        guild_id, interaction.user.id, _display_name(interaction.user), grams,
+    )
+    await interaction.response.send_message(
+        f"🥩 Daily protein max set to **{protein_mod.format_grams(grams)}**.\n"
+        "Log it with `/protein add <grams>` or just type `40p` in chat, and "
+        "check in with `/protein today`. I'll flag when you go over."
+    )
+
+
+@protein_group.command(
+    name="add", description="Log protein you just ate (grams).",
+)
+@app_commands.describe(
+    grams='Grams of protein, e.g. "40".',
+    note="What it was (optional, shows in /protein today).",
+)
+async def protein_add_cmd(
+    interaction: discord.Interaction, grams: str, note: str | None = None,
+) -> None:
+    guild_id = interaction.guild_id or 0
+    goal = db.protein_goal_get(guild_id, interaction.user.id)
+    if goal is None:
+        await interaction.response.send_message(
+            _PROTEIN_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    amount = protein_mod.parse_protein_amount(grams)
+    if amount is None or amount <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that — give a number of grams, e.g. `40`.",
+            ephemeral=True,
+        )
+        return
+    if amount > _MAX_PROTEIN_ENTRY_G:
+        await interaction.response.send_message(
+            f"That's over {_MAX_PROTEIN_ENTRY_G}g in one entry — looks like a typo.",
+            ephemeral=True,
+        )
+        return
+    db.protein_add(
+        guild_id, interaction.user.id, _display_name(interaction.user),
+        amount, note=note, raw=grams.strip(),
+    )
+    total, _n = db.protein_total_between(
+        guild_id, interaction.user.id, *_today_window(),
+    )
+    note_part = f" — {note}" if note else ""
+    await interaction.response.send_message(
+        f"🥩 Logged **{protein_mod.format_grams(amount)}** protein{note_part}\n"
+        + _protein_status_line(total, float(goal["daily_target_g"]))
+    )
+
+
+@protein_group.command(
+    name="today", description="Show today's protein vs your daily max.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def protein_today_cmd(
+    interaction: discord.Interaction, user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    goal = db.protein_goal_get(guild_id, target_user.id)
+    if goal is None:
+        msg = (
+            _PROTEIN_NOT_SET_MSG if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking protein."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    entries = db.protein_entries_between(
+        guild_id, target_user.id, *_today_window(),
+    )
+    total = sum(float(r["grams"]) for r in entries)
+    lines = [_protein_status_line(total, float(goal["daily_target_g"]))]
+    if entries:
+        lines.append("")
+        for r in entries:
+            dt = datetime.fromisoformat(r["logged_at"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            when = dt.astimezone(DISPLAY_TZ).strftime("%H:%M")
+            note_part = f" — {r['note']}" if r["note"] else ""
+            lines.append(
+                f"`{when}` {protein_mod.format_grams(float(r['grams']))}{note_part}"
+            )
+    else:
+        lines.append("\nNothing logged yet today.")
+    embed = discord.Embed(
+        title=f"🥩 Protein today — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@protein_group.command(
+    name="week", description="Per-day protein totals for the last 7 days.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def protein_week_cmd(
+    interaction: discord.Interaction, user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    guild_id = interaction.guild_id or 0
+    goal = db.protein_goal_get(guild_id, target_user.id)
+    if goal is None:
+        msg = (
+            _PROTEIN_NOT_SET_MSG if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking protein."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    _label, start_iso, end_iso = _week_window()
+    day_totals = _protein_week_days(guild_id, target_user.id, start_iso, end_iso)
+    target_g = float(goal["daily_target_g"])
+    today = datetime.now(DISPLAY_TZ).date()
+    lines = []
+    logged_days = 0
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        key = day.isoformat()
+        day_name = _WEEKDAY_NAMES[day.weekday()][:3]
+        total = day_totals.get(key)
+        if total is None:
+            lines.append(f"`{day_name}` — nothing logged")
+            continue
+        logged_days += 1
+        bar = calories.progress_bar(total, target_g)
+        over = " ⚠️" if total > target_g else ""
+        lines.append(
+            f"`{day_name}` `{bar}` {protein_mod.format_grams(total)}{over}"
+        )
+    if logged_days:
+        avg = sum(day_totals.values()) / logged_days
+        lines.append(
+            f"\nAvg on logged days: **{protein_mod.format_grams(avg)}** vs "
+            f"max {protein_mod.format_grams(target_g)}"
+        )
+    embed = discord.Embed(
+        title=f"🥩 Protein this week — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@protein_group.command(
+    name="undo", description="Remove your most recent protein entry.",
+)
+async def protein_undo_cmd(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild_id or 0
+    row = db.protein_pop_last(guild_id, interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "No protein entries to undo.", ephemeral=True,
+        )
+        return
+    note_part = f" — {row['note']}" if row["note"] else ""
+    goal = db.protein_goal_get(guild_id, interaction.user.id)
+    lines = [
+        f"↩️ Removed **{protein_mod.format_grams(float(row['grams']))}** "
+        f"protein{note_part}",
+    ]
+    if goal is not None:
+        total, _n = db.protein_total_between(
+            guild_id, interaction.user.id, *_today_window(),
+        )
+        lines.append(_protein_status_line(total, float(goal["daily_target_g"])))
+    await interaction.response.send_message("\n".join(lines))
+
+
+@protein_group.command(
+    name="stop", description="Stop tracking protein (your history is kept).",
+)
+async def protein_stop_cmd(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild_id or 0
+    removed = db.protein_goal_remove(guild_id, interaction.user.id)
+    if not removed:
+        await interaction.response.send_message(
+            "You weren't tracking protein.", ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        "🥩 Protein tracking stopped — your history is kept, and "
+        "`/protein setup` re-enables it any time."
+    )
+
+
+bot.tree.add_command(protein_group)
 
 
 def main() -> None:

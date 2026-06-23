@@ -117,6 +117,21 @@ plain food words aren't picked up by the history backfill.
 Everyone with a calorie target gets a personal AI summary in the weekly
 report (see below).
 
+### Protein (optional daily max)
+
+A lightweight, separate tracker for keeping protein **under** a daily ceiling
+(it flags when you go over, rather than nudging you to hit a goal).
+
+- `/protein setup <grams>` — set your daily max, e.g. `180`.
+- `/protein add <grams> [note]` — log protein, e.g. `/protein add 40 chicken`.
+- Or just type **`40p`** / **`40g protein`** / **`protein 40`** in chat — the
+  bot reacts ✅ and replies with your running total vs your max (with a ⚠️ once
+  you're over). An explicit `p`/`protein` marker is required, so a bare number
+  or a `40kg` lift is never mistaken for protein.
+- `/protein today [user]` · `/protein week [user]` — totals vs your max.
+- `/protein undo` — remove your most recent entry.
+- `/protein stop` — stop tracking (history kept; `setup` re-enables).
+
 Logging & editing:
 
 - `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally

@@ -214,6 +214,37 @@ CREATE TABLE IF NOT EXISTS calorie_foods (
     PRIMARY KEY (guild_id, user_id, name)
 );
 
+-- Optional protein tracker (grams). ``protein_goals`` holds each user's daily
+-- *ceiling* (the feature is about not overeating protein), and a row here is
+-- what marks a user as protein-tracking. ``protein_entries`` is one row per
+-- logged amount; ``message_id`` dedupes chat-logged entries on backfill re-scan.
+CREATE TABLE IF NOT EXISTS protein_goals (
+    guild_id       INTEGER NOT NULL,
+    user_id        INTEGER NOT NULL,
+    username       TEXT    NOT NULL,
+    daily_target_g REAL    NOT NULL,
+    set_at         TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS protein_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    username   TEXT    NOT NULL,
+    grams      REAL    NOT NULL,
+    note       TEXT,
+    raw        TEXT,
+    message_id INTEGER,
+    logged_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_protein_entries_user
+    ON protein_entries (guild_id, user_id, logged_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_protein_entries_dedupe
+    ON protein_entries (message_id) WHERE message_id IS NOT NULL;
+
 -- Maps the bot's calorie-log reply to the entry it created, so a ❌ reaction on
 -- that reply removes exactly that entry (per-entry undo, mirroring lifts).
 -- original_message_id is the chat message that triggered the log — suppressed on
@@ -2646,6 +2677,135 @@ class Database:
                 (guild_id, user_id, start_iso, end_iso),
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
+
+    # ---- protein (grams) -------------------------------------------------
+
+    def protein_goal_set(
+        self, guild_id: int, user_id: int, username: str,
+        daily_target_g: float,
+    ) -> None:
+        """Create or update a user's daily protein ceiling (grams)."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO protein_goals
+                    (guild_id, user_id, username, daily_target_g, set_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    username       = excluded.username,
+                    daily_target_g = excluded.daily_target_g,
+                    set_at         = excluded.set_at
+                """,
+                (
+                    guild_id, user_id, username,
+                    float(daily_target_g), _normalize_iso(None),
+                ),
+            )
+
+    def protein_goal_get(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT username, daily_target_g, set_at "
+                "FROM protein_goals WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+
+    def protein_goal_remove(self, guild_id: int, user_id: int) -> bool:
+        """Stop protein tracking; logged history is kept."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM protein_goals WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def protein_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, username, daily_target_g "
+                "FROM protein_goals WHERE guild_id = ? ORDER BY username",
+                (guild_id,),
+            ))
+
+    def protein_add(
+        self, guild_id: int, user_id: int, username: str, grams: float,
+        note: str | None = None, raw: str | None = None,
+        logged_at: datetime | None = None,
+        message_id: int | None = None,
+    ) -> int:
+        """Insert one protein entry. Returns the new row id, or 0 if a row for
+        this ``message_id`` already exists (dedupe)."""
+        with self._conn() as c:
+            try:
+                cur = c.execute(
+                    """
+                    INSERT INTO protein_entries
+                        (guild_id, user_id, username, grams, note, raw,
+                         message_id, logged_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id, user_id, username, float(grams),
+                        note, raw, message_id, _normalize_iso(logged_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return 0
+            return int(cur.lastrowid or 0)
+
+    def protein_pop_last(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        """Delete the user's most recent protein entry and return it."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, grams, note, raw, logged_at
+                FROM protein_entries
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY logged_at DESC, id DESC
+                LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM protein_entries WHERE id = ?", (row["id"],))
+            return row
+
+    def protein_total_between(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> tuple[float, int]:
+        """Sum of grams and entry count in [start_iso, end_iso)."""
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COALESCE(SUM(grams), 0) AS total, COUNT(*) AS n
+                FROM protein_entries
+                WHERE guild_id = ? AND user_id = ?
+                  AND logged_at >= ? AND logged_at < ?
+                """,
+                (guild_id, user_id, start_iso, end_iso),
+            ).fetchone()
+            return float(row["total"] or 0.0), int(row["n"] or 0)
+
+    def protein_entries_between(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> list[sqlite3.Row]:
+        """All protein entries in [start_iso, end_iso), oldest first."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT id, grams, note, raw, logged_at
+                FROM protein_entries
+                WHERE guild_id = ? AND user_id = ?
+                  AND logged_at >= ? AND logged_at < ?
+                ORDER BY logged_at, id
+                """,
+                (guild_id, user_id, start_iso, end_iso),
+            ))
 
     # ---- saved foods -----------------------------------------------------
 
