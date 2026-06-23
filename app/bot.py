@@ -63,6 +63,7 @@ from .presence import (
 from . import __version__
 from . import calories
 from . import gemini_client
+from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
 from . import strava_client
@@ -1091,11 +1092,115 @@ async def _reply_protein_logged(
     total, _n = db.protein_total_between(guild_id, target_id, *_today_window())
     suffix = _target_suffix(message.author, target)
     try:
-        await message.reply(
+        reply = await message.reply(
             f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}\n"
             + _protein_status_line(total, float(goal["daily_target_g"])),
             mention_author=False,
         )
+    except discord.HTTPException:
+        return
+    # ❌ affordance — the legacy undo path resolves the entry via this reply's
+    # reference, so no tracking row is needed.
+    try:
+        await reply.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+
+
+async def _handle_combined_nutrition(
+    message: discord.Message, target: object, kcal: float, grams: float,
+) -> None:
+    """Log a message that carries BOTH a calorie and a protein amount
+    (`500c and 40p`) — stores each entry the user is tracking and posts one
+    combined reply."""
+    guild_id = message.guild.id if message.guild else 0
+    target_id = int(getattr(target, "id"))
+    cal_goal = db.calorie_goal_get(guild_id, target_id)
+    pro_goal = db.protein_goal_get(guild_id, target_id)
+    suffix = _target_suffix(message.author, target)
+    if cal_goal is None and pro_goal is None:
+        try:
+            await message.reply(
+                f"No calorie or protein target set{suffix} yet — run "
+                "`/calories setup` and/or `/protein setup` first.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    raw = message.content.strip()[:80]
+    logged: list[str] = []      # "**500 cal**", "**40 g** protein"
+    status_lines: list[str] = []
+    skipped: list[str] = []
+
+    if cal_goal is not None:
+        if 0 < kcal <= _MAX_ENTRY_KCAL:
+            db.calorie_add(
+                guild_id, target_id, _display_name(target), kcal,
+                raw=raw, message_id=message.id,
+            )
+            total, _n = db.calorie_total_between(
+                guild_id, target_id, *_today_window(),
+            )
+            logged.append(f"**{calories.format_kcal(kcal)}**")
+            status_lines.append(
+                _calorie_status_line(total, float(cal_goal["daily_target_kcal"]))
+            )
+        else:
+            skipped.append("calories (looks like a typo)")
+    elif kcal > 0:
+        skipped.append("calories (run `/calories setup`)")
+
+    if pro_goal is not None:
+        if 0 < grams <= _MAX_PROTEIN_ENTRY_G:
+            db.protein_add(
+                guild_id, target_id, _display_name(target), grams,
+                raw=raw, message_id=message.id,
+            )
+            total, _n = db.protein_total_between(
+                guild_id, target_id, *_today_window(),
+            )
+            logged.append(f"**{protein_mod.format_grams(grams)}** protein")
+            status_lines.append(
+                _protein_status_line(total, float(pro_goal["daily_target_g"]))
+            )
+        else:
+            skipped.append("protein (looks like a typo)")
+    elif grams > 0:
+        skipped.append("protein (run `/protein setup`)")
+
+    if not logged:
+        note = ", ".join(skipped) if skipped else "nothing"
+        try:
+            await message.reply(f"Didn't log {note}.", mention_author=False)
+        except discord.HTTPException:
+            pass
+        return
+
+    LOG.info(
+        "Stored combined entry (%s) for %s in #%s",
+        " + ".join(logged), target, message.channel,
+    )
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    tail = (
+        f"\n*(skipped {', '.join(skipped)})*" if skipped else ""
+    )
+    try:
+        # Leading 🥗 marks this as a combined reply; the undo handler removes
+        # every nutrition entry tied to the source message.
+        reply = await message.reply(
+            f"🥗 Logged {' + '.join(logged)}{suffix}\n"
+            + "\n".join(status_lines) + tail,
+            mention_author=False,
+        )
+    except discord.HTTPException:
+        return
+    try:
+        await reply.add_reaction("❌")
     except discord.HTTPException:
         pass
 
@@ -1927,6 +2032,14 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
+    # Combined log: a message carrying BOTH a calorie and a protein amount,
+    # e.g. `500c and 40p`. Only fires when both tokens are present.
+    combined = nutrition.parse_combined(content)
+    if combined is not None:
+        await _handle_combined_nutrition(message, target, *combined)
+        await bot.process_commands(message)
+        return
+
     lifts = parse_message(content, custom_aliases=guild_aliases)
     lifts, rejected_lifts = _split_reasonable_lifts(lifts)
     # Backdated logging: phrases like "yesterday", "3 days ago", "monday",
@@ -2114,6 +2227,13 @@ async def _handle_calorie_edit(
     target_id = int(getattr(target, "id"))
     existing = db.get_calorie_entry_by_message(guild_id, after.id)
     new_hit = calories.parse_chat_message(content)
+    if new_hit is None:
+        # A combined "500c and 40p" message still carries a calorie amount —
+        # treat its calorie part as the entry so an edit updates (not deletes)
+        # the stored calories.
+        combined = nutrition.parse_combined(content)
+        if combined is not None:
+            new_hit = (combined[0], "kcal", None)
     if existing is None and new_hit is None:
         return False  # not a calorie message before or after
 
@@ -2314,15 +2434,16 @@ def _check_goal_hits(
     return cleared
 
 
-async def _handle_calorie_reaction_undo(
+async def _handle_nutrition_reaction_undo(
     payload: discord.RawReactionActionEvent,
 ) -> None:
-    """Remove a single calorie entry when its logger/target/admin reacts ❌ on
-    the bot's `🍽️ +N cal` reply.
+    """Remove the calorie and/or protein entries a chat message logged when its
+    logger/target/admin reacts ❌ on the bot's reply.
 
-    Works for tracked replies (new logs) *and* legacy ones: when there's no
-    tracking row, we follow the bot reply's reference back to the original chat
-    message and look the entry up by that message id.
+    Covers calorie (🍽️), protein (🥩) and combined (🥗) replies. Tracked
+    single-calorie replies use their tracking row; the rest (protein, combined,
+    legacy) resolve via the reply's referenced source message and remove every
+    nutrition entry tied to it.
     """
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
@@ -2334,41 +2455,45 @@ async def _handle_calorie_reaction_undo(
         reply_msg = await channel.fetch_message(payload.message_id)
     except discord.HTTPException:
         return
-    # Only act on our own calorie-log replies (skip lift replies, already-undone
-    # ones whose text now starts with "~~", etc.).
+    # Only act on our own nutrition-log replies (skip lift replies and
+    # already-undone ones whose text now starts with "~~").
     if reply_msg.author.id != (bot.user.id if bot.user else 0):
         return
-    if not reply_msg.content.startswith("🍽️"):
+    if not reply_msg.content.startswith(("🍽️", "🥩", "🥗")):
         return
 
     guild_id = payload.guild_id or 0
     logger_id: int | None = None
+    removed_bits: list[str] = []
+
     crec = db.get_calorie_reply(payload.message_id)
     if crec is not None:
+        # Tracked single-calorie reply.
         target_user_id = int(crec["target_user_id"])
         logger_id = int(crec["user_id"])
         if payload.user_id not in ({logger_id, target_user_id} | ADMIN_USER_IDS):
             return
-        # Race protection: claim the reply by deleting its tracking row first.
         if db.delete_calorie_reply(payload.message_id) == 0:
-            return
-        calorie_id = int(crec["calorie_id"])
+            return  # race: another ❌ already claimed it
         original_id = crec["original_message_id"]
+        r = db.delete_calorie_entry(
+            guild_id, target_user_id, int(crec["calorie_id"]),
+        )
+        if r is not None:
+            removed_bits.append(calories.format_kcal(float(r["kcal"])))
     else:
-        # Legacy fallback: resolve the entry via the reply's referenced message.
+        # Protein / combined / legacy: resolve via the referenced message and
+        # remove every nutrition entry it created.
         ref = reply_msg.reference
         original_id = ref.message_id if ref else None
         if original_id is None:
             return
-        entry = db.get_calorie_entry_by_message(guild_id, int(original_id))
-        if entry is None:
-            return  # already removed, or not a tracked calorie message
-        target_user_id = int(entry["user_id"])
-        calorie_id = int(entry["id"])
-        allowed = {target_user_id} | ADMIN_USER_IDS
-        if payload.user_id not in allowed:
-            # We don't know the logger from the DB here — check the source
-            # message's author before refusing.
+        cal_entry = db.get_calorie_entry_by_message(guild_id, int(original_id))
+        pro_entry = db.get_protein_entry_by_message(guild_id, int(original_id))
+        if cal_entry is None and pro_entry is None:
+            return
+        target_user_id = int((cal_entry or pro_entry)["user_id"])
+        if payload.user_id not in ({target_user_id} | ADMIN_USER_IDS):
             try:
                 original = await channel.fetch_message(int(original_id))
                 logger_id = original.author.id
@@ -2376,8 +2501,21 @@ async def _handle_calorie_reaction_undo(
                 logger_id = None
             if payload.user_id != logger_id:
                 return
+        if cal_entry is not None:
+            r = db.delete_calorie_entry(
+                guild_id, target_user_id, int(cal_entry["id"]),
+            )
+            if r is not None:
+                removed_bits.append(calories.format_kcal(float(r["kcal"])))
+        if pro_entry is not None:
+            r = db.delete_protein_entry(
+                guild_id, target_user_id, int(pro_entry["id"]),
+            )
+            if r is not None:
+                removed_bits.append(
+                    f"{protein_mod.format_grams(float(r['grams']))} protein"
+                )
 
-    removed = db.delete_calorie_entry(guild_id, target_user_id, calorie_id)
     # Suppress the source message so a restart backfill won't re-import it.
     if original_id is not None:
         db.suppress_message(guild_id, int(original_id))
@@ -2388,14 +2526,9 @@ async def _handle_calorie_reaction_undo(
         and payload.user_id != logger_id
     )
     actor = "an admin" if by_admin else "the user"
-    if removed is not None:
-        total, _n = db.calorie_total_between(
-            guild_id, target_user_id, *_today_window(),
-        )
+    if removed_bits:
         note = (
-            f"↩️ Removed **{calories.format_kcal(float(removed['kcal']))}** at "
-            f"{actor}'s request. Today's total is now "
-            f"{calories.format_kcal(total)}."
+            f"↩️ Removed **{' + '.join(removed_bits)}** at {actor}'s request."
         )
     else:
         note = "↩️ Nothing to undo (already removed)."
@@ -2438,7 +2571,7 @@ async def on_raw_reaction_add(
     rec = db.get_reply(payload.message_id)
     if rec is None:
         # Not a lift reply — maybe a calorie reply.
-        await _handle_calorie_reaction_undo(payload)
+        await _handle_nutrition_reaction_undo(payload)
         return
     target_user_id = int(rec["target_user_id"])
     allowed = {int(rec["user_id"]), target_user_id} | ADMIN_USER_IDS
@@ -3842,6 +3975,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/protein setup <grams>` — set your daily max (e.g. `180`)\n"
             "`/protein add <grams> [note]` — log protein\n"
             "Or just type `40p` / `40g protein` in chat\n"
+            "Log both at once: `500c and 40p`\n"
             "`/protein today [user]` · `/protein week [user]`\n"
             "`/protein undo` — remove your last entry\n"
             "`/protein stop` — stop tracking (history kept)"

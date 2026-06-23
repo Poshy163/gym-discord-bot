@@ -2791,6 +2791,34 @@ class Database:
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
 
+    def get_protein_entry_by_message(
+        self, guild_id: int, message_id: int,
+    ) -> sqlite3.Row | None:
+        """The protein entry created from a given source chat message, or None
+        (used by ❌ reaction-undo on protein/combined replies)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT id, user_id, grams, note FROM protein_entries "
+                "WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            ).fetchone()
+
+    def delete_protein_entry(
+        self, guild_id: int, target_user_id: int, protein_id: int,
+    ) -> sqlite3.Row | None:
+        """Delete one protein entry by id, scoped to (guild, user). Returns the
+        deleted row or None if already gone."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, grams, note FROM protein_entries "
+                "WHERE id = ? AND guild_id = ? AND user_id = ?",
+                (protein_id, guild_id, target_user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM protein_entries WHERE id = ?", (protein_id,))
+            return row
+
     def protein_entries_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> list[sqlite3.Row]:

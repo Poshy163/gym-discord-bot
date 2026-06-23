@@ -110,3 +110,16 @@ def test_protein_entries_between_scoped_to_user(db):
         1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
     )
     assert [r["grams"] for r in rows] == [40]
+
+
+def test_get_and_delete_protein_entry_by_message(db):
+    # Backs ❌ reaction-undo on protein/combined replies.
+    eid = db.protein_add(1, 100, "alice", 40, message_id=777)
+    row = db.get_protein_entry_by_message(1, 777)
+    assert row is not None and row["id"] == eid and row["user_id"] == 100
+    assert db.get_protein_entry_by_message(1, 999) is None
+    # Wrong user can't delete; correct (guild, user) removes it.
+    assert db.delete_protein_entry(1, 999, eid) is None
+    removed = db.delete_protein_entry(1, 100, eid)
+    assert removed is not None and removed["grams"] == 40
+    assert db.delete_protein_entry(1, 100, eid) is None

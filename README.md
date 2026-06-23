@@ -129,8 +129,14 @@ A lightweight, separate tracker for keeping protein **under** a daily ceiling
   you're over). An explicit `p`/`protein` marker is required, so a bare number
   or a `40kg` lift is never mistaken for protein.
 - `/protein today [user]` · `/protein week [user]` — totals vs your max.
-- `/protein undo` — remove your most recent entry.
+- `/protein undo` — remove your most recent entry, or react ❌ on the bot's
+  reply to remove that specific one (the logger, the target, or an admin).
 - `/protein stop` — stop tracking (history kept; `setup` re-enables).
+
+**Log both at once:** a message with both amounts — e.g. `500c and 40p` (also
+`40p 500c`, `2700kj and 40g protein`) — records the calorie *and* the protein
+entry together and replies with both totals. Only what you're tracking is
+logged; the rest is skipped with a note. React ❌ on the reply to remove both.
 
 Logging & editing:
 
