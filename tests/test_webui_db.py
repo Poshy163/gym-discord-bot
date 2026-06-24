@@ -1,0 +1,187 @@
+"""Tests for the web-dashboard data layer: the member/role mirror, the unified
+audit log, the ``audit_live`` gate (so a startup backfill doesn't flood the
+log), and the audited edit helpers the dashboard calls.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+
+from app.db import Database
+
+
+@dataclass
+class _Lift:
+    equipment: str
+    weight_kg: float
+    bodyweight_add: bool = False
+    raw: str = ""
+    reps: int | None = None
+
+
+@pytest.fixture()
+def db(tmp_path):
+    d = Database(tmp_path / "gym.sqlite3")
+    yield d
+    d.close()
+
+
+def _seed_guild(db):
+    db.set_guild_meta(1, "Gym Server", 2)
+    db.sync_guild_roles(1, [
+        {"id": 10, "name": "Admin", "color": 0xFF0000, "position": 5,
+         "managed": False},
+        {"id": 11, "name": "Member", "color": 0, "position": 1,
+         "managed": False},
+    ])
+    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.upsert_member(1, 200, "bob", "Bob", present=True)
+    db.set_member_roles(1, 100, [10, 11])
+    db.set_member_roles(1, 200, [11])
+
+
+# ---- mirror ---------------------------------------------------------------
+
+def test_roles_carry_member_counts(db):
+    _seed_guild(db)
+    roles = {r["name"]: r["members"] for r in db.list_guild_roles(1)}
+    assert roles == {"Admin": 1, "Member": 2}
+
+
+def test_members_list_includes_role_count(db):
+    _seed_guild(db)
+    members = {m["display_name"]: m["role_count"] for m in db.list_members(1)}
+    assert members == {"Alice": 2, "Bob": 1}
+
+
+def test_set_member_roles_replaces_wholesale(db):
+    _seed_guild(db)
+    db.set_member_roles(1, 100, [11])  # drop Admin
+    names = [r["name"] for r in db.member_role_names(1, 100)]
+    assert names == ["Member"]
+    assert {r["name"]: r["members"] for r in db.list_guild_roles(1)}["Admin"] == 0
+
+
+def test_members_with_role(db):
+    _seed_guild(db)
+    holders = {m["display_name"] for m in db.members_with_role(1, 11)}
+    assert holders == {"Alice", "Bob"}
+
+
+def test_delete_role_removes_edges(db):
+    _seed_guild(db)
+    db.delete_role(1, 10)
+    assert all(r["name"] != "Admin" for r in db.list_guild_roles(1))
+    assert [r["name"] for r in db.member_role_names(1, 100)] == ["Member"]
+
+
+def test_absent_member_kept_for_history(db):
+    _seed_guild(db)
+    db.set_member_present(1, 200, False)
+    rows = {m["display_name"]: m["present"] for m in db.list_members(1)}
+    assert rows["Bob"] == 0
+    # Still excluded when asked for present-only.
+    present = [m["display_name"] for m in db.list_members(1, include_absent=False)]
+    assert present == ["Alice"]
+
+
+def test_list_guilds_unions_sources(db):
+    db.set_guild_meta(1, "Named", 1)
+    db.add_lifts(2, 100, "u100", [_Lift("bench", 100)], message_id=1)
+    ids = {r["guild_id"]: r["name"] for r in db.list_guilds()}
+    assert ids[1] == "Named"
+    assert 2 in ids  # appears via lifts even without metadata
+
+
+# ---- audit log ------------------------------------------------------------
+
+def test_add_and_filter_audit(db):
+    db.add_audit(1, "role", "role_add", subject_id=100,
+                 subject_name="Alice", detail="gained Admin")
+    db.add_audit(1, "member", "join", subject_id=200, subject_name="Bob")
+    db.add_audit(1, "data", "lift_add", subject_id=100, subject_name="Alice")
+
+    assert db.count_audit(1) == 3
+    assert db.count_audit(1, category="role") == 1
+    assert db.count_audit(1, subject_id=100) == 2
+    roles = db.list_audit(1, category="role")
+    assert len(roles) == 1 and roles[0]["detail"] == "gained Admin"
+
+
+def test_audit_newest_first(db):
+    for i in range(3):
+        db.add_audit(1, "data", f"a{i}", subject_id=1)
+    actions = [r["action"] for r in db.list_audit(1)]
+    assert actions == ["a2", "a1", "a0"]
+
+
+# ---- audit_live gate ------------------------------------------------------
+
+def test_data_changes_not_audited_during_backfill(db):
+    # audit_live defaults False: a backfill import logs nothing.
+    db.calorie_add(1, 100, "Alice", 500)
+    db.protein_add(1, 100, "Alice", 40)
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)], message_id=1)
+    assert db.count_audit(1, category="data") == 0
+
+
+def test_data_changes_audited_when_live(db):
+    db.audit_live = True
+    db.calorie_add(1, 100, "Alice", 500, note="lunch")
+    db.protein_add(1, 100, "Alice", 40)
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)], message_id=1)
+    assert db.count_audit(1, category="data") == 3
+    actions = {r["action"] for r in db.list_audit(1, category="data")}
+    assert actions == {"calorie_add", "protein_add", "lift_add"}
+
+
+# ---- audited edit helpers -------------------------------------------------
+
+def test_web_delete_lift_audits(db):
+    ids = db.add_lifts_returning_ids(1, 100, "Alice", [_Lift("bench", 100)])
+    assert db.web_delete_lift(1, ids[0], "web:1.2.3.4") is True
+    # Row gone, deletion audited and attributed to the web actor.
+    assert db.web_list_lifts(1) == []
+    row = db.list_audit(1, category="data")[0]
+    assert row["action"] == "lift_delete"
+    assert row["actor_name"] == "web:1.2.3.4"
+    assert row["subject_id"] == 100
+
+
+def test_web_update_lift_audits_change(db):
+    ids = db.add_lifts_returning_ids(1, 100, "Alice", [_Lift("bench", 100)])
+    ok = db.web_update_lift(
+        1, ids[0], weight_kg=110, reps=5, equipment="bench press",
+        actor_name="web:op",
+    )
+    assert ok
+    rows = db.web_list_lifts(1)
+    assert rows[0]["weight_kg"] == 110 and rows[0]["equipment"] == "bench press"
+    assert db.list_audit(1, category="data")[0]["action"] == "lift_edit"
+
+
+def test_web_delete_missing_is_false(db):
+    assert db.web_delete_lift(1, 999, "web:op") is False
+    assert db.web_delete_calorie(1, 999, "web:op") is False
+    assert db.web_delete_protein(1, 999, "web:op") is False
+
+
+def test_web_delete_calorie_and_protein(db):
+    cid = db.calorie_add(1, 100, "Alice", 500)
+    pid = db.protein_add(1, 100, "Alice", 40)
+    assert db.web_delete_calorie(1, cid, "web:op") is True
+    assert db.web_delete_protein(1, pid, "web:op") is True
+    assert db.count_audit(1, category="data") == 2
+
+
+def test_member_overview_aggregates(db):
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100), _Lift("squat", 140)])
+    db.calorie_add(1, 100, "Alice", 500)
+    db.calorie_add(1, 100, "Alice", 300)
+    db.set_bodyweight(1, 100, 82.5)
+    ov = db.web_member_overview(1, 100)
+    assert ov["lifts"]["n"] == 2 and ov["lifts"]["equip"] == 2
+    assert ov["calories"]["total"] == 800
+    assert ov["bodyweight"]["weight_kg"] == 82.5

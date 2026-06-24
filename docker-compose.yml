@@ -12,6 +12,10 @@ services:
     # match STRAVA_PORT if you change it.
     ports:
       - "8080:8080"
+      # Operator web dashboard (app/webui.py). Only needed when WEBUI_PASSWORD
+      # is set; keep it behind a reverse proxy / VPN since it exposes member
+      # data. Match the host port to WEBUI_PORT if you change it.
+      - "8081:8081"
     volumes:
       - gym-data:/data
     # The bot has no HTTP surface, so health is "can we still open the SQLite

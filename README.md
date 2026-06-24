@@ -265,6 +265,27 @@ Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, `/strava_latest`
 (show the most recent activity on demand), and owner-only `/strava_subscribe`,
 `/strava_subscription`, `/strava_unsubscribe`.
 
+## Web dashboard
+
+An authenticated operator dashboard (separate web server, default port `8081`)
+for browsing and editing everything the bot tracks without touching Discord:
+
+- **Overview** — server totals and the most recent activity.
+- **Members** — every member with their roles, join date, and linked
+  Strava/Revo accounts; drill into one member for their lift/nutrition
+  counters, bodyweight, roles, and personal history.
+- **Roles** — each role with its colour and live member list.
+- **Audit log** — a unified, filterable trail of role changes, member
+  join/leave/nickname/username changes, and every data edit (logs, deletes,
+  and dashboard corrections).
+- **Lifts / Calories / Protein** — the raw entries, with inline delete and
+  (for lifts) edit. Every change is written to the audit log.
+
+It is **off until you set `WEBUI_PASSWORD`**. Enabling it also turns on the
+privileged **Server Members** intent, which you must additionally toggle on for
+the bot in the Discord Developer Portal. Full setup is in
+[docs/WEBUI.md](docs/WEBUI.md).
+
 ## Setup
 
 1. Create a Discord application + bot at <https://discord.com/developers/applications>.

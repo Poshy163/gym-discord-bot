@@ -287,6 +287,88 @@ CREATE TABLE IF NOT EXISTS strava_pending_auth (
     user_id    INTEGER NOT NULL,
     created_at TEXT    NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- Web dashboard support: a mirror of the guild's member/role state plus a
+-- unified audit log. These are populated by the bot (members intent required)
+-- on startup and from gateway events, and read/edited by app/webui.py.
+-- ---------------------------------------------------------------------------
+
+-- Friendly guild names for the dashboard's guild picker, kept fresh by the
+-- member/role sync. Tiny by design — one row per guild the bot is in.
+CREATE TABLE IF NOT EXISTS guild_meta (
+    guild_id     INTEGER PRIMARY KEY,
+    name         TEXT    NOT NULL,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT    NOT NULL
+);
+
+-- One row per role the bot can see, refreshed on startup and from the
+-- guild_role_* gateway events. ``color`` is the integer RGB value Discord
+-- gives us (0 = no colour). ``position`` orders roles like the Discord UI.
+CREATE TABLE IF NOT EXISTS guild_roles (
+    guild_id   INTEGER NOT NULL,
+    role_id    INTEGER NOT NULL,
+    name       TEXT    NOT NULL,
+    color      INTEGER NOT NULL DEFAULT 0,
+    position   INTEGER NOT NULL DEFAULT 0,
+    managed    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, role_id)
+);
+
+-- Mirror of guild membership. ``present`` is 1 while the member is in the
+-- guild, 0 once they leave (we keep the row so historical audit entries still
+-- resolve to a name). ``display_name`` is the server nickname or username.
+CREATE TABLE IF NOT EXISTS members (
+    guild_id     INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    username     TEXT    NOT NULL,
+    display_name TEXT    NOT NULL,
+    is_bot       INTEGER NOT NULL DEFAULT 0,
+    present      INTEGER NOT NULL DEFAULT 1,
+    joined_at    TEXT,
+    updated_at   TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+-- Current role assignments — the (guild, user) -> role edges. Replaced
+-- wholesale whenever a member's roles change so it always reflects "now".
+CREATE TABLE IF NOT EXISTS member_roles (
+    guild_id INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    role_id  INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_roles_role
+    ON member_roles (guild_id, role_id);
+
+-- Append-only audit trail. ``category`` is one of: role, member, data. ``actor``
+-- is who performed the change (a Discord user, or the web user for dashboard
+-- edits — actor_id is NULL/0 then and actor_name carries the label). ``subject``
+-- is who/what the change is about. ``detail`` is a free-form human string.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    at           TEXT    NOT NULL,
+    category     TEXT    NOT NULL,
+    action       TEXT    NOT NULL,
+    actor_id     INTEGER,
+    actor_name   TEXT,
+    subject_id   INTEGER,
+    subject_name TEXT,
+    detail       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_at
+    ON audit_log (guild_id, at);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_subject
+    ON audit_log (guild_id, subject_id, at);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_category
+    ON audit_log (guild_id, category, at);
 """
 
 
@@ -321,6 +403,12 @@ class Database:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Gates audit logging of *data* mutations (lift/calorie/protein adds and
+        # removals) made through normal bot operation. Left False during the
+        # startup backfill so re-importing history doesn't flood the audit log;
+        # bot.py flips it to True once the backfill settles. Web-dashboard edits
+        # always audit explicitly via ``add_audit`` regardless of this flag.
+        self.audit_live = False
         self._connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -584,6 +672,13 @@ class Database:
                         ),
                     )
                     inserted += 1
+                    if self.audit_live:
+                        self._audit(
+                            c, guild_id, "data", "lift_add",
+                            actor_id=user_id, actor_name=username,
+                            subject_id=user_id, subject_name=username,
+                            detail=f"{lift.equipment} {lift.weight_kg:g}kg",
+                        )
                 except sqlite3.IntegrityError:
                     # dedupe on (message_id, equipment) — silent skip is
                     # intentional so re-runs of /parse and backfills are
@@ -631,6 +726,13 @@ class Database:
                     )
                     if cur.lastrowid:
                         ids.append(int(cur.lastrowid))
+                        if self.audit_live:
+                            self._audit(
+                                c, guild_id, "data", "lift_add",
+                                actor_id=user_id, actor_name=username,
+                                subject_id=user_id, subject_name=username,
+                                detail=f"{lift.equipment} {lift.weight_kg:g}kg",
+                            )
                 except sqlite3.IntegrityError:
                     continue
         return ids
@@ -2523,7 +2625,16 @@ class Database:
             except sqlite3.IntegrityError:
                 # Duplicate (message_id) — already logged this message.
                 return 0
-            return int(cur.lastrowid or 0)
+            new_id = int(cur.lastrowid or 0)
+            if self.audit_live and new_id:
+                self._audit(
+                    c, guild_id, "data", "calorie_add",
+                    actor_id=user_id, actor_name=username,
+                    subject_id=user_id, subject_name=username,
+                    detail=f"+{float(kcal):.0f} kcal"
+                    + (f" ({note})" if note else ""),
+                )
+            return new_id
 
     def calorie_pop_last(
         self, guild_id: int, user_id: int,
@@ -2753,7 +2864,16 @@ class Database:
                 )
             except sqlite3.IntegrityError:
                 return 0
-            return int(cur.lastrowid or 0)
+            new_id = int(cur.lastrowid or 0)
+            if self.audit_live and new_id:
+                self._audit(
+                    c, guild_id, "data", "protein_add",
+                    actor_id=user_id, actor_name=username,
+                    subject_id=user_id, subject_name=username,
+                    detail=f"+{float(grams):.0f} g"
+                    + (f" ({note})" if note else ""),
+                )
+            return new_id
 
     def protein_pop_last(
         self, guild_id: int, user_id: int,
@@ -2891,3 +3011,532 @@ class Database:
                 "ORDER BY display COLLATE NOCASE",
                 (guild_id, user_id),
             ))
+
+    # ====================================================================
+    # Web dashboard: audit log, member/role mirror, and editing helpers.
+    # ====================================================================
+
+    def _audit(
+        self,
+        c: sqlite3.Connection,
+        guild_id: int,
+        category: str,
+        action: str,
+        *,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
+        subject_id: int | None = None,
+        subject_name: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Insert one audit row using an existing connection/transaction.
+
+        Defensive by design: a failure to write an audit row must never break
+        the real mutation it accompanies, so all errors are swallowed.
+        """
+        try:
+            c.execute(
+                """
+                INSERT INTO audit_log
+                    (guild_id, at, category, action, actor_id, actor_name,
+                     subject_id, subject_name, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id, _normalize_iso(None), category, action,
+                    actor_id, actor_name, subject_id, subject_name, detail,
+                ),
+            )
+        except sqlite3.Error:  # pragma: no cover - audit is best-effort
+            pass
+
+    def add_audit(
+        self,
+        guild_id: int,
+        category: str,
+        action: str,
+        *,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
+        subject_id: int | None = None,
+        subject_name: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Public, self-contained audit insert (its own transaction). Used by
+        the bot's gateway-event handlers and the web dashboard's edits."""
+        with self._conn() as c:
+            self._audit(
+                c, guild_id, category, action,
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=subject_id, subject_name=subject_name,
+                detail=detail,
+            )
+
+    def list_audit(
+        self,
+        guild_id: int,
+        *,
+        category: str | None = None,
+        subject_id: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        """Most-recent-first slice of the audit log, optionally filtered by
+        category and/or subject user."""
+        sql = "SELECT * FROM audit_log WHERE guild_id = ?"
+        params: list[object] = [guild_id]
+        if category:
+            sql += " AND category = ?"
+            params.append(category)
+        if subject_id is not None:
+            sql += " AND subject_id = ?"
+            params.append(subject_id)
+        sql += " ORDER BY at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._conn() as c:
+            return list(c.execute(sql, params))
+
+    def count_audit(
+        self,
+        guild_id: int,
+        *,
+        category: str | None = None,
+        subject_id: int | None = None,
+    ) -> int:
+        sql = "SELECT COUNT(*) FROM audit_log WHERE guild_id = ?"
+        params: list[object] = [guild_id]
+        if category:
+            sql += " AND category = ?"
+            params.append(category)
+        if subject_id is not None:
+            sql += " AND subject_id = ?"
+            params.append(subject_id)
+        with self._conn() as c:
+            row = c.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
+
+    # ---- role / member mirror -------------------------------------------
+
+    def set_guild_meta(
+        self, guild_id: int, name: str, member_count: int = 0,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO guild_meta (guild_id, name, member_count, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    name = excluded.name,
+                    member_count = excluded.member_count,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, name, int(member_count), _normalize_iso(None)),
+            )
+
+    def list_guilds(self) -> list[sqlite3.Row]:
+        """Guild picker data: every known guild_id with a name when we have one.
+
+        Left-joins the metadata table over the union of guilds that appear in
+        any tracked table, so a guild shows up even before its first sync.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT g.guild_id,
+                       COALESCE(gm.name, '') AS name,
+                       COALESCE(gm.member_count, 0) AS member_count
+                FROM (
+                    SELECT guild_id FROM members
+                    UNION SELECT guild_id FROM lifts
+                    UNION SELECT guild_id FROM guild_meta
+                ) g
+                LEFT JOIN guild_meta gm ON gm.guild_id = g.guild_id
+                ORDER BY name COLLATE NOCASE, g.guild_id
+                """
+            ))
+
+    def sync_guild_roles(
+        self, guild_id: int, roles: list[dict],
+    ) -> None:
+        """Replace the stored role list for a guild with ``roles`` (each a dict
+        with id/name/color/position/managed). Idempotent full refresh used on
+        startup; individual gateway events use ``upsert_role``/``delete_role``."""
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            c.execute("DELETE FROM guild_roles WHERE guild_id = ?", (guild_id,))
+            for r in roles:
+                c.execute(
+                    """
+                    INSERT INTO guild_roles
+                        (guild_id, role_id, name, color, position, managed,
+                         updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id, int(r["id"]), str(r["name"]),
+                        int(r.get("color", 0)), int(r.get("position", 0)),
+                        1 if r.get("managed") else 0, ts,
+                    ),
+                )
+
+    def upsert_role(
+        self, guild_id: int, role_id: int, name: str,
+        color: int = 0, position: int = 0, managed: bool = False,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO guild_roles
+                    (guild_id, role_id, name, color, position, managed,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, role_id) DO UPDATE SET
+                    name = excluded.name,
+                    color = excluded.color,
+                    position = excluded.position,
+                    managed = excluded.managed,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id, role_id, name, int(color), int(position),
+                    1 if managed else 0, _normalize_iso(None),
+                ),
+            )
+
+    def delete_role(self, guild_id: int, role_id: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM guild_roles WHERE guild_id = ? AND role_id = ?",
+                (guild_id, role_id),
+            )
+            c.execute(
+                "DELETE FROM member_roles WHERE guild_id = ? AND role_id = ?",
+                (guild_id, role_id),
+            )
+
+    def list_guild_roles(self, guild_id: int) -> list[sqlite3.Row]:
+        """Roles in a guild with a live member count, ordered like Discord
+        (highest position first)."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT g.role_id, g.name, g.color, g.position, g.managed,
+                       COUNT(mr.user_id) AS members
+                FROM guild_roles g
+                LEFT JOIN member_roles mr
+                    ON mr.guild_id = g.guild_id AND mr.role_id = g.role_id
+                WHERE g.guild_id = ?
+                GROUP BY g.role_id
+                ORDER BY g.position DESC, g.name COLLATE NOCASE
+                """,
+                (guild_id,),
+            ))
+
+    def upsert_member(
+        self, guild_id: int, user_id: int, username: str,
+        display_name: str, is_bot: bool = False, present: bool = True,
+        joined_at: str | None = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO members
+                    (guild_id, user_id, username, display_name, is_bot,
+                     present, joined_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    is_bot = excluded.is_bot,
+                    present = excluded.present,
+                    joined_at = COALESCE(excluded.joined_at, members.joined_at),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id, user_id, username, display_name,
+                    1 if is_bot else 0, 1 if present else 0, joined_at,
+                    _normalize_iso(None),
+                ),
+            )
+
+    def set_member_present(self, guild_id: int, user_id: int, present: bool) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE members SET present = ?, updated_at = ? "
+                "WHERE guild_id = ? AND user_id = ?",
+                (1 if present else 0, _normalize_iso(None), guild_id, user_id),
+            )
+
+    def set_member_roles(
+        self, guild_id: int, user_id: int, role_ids: list[int],
+    ) -> None:
+        """Replace a member's role edges wholesale with ``role_ids``."""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM member_roles WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            for rid in role_ids:
+                c.execute(
+                    "INSERT OR IGNORE INTO member_roles "
+                    "(guild_id, user_id, role_id) VALUES (?, ?, ?)",
+                    (guild_id, user_id, int(rid)),
+                )
+
+    def get_member(self, guild_id: int, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM members WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+
+    def list_members(
+        self, guild_id: int, include_absent: bool = True,
+    ) -> list[sqlite3.Row]:
+        """All known members with their role count, ordered by display name."""
+        sql = """
+            SELECT m.user_id, m.username, m.display_name, m.is_bot,
+                   m.present, m.joined_at,
+                   COUNT(mr.role_id) AS role_count
+            FROM members m
+            LEFT JOIN member_roles mr
+                ON mr.guild_id = m.guild_id AND mr.user_id = m.user_id
+            WHERE m.guild_id = ?
+        """
+        if not include_absent:
+            sql += " AND m.present = 1"
+        sql += " GROUP BY m.user_id ORDER BY m.display_name COLLATE NOCASE"
+        with self._conn() as c:
+            return list(c.execute(sql, (guild_id,)))
+
+    def member_role_names(
+        self, guild_id: int, user_id: int,
+    ) -> list[sqlite3.Row]:
+        """A member's roles (id/name/color), highest position first."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT g.role_id, g.name, g.color, g.position
+                FROM member_roles mr
+                JOIN guild_roles g
+                    ON g.guild_id = mr.guild_id AND g.role_id = mr.role_id
+                WHERE mr.guild_id = ? AND mr.user_id = ?
+                ORDER BY g.position DESC, g.name COLLATE NOCASE
+                """,
+                (guild_id, user_id),
+            ))
+
+    def members_with_role(
+        self, guild_id: int, role_id: int,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT m.user_id, m.username, m.display_name, m.present
+                FROM member_roles mr
+                JOIN members m
+                    ON m.guild_id = mr.guild_id AND m.user_id = mr.user_id
+                WHERE mr.guild_id = ? AND mr.role_id = ?
+                ORDER BY m.display_name COLLATE NOCASE
+                """,
+                (guild_id, role_id),
+            ))
+
+    def known_guild_ids(self) -> list[int]:
+        """Every guild_id that appears across the dashboard-relevant tables.
+
+        Lets the web UI offer a guild picker without the bot having to inject
+        its live guild list. Unions the member mirror with the lifts table so a
+        guild shows up even before the member sync has run.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT guild_id FROM members
+                UNION
+                SELECT guild_id FROM lifts
+                """
+            )
+            return [int(r[0]) for r in rows]
+
+    # ---- dashboard data browsing + editing ------------------------------
+
+    def web_list_lifts(
+        self, guild_id: int, user_id: int | None = None,
+        limit: int = 100, offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT id, user_id, username, equipment, weight_kg, "
+            "bodyweight_add AS bw, reps, logged_at FROM lifts WHERE guild_id = ?"
+        )
+        params: list[object] = [guild_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._conn() as c:
+            return list(c.execute(sql, params))
+
+    def web_delete_lift(
+        self, guild_id: int, lift_id: int, actor_name: str,
+    ) -> bool:
+        """Delete one lift by id (scoped to guild) and audit it. Returns True
+        if a row was removed."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, username, equipment, weight_kg "
+                "FROM lifts WHERE id = ? AND guild_id = ?",
+                (lift_id, guild_id),
+            ).fetchone()
+            if row is None:
+                return False
+            c.execute("DELETE FROM lifts WHERE id = ?", (lift_id,))
+            self._audit(
+                c, guild_id, "data", "lift_delete",
+                actor_name=actor_name,
+                subject_id=row["user_id"], subject_name=row["username"],
+                detail=f"{row['equipment']} {row['weight_kg']:g}kg (web)",
+            )
+            return True
+
+    def web_update_lift(
+        self, guild_id: int, lift_id: int, *,
+        weight_kg: float, reps: int | None, equipment: str,
+        actor_name: str,
+    ) -> bool:
+        """Edit a lift's weight/reps/equipment from the dashboard and audit it."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, username, equipment, weight_kg, reps "
+                "FROM lifts WHERE id = ? AND guild_id = ?",
+                (lift_id, guild_id),
+            ).fetchone()
+            if row is None:
+                return False
+            c.execute(
+                "UPDATE lifts SET weight_kg = ?, reps = ?, equipment = ? "
+                "WHERE id = ?",
+                (float(weight_kg), reps, equipment, lift_id),
+            )
+            self._audit(
+                c, guild_id, "data", "lift_edit",
+                actor_name=actor_name,
+                subject_id=row["user_id"], subject_name=row["username"],
+                detail=(
+                    f"{row['equipment']} {row['weight_kg']:g}kg → "
+                    f"{equipment} {float(weight_kg):g}kg (web)"
+                ),
+            )
+            return True
+
+    def web_list_calories(
+        self, guild_id: int, user_id: int | None = None,
+        limit: int = 100, offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT id, user_id, username, kcal, note, logged_at "
+            "FROM calorie_entries WHERE guild_id = ?"
+        )
+        params: list[object] = [guild_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._conn() as c:
+            return list(c.execute(sql, params))
+
+    def web_delete_calorie(
+        self, guild_id: int, entry_id: int, actor_name: str,
+    ) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, username, kcal FROM calorie_entries "
+                "WHERE id = ? AND guild_id = ?",
+                (entry_id, guild_id),
+            ).fetchone()
+            if row is None:
+                return False
+            c.execute("DELETE FROM calorie_entries WHERE id = ?", (entry_id,))
+            self._audit(
+                c, guild_id, "data", "calorie_delete",
+                actor_name=actor_name,
+                subject_id=row["user_id"], subject_name=row["username"],
+                detail=f"{row['kcal']:.0f} kcal (web)",
+            )
+            return True
+
+    def web_list_protein(
+        self, guild_id: int, user_id: int | None = None,
+        limit: int = 100, offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT id, user_id, username, grams, note, logged_at "
+            "FROM protein_entries WHERE guild_id = ?"
+        )
+        params: list[object] = [guild_id]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._conn() as c:
+            return list(c.execute(sql, params))
+
+    def web_delete_protein(
+        self, guild_id: int, entry_id: int, actor_name: str,
+    ) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, username, grams FROM protein_entries "
+                "WHERE id = ? AND guild_id = ?",
+                (entry_id, guild_id),
+            ).fetchone()
+            if row is None:
+                return False
+            c.execute("DELETE FROM protein_entries WHERE id = ?", (entry_id,))
+            self._audit(
+                c, guild_id, "data", "protein_delete",
+                actor_name=actor_name,
+                subject_id=row["user_id"], subject_name=row["username"],
+                detail=f"{row['grams']:.0f} g (web)",
+            )
+            return True
+
+    def web_member_overview(
+        self, guild_id: int, user_id: int,
+    ) -> dict:
+        """Compact per-member snapshot for the dashboard member page: lift
+        counters, latest bodyweight, and today/total nutrition counts."""
+        with self._conn() as c:
+            lifts = c.execute(
+                """
+                SELECT COUNT(*) AS n, COUNT(DISTINCT equipment) AS equip,
+                       MAX(logged_at) AS last_at
+                FROM lifts WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            bw = c.execute(
+                "SELECT weight_kg, recorded_at FROM bodyweights "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY recorded_at DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+            cal = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(kcal),0) AS total "
+                "FROM calorie_entries WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+            pro = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(grams),0) AS total "
+                "FROM protein_entries WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+            return {
+                "lifts": dict(lifts) if lifts else {},
+                "bodyweight": dict(bw) if bw else None,
+                "calories": dict(cal) if cal else {},
+                "protein": dict(pro) if pro else {},
+            }

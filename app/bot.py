@@ -68,6 +68,7 @@ from . import protein as protein_mod
 from . import revo_client
 from . import strava_client
 from . import strava_web
+from . import webui
 
 # Set of all alias phrases (canonical + aliases) the built-in table already
 # recognises, normalised. Used by /log to decide whether a logged equipment
@@ -247,11 +248,30 @@ ENABLE_PRESENCE_TRACKING = os.getenv(
     "ENABLE_PRESENCE_TRACKING", "false"
 ).lower() in ("1", "true", "yes", "y", "on")
 
+# Web dashboard (app/webui.py). Enabled only when WEBUI_PASSWORD is set — the
+# dashboard exposes member/role/nutrition data so it must never run without a
+# login secret. It needs the Server Members privileged intent to mirror the
+# guild's members/roles and to receive member/role change events; flip that
+# toggle on in the Discord Developer Portal too.
+WEBUI_PASSWORD = os.getenv("WEBUI_PASSWORD", "").strip()
+WEBUI_DISABLED = os.getenv("WEBUI_DISABLED", "0").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+WEBUI_ENABLED = bool(WEBUI_PASSWORD) and not WEBUI_DISABLED
+WEBUI_BIND_HOST = os.getenv("WEBUI_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+try:
+    WEBUI_PORT = int(os.getenv("WEBUI_PORT", "8081"))
+except ValueError:
+    WEBUI_PORT = 8081
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = False
 if ENABLE_PRESENCE_TRACKING:
     intents.presences = True
+    intents.members = True
+if WEBUI_ENABLED:
+    # Required to enumerate members/roles and receive on_member_* events.
     intents.members = True
 bot = commands.Bot(command_prefix="!gym ", intents=intents)
 
@@ -1229,6 +1249,18 @@ async def on_ready() -> None:
 
     if BACKFILL_ON_START and GYM_CHANNEL_IDS:
         bot.loop.create_task(_run_startup_backfill())
+    else:
+        # No backfill to wait on — start auditing live data changes now.
+        db.audit_live = True
+
+    if WEBUI_ENABLED:
+        LOG.info(
+            "Web dashboard ENABLED on port %d (Server Members intent in use). "
+            "Make sure the Server Members intent is toggled on in the Discord "
+            "Developer Portal.",
+            WEBUI_PORT,
+        )
+        bot.loop.create_task(_webui_sync_all_guilds())
 
     if REMINDER_CHANNEL_ID and not weekly_reminder.is_running():
         weekly_reminder.start()
@@ -1974,6 +2006,9 @@ async def _run_startup_backfill() -> None:
             "new_lifts=%d, skipped_suppressed=%d, new_calorie_entries=%d",
             channel, scanned, matched, inserted, skipped, cal_inserted,
         )
+    # History import is done — from here on, data mutations are live user
+    # actions worth recording in the dashboard audit log.
+    db.audit_live = True
 
 
 @bot.event
@@ -7376,6 +7411,9 @@ STRAVA_AUTO_SUBSCRIBE = os.getenv("STRAVA_AUTO_SUBSCRIBE", "1").lower() in (
 # clean it up.
 _strava_runner = None
 
+# AppRunner handle for the operator web dashboard (app/webui.py).
+_webui_runner = None
+
 # Live webhook subscription id (set once known via ensure/subscribe). The event
 # handler uses it to reject deliveries from any other subscription. None means
 # "not yet known" → fail open so valid events during startup aren't dropped.
@@ -8046,13 +8084,8 @@ async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
     )
 
 
-@bot.event
-async def setup_hook() -> None:  # pragma: no cover - discord runtime
-    """Start the Strava web server on the bot's event loop before connecting.
-
-    No-op (logs a hint) when Strava is disabled or unconfigured, so the bot
-    still boots cleanly for users who don't want the integration.
-    """
+async def _start_strava_server() -> None:  # pragma: no cover - discord runtime
+    """Start the Strava OAuth/webhook web server (no-op when disabled)."""
     global _strava_runner
     if not _strava_enabled():
         if not STRAVA_DISABLED and strava_client.available() and not _strava_cfg().configured:
@@ -8087,22 +8120,278 @@ async def setup_hook() -> None:  # pragma: no cover - discord runtime
         LOG.exception("Failed to start Strava web server")
 
 
-# Tear the Strava web server down cleanly on shutdown by wrapping Client.close.
+async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
+    """Start the operator web dashboard (no-op unless WEBUI_PASSWORD is set)."""
+    global _webui_runner
+    if not WEBUI_ENABLED:
+        if WEBUI_PASSWORD == "" and not WEBUI_DISABLED:
+            LOG.info(
+                "Web dashboard idle — set WEBUI_PASSWORD to enable it on port %d.",
+                WEBUI_PORT,
+            )
+        return
+    app = webui.build_app(
+        db=db,
+        password=WEBUI_PASSWORD,
+        resync=_webui_resync_guild,
+    )
+    try:
+        _webui_runner = await webui.start_server(
+            app, WEBUI_BIND_HOST, WEBUI_PORT,
+        )
+        LOG.info("Web dashboard enabled on %s:%d", WEBUI_BIND_HOST, WEBUI_PORT)
+    except Exception:
+        LOG.exception("Failed to start web dashboard server")
+
+
+@bot.event
+async def setup_hook() -> None:  # pragma: no cover - discord runtime
+    """Start the auxiliary web servers on the bot's event loop before connecting.
+
+    Each is independently optional: the bot still boots cleanly for users who
+    don't want Strava or the dashboard.
+    """
+    await _start_strava_server()
+    await _start_webui_server()
+
+
+# Tear the auxiliary web servers down cleanly on shutdown by wrapping
+# Client.close (discord.py has no dedicated teardown hook).
 _strava_orig_close = bot.close
 
 
 async def _close_with_strava() -> None:  # pragma: no cover - discord runtime
-    global _strava_runner
-    if _strava_runner is not None:
-        try:
-            await _strava_runner.cleanup()
-        except Exception:
-            LOG.warning("Strava web server cleanup failed", exc_info=True)
-        _strava_runner = None
+    global _strava_runner, _webui_runner
+    for name, runner in (("Strava", _strava_runner), ("dashboard", _webui_runner)):
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception:
+                LOG.warning("%s web server cleanup failed", name, exc_info=True)
+    _strava_runner = None
+    _webui_runner = None
     await _strava_orig_close()
 
 
 bot.close = _close_with_strava  # type: ignore[method-assign]
+
+
+# ===========================================================================
+# Web dashboard data mirror (app/webui.py).
+#
+# Keeps the members / member_roles / guild_roles / guild_meta tables in step
+# with Discord and writes role/member changes to the audit log. Everything here
+# is gated on WEBUI_ENABLED (which also turns on the Server Members intent), so
+# it's inert for deployments that don't run the dashboard.
+# ===========================================================================
+
+def _member_display(member: "discord.Member") -> str:
+    return getattr(member, "display_name", None) or member.name
+
+
+def _role_payload(role: "discord.Role") -> dict:
+    return {
+        "id": role.id,
+        "name": role.name,
+        "color": role.colour.value,
+        "position": role.position,
+        "managed": role.managed,
+    }
+
+
+def _sync_guild_snapshot(guild: "discord.Guild") -> None:
+    """Full refresh of one guild's roles + members into the DB mirror.
+
+    Synchronous (DB calls take the connection lock); callers run it directly
+    on the loop — it's fast for hobby-sized guilds and only runs on
+    startup / manual resync.
+    """
+    try:
+        db.set_guild_meta(guild.id, guild.name, guild.member_count or 0)
+        roles = [_role_payload(r) for r in guild.roles if not r.is_default()]
+        db.sync_guild_roles(guild.id, roles)
+        for m in guild.members:
+            db.upsert_member(
+                guild.id, m.id, m.name, _member_display(m),
+                is_bot=m.bot, present=True,
+                joined_at=m.joined_at.isoformat() if m.joined_at else None,
+            )
+            db.set_member_roles(
+                guild.id, m.id,
+                [r.id for r in m.roles if not r.is_default()],
+            )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception(
+            "Dashboard guild sync failed for %s", getattr(guild, "id", "?"),
+        )
+
+
+async def _webui_sync_all_guilds() -> None:  # pragma: no cover - discord runtime
+    """Mirror every guild the bot is in. Scheduled once from on_ready."""
+    for guild in bot.guilds:
+        _sync_guild_snapshot(guild)
+    LOG.info("Dashboard mirror synced %d guild(s)", len(bot.guilds))
+
+
+async def _webui_resync_guild(guild_id: int) -> bool:  # pragma: no cover
+    """Re-pull one guild on demand (the dashboard's ↻ Sync button)."""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return False
+    # Members may not all be cached; pull them if the count looks short.
+    try:
+        if (guild.member_count or 0) > len(guild.members):
+            async for _ in guild.fetch_members(limit=None):
+                pass
+    except Exception:
+        LOG.info("fetch_members failed for %s", guild_id, exc_info=True)
+    _sync_guild_snapshot(guild)
+    return True
+
+
+@bot.event
+async def on_member_join(member: "discord.Member") -> None:  # pragma: no cover
+    if not WEBUI_ENABLED:
+        return
+    db.upsert_member(
+        member.guild.id, member.id, member.name, _member_display(member),
+        is_bot=member.bot, present=True,
+        joined_at=member.joined_at.isoformat() if member.joined_at else None,
+    )
+    db.set_member_roles(
+        member.guild.id, member.id,
+        [r.id for r in member.roles if not r.is_default()],
+    )
+    db.add_audit(
+        member.guild.id, "member", "join",
+        subject_id=member.id, subject_name=_member_display(member),
+        detail="joined the server",
+    )
+
+
+@bot.event
+async def on_member_remove(member: "discord.Member") -> None:  # pragma: no cover
+    if not WEBUI_ENABLED:
+        return
+    db.set_member_present(member.guild.id, member.id, False)
+    db.add_audit(
+        member.guild.id, "member", "leave",
+        subject_id=member.id, subject_name=_member_display(member),
+        detail="left the server",
+    )
+
+
+@bot.event
+async def on_member_update(
+    before: "discord.Member", after: "discord.Member",
+) -> None:  # pragma: no cover - discord runtime
+    if not WEBUI_ENABLED:
+        return
+    gid = after.guild.id
+    name = _member_display(after)
+    before_roles = {r.id for r in before.roles if not r.is_default()}
+    after_roles = {r.id for r in after.roles if not r.is_default()}
+    if before_roles != after_roles:
+        db.set_member_roles(gid, after.id, list(after_roles))
+        for rid in after_roles - before_roles:
+            role = after.guild.get_role(rid)
+            db.add_audit(
+                gid, "role", "role_add",
+                subject_id=after.id, subject_name=name,
+                detail=f"gained role {role.name if role else rid}",
+            )
+        for rid in before_roles - after_roles:
+            role = before.guild.get_role(rid)
+            db.add_audit(
+                gid, "role", "role_remove",
+                subject_id=after.id, subject_name=name,
+                detail=f"lost role {role.name if role else rid}",
+            )
+    # Server nickname change (username changes arrive via on_user_update).
+    if before.nick != after.nick:
+        db.upsert_member(
+            gid, after.id, after.name, name,
+            is_bot=after.bot, present=True,
+            joined_at=after.joined_at.isoformat() if after.joined_at else None,
+        )
+        db.add_audit(
+            gid, "member", "nick_change",
+            subject_id=after.id, subject_name=name,
+            detail=f"nickname: {before.nick or '—'} → {after.nick or '—'}",
+        )
+
+
+@bot.event
+async def on_user_update(
+    before: "discord.User", after: "discord.User",
+) -> None:  # pragma: no cover - discord runtime
+    if not WEBUI_ENABLED or before.name == after.name:
+        return
+    # A username change is global; reflect it in every guild we share.
+    for guild in bot.guilds:
+        m = guild.get_member(after.id)
+        if m is None:
+            continue
+        db.upsert_member(
+            guild.id, m.id, after.name, _member_display(m),
+            is_bot=m.bot, present=True,
+            joined_at=m.joined_at.isoformat() if m.joined_at else None,
+        )
+        db.add_audit(
+            guild.id, "member", "username_change",
+            subject_id=after.id, subject_name=_member_display(m),
+            detail=f"username: {before.name} → {after.name}",
+        )
+
+
+@bot.event
+async def on_guild_role_create(role: "discord.Role") -> None:  # pragma: no cover
+    if not WEBUI_ENABLED or role.is_default():
+        return
+    db.upsert_role(
+        role.guild.id, role.id, role.name, role.colour.value,
+        role.position, role.managed,
+    )
+    db.add_audit(
+        role.guild.id, "role", "role_create",
+        subject_name=role.name, detail=f"role created: {role.name}",
+    )
+
+
+@bot.event
+async def on_guild_role_delete(role: "discord.Role") -> None:  # pragma: no cover
+    if not WEBUI_ENABLED or role.is_default():
+        return
+    db.delete_role(role.guild.id, role.id)
+    db.add_audit(
+        role.guild.id, "role", "role_delete",
+        subject_name=role.name, detail=f"role deleted: {role.name}",
+    )
+
+
+@bot.event
+async def on_guild_role_update(
+    before: "discord.Role", after: "discord.Role",
+) -> None:  # pragma: no cover - discord runtime
+    if not WEBUI_ENABLED or after.is_default():
+        return
+    db.upsert_role(
+        after.guild.id, after.id, after.name, after.colour.value,
+        after.position, after.managed,
+    )
+    if before.name != after.name:
+        db.add_audit(
+            after.guild.id, "role", "role_rename",
+            subject_name=after.name,
+            detail=f"role renamed: {before.name} → {after.name}",
+        )
+
+
+@bot.event
+async def on_guild_join(guild: "discord.Guild") -> None:  # pragma: no cover
+    if not WEBUI_ENABLED:
+        return
+    _sync_guild_snapshot(guild)
 
 
 @bot.tree.command(
