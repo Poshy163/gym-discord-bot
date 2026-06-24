@@ -42,9 +42,12 @@ import hmac
 import logging
 import secrets
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from aiohttp import web
+
+from . import presence
 
 LOG = logging.getLogger("gymbot.webui")
 
@@ -400,6 +403,48 @@ def build_app(
             }
             for r in rows
         ]})
+
+    async def api_activity(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        days = _clamp_int(request.query.get("days"), 7, 1, 90)
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=days)
+        users = []
+        for row in db.presence_track_list(gid):
+            uid = int(row["user_id"])
+            member = db.get_member(gid, uid)
+            pres = db.presence_current(gid, uid)
+            cur = db.activity_current(gid, uid)
+            imgmap = db.activity_image_map(gid, uid)
+            events = [
+                (r["activity"], r["at"])
+                for r in db.activity_events_for(gid, uid, since=since)
+            ]
+            totals = presence.summarize_activities(events, since, now)
+            top = [
+                {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
+                for nm, secs in list(totals.items())[:6]
+            ]
+            current_game = None
+            if cur and cur["activity"]:
+                current_game = {
+                    "name": cur["activity"],
+                    "image": cur["image_url"] or imgmap.get(cur["activity"]),
+                    "since": cur["at"],
+                }
+            users.append({
+                "user_id": str(uid),
+                "display_name": (
+                    member["display_name"] if member else str(uid)
+                ),
+                "avatar": member["avatar"] if member else None,
+                "status": pres["status"] if pres else None,
+                "status_at": pres["at"] if pres else None,
+                "current_game": current_game,
+                "top_games": top,
+            })
+        return web.json_response({"users": users, "window_days": days})
 
     # ---- JSON API: edits (audited) --------------------------------------
 

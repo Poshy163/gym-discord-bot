@@ -157,12 +157,16 @@ CREATE INDEX IF NOT EXISTS idx_presence_events_user
     ON presence_events (guild_id, user_id, at);
 
 -- Activity tracking. ``activity`` is the game/app name, or NULL when the
--- user stops playing. We de-dupe consecutive identical values.
+-- user stops playing. We de-dupe consecutive identical values. ``image_url``
+-- is the Discord rich-presence large image for that activity when one is
+-- available (many plain "playing X" presences have none) — used by the web
+-- dashboard to show real game art.
 CREATE TABLE IF NOT EXISTS activity_events (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id  INTEGER NOT NULL,
     user_id   INTEGER NOT NULL,
     activity  TEXT,
+    image_url TEXT,
     at        TEXT    NOT NULL
 );
 
@@ -522,6 +526,17 @@ class Database:
             if food_cols and "protein_g" not in food_cols:
                 self._connection.execute(
                     "ALTER TABLE calorie_foods ADD COLUMN protein_g REAL"
+                )
+            # Game art for the activity feed: older activity logs predate it.
+            act_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(activity_events)"
+                )
+            }
+            if act_cols and "image_url" not in act_cols:
+                self._connection.execute(
+                    "ALTER TABLE activity_events ADD COLUMN image_url TEXT"
                 )
             self._recanonicalize_equipment()
 
@@ -2553,11 +2568,12 @@ class Database:
 
     def activity_log_event(
         self, guild_id: int, user_id: int, activity: str | None,
-        at: datetime | None = None,
+        at: datetime | None = None, image_url: str | None = None,
     ) -> bool:
         """Append an activity event (game/app name or None = stopped).
-        De-duplicates against the most recent stored value. Returns True
-        if a row was inserted."""
+        De-duplicates against the most recent stored value (on name only, so a
+        late-arriving image for the same game doesn't spam a new row). Returns
+        True if a row was inserted."""
         ts = _normalize_iso(at)
         with self._conn() as c:
             last = c.execute(
@@ -2571,11 +2587,54 @@ class Database:
             if last is not None and last["activity"] == activity:
                 return False
             c.execute(
-                "INSERT INTO activity_events (guild_id, user_id, activity, at) "
-                "VALUES (?, ?, ?, ?)",
-                (guild_id, user_id, activity, ts),
+                "INSERT INTO activity_events "
+                "(guild_id, user_id, activity, image_url, at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (guild_id, user_id, activity, image_url, ts),
             )
             return True
+
+    # ---- web dashboard: current presence/activity snapshots --------------
+
+    def presence_current(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        """Latest known presence status (and when) for a user, or None."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT status, at FROM presence_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY at DESC, id DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+
+    def activity_current(
+        self, guild_id: int, user_id: int,
+    ) -> sqlite3.Row | None:
+        """Latest activity event for a user (activity may be NULL = stopped)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT activity, image_url, at FROM activity_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY at DESC, id DESC LIMIT 1",
+                (guild_id, user_id),
+            ).fetchone()
+
+    def activity_image_map(
+        self, guild_id: int, user_id: int,
+    ) -> dict[str, str]:
+        """Best-known image URL per game name for a user (most recent wins).
+        Lets the activity feed show art for games whose current event has none
+        but an earlier session captured one."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT activity, image_url FROM activity_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "AND activity IS NOT NULL AND image_url IS NOT NULL "
+                "ORDER BY at ASC, id ASC",
+                (guild_id, user_id),
+            )
+            return {r["activity"]: r["image_url"] for r in rows}
 
     def activity_events_for(
         self, guild_id: int, user_id: int,
@@ -2866,6 +2925,19 @@ class Database:
                 (guild_id, user_id, start_iso, end_iso),
             ))
 
+    def calorie_logged_days(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> list[str]:
+        """Distinct calendar dates (YYYY-MM-DD) with a calorie entry in the
+        window. Lets callers tell 'logged 0' from 'didn't track'."""
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                "SELECT DISTINCT substr(logged_at, 1, 10) FROM calorie_entries "
+                "WHERE guild_id = ? AND user_id = ? "
+                "AND logged_at >= ? AND logged_at < ?",
+                (guild_id, user_id, start_iso, end_iso),
+            )]
+
     def calorie_total_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> tuple[float, int]:
@@ -3004,6 +3076,18 @@ class Database:
                 detail=f"undid {float(row['grams']):.0f} g protein",
             )
             return row
+
+    def protein_logged_days(
+        self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
+    ) -> list[str]:
+        """Distinct calendar dates (YYYY-MM-DD) with a protein entry in window."""
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                "SELECT DISTINCT substr(logged_at, 1, 10) FROM protein_entries "
+                "WHERE guild_id = ? AND user_id = ? "
+                "AND logged_at >= ? AND logged_at < ?",
+                (guild_id, user_id, start_iso, end_iso),
+            )]
 
     def protein_total_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,

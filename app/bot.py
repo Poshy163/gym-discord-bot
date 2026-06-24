@@ -1782,7 +1782,11 @@ _CALORIE_SUMMARY_SYSTEM = (
     "Tone: friendly, encouraging, a little playful — a coach genuinely rooting "
     "for them. Never shame them, never give medical advice or rigid rules. "
     "3-4 sentences, plain text only (no headings, bullets, or markdown), under "
-    "550 characters."
+    "550 characters.\n\n"
+    "Note on gaps: only logged days are included. A low days_logged or a day "
+    "missing from per_day means they didn't record it, NOT that they ate "
+    "nothing — treat it as a tracking gap (gently encourage logging), never as "
+    "a 0-calorie day or fasting."
 )
 
 
@@ -8958,22 +8962,35 @@ def _discord_status_to_str(status: discord.Status) -> str:
     return raw  # "online", "idle", or "offline"
 
 
-def _get_main_activity(member: discord.Member) -> str | None:
-    """Return the primary game/app name from a member's activities, or None.
+def _get_main_activity_info(
+    member: discord.Member,
+) -> tuple[str | None, str | None]:
+    """Return ``(name, image_url)`` for the member's primary game/app activity.
 
     Ignores Spotify and custom statuses; everything else with a name (games,
     rich-presence apps, streams, embedded voice activities) is fair game.
     Whitelisting specific classes is fragile — discord.py occasionally
     delivers rich-presence payloads as subclasses we didn't list, and they
-    silently get dropped.
+    silently get dropped. ``image_url`` is the rich-presence large image when
+    the activity exposes one (many plain "playing X" presences don't).
     """
     for act in member.activities:
         if isinstance(act, (discord.Spotify, discord.CustomActivity)):
             continue
         name = getattr(act, "name", None) or getattr(act, "title", None)
         if name:
-            return str(name)
-    return None
+            image: str | None = None
+            try:
+                image = getattr(act, "large_image_url", None)
+            except Exception:  # pragma: no cover - asset URL build can throw
+                image = None
+            return str(name), (str(image) if image else None)
+    return None, None
+
+
+def _get_main_activity(member: discord.Member) -> str | None:
+    """Primary game/app name only (see :func:`_get_main_activity_info`)."""
+    return _get_main_activity_info(member)[0]
 
 
 def _seed_presence_snapshot(guild_id: int, member: discord.Member) -> None:
@@ -8984,7 +9001,8 @@ def _seed_presence_snapshot(guild_id: int, member: discord.Member) -> None:
     bot came back online after a restart.
     """
     db.presence_log_event(guild_id, member.id, _discord_status_to_str(member.status))
-    db.activity_log_event(guild_id, member.id, _get_main_activity(member))
+    name, image = _get_main_activity_info(member)
+    db.activity_log_event(guild_id, member.id, name, image_url=image)
 
 
 def _seed_tracked_presence_snapshots() -> None:
@@ -9021,9 +9039,11 @@ async def on_presence_update(
             db.presence_log_event(after.guild.id, after.id, status)
         # Activity tracking
         before_act = _get_main_activity(before)
-        after_act = _get_main_activity(after)
+        after_act, after_img = _get_main_activity_info(after)
         if before_act != after_act:
-            db.activity_log_event(after.guild.id, after.id, after_act)
+            db.activity_log_event(
+                after.guild.id, after.id, after_act, image_url=after_img,
+            )
             LOG.info(
                 "Activity change for %s in %s: %r -> %r (raw=%s)",
                 after.id, after.guild.id, before_act, after_act,
@@ -9597,6 +9617,31 @@ async def track_export_cmd(
         )
 
 
+def _ai_error_embed(exc: gemini_client.GeminiError) -> discord.Embed:
+    """A tidy, user-facing embed for an AI failure.
+
+    Surfaces ``gemini_client.friendly_message`` (e.g. "model is swamped, try
+    again") instead of dumping the raw API JSON at the user. Transient overloads
+    get an amber card; genuine misconfiguration gets a red one so it's visually
+    distinct from a "just retry" blip.
+    """
+    config_problem = (
+        getattr(exc, "status_code", None) in (401, 403)
+        or (getattr(exc, "status", None) or "").upper()
+        in ("UNAUTHENTICATED", "PERMISSION_DENIED")
+        or "configured" in gemini_client.friendly_message(exc)
+    )
+    colour = discord.Colour.red() if config_problem else discord.Colour.orange()
+    embed = discord.Embed(
+        title="🤖 AI unavailable",
+        description=gemini_client.friendly_message(exc),
+        colour=colour,
+    )
+    if getattr(exc, "retryable", False):
+        embed.set_footer(text="This is usually temporary — give it a moment.")
+    return embed
+
+
 _SLEEP_ANALYSIS_SYSTEM = (
     "You are a sleep-pattern analyst. You are given a person's sleep sessions "
     "derived from their Discord online/offline presence (a proxy, not a sleep "
@@ -9669,7 +9714,7 @@ async def track_analyze_cmd(
     except gemini_client.GeminiError as exc:
         LOG.warning("Gemini sleep analysis failed: %s", exc)
         await interaction.followup.send(
-            f"Gemini request failed: {exc}", ephemeral=True,
+            embed=_ai_error_embed(exc), ephemeral=True,
         )
         return
 
@@ -9707,7 +9752,17 @@ _COACH_SYSTEM = (
     "Reference actual lifts and numbers from the data, call out plateaus, "
     "muscle-group imbalances, training frequency, and goal progress. Be "
     "motivating but honest. Use short bullet points. Keep the whole reply under "
-    "1800 characters so it fits in a Discord embed."
+    "1800 characters so it fits in a Discord embed.\n\n"
+    "IMPORTANT — missing data vs real zeros: this bot only has what the user "
+    "manually logs. A zero, null, empty, or stale value almost always means "
+    "THEY DIDN'T LOG IT, not that the true value is zero. Specifically: if "
+    "'calorie_tracking_active' or 'protein_tracking_active' is false, that macro "
+    "is NOT being tracked — say so and skip judging it (never claim they ate 0 "
+    "calories or are starving). If 'days_since_last_lift' or "
+    "'days_since_bodyweight' is large, treat it as a possible logging gap and "
+    "gently nudge them to log/track, rather than concluding they stopped "
+    "training or lost progress. Frame gaps as 'no data logged recently — worth "
+    "tracking again', never as a regression."
 )
 
 
@@ -9721,6 +9776,17 @@ def _build_progress_payload(
     start_iso = (now - timedelta(days=days)).isoformat()
     end_iso = now.isoformat()
 
+    def _days_since(iso: str | None) -> int | None:
+        if not iso:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, (now - dt.astimezone(timezone.utc)).days)
+
     summary = db.user_summary(guild_id, user_id)
     tonnage, _n = db.total_tonnage(guild_id, user_id)
     cal_goal = db.calorie_goal_get(guild_id, user_id)
@@ -9733,11 +9799,32 @@ def _build_progress_payload(
     )
     bw = db.bodyweight_history(guild_id, user_id, limit=60)
     dates = db.user_log_dates(guild_id, user_id)
+    last_lift_at = summary["last_at"] if summary else None
+    last_bw_at = bw[-1]["recorded_at"] if bw else None
+    # Distinct local days with a nutrition entry in the window — lets the model
+    # tell "0 because untracked" from "0 because genuinely fasted".
+    cal_days = len(db.calorie_logged_days(guild_id, user_id, start_iso, end_iso))
+    pro_days = len(db.protein_logged_days(guild_id, user_id, start_iso, end_iso))
 
     return {
         "name": name,
         "window_days": days,
         "timezone": str(DISPLAY_TZ),
+        # Top-level so the model can't miss it: what's actually being tracked,
+        # and how fresh each stream is. Empty/zero elsewhere should be read
+        # through these flags (see system prompt).
+        "tracking_status": {
+            "calorie_tracking_active": cal_goal is not None,
+            "protein_tracking_active": pro_goal is not None,
+            "has_any_lifts": summary is not None,
+            "days_since_last_lift": _days_since(last_lift_at),
+            "days_since_bodyweight": _days_since(last_bw_at),
+            "nutrition_days_logged_in_window": {
+                "calories": cal_days,
+                "protein": pro_days,
+                "out_of": days,
+            },
+        },
         "lifting": {
             "summary": dict(summary) if summary else None,
             "total_tonnage_kg": round(tonnage, 1),
@@ -9757,6 +9844,7 @@ def _build_progress_payload(
             "goals": [dict(r) for r in db.goal_list(guild_id, user_id)],
             "training_dates_recent": dates[-60:],
             "total_training_days": len(dates),
+            "last_lift_at": last_lift_at,
         },
         "bodyweight": {
             "recent": [
@@ -9770,9 +9858,11 @@ def _build_progress_payload(
             ),
             "calorie_total_window": round(cal_total),
             "calorie_entries_window": cal_entries,
+            "calorie_days_logged_window": cal_days,
             "protein_goal_g": pro_goal["daily_target_g"] if pro_goal else None,
             "protein_total_window": round(pro_total),
             "protein_entries_window": pro_entries,
+            "protein_days_logged_window": pro_days,
         },
     }
 
@@ -9832,7 +9922,7 @@ async def coach_cmd(
     except gemini_client.GeminiError as exc:
         LOG.warning("Gemini coach analysis failed: %s", exc)
         await interaction.followup.send(
-            f"Gemini request failed: {exc}", ephemeral=True,
+            embed=_ai_error_embed(exc), ephemeral=True,
         )
         return
 
