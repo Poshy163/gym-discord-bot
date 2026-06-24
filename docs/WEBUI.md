@@ -23,14 +23,28 @@ It is **disabled by default** and only starts once you set a login password.
 The audit log is a single append-only trail in the `audit_log` table, written
 by the bot from gateway events and by the dashboard on every edit. It covers:
 
-- **Roles** — a member gaining or losing a role; roles created, deleted, or
-  renamed.
+- **Roles** — a member gaining or losing a role (**with the moderator who made
+  the change**, when available — see below); roles created, deleted, or renamed.
 - **Members** — joins, leaves, nickname changes, and username changes.
 - **Data** — lifts / calories / protein logged through normal bot use (after
   the startup history backfill settles, so re-imports don't flood it) and every
   add/delete/edit performed from the dashboard. Dashboard edits are attributed
   to `web:<ip>` since the dashboard has a single shared login rather than
   per-user identity.
+
+### Seeing *who* changed a role
+
+Discord's member-update gateway event says a member's roles changed but not who
+changed them. To attribute role and nickname changes to the moderator who made
+them, the bot reads the guild's audit log via the `on_audit_log_entry_create`
+event — which requires the bot to have the **View Audit Log** permission in the
+server (the moderation intent it also needs is non-privileged and on by
+default). Grant that permission and audit rows read e.g. *"gained role Admin (by
+Josh)"* with the actor shown in the **Actor** column.
+
+Without that permission the change is still recorded (so nothing is lost), just
+without the actor — the row reads *"gained role Admin"* and the actor shows as
+`—`.
 
 ## Setup
 

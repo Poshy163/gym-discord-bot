@@ -8298,6 +8298,17 @@ async def on_member_remove(member: "discord.Member") -> None:  # pragma: no cove
     )
 
 
+def _can_read_audit_log(guild: "discord.Guild") -> bool:
+    """Whether we'll get an ``on_audit_log_entry_create`` for changes in this
+    guild — i.e. the bot has the View Audit Log permission. When True, role and
+    nickname changes are audited from that event instead (so they include the
+    actor who made the change); ``on_member_update`` only mirrors state. When
+    False we fall back to auditing here, without an actor.
+    """
+    me = guild.me
+    return bool(me and guild.me.guild_permissions.view_audit_log)
+
+
 @bot.event
 async def on_member_update(
     before: "discord.Member", after: "discord.Member",
@@ -8306,24 +8317,28 @@ async def on_member_update(
         return
     gid = after.guild.id
     name = _member_display(after)
+    # Prefer the audit-log event (it knows the actor); only audit here when we
+    # can't read the guild audit log. The mirror is always kept current.
+    audit_here = not _can_read_audit_log(after.guild)
     before_roles = {r.id for r in before.roles if not r.is_default()}
     after_roles = {r.id for r in after.roles if not r.is_default()}
     if before_roles != after_roles:
         db.set_member_roles(gid, after.id, list(after_roles))
-        for rid in after_roles - before_roles:
-            role = after.guild.get_role(rid)
-            db.add_audit(
-                gid, "role", "role_add",
-                subject_id=after.id, subject_name=name,
-                detail=f"gained role {role.name if role else rid}",
-            )
-        for rid in before_roles - after_roles:
-            role = before.guild.get_role(rid)
-            db.add_audit(
-                gid, "role", "role_remove",
-                subject_id=after.id, subject_name=name,
-                detail=f"lost role {role.name if role else rid}",
-            )
+        if audit_here:
+            for rid in after_roles - before_roles:
+                role = after.guild.get_role(rid)
+                db.add_audit(
+                    gid, "role", "role_add",
+                    subject_id=after.id, subject_name=name,
+                    detail=f"gained role {role.name if role else rid}",
+                )
+            for rid in before_roles - after_roles:
+                role = before.guild.get_role(rid)
+                db.add_audit(
+                    gid, "role", "role_remove",
+                    subject_id=after.id, subject_name=name,
+                    detail=f"lost role {role.name if role else rid}",
+                )
     # Server nickname change (username changes arrive via on_user_update).
     if before.nick != after.nick:
         db.upsert_member(
@@ -8332,11 +8347,79 @@ async def on_member_update(
             joined_at=after.joined_at.isoformat() if after.joined_at else None,
             avatar=_member_avatar(after),
         )
-        db.add_audit(
-            gid, "member", "nick_change",
-            subject_id=after.id, subject_name=name,
-            detail=f"nickname: {before.nick or '—'} → {after.nick or '—'}",
-        )
+        if audit_here:
+            db.add_audit(
+                gid, "member", "nick_change",
+                subject_id=after.id, subject_name=name,
+                detail=f"nickname: {before.nick or '—'} → {after.nick or '—'}",
+            )
+
+
+@bot.event
+async def on_audit_log_entry_create(
+    entry: "discord.AuditLogEntry",
+) -> None:  # pragma: no cover - discord runtime
+    """Attribute role/nickname changes to the moderator who made them.
+
+    Discord's gateway member-update event doesn't say *who* changed a role, but
+    the guild audit log does. This event delivers each new audit-log entry in
+    real time (needs the bot's View Audit Log permission + the non-privileged
+    moderation intent, which is on by default), so we record the actor here.
+    """
+    if not WEBUI_ENABLED or entry.guild is None:
+        return
+    gid = entry.guild.id
+    actor = entry.user
+    actor_id = actor.id if actor else None
+    actor_name = (_member_display(actor) if actor else None)
+    target = entry.target
+    subject_id = getattr(target, "id", None)
+    subject_name = None
+    if subject_id is not None:
+        member = entry.guild.get_member(subject_id)
+        if member is not None:
+            subject_name = _member_display(member)
+        else:
+            row = db.get_member(gid, subject_id)
+            subject_name = row["display_name"] if row else str(subject_id)
+
+    action = entry.action
+    A = discord.AuditLogAction
+    if action is A.member_role_update:
+        added = getattr(entry.after, "roles", None) or []
+        removed = getattr(entry.before, "roles", None) or []
+        for role in added:
+            rname = getattr(role, "name", str(getattr(role, "id", role)))
+            db.add_audit(
+                gid, "role", "role_add",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=subject_id, subject_name=subject_name,
+                detail=f"gained role {rname} (by {actor_name or 'unknown'})",
+            )
+        for role in removed:
+            rname = getattr(role, "name", str(getattr(role, "id", role)))
+            db.add_audit(
+                gid, "role", "role_remove",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=subject_id, subject_name=subject_name,
+                detail=f"lost role {rname} (by {actor_name or 'unknown'})",
+            )
+    elif action is A.member_update:
+        # Nickname changes (only audit when the nick actually changed).
+        before_nick = getattr(entry.before, "nick", None)
+        after_nick = getattr(entry.after, "nick", None)
+        if before_nick != after_nick and (
+            hasattr(entry.before, "nick") or hasattr(entry.after, "nick")
+        ):
+            db.add_audit(
+                gid, "member", "nick_change",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=subject_id, subject_name=subject_name,
+                detail=(
+                    f"nickname: {before_nick or '—'} → {after_nick or '—'}"
+                    f" (by {actor_name or 'unknown'})"
+                ),
+            )
 
 
 @bot.event

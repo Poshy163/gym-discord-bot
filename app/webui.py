@@ -853,7 +853,9 @@ function auditTable(rows){
       <td class="muted" style="white-space:nowrap">${fmtTs(a.at)}</td>
       <td class="cat-${a.category}">${esc(a.category)}</td>
       <td>${esc(a.action)}</td>
-      <td class="muted">${esc(a.actor_name||"—")}</td>
+      <td>${a.actor_id?`<span class="who">${avatar(a.actor_id,a.actor_name,(AV[a.actor_id]||{}).avatar,24)}
+        <a class="link" onclick="memberView('${a.actor_id}')">${esc(a.actor_name)}</a></span>`
+        :`<span class="muted">${esc(a.actor_name||"—")}</span>`}</td>
       <td>${a.subject_id?`<span class="who">${avatar(a.subject_id,a.subject_name,a.subject_avatar||(AV[a.subject_id]||{}).avatar)}
         <a class="link" onclick="memberView('${a.subject_id}')">${esc(a.subject_name||a.subject_id)}</a></span>`
         :esc(a.subject_name||"—")}</td>
