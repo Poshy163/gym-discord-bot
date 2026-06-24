@@ -8189,6 +8189,21 @@ def _member_display(member: "discord.Member") -> str:
     return getattr(member, "display_name", None) or member.name
 
 
+def _member_avatar(member) -> str | None:
+    """Resolved Discord avatar URL (server avatar > user avatar > default).
+
+    ``display_avatar`` always returns something — a custom avatar when set, or
+    the user's default embed avatar — so the dashboard never has a broken image.
+    Stored at a fixed size to keep the CDN URL stable and the thumbnails crisp.
+    """
+    try:
+        asset = member.display_avatar
+        sized = asset.with_size(128) if hasattr(asset, "with_size") else asset
+        return str(sized.url)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _role_payload(role: "discord.Role") -> dict:
     return {
         "id": role.id,
@@ -8215,6 +8230,7 @@ def _sync_guild_snapshot(guild: "discord.Guild") -> None:
                 guild.id, m.id, m.name, _member_display(m),
                 is_bot=m.bot, present=True,
                 joined_at=m.joined_at.isoformat() if m.joined_at else None,
+                avatar=_member_avatar(m),
             )
             db.set_member_roles(
                 guild.id, m.id,
@@ -8257,6 +8273,7 @@ async def on_member_join(member: "discord.Member") -> None:  # pragma: no cover
         member.guild.id, member.id, member.name, _member_display(member),
         is_bot=member.bot, present=True,
         joined_at=member.joined_at.isoformat() if member.joined_at else None,
+        avatar=_member_avatar(member),
     )
     db.set_member_roles(
         member.guild.id, member.id,
@@ -8313,6 +8330,7 @@ async def on_member_update(
             gid, after.id, after.name, name,
             is_bot=after.bot, present=True,
             joined_at=after.joined_at.isoformat() if after.joined_at else None,
+            avatar=_member_avatar(after),
         )
         db.add_audit(
             gid, "member", "nick_change",
@@ -8336,6 +8354,7 @@ async def on_user_update(
             guild.id, m.id, after.name, _member_display(m),
             is_bot=m.bot, present=True,
             joined_at=m.joined_at.isoformat() if m.joined_at else None,
+            avatar=_member_avatar(m),
         )
         db.add_audit(
             guild.id, "member", "username_change",

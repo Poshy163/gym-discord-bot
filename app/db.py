@@ -325,6 +325,7 @@ CREATE TABLE IF NOT EXISTS members (
     user_id      INTEGER NOT NULL,
     username     TEXT    NOT NULL,
     display_name TEXT    NOT NULL,
+    avatar       TEXT,
     is_bot       INTEGER NOT NULL DEFAULT 0,
     present      INTEGER NOT NULL DEFAULT 1,
     joined_at    TEXT,
@@ -499,6 +500,15 @@ class Database:
             if strava_cols and "last_channel_id" not in strava_cols:
                 self._connection.execute(
                     "ALTER TABLE strava_account ADD COLUMN last_channel_id INTEGER"
+                )
+            # Dashboard avatars: older member mirrors predate the avatar column.
+            member_cols = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(members)")
+            }
+            if member_cols and "avatar" not in member_cols:
+                self._connection.execute(
+                    "ALTER TABLE members ADD COLUMN avatar TEXT"
                 )
             self._recanonicalize_equipment()
 
@@ -3082,16 +3092,23 @@ class Database:
         offset: int = 0,
     ) -> list[sqlite3.Row]:
         """Most-recent-first slice of the audit log, optionally filtered by
-        category and/or subject user."""
-        sql = "SELECT * FROM audit_log WHERE guild_id = ?"
+        category and/or subject user. Left-joins the member mirror so each row
+        carries the subject's avatar for the dashboard."""
+        sql = (
+            "SELECT a.*, m.avatar AS subject_avatar "
+            "FROM audit_log a "
+            "LEFT JOIN members m "
+            "  ON m.guild_id = a.guild_id AND m.user_id = a.subject_id "
+            "WHERE a.guild_id = ?"
+        )
         params: list[object] = [guild_id]
         if category:
-            sql += " AND category = ?"
+            sql += " AND a.category = ?"
             params.append(category)
         if subject_id is not None:
-            sql += " AND subject_id = ?"
+            sql += " AND a.subject_id = ?"
             params.append(subject_id)
-        sql += " ORDER BY at DESC, id DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY a.at DESC, a.id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         with self._conn() as c:
             return list(c.execute(sql, params))
@@ -3235,25 +3252,26 @@ class Database:
     def upsert_member(
         self, guild_id: int, user_id: int, username: str,
         display_name: str, is_bot: bool = False, present: bool = True,
-        joined_at: str | None = None,
+        joined_at: str | None = None, avatar: str | None = None,
     ) -> None:
         with self._conn() as c:
             c.execute(
                 """
                 INSERT INTO members
-                    (guild_id, user_id, username, display_name, is_bot,
+                    (guild_id, user_id, username, display_name, avatar, is_bot,
                      present, joined_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id, user_id) DO UPDATE SET
                     username = excluded.username,
                     display_name = excluded.display_name,
+                    avatar = COALESCE(excluded.avatar, members.avatar),
                     is_bot = excluded.is_bot,
                     present = excluded.present,
                     joined_at = COALESCE(excluded.joined_at, members.joined_at),
                     updated_at = excluded.updated_at
                 """,
                 (
-                    guild_id, user_id, username, display_name,
+                    guild_id, user_id, username, display_name, avatar,
                     1 if is_bot else 0, 1 if present else 0, joined_at,
                     _normalize_iso(None),
                 ),
@@ -3295,7 +3313,7 @@ class Database:
     ) -> list[sqlite3.Row]:
         """All known members with their role count, ordered by display name."""
         sql = """
-            SELECT m.user_id, m.username, m.display_name, m.is_bot,
+            SELECT m.user_id, m.username, m.display_name, m.avatar, m.is_bot,
                    m.present, m.joined_at,
                    COUNT(mr.role_id) AS role_count
             FROM members m
@@ -3332,7 +3350,7 @@ class Database:
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT m.user_id, m.username, m.display_name, m.present
+                SELECT m.user_id, m.username, m.display_name, m.avatar, m.present
                 FROM member_roles mr
                 JOIN members m
                     ON m.guild_id = mr.guild_id AND m.user_id = mr.user_id

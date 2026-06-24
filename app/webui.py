@@ -193,6 +193,7 @@ def build_app(
                 "user_id": str(r["user_id"]),
                 "username": r["username"],
                 "display_name": r["display_name"],
+                "avatar": r["avatar"],
                 "is_bot": bool(r["is_bot"]),
                 "present": bool(r["present"]),
                 "joined_at": r["joined_at"],
@@ -240,6 +241,7 @@ def build_app(
                 "user_id": str(r["user_id"]),
                 "username": r["username"],
                 "display_name": r["display_name"],
+                "avatar": r["avatar"],
                 "present": bool(r["present"]),
             }
             for r in rows
@@ -380,6 +382,13 @@ def build_app(
             raise web.HTTPBadRequest(text="missing id")
         return gid, body
 
+    async def logo(_request: web.Request) -> web.Response:
+        # Unauthenticated so it works as the favicon on the login page too.
+        return web.Response(
+            text=LOGO_SVG, content_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
@@ -388,6 +397,7 @@ def build_app(
         web.get("/login", login_get),
         web.post("/login", login_post),
         web.post("/logout", logout_post),
+        web.get("/logo.svg", logo),
         web.get("/", index),
         web.get("/api/guilds", api_guilds),
         web.get("/api/overview", api_overview),
@@ -439,6 +449,7 @@ def _member_dict(r) -> dict:
         "user_id": str(r["user_id"]),
         "username": r["username"],
         "display_name": r["display_name"],
+        "avatar": r["avatar"] if "avatar" in r.keys() else None,
         "is_bot": bool(r["is_bot"]),
         "present": bool(r["present"]),
         "joined_at": r["joined_at"],
@@ -462,6 +473,7 @@ def _role_dict(r) -> dict:
 
 
 def _audit_dict(r) -> dict:
+    keys = r.keys()
     return {
         "id": r["id"],
         "at": r["at"],
@@ -471,6 +483,7 @@ def _audit_dict(r) -> dict:
         "actor_name": r["actor_name"],
         "subject_id": str(r["subject_id"]) if r["subject_id"] else None,
         "subject_name": r["subject_name"],
+        "subject_avatar": r["subject_avatar"] if "subject_avatar" in keys else None,
         "detail": r["detail"],
     }
 
@@ -490,139 +503,262 @@ def _clamp_int(val, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
-# ---- static HTML -----------------------------------------------------------
+# ---- static assets ---------------------------------------------------------
 
-LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
+# Served at /logo.svg and reused as the favicon and header mark. A gradient
+# dumbbell on a rounded dark tile.
+LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="#0d1117"/>
+  <g fill="url(#g)">
+    <rect x="21" y="29" width="22" height="6" rx="3"/>
+    <rect x="9"  y="21" width="8" height="22" rx="3.5"/>
+    <rect x="17" y="25" width="5" height="14" rx="2.5"/>
+    <rect x="47" y="21" width="8" height="22" rx="3.5"/>
+    <rect x="42" y="25" width="5" height="14" rx="2.5"/>
+  </g>
+</svg>"""
+
+
+LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gym Dashboard — Login</title>
+<title>Gym Dashboard — Sign in</title>
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
 :root{color-scheme:dark}
-body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;
-padding:2.5rem;width:320px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
-h1{margin:0 0 1.25rem;font-size:1.3rem}
-input{width:100%;box-sizing:border-box;padding:.65rem;margin:.25rem 0 1rem;
-background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;
-font-size:1rem}
-button{width:100%;padding:.7rem;background:#238636;border:0;border-radius:8px;
-color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
-button:hover{background:#2ea043}
-.err{color:#f85149;margin:.25rem 0 0;font-size:.9rem}
-.sub{color:#7d8590;font-size:.8rem;margin-top:1rem;text-align:center}
+*{box-sizing:border-box}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;height:100vh;
+display:flex;align-items:center;justify-content:center;color:#e6edf3;
+background:radial-gradient(1200px 600px at 50% -10%,#1b2540 0%,#0b0e14 55%)}
+.card{background:rgba(22,27,34,.7);backdrop-filter:blur(12px);
+border:1px solid rgba(255,255,255,.08);border-radius:18px;
+padding:2.5rem 2.25rem;width:340px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.brand{display:flex;align-items:center;gap:.7rem;margin-bottom:1.75rem}
+.brand img{width:44px;height:44px}
+.brand b{font-size:1.25rem;background:linear-gradient(90deg,#a5b4fc,#67e8f9);
+-webkit-background-clip:text;background-clip:text;color:transparent}
+label{font-size:.78rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
+input{width:100%;padding:.7rem .8rem;margin:.4rem 0 1.1rem;font-size:1rem;
+background:#0d1117;border:1px solid #30363d;border-radius:10px;color:#e6edf3}
+input:focus{outline:none;border-color:#6366f1;box-shadow:0 0 0 3px #6366f133}
+button{width:100%;padding:.75rem;border:0;border-radius:10px;font-size:1rem;
+font-weight:600;cursor:pointer;color:#fff;
+background:linear-gradient(90deg,#6366f1,#22d3ee)}
+button:hover{filter:brightness(1.08)}
+.err{color:#f85149;margin:0 0 .75rem;font-size:.88rem}
+.sub{color:#6e7681;font-size:.78rem;margin-top:1.25rem;text-align:center}
 </style></head><body>
 <form class="card" method="post" action="/login">
-<h1>🏋️ Gym Dashboard</h1>
+<div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
 <label>Password</label>
 <input type="password" name="password" autofocus autocomplete="current-password">
 <!--ERR-->
 <button type="submit">Sign in</button>
-<p class="sub">Operator access only.</p>
+<p class="sub">Operator access only</p>
 </form></body></html>"""
 
 
-DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gym Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
-:root{color-scheme:dark}
+:root{
+  color-scheme:dark;
+  --bg:#0b0e14; --panel:#161b22; --panel2:#1c222c; --line:#262d38;
+  --text:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+  --indigo:#818cf8; --cyan:#22d3ee; --accent:linear-gradient(90deg,#6366f1,#22d3ee);
+}
 *{box-sizing:border-box}
-body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0}
-header{display:flex;align-items:center;gap:1rem;padding:.75rem 1.25rem;
-background:#161b22;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:5}
-header h1{font-size:1.05rem;margin:0}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;color:var(--text);
+background:radial-gradient(1100px 520px at 100% -5%,#172036 0%,rgba(11,14,20,0) 60%),
+          radial-gradient(900px 500px at -5% 0%,#16242b 0%,rgba(11,14,20,0) 55%),var(--bg);
+min-height:100vh}
+a{color:inherit}
+::-webkit-scrollbar{height:10px;width:10px}
+::-webkit-scrollbar-thumb{background:#2a313c;border-radius:6px}
+
+/* header */
+header{display:flex;align-items:center;gap:.85rem;padding:.7rem 1.4rem;
+background:rgba(13,17,23,.72);backdrop-filter:blur(12px);
+border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+.brand{display:flex;align-items:center;gap:.6rem}
+.brand img{width:30px;height:30px}
+.brand b{font-size:1.05rem;background:var(--accent);-webkit-background-clip:text;
+background-clip:text;color:transparent;letter-spacing:.2px}
 header .sp{flex:1}
-select,button,input{font:inherit;color:#e6edf3;background:#0d1117;
-border:1px solid #30363d;border-radius:7px;padding:.4rem .55rem}
-button{cursor:pointer;background:#21262d}
-button:hover{background:#30363d}
-button.danger{border-color:#5c2626}button.danger:hover{background:#5c2626}
-nav{display:flex;gap:.25rem;padding:.5rem 1.25rem;background:#161b22;
-border-bottom:1px solid #30363d;flex-wrap:wrap}
-nav a{padding:.4rem .8rem;border-radius:7px;cursor:pointer;color:#9da7b3;
-text-decoration:none;font-size:.92rem}
-nav a.active{background:#1f6feb33;color:#e6edf3}
-main{padding:1.25rem;max-width:1200px;margin:0 auto}
-.cards{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.25rem}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:10px;
-padding:1rem 1.25rem;min-width:130px}
-.stat .n{font-size:1.7rem;font-weight:700}
-.stat .l{color:#7d8590;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}
+.gselect{position:relative}
+select,.btn{font:inherit;color:var(--text);background:var(--panel);
+border:1px solid var(--line);border-radius:10px;padding:.45rem .7rem;cursor:pointer}
+select:hover,.btn:hover{border-color:#3a4350;background:var(--panel2)}
+.btn{display:inline-flex;align-items:center;gap:.4rem}
+.btn.primary{background:var(--accent);border:0;color:#fff;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:#ff9a96;border-color:#5c2b2b}
+.btn.danger:hover{background:#3a1d1d}
+form.inline{margin:0}
+
+/* nav */
+nav{display:flex;gap:.3rem;padding:.6rem 1.4rem;flex-wrap:wrap;
+border-bottom:1px solid var(--line);background:rgba(13,17,23,.4)}
+nav a{display:flex;align-items:center;gap:.4rem;padding:.4rem .85rem;border-radius:9px;
+cursor:pointer;color:var(--muted);font-size:.92rem;font-weight:500;transition:.15s}
+nav a:hover{color:var(--text);background:#ffffff0a}
+nav a.active{color:#fff;background:linear-gradient(90deg,#6366f133,#22d3ee22);
+box-shadow:inset 0 0 0 1px #6366f155}
+
+main{padding:1.5rem;max-width:1240px;margin:0 auto}
+h2{font-size:1.15rem;margin:.2rem 0 1.1rem;font-weight:650}
+.muted{color:var(--muted)}.faint{color:var(--faint)}
+
+/* stat cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+gap:1rem;margin-bottom:1.6rem}
+.stat{position:relative;background:linear-gradient(180deg,#1a212c,#141a22);
+border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.2rem;overflow:hidden}
+.stat::before{content:"";position:absolute;inset:0 auto auto 0;width:100%;height:3px;
+background:var(--accent);opacity:.85}
+.stat .n{font-size:1.85rem;font-weight:750;line-height:1.1;letter-spacing:-.5px}
+.stat .l{color:var(--muted);font-size:.74rem;text-transform:uppercase;
+letter-spacing:.06em;margin-top:.25rem}
+
+/* table card */
+.tcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:.9rem}
-th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid #21262d}
-th{color:#7d8590;font-weight:600;font-size:.78rem;text-transform:uppercase}
-tr:hover td{background:#161b2255}
-.pill{display:inline-block;padding:.1rem .5rem;border-radius:999px;
-font-size:.78rem;border:1px solid #30363d;margin:1px}
-.muted{color:#7d8590}
+thead th{position:sticky;top:0;background:#1a212c;color:var(--muted);
+font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+text-align:left;padding:.7rem .9rem;border-bottom:1px solid var(--line)}
+tbody td{padding:.6rem .9rem;border-bottom:1px solid #1e242e;vertical-align:middle}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:#ffffff05}
+
+/* avatars + identity */
+.av{border-radius:50%;object-fit:cover;background:#222;flex:none;
+box-shadow:0 0 0 1px #ffffff14}
+.av-fallback{display:inline-flex;align-items:center;justify-content:center;
+color:#fff;font-weight:600;font-size:.8em}
+.who{display:inline-flex;align-items:center;gap:.6rem;min-width:0}
+.who a{font-weight:550;text-decoration:none}
+.who a:hover{color:var(--indigo)}
+
+.pill{display:inline-flex;align-items:center;gap:.35rem;padding:.16rem .6rem;
+border-radius:999px;font-size:.78rem;border:1px solid var(--line);margin:2px 1px;
+background:#ffffff08}
+.pill .dot{width:8px;height:8px;border-radius:50%}
+.tag{padding:.12rem .5rem;border-radius:6px;font-size:.72rem;font-weight:600}
+.link{color:var(--indigo);cursor:pointer;text-decoration:none}
+.link:hover{text-decoration:underline}
 .cat-role{color:#d2a8ff}.cat-member{color:#7ee787}.cat-data{color:#79c0ff}
-.row-actions{display:flex;gap:.35rem}
-a.link{color:#58a6ff;cursor:pointer;text-decoration:none}
-a.link:hover{text-decoration:underline}
-.filters{display:flex;gap:.5rem;align-items:center;margin-bottom:1rem;flex-wrap:wrap}
-.empty{color:#7d8590;padding:2rem;text-align:center}
-h2{font-size:1.1rem;margin:.2rem 0 1rem}
-dialog{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:12px;
-padding:1.5rem;min-width:320px}
-dialog::backdrop{background:rgba(0,0,0,.6)}
-dialog label{display:block;font-size:.8rem;color:#7d8590;margin:.6rem 0 .2rem}
-dialog input{width:100%}
-.dlg-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.25rem}
-.toast{position:fixed;bottom:1.25rem;right:1.25rem;background:#1f6feb;
-color:#fff;padding:.7rem 1rem;border-radius:8px;opacity:0;transition:.25s;
-pointer-events:none}
-.toast.show{opacity:1}
+.row-actions{display:flex;gap:.4rem;justify-content:flex-end}
+.btn.sm{padding:.28rem .55rem;font-size:.82rem;border-radius:8px}
+
+.filters{display:flex;gap:.5rem;align-items:center;margin-bottom:1.1rem;flex-wrap:wrap}
+.seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);
+border-radius:10px;overflow:hidden}
+.seg button{background:transparent;border:0;color:var(--muted);padding:.4rem .8rem;
+cursor:pointer;font:inherit}
+.seg button.on{background:linear-gradient(90deg,#6366f133,#22d3ee22);color:#fff}
+.empty{color:var(--muted);padding:2.5rem;text-align:center}
+
+/* member hero */
+.hero{display:flex;align-items:center;gap:1.1rem;margin:.4rem 0 1.4rem}
+.hero .av{box-shadow:0 0 0 3px #0b0e14,0 0 0 5px #6366f1aa}
+.hero h2{margin:0;font-size:1.5rem}
+.crumb{display:inline-flex;align-items:center;gap:.35rem;color:var(--muted);
+cursor:pointer;margin-bottom:.6rem;font-size:.88rem}
+.crumb:hover{color:var(--text)}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.3rem 0}
+
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);
+border-radius:16px;padding:1.5rem;min-width:340px;box-shadow:0 30px 80px #000a}
+dialog::backdrop{background:#0009;backdrop-filter:blur(2px)}
+dialog h2{margin-top:0}
+dialog label{display:block;font-size:.74rem;color:var(--muted);
+text-transform:uppercase;letter-spacing:.05em;margin:.7rem 0 .25rem}
+dialog input{width:100%;padding:.6rem .7rem;background:#0d1117;border:1px solid var(--line);
+border-radius:9px;color:var(--text);font:inherit}
+.dlg-actions{display:flex;gap:.6rem;justify-content:flex-end;margin-top:1.4rem}
+
+.toast{position:fixed;bottom:1.4rem;right:1.4rem;padding:.7rem 1.1rem;border-radius:11px;
+background:var(--panel2);border:1px solid var(--line);box-shadow:0 12px 30px #0007;
+opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none;z-index:50}
+.toast.show{opacity:1;transform:none}
+.spin{display:inline-block;width:34px;height:34px;border:3px solid #2a313c;
+border-top-color:var(--indigo);border-radius:50%;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.center{display:flex;justify-content:center;padding:3rem}
 </style></head><body>
 <header>
-  <h1>🏋️ Gym Dashboard</h1>
-  <select id="guild" onchange="onGuild()"></select>
+  <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
+  <div class="gselect"><select id="guild" onchange="onGuild()"></select></div>
   <span class="sp"></span>
-  <button onclick="resync()" title="Re-pull members & roles from Discord">↻ Sync</button>
-  <form method="post" action="/logout" style="margin:0"><button>Logout</button></form>
+  <button class="btn" onclick="resync()" title="Re-pull members & roles from Discord">↻ Sync</button>
+  <form class="inline" method="post" action="/logout"><button class="btn">Logout</button></form>
 </header>
 <nav id="nav"></nav>
-<main id="view"><div class="empty">Loading…</div></main>
+<main id="view"><div class="center"><div class="spin"></div></div></main>
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS = ["overview","members","roles","audit","lifts","calories","protein"];
-let guild = null, tab = "overview";
+const TABS=[["overview","📊"],["members","👥"],["roles","🛡️"],["audit","📜"],
+  ["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
+const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
+let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="";
 
-function toast(msg){const t=document.getElementById("toast");t.textContent=msg;
+function toast(m){const t=document.getElementById("toast");t.textContent=m;
   t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200);}
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,
+function esc(s){return(s==null?"":String(s)).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtTs(s){if(!s)return"";const d=new Date(s);return isNaN(d)?s:
-  d.toLocaleString();}
-function roleColor(c){if(!c)return"#8b949e";return"#"+c.toString(16).padStart(6,"0");}
-async function api(path){const r=await fetch(path);if(r.status===401){
-  location.href="/login";return null;}if(!r.ok)throw new Error(await r.text());
-  return r.json();}
-async function post(path,body){const r=await fetch(path,{method:"POST",
-  headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(r.status===401){location.href="/login";return null;}return r.json();}
+  d.toLocaleString([], {dateStyle:"medium",timeStyle:"short"});}
+function roleColor(c){return c?("#"+(c>>>0).toString(16).padStart(6,"0").slice(-6)):"#8b949e";}
+function idColor(id){let h=0;const s=String(id);for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))>>>0;
+  return PALETTE[h%PALETTE.length];}
+function avatar(uid,name,url,size){size=size||30;const st=`width:${size}px;height:${size}px`;
+  if(url)return `<img class="av" style="${st}" src="${esc(url)}" alt="" loading="lazy"
+    onerror="this.replaceWith(Object.assign(document.createElement('span'),
+    {className:'av av-fallback',style:'${st};background:${idColor(uid)}',textContent:'${esc((name||'?')[0]||'?').toUpperCase()}'}))">`;
+  return `<span class="av av-fallback" style="${st};background:${idColor(uid)}">${esc((name||'?')[0]||'?').toUpperCase()}</span>`;}
+function avFor(uid,name,size){const m=AV[uid];return avatar(uid,name||(m&&m.name),m&&m.avatar,size);}
+function who(uid,name){return `<span class="who">${avFor(uid,name)}<a class="link" onclick="memberView('${uid}')">${esc(name)}</a></span>`;}
 
-function renderNav(){const n=document.getElementById("nav");
-  n.innerHTML=TABS.map(t=>`<a class="${t===tab?'active':''}" onclick="go('${t}')">${t}</a>`).join("");}
-function go(t){tab=t;renderNav();render();}
-function onGuild(){guild=document.getElementById("guild").value;render();}
+async function api(p){const r=await fetch(p);if(r.status===401){location.href="/login";return null;}
+  if(!r.ok)throw new Error(await r.text());return r.json();}
+async function post(p,b){const r=await fetch(p,{method:"POST",
+  headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
+  if(r.status===401){location.href="/login";return null;}return r.json();}
+function spinner(){return '<div class="center"><div class="spin"></div></div>';}
+
+function renderNav(){document.getElementById("nav").innerHTML=
+  TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" onclick="go('${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
+function go(t){tab=t;dataUserFilter=null;renderNav();render();}
+async function onGuild(){guild=document.getElementById("guild").value;await loadAvatars();render();}
+
+async function loadAvatars(){AV={};try{const d=await api(`/api/members?guild=${guild}`);
+  if(d)for(const m of d.members)AV[m.user_id]={avatar:m.avatar,name:m.display_name};}catch(e){}}
 
 async function boot(){
   const g=await api("/api/guilds");if(!g)return;
   const sel=document.getElementById("guild");
   if(!g.guilds.length){document.getElementById("view").innerHTML=
     '<div class="empty">No guilds tracked yet. Once the bot syncs a server it appears here.</div>';return;}
-  sel.innerHTML=g.guilds.map(x=>`<option value="${x.id}">${esc(x.name||("Guild "+x.id))}</option>`).join("");
-  guild=g.guilds[0].id;renderNav();render();
+  sel.innerHTML=g.guilds.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join("");
+  guild=g.guilds[0].id;renderNav();await loadAvatars();render();
 }
 async function resync(){if(!guild)return;toast("Syncing…");
-  const r=await post("/api/resync",{guild});
-  toast(r&&r.ok?"Synced":"Sync unavailable");render();}
+  const r=await post("/api/resync",{guild});await loadAvatars();
+  toast(r&&r.ok?"Synced ✓":"Sync unavailable");render();}
 
 async function render(){
   const v=document.getElementById("view");
   if(!guild){v.innerHTML='<div class="empty">Pick a guild.</div>';return;}
-  v.innerHTML='<div class="empty">Loading…</div>';
+  v.innerHTML=spinner();
   try{
     if(tab==="overview")return renderOverview(v);
     if(tab==="members")return renderMembers(v);
@@ -631,152 +767,144 @@ async function render(){
     if(["lifts","calories","protein"].includes(tab))return renderData(v,tab);
   }catch(e){v.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
 }
+function stat(n,l){return `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`;}
 
 async function renderOverview(v){
-  const d=await api(`/api/overview?guild=${guild}`);if(!d)return;
-  const t=d.totals||{};
+  const d=await api(`/api/overview?guild=${guild}`);if(!d)return;const t=d.totals||{};
   v.innerHTML=`<div class="cards">
-    ${stat(d.member_count,"Members")}
-    ${stat(d.role_count,"Roles")}
-    ${stat(t.total_lifts||0,"Lifts")}
-    ${stat(t.lifters||0,"Lifters")}
-    ${stat(t.unique_equip||0,"Exercises")}
-  </div>
-  <h2>Recent activity</h2>${auditTable(d.recent_audit)}`;
+    ${stat(d.member_count,"Members")}${stat(d.role_count,"Roles")}
+    ${stat(t.total_lifts||0,"Lifts")}${stat(t.lifters||0,"Lifters")}
+    ${stat(t.unique_equip||0,"Exercises")}</div>
+    <h2>Recent activity</h2>${auditTable(d.recent_audit)}`;
 }
-function stat(n,l){return `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`;}
 
 async function renderMembers(v){
   const d=await api(`/api/members?guild=${guild}`);if(!d)return;
-  if(!d.members.length){v.innerHTML='<div class="empty">No members synced. Hit ↻ Sync.</div>';return;}
-  v.innerHTML=`<h2>Members (${d.members.length})</h2><table><thead><tr>
-    <th>Name</th><th>Username</th><th>Roles</th><th>Joined</th><th></th></tr></thead><tbody>${
-    d.members.map(m=>`<tr>
-      <td><a class="link" onclick="memberView('${m.user_id}')">${esc(m.display_name)}</a>
-        ${m.is_bot?'<span class="pill">bot</span>':''}${m.present?'':'<span class="pill muted">left</span>'}</td>
+  if(!d.members.length){v.innerHTML='<div class="empty">No members synced yet. Hit ↻ Sync.</div>';return;}
+  v.innerHTML=`<h2>Members <span class="faint">· ${d.members.length}</span></h2>
+    <div class="tcard"><table><thead><tr><th>Member</th><th>Username</th><th>Roles</th>
+    <th>Joined</th></tr></thead><tbody>${d.members.map(m=>`<tr>
+      <td>${who(m.user_id,m.display_name)} ${m.is_bot?'<span class="pill">bot</span>':''}
+        ${m.present?'':'<span class="pill faint">left</span>'}</td>
       <td class="muted">${esc(m.username)}</td>
       <td>${m.role_count}</td>
-      <td class="muted">${fmtTs(m.joined_at)}</td>
-      <td><a class="link" onclick="memberView('${m.user_id}')">view</a></td>
-    </tr>`).join("")}</tbody></table>`;
+      <td class="muted">${fmtTs(m.joined_at)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 async function memberView(uid){
-  const v=document.getElementById("view");v.innerHTML='<div class="empty">Loading…</div>';
+  tab="members";renderNav();
+  const v=document.getElementById("view");v.innerHTML=spinner();
   const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
-  const m=d.member,o=d.overview||{};
-  const lifts=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
-  v.innerHTML=`<a class="link" onclick="go('members')">&larr; members</a>
-    <h2>${esc(m.display_name||uid)} <span class="muted" style="font-size:.8rem">${esc(m.username||"")}</span></h2>
-    <div class="cards">
-      ${stat(lifts.n||0,"Lifts")}
-      ${stat(lifts.equip||0,"Exercises")}
-      ${stat(o.bodyweight?o.bodyweight.weight_kg+"kg":"—","Bodyweight")}
-      ${stat(Math.round(cal.total||0),"kcal logged")}
-      ${stat(Math.round(pro.total||0),"g protein")}
-    </div>
-    <p>${d.strava_linked?'<span class="pill">Strava linked</span>':''}
-       ${d.revo_linked?'<span class="pill">Revo linked</span>':''}</p>
-    <h2>Roles</h2><div>${d.roles.length?d.roles.map(r=>
-      `<span class="pill" style="border-color:${roleColor(r.color)};color:${roleColor(r.color)}">${esc(r.name)}</span>`
-      ).join(""):'<span class="muted">none</span>'}</div>
-    <h2 style="margin-top:1.5rem">History (this member)</h2>${auditTable(d.audit)}
-    <p style="margin-top:1rem"><a class="link" onclick="go2('lifts','${uid}')">lifts</a> ·
-       <a class="link" onclick="go2('calories','${uid}')">calories</a> ·
-       <a class="link" onclick="go2('protein','${uid}')">protein</a> for this member</p>`;
+  const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
+  v.innerHTML=`<div class="crumb" onclick="go('members')">← Members</div>
+    <div class="hero">${avatar(uid,m.display_name,m.avatar,72)}
+      <div><h2>${esc(m.display_name||uid)}</h2>
+      <div class="muted">${esc(m.username||"")}</div>
+      <div class="chips">${d.strava_linked?'<span class="pill">🟧 Strava</span>':''}
+        ${d.revo_linked?'<span class="pill">🟢 Revo</span>':''}
+        ${m.present?'':'<span class="pill faint">left server</span>'}</div></div></div>
+    <div class="cards">${stat(L.n||0,"Lifts")}${stat(L.equip||0,"Exercises")}
+      ${stat(o.bodyweight?o.bodyweight.weight_kg+" kg":"—","Bodyweight")}
+      ${stat(Math.round(cal.total||0),"kcal logged")}${stat(Math.round(pro.total||0),"g protein")}</div>
+    <h2>Roles</h2><div class="chips">${d.roles.length?d.roles.map(r=>
+      `<span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}</span>`
+      ).join(""):'<span class="muted">No roles.</span>'}</div>
+    <h2 style="margin-top:1.6rem">History</h2>${auditTable(d.audit)}
+    <p style="margin-top:1rem" class="muted">View this member's
+      <a class="link" onclick="go2('lifts','${uid}')">lifts</a>,
+      <a class="link" onclick="go2('calories','${uid}')">calories</a> or
+      <a class="link" onclick="go2('protein','${uid}')">protein</a>.</p>`;
 }
-let dataUserFilter=null;
 function go2(t,uid){dataUserFilter=uid;tab=t;renderNav();render();}
 
 async function renderRoles(v){
   const d=await api(`/api/roles?guild=${guild}`);if(!d)return;
-  if(!d.roles.length){v.innerHTML='<div class="empty">No roles synced. Hit ↻ Sync.</div>';return;}
-  v.innerHTML=`<h2>Roles (${d.roles.length})</h2><table><thead><tr>
-    <th>Role</th><th>Members</th><th>Position</th></tr></thead><tbody>${
-    d.roles.map(r=>`<tr>
-      <td><span class="pill" style="border-color:${roleColor(r.color)};color:${roleColor(r.color)}">${esc(r.name)}</span>
-        ${r.managed?'<span class="pill muted">managed</span>':''}</td>
-      <td><a class="link" onclick="roleView('${r.role_id}','${esc(r.name)}')">${r.members}</a></td>
-      <td class="muted">${r.position}</td></tr>`).join("")}</tbody></table>`;
+  if(!d.roles.length){v.innerHTML='<div class="empty">No roles synced yet. Hit ↻ Sync.</div>';return;}
+  v.innerHTML=`<h2>Roles <span class="faint">· ${d.roles.length}</span></h2>
+    <div class="tcard"><table><thead><tr><th>Role</th><th>Members</th><th>Position</th></tr></thead>
+    <tbody>${d.roles.map(r=>`<tr>
+      <td><span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}</span>
+        ${r.managed?'<span class="pill faint">managed</span>':''}</td>
+      <td><a class="link" onclick="roleView('${r.role_id}','${esc(r.name).replace(/'/g,"&#39;")}')">${r.members}</a></td>
+      <td class="muted">${r.position}</td></tr>`).join("")}</tbody></table></div>`;
 }
 async function roleView(rid,name){
-  const v=document.getElementById("view");
+  const v=document.getElementById("view");v.innerHTML=spinner();
   const d=await api(`/api/role?guild=${guild}&role=${rid}`);if(!d)return;
-  v.innerHTML=`<a class="link" onclick="go('roles')">&larr; roles</a><h2>${esc(name)}</h2>
-    <table><thead><tr><th>Name</th><th>Username</th></tr></thead><tbody>${
-    d.members.map(m=>`<tr><td><a class="link" onclick="memberView('${m.user_id}')">${esc(m.display_name)}</a>
-      ${m.present?'':'<span class="pill muted">left</span>'}</td>
+  v.innerHTML=`<div class="crumb" onclick="go('roles')">← Roles</div><h2>${esc(name)}
+    <span class="faint">· ${d.members.length}</span></h2>
+    <div class="tcard"><table><thead><tr><th>Member</th><th>Username</th></tr></thead>
+    <tbody>${d.members.map(m=>`<tr><td>${who(m.user_id,m.display_name)}
+      ${m.present?'':'<span class="pill faint">left</span>'}</td>
       <td class="muted">${esc(m.username)}</td></tr>`).join("")||
-      '<tr><td colspan=2 class="muted">No members.</td></tr>'}</tbody></table>`;
+      '<tr><td colspan="2" class="muted">No members.</td></tr>'}</tbody></table></div>`;
 }
 
-let auditCat="";
 async function renderAudit(v){
   const d=await api(`/api/audit?guild=${guild}&limit=200${auditCat?'&category='+auditCat:''}`);if(!d)return;
-  v.innerHTML=`<div class="filters">Filter:
-    ${["","role","member","data"].map(c=>`<button onclick="auditCat='${c}';render()"
-      ${c===auditCat?'style="background:#1f6feb33"':''}>${c||"all"}</button>`).join("")}
-    <span class="muted">${d.total} total</span></div>
-    ${auditTable(d.audit)}`;
+  v.innerHTML=`<div class="filters"><div class="seg">${["","role","member","data"].map(c=>
+      `<button class="${c===auditCat?'on':''}" onclick="auditCat='${c}';render()">${c||"all"}</button>`).join("")}</div>
+      <span class="faint">${d.total} total</span></div>${auditTable(d.audit)}`;
 }
 function auditTable(rows){
-  if(!rows||!rows.length)return '<div class="empty">Nothing yet.</div>';
-  return `<table><thead><tr><th>When</th><th>Category</th><th>Action</th>
-    <th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>${
-    rows.map(a=>`<tr>
-      <td class="muted">${fmtTs(a.at)}</td>
+  if(!rows||!rows.length)return '<div class="empty">Nothing here yet.</div>';
+  return `<div class="tcard"><table><thead><tr><th>When</th><th>Category</th><th>Action</th>
+    <th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>${rows.map(a=>`<tr>
+      <td class="muted" style="white-space:nowrap">${fmtTs(a.at)}</td>
       <td class="cat-${a.category}">${esc(a.category)}</td>
       <td>${esc(a.action)}</td>
-      <td>${esc(a.actor_name||"—")}</td>
-      <td>${a.subject_id?`<a class="link" onclick="memberView('${a.subject_id}')">${esc(a.subject_name||a.subject_id)}</a>`:esc(a.subject_name||"—")}</td>
-      <td class="muted">${esc(a.detail||"")}</td></tr>`).join("")}</tbody></table>`;
+      <td class="muted">${esc(a.actor_name||"—")}</td>
+      <td>${a.subject_id?`<span class="who">${avatar(a.subject_id,a.subject_name,a.subject_avatar||(AV[a.subject_id]||{}).avatar)}
+        <a class="link" onclick="memberView('${a.subject_id}')">${esc(a.subject_name||a.subject_id)}</a></span>`
+        :esc(a.subject_name||"—")}</td>
+      <td class="muted">${esc(a.detail||"")}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 async function renderData(v,kind){
-  const u=dataUserFilter;dataUserFilter=null;
+  const u=dataUserFilter;
   const d=await api(`/api/${kind}?guild=${guild}&limit=200${u?'&user='+u:''}`);if(!d)return;
   const rows=d[kind];
   const head=kind==="lifts"?"<th>Exercise</th><th>Weight</th><th>Reps</th>":
-    kind==="calories"?"<th>kcal</th><th>Note</th>":"<th>grams</th><th>Note</th>";
-  v.innerHTML=`<h2>${kind[0].toUpperCase()+kind.slice(1)} ${u?'(filtered)':''} — ${rows.length} shown</h2>
-    ${u?`<p><a class="link" onclick="render()">clear filter</a></p>`:''}
-    <table><thead><tr><th>When</th><th>Member</th>${head}<th></th></tr></thead><tbody>${
-    rows.map(r=>dataRow(kind,r)).join("")||'<tr><td colspan=6 class="empty">Nothing logged.</td></tr>'}</tbody></table>`;
+    kind==="calories"?"<th>kcal</th><th>Note</th>":"<th>Protein</th><th>Note</th>";
+  v.innerHTML=`<h2>${kind[0].toUpperCase()+kind.slice(1)}
+      <span class="faint">· ${rows.length}${u?' · filtered':''}</span></h2>
+    ${u?`<p><a class="link" onclick="dataUserFilter=null;render()">× clear member filter</a></p>`:''}
+    <div class="tcard"><table><thead><tr><th>When</th><th>Member</th>${head}<th></th></tr></thead>
+    <tbody>${rows.map(r=>dataRow(kind,r)).join("")||
+      '<tr><td colspan="6" class="empty">Nothing logged.</td></tr>'}</tbody></table></div>`;
 }
 function dataRow(kind,r){
   let cells;
-  if(kind==="lifts")cells=`<td>${esc(r.equipment)}</td><td>${r.weight_kg}${r.bw?' (BW+)':''}</td><td>${r.reps??""}</td>`;
-  else if(kind==="calories")cells=`<td>${Math.round(r.kcal)}</td><td class="muted">${esc(r.note||"")}</td>`;
-  else cells=`<td>${Math.round(r.grams)}</td><td class="muted">${esc(r.note||"")}</td>`;
-  const edit=kind==="lifts"?`<button onclick='editLift(${JSON.stringify(r)})'>edit</button>`:"";
-  return `<tr><td class="muted">${fmtTs(r.logged_at)}</td>
-    <td><a class="link" onclick="memberView('${r.user_id}')">${esc(r.username)}</a></td>
-    ${cells}<td><div class="row-actions">${edit}
-    <button class="danger" onclick="delData('${kind}',${r.id})">del</button></div></td></tr>`;
+  if(kind==="lifts")cells=`<td><b>${esc(r.equipment)}</b></td><td>${r.weight_kg}${r.bw?' <span class="faint">(BW+)</span>':''}</td><td class="muted">${r.reps??""}</td>`;
+  else if(kind==="calories")cells=`<td><b>${Math.round(r.kcal)}</b></td><td class="muted">${esc(r.note||"")}</td>`;
+  else cells=`<td><b>${Math.round(r.grams)} g</b></td><td class="muted">${esc(r.note||"")}</td>`;
+  const editBtn=kind==="lifts"?`<button class="btn sm" onclick='editLift(${JSON.stringify(r)})'>Edit</button>`:"";
+  return `<tr><td class="muted" style="white-space:nowrap">${fmtTs(r.logged_at)}</td>
+    <td>${who(r.user_id,r.username)}</td>${cells}
+    <td><div class="row-actions">${editBtn}
+    <button class="btn sm danger" onclick="delData('${kind}',${r.id})">Delete</button></div></td></tr>`;
 }
 async function delData(kind,id){
   if(!confirm("Delete this entry? This is audited and cannot be undone."))return;
   const path={lifts:"/api/lifts/delete",calories:"/api/calories/delete",protein:"/api/protein/delete"}[kind];
-  const r=await post(path,{guild,id});toast(r&&r.ok?"Deleted":"Failed");render();
+  const r=await post(path,{guild,id});toast(r&&r.ok?"Deleted ✓":"Failed");render();
 }
 function editLift(r){
   const dlg=document.getElementById("editDlg");
-  dlg.innerHTML=`<h2 style="margin-top:0">Edit lift</h2>
+  dlg.innerHTML=`<h2>Edit lift</h2>
     <label>Exercise</label><input id="e_eq" value="${esc(r.equipment)}">
     <label>Weight (kg)</label><input id="e_w" type="number" step="0.5" value="${r.weight_kg}">
     <label>Reps</label><input id="e_r" type="number" value="${r.reps??''}">
-    <div class="dlg-actions"><button onclick="document.getElementById('editDlg').close()">Cancel</button>
-    <button onclick="saveLift(${r.id})" style="background:#238636">Save</button></div>`;
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
+    <button class="btn primary" onclick="saveLift(${r.id})">Save</button></div>`;
   dlg.showModal();
 }
 async function saveLift(id){
   const eq=document.getElementById("e_eq").value.trim();
-  const w=document.getElementById("e_w").value;
-  const rp=document.getElementById("e_r").value;
+  const w=document.getElementById("e_w").value;const rp=document.getElementById("e_r").value;
   const r=await post("/api/lifts/edit",{guild,id,equipment:eq,weight_kg:w,reps:rp||null});
-  document.getElementById("editDlg").close();
-  toast(r&&r.ok?"Saved":"Failed");render();
+  document.getElementById("editDlg").close();toast(r&&r.ok?"Saved ✓":"Failed");render();
 }
 boot();
-</script>
-</body></html>"""
+</script></body></html>"""
+

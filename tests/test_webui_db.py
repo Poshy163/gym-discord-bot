@@ -36,7 +36,8 @@ def _seed_guild(db):
         {"id": 11, "name": "Member", "color": 0, "position": 1,
          "managed": False},
     ])
-    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.upsert_member(1, 100, "alice", "Alice", present=True,
+                     avatar="https://cdn.example/100.png")
     db.upsert_member(1, 200, "bob", "Bob", present=True)
     db.set_member_roles(1, 100, [10, 11])
     db.set_member_roles(1, 200, [11])
@@ -68,6 +69,26 @@ def test_members_with_role(db):
     _seed_guild(db)
     holders = {m["display_name"] for m in db.members_with_role(1, 11)}
     assert holders == {"Alice", "Bob"}
+
+
+def test_avatar_stored_and_surfaced(db):
+    _seed_guild(db)
+    # list_members and members_with_role carry the avatar URL.
+    alice = next(m for m in db.list_members(1) if m["display_name"] == "Alice")
+    assert alice["avatar"] == "https://cdn.example/100.png"
+    holder = next(m for m in db.members_with_role(1, 10))
+    assert holder["avatar"] == "https://cdn.example/100.png"
+    # An update without an avatar must not wipe the stored one (COALESCE).
+    db.upsert_member(1, 100, "alice", "Alice2", present=True)
+    again = next(m for m in db.list_members(1) if m["user_id"] == 100)
+    assert again["avatar"] == "https://cdn.example/100.png"
+
+
+def test_audit_join_carries_subject_avatar(db):
+    _seed_guild(db)
+    db.add_audit(1, "role", "role_add", subject_id=100, subject_name="Alice")
+    row = db.list_audit(1, category="role")[0]
+    assert row["subject_avatar"] == "https://cdn.example/100.png"
 
 
 def test_delete_role_removes_edges(db):
