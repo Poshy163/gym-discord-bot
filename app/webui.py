@@ -88,13 +88,26 @@ def build_app(
     db,
     password: str,
     resync: ResyncHandler | None = None,
+    today_window: Callable[[], tuple[str, str]] | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
     ``db`` is the shared :class:`app.db.Database`. ``password`` is the shared
     login secret. ``resync`` (optional) re-pulls member/role state from Discord.
+    ``today_window`` (optional) returns the ``(start_iso, end_iso)`` of "today"
+    in the bot's display timezone — used for today's nutrition totals; falls
+    back to a UTC calendar day.
     """
     sessions = _Sessions()
+
+    def _today() -> tuple[str, str]:
+        if today_window is not None:
+            return today_window()
+        from datetime import datetime, timedelta, timezone
+        start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        return start.isoformat(), (start + timedelta(days=1)).isoformat()
 
     # ---- auth helpers ----------------------------------------------------
 
@@ -213,6 +226,15 @@ def build_app(
         roles = db.member_role_names(gid, uid)
         overview = db.web_member_overview(gid, uid)
         audit = [_audit_dict(r) for r in db.list_audit(gid, subject_id=uid, limit=50)]
+        start, end = _today()
+        cal_goal = db.calorie_goal_get(gid, uid)
+        pro_goal = db.protein_goal_get(gid, uid)
+        cal_today, _ = db.calorie_total_between(gid, uid, start, end)
+        pro_today, _ = db.protein_total_between(gid, uid, start, end)
+        bw = [
+            {"weight_kg": r["weight_kg"], "at": r["recorded_at"]}
+            for r in db.bodyweight_history(gid, uid, limit=400)
+        ]
         return web.json_response({
             "member": _member_dict(member) if member else {"user_id": str(uid)},
             "roles": [_role_dict(r) for r in roles],
@@ -220,6 +242,27 @@ def build_app(
             "audit": audit,
             "strava_linked": db.get_strava_account(uid) is not None,
             "revo_linked": db.get_revo_account(uid) is not None,
+            "nutrition": {
+                "calorie_goal": (
+                    cal_goal["daily_target_kcal"] if cal_goal else None
+                ),
+                "calorie_today": cal_today,
+                "protein_goal": (
+                    pro_goal["daily_target_g"] if pro_goal else None
+                ),
+                "protein_today": pro_today,
+            },
+            "foods": [_food_dict(r) for r in db.calorie_food_list(gid, uid)],
+            "lift_goals": [
+                {
+                    "equipment": r["equipment"],
+                    "target_kg": r["target_kg"],
+                    "bw": bool(r["bw"]),
+                    "current_best": r["current_best"],
+                }
+                for r in db.goal_list(gid, uid)
+            ],
+            "bodyweights": bw,
         })
 
     async def api_roles(request: web.Request) -> web.Response:
@@ -326,6 +369,38 @@ def build_app(
             for r in rows
         ]})
 
+    async def api_foods(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        uid = _opt_user(request)
+        if uid is None:
+            raise web.HTTPBadRequest(text="?user required")
+        rows = db.calorie_food_list(gid, uid)
+        return web.json_response({"foods": [_food_dict(r) for r in rows]})
+
+    async def api_equipment(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        return web.json_response({"equipment": db.known_equipment(gid)})
+
+    async def api_leaderboard(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        equipment = request.query.get("equipment", "").strip()
+        if not equipment:
+            raise web.HTTPBadRequest(text="?equipment required")
+        rows = db.leaderboard(gid, equipment)
+        return web.json_response({"equipment": equipment, "rows": [
+            {
+                "user_id": str(r["user_id"]),
+                "username": r["username"],
+                "best": r["best"],
+                "bw": bool(r["bw"]),
+                "set_on": r["set_on"],
+            }
+            for r in rows
+        ]})
+
     # ---- JSON API: edits (audited) --------------------------------------
 
     async def api_lift_delete(request: web.Request) -> web.Response:
@@ -357,6 +432,58 @@ def build_app(
         _require(request)
         gid, body = await _edit_ctx(request)
         ok = db.web_delete_protein(gid, int(body["id"]), _actor(request))
+        return web.json_response({"ok": ok})
+
+    async def api_food_set(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+            display = str(body["display"]).strip()
+            kcal = float(body["kcal"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild, user, display, kcal required")
+        if not display:
+            raise web.HTTPBadRequest(text="display name required")
+        # Normalize the lookup key the same way the bot does for chat shortcuts.
+        from . import calories as _cal
+        name = _cal.normalize_food(display)
+        if not name:
+            raise web.HTTPBadRequest(text="invalid food name")
+        protein_raw = body.get("protein_g")
+        protein_g = None
+        if protein_raw not in (None, "", "null"):
+            try:
+                protein_g = float(protein_raw)
+            except (ValueError, TypeError):
+                raise web.HTTPBadRequest(text="invalid protein")
+        member = db.get_member(gid, uid)
+        username = member["display_name"] if member else str(uid)
+        db.web_food_set(
+            gid, uid, username, name=name, display=display,
+            kcal=kcal, protein_g=protein_g, actor_name=_actor(request),
+        )
+        return web.json_response({"ok": True})
+
+    async def api_food_delete(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+            name = str(body["name"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild, user, name required")
+        member = db.get_member(gid, uid)
+        username = member["display_name"] if member else str(uid)
+        ok = db.web_food_delete(gid, uid, username, name, _actor(request))
         return web.json_response({"ok": ok})
 
     async def api_resync(request: web.Request) -> web.Response:
@@ -409,10 +536,15 @@ def build_app(
         web.get("/api/lifts", api_lifts),
         web.get("/api/calories", api_calories),
         web.get("/api/protein", api_protein),
+        web.get("/api/foods", api_foods),
+        web.get("/api/equipment", api_equipment),
+        web.get("/api/leaderboard", api_leaderboard),
         web.post("/api/lifts/delete", api_lift_delete),
         web.post("/api/lifts/edit", api_lift_edit),
         web.post("/api/calories/delete", api_calorie_delete),
         web.post("/api/protein/delete", api_protein_delete),
+        web.post("/api/foods/set", api_food_set),
+        web.post("/api/foods/delete", api_food_delete),
         web.post("/api/resync", api_resync),
         web.get("/healthz", health),
     ])
@@ -470,6 +602,15 @@ def _role_dict(r) -> dict:
     if "managed" in keys:
         out["managed"] = bool(r["managed"])
     return out
+
+
+def _food_dict(r) -> dict:
+    return {
+        "name": r["name"],
+        "display": r["display"],
+        "kcal": r["kcal"],
+        "protein_g": r["protein_g"],
+    }
 
 
 def _audit_dict(r) -> dict:
@@ -693,6 +834,35 @@ opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none;z-index:
 border-top-color:var(--indigo);border-radius:50%;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .center{display:flex;justify-content:center;padding:3rem}
+
+/* search */
+.search{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+padding:.45rem .7rem .45rem 2rem;color:var(--text);font:inherit;min-width:220px;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%238b949e' stroke-width='2'%3E%3Ccircle cx='6' cy='6' r='4.5'/%3E%3Cpath d='M10 10l3 3'/%3E%3C/svg%3E");
+background-repeat:no-repeat;background-position:.6rem center}
+.search:focus{outline:none;border-color:#6366f1}
+
+/* progress bars (nutrition + goals) */
+.pgoal{margin:.5rem 0}
+.pgrow{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:.3rem}
+.ptrack{height:8px;background:#0d1117;border-radius:6px;overflow:hidden;
+border:1px solid var(--line)}
+.pfill{height:100%;border-radius:6px;transition:width .4s}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.1rem;margin-bottom:1.4rem}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.2rem}
+.box h3{margin:.1rem 0 .8rem;font-size:.8rem;text-transform:uppercase;
+letter-spacing:.05em;color:var(--muted)}
+.kv{display:flex;justify-content:space-between;padding:.3rem 0;
+border-bottom:1px solid #1e242e;font-size:.9rem}
+.kv:last-child{border-bottom:0}
+
+/* sparkline */
+.spark{width:100%;height:64px;display:block}
+.spark path.line{fill:none;stroke:url(#grad);stroke-width:2}
+.spark path.area{fill:url(#fade);opacity:.25}
+
+/* medals on leaderboard */
+.rank{display:inline-flex;width:24px;justify-content:center;font-weight:700}
 </style></head><body>
 <header>
   <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
@@ -706,10 +876,40 @@ border-top-color:var(--indigo);border-radius:50%;animation:sp 1s linear infinite
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["roles","🛡️"],["audit","📜"],
-  ["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
+const TABS=[["overview","📊"],["members","👥"],["roles","🛡️"],["leaderboard","🏆"],
+  ["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
-let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="";
+let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[];
+
+function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" oninput="filterTable(this.value)">`;}
+function filterTable(term){term=(term||"").toLowerCase();
+  document.querySelectorAll("#view tbody tr").forEach(tr=>{
+    tr.style.display=tr.textContent.toLowerCase().includes(term)?"":"none";});}
+function pct(v,g){return Math.max(0,Math.min(100,g?v/g*100:0));}
+function bar(label,val,goal,unit,warnOver){
+  val=val||0;
+  if(!goal)return `<div class="pgoal"><div class="pgrow"><span>${label}</span>
+    <span><b>${Math.round(val)}</b>${unit} <span class="faint">· no goal set</span></span></div></div>`;
+  const over=val>goal;
+  const col=over?(warnOver?"#f85149":"#f0a500"):"linear-gradient(90deg,#6366f1,#22d3ee)";
+  return `<div class="pgoal"><div class="pgrow"><span>${label}</span>
+    <span><b>${Math.round(val)}</b> / ${Math.round(goal)}${unit}${over?(warnOver?' ⚠️ over':' ✓ over'):''}</span></div>
+    <div class="ptrack"><div class="pfill" style="width:${pct(val,goal)}%;background:${col}"></div></div></div>`;
+}
+function sparkline(pts){
+  if(!pts||pts.length<2)return '<div class="faint">Not enough data for a trend.</div>';
+  const ys=pts.map(p=>p.weight_kg),mn=Math.min(...ys),mx=Math.max(...ys),rng=(mx-mn)||1;
+  const W=600,H=64,pad=4;
+  const xs=(i)=>pad+i*(W-2*pad)/(pts.length-1);
+  const yy=(v)=>H-pad-((v-mn)/rng)*(H-2*pad);
+  const line=pts.map((p,i)=>`${i?'L':'M'}${xs(i).toFixed(1)},${yy(p.weight_kg).toFixed(1)}`).join(" ");
+  const area=`M${pad},${H} `+pts.map((p,i)=>`L${xs(i).toFixed(1)},${yy(p.weight_kg).toFixed(1)}`).join(" ")+` L${W-pad},${H} Z`;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="grad" x1="0" x2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+    <linearGradient id="fade" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>
+    <path class="area" d="${area}"/><path class="line" d="${line}"/></svg>
+    <div class="pgrow faint"><span>${mn.toFixed(1)} kg</span><span>latest ${ys[ys.length-1].toFixed(1)} kg</span><span>${mx.toFixed(1)} kg</span></div>`;
+}
 
 function toast(m){const t=document.getElementById("toast");t.textContent=m;
   t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200);}
@@ -763,6 +963,7 @@ async function render(){
     if(tab==="overview")return renderOverview(v);
     if(tab==="members")return renderMembers(v);
     if(tab==="roles")return renderRoles(v);
+    if(tab==="leaderboard")return renderLeaderboard(v);
     if(tab==="audit")return renderAudit(v);
     if(["lifts","calories","protein"].includes(tab))return renderData(v,tab);
   }catch(e){v.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
@@ -781,7 +982,9 @@ async function renderOverview(v){
 async function renderMembers(v){
   const d=await api(`/api/members?guild=${guild}`);if(!d)return;
   if(!d.members.length){v.innerHTML='<div class="empty">No members synced yet. Hit ↻ Sync.</div>';return;}
-  v.innerHTML=`<h2>Members <span class="faint">· ${d.members.length}</span></h2>
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">Members
+      <span class="faint">· ${d.members.length}</span></h2><span class="sp" style="flex:1"></span>
+      ${searchBar("Search members…")}</div>
     <div class="tcard"><table><thead><tr><th>Member</th><th>Username</th><th>Roles</th>
     <th>Joined</th></tr></thead><tbody>${d.members.map(m=>`<tr>
       <td>${who(m.user_id,m.display_name)} ${m.is_bot?'<span class="pill">bot</span>':''}
@@ -792,10 +995,12 @@ async function renderMembers(v){
 }
 
 async function memberView(uid){
-  tab="members";renderNav();
+  tab="members";renderNav();currentMember=uid;
   const v=document.getElementById("view");v.innerHTML=spinner();
   const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
+  const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[];
+  currentFoods=foods;
   v.innerHTML=`<div class="crumb" onclick="go('members')">← Members</div>
     <div class="hero">${avatar(uid,m.display_name,m.avatar,72)}
       <div><h2>${esc(m.display_name||uid)}</h2>
@@ -806,6 +1011,29 @@ async function memberView(uid){
     <div class="cards">${stat(L.n||0,"Lifts")}${stat(L.equip||0,"Exercises")}
       ${stat(o.bodyweight?o.bodyweight.weight_kg+" kg":"—","Bodyweight")}
       ${stat(Math.round(cal.total||0),"kcal logged")}${stat(Math.round(pro.total||0),"g protein")}</div>
+    <div class="grid2">
+      <div class="box"><h3>Today's nutrition</h3>
+        ${bar("Calories",n.calorie_today,n.calorie_goal," kcal",false)}
+        ${bar("Protein",n.protein_today,n.protein_goal," g",true)}</div>
+      <div class="box"><h3>Bodyweight trend</h3>${sparkline(bw)}</div>
+    </div>
+    <div class="grid2">
+      <div class="box"><h3 style="display:flex;justify-content:space-between">Saved foods
+        <a class="link" onclick="foodDialog('${uid}')">+ add</a></h3>
+        ${foods.length?`<table><tbody>${foods.map((f,i)=>`<tr>
+          <td><b>${esc(f.display)}</b></td><td>${Math.round(f.kcal)} kcal</td>
+          <td>${f.protein_g!=null?Math.round(f.protein_g)+' g':'<span class="faint">—</span>'}</td>
+          <td><div class="row-actions">
+          <button class="btn sm" onclick="foodEditIdx('${uid}',${i})">edit</button>
+          <button class="btn sm danger" onclick="foodDeleteIdx('${uid}',${i})">del</button>
+          </div></td></tr>`).join("")}</tbody></table>`:'<div class="faint">No saved foods.</div>'}</div>
+      <div class="box"><h3>Lift goals</h3>${goals.length?goals.map(g=>{
+        const p=pct(g.current_best,g.target_kg),done=g.current_best>=g.target_kg;
+        return `<div class="pgoal"><div class="pgrow"><span>${esc(g.equipment)}${g.bw?' <span class="faint">(BW+)</span>':''}</span>
+          <span>${g.current_best}/${g.target_kg} kg${done?' 🎯':''}</span></div>
+          <div class="ptrack"><div class="pfill" style="width:${p}%;background:${done?'#10b981':'linear-gradient(90deg,#6366f1,#22d3ee)'}"></div></div></div>`;
+        }).join(""):'<div class="faint">No goals set.</div>'}</div>
+    </div>
     <h2>Roles</h2><div class="chips">${d.roles.length?d.roles.map(r=>
       `<span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}</span>`
       ).join(""):'<span class="muted">No roles.</span>'}</div>
@@ -814,6 +1042,51 @@ async function memberView(uid){
       <a class="link" onclick="go2('lifts','${uid}')">lifts</a>,
       <a class="link" onclick="go2('calories','${uid}')">calories</a> or
       <a class="link" onclick="go2('protein','${uid}')">protein</a>.</p>`;
+}
+
+function foodEditIdx(uid,i){foodDialog(uid,currentFoods[i]);}
+function foodDeleteIdx(uid,i){foodDelete(uid,currentFoods[i].name);}
+function foodDialog(uid,f){
+  const dlg=document.getElementById("editDlg");f=f||{};
+  dlg.innerHTML=`<h2>${f.name?'Edit':'Add'} food</h2>
+    <label>Name</label><input id="f_name" value="${f.display?esc(f.display):''}" ${f.name?'readonly':''} placeholder="e.g. Protein shake">
+    <label>Calories (kcal)</label><input id="f_kcal" type="number" value="${f.kcal!=null?f.kcal:''}">
+    <label>Protein (g, optional)</label><input id="f_pro" type="number" value="${f.protein_g!=null?f.protein_g:''}">
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
+    <button class="btn primary" onclick="foodSave('${uid}')">Save</button></div>`;
+  dlg.showModal();
+}
+async function foodSave(uid){
+  const display=document.getElementById("f_name").value.trim();
+  const kcal=document.getElementById("f_kcal").value;
+  const pro=document.getElementById("f_pro").value;
+  if(!display||kcal===""){toast("Name and calories required");return;}
+  const r=await post("/api/foods/set",{guild,user:uid,display,kcal,protein_g:pro===""?null:pro});
+  document.getElementById("editDlg").close();toast(r&&r.ok?"Saved ✓":"Failed");memberView(uid);
+}
+async function foodDelete(uid,name){
+  if(!confirm("Delete this saved food?"))return;
+  const r=await post("/api/foods/delete",{guild,user:uid,name});
+  toast(r&&r.ok?"Deleted ✓":"Failed");memberView(uid);
+}
+
+async function renderLeaderboard(v){
+  const eq=await api(`/api/equipment?guild=${guild}`);if(!eq)return;
+  const list=eq.equipment||[];
+  if(!list.length){v.innerHTML='<div class="empty">No lifts logged yet.</div>';return;}
+  if(!lbEquip||!list.includes(lbEquip))lbEquip=list[0];
+  const d=await api(`/api/leaderboard?guild=${guild}&equipment=${encodeURIComponent(lbEquip)}`);if(!d)return;
+  const medal=["🥇","🥈","🥉"];
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">🏆 Leaderboard</h2>
+    <select onchange="lbEquip=this.value;render()">${list.map(e=>
+      `<option ${e===lbEquip?'selected':''}>${esc(e)}</option>`).join("")}</select>
+    <span class="sp" style="flex:1"></span>${searchBar("Search…")}</div>
+    <div class="tcard"><table><thead><tr><th>#</th><th>Member</th><th>Best</th><th>Set</th></tr></thead>
+    <tbody>${d.rows.map((r,i)=>`<tr><td><span class="rank">${medal[i]||(i+1)}</span></td>
+      <td>${who(r.user_id,r.username)}</td>
+      <td><b>${r.best}${r.bw?' <span class="faint">(BW+)</span>':''}</b> kg</td>
+      <td class="muted">${fmtTs(r.set_on)}</td></tr>`).join("")||
+      '<tr><td colspan="4" class="muted">No entries.</td></tr>'}</tbody></table></div>`;
 }
 function go2(t,uid){dataUserFilter=uid;tab=t;renderNav();render();}
 
@@ -868,9 +1141,10 @@ async function renderData(v,kind){
   const rows=d[kind];
   const head=kind==="lifts"?"<th>Exercise</th><th>Weight</th><th>Reps</th>":
     kind==="calories"?"<th>kcal</th><th>Note</th>":"<th>Protein</th><th>Note</th>";
-  v.innerHTML=`<h2>${kind[0].toUpperCase()+kind.slice(1)}
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">${kind[0].toUpperCase()+kind.slice(1)}
       <span class="faint">· ${rows.length}${u?' · filtered':''}</span></h2>
-    ${u?`<p><a class="link" onclick="dataUserFilter=null;render()">× clear member filter</a></p>`:''}
+      ${u?`<a class="link" onclick="dataUserFilter=null;render()">× clear member filter</a>`:''}
+      <span class="sp" style="flex:1"></span>${searchBar("Search…")}</div>
     <div class="tcard"><table><thead><tr><th>When</th><th>Member</th>${head}<th></th></tr></thead>
     <tbody>${rows.map(r=>dataRow(kind,r)).join("")||
       '<tr><td colspan="6" class="empty">Nothing logged.</td></tr>'}</tbody></table></div>`;

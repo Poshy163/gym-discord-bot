@@ -197,6 +197,30 @@ def test_web_delete_calorie_and_protein(db):
     assert db.count_audit(1, category="data") == 2
 
 
+def test_web_food_set_and_delete_audited(db):
+    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.web_food_set(
+        1, 100, "Alice", name="eggs", display="Eggs", kcal=140,
+        protein_g=12, actor_name="web:op",
+    )
+    foods = db.calorie_food_list(1, 100)
+    assert foods[0]["display"] == "Eggs" and foods[0]["protein_g"] == 12
+    row = db.list_audit(1, category="data")[0]
+    assert row["action"] == "food_set" and "12g protein" in row["detail"]
+    # Delete is audited and returns True only when something was removed.
+    assert db.web_food_delete(1, 100, "Alice", "eggs", "web:op") is True
+    assert db.web_food_delete(1, 100, "Alice", "eggs", "web:op") is False
+    assert db.list_audit(1, category="data")[0]["action"] == "food_delete"
+
+
+def test_leaderboard_orders_by_best(db):
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)])
+    db.add_lifts(1, 200, "Bob", [_Lift("bench", 120)])
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 110)])  # Alice PR
+    rows = db.leaderboard(1, "bench")
+    assert [(r["username"], r["best"]) for r in rows] == [("Bob", 120), ("Alice", 110)]
+
+
 def test_member_overview_aggregates(db):
     db.add_lifts(1, 100, "Alice", [_Lift("bench", 100), _Lift("squat", 140)])
     db.calorie_add(1, 100, "Alice", 500)

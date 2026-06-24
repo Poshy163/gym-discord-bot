@@ -329,6 +329,22 @@ def test_calorie_food_set_get_update_remove(db):
     assert db.calorie_food_remove(1, 100, "coffee") is False
 
 
+def test_calorie_food_protein_optional_and_preserved(db):
+    # Save with protein.
+    db.calorie_food_set(1, 100, "shake", "Protein Shake", 250, 30)
+    row = db.calorie_food_get(1, 100, "shake")
+    assert row["kcal"] == 250 and row["protein_g"] == 30
+    # Re-save with only a new calorie amount (protein omitted) → protein kept.
+    db.calorie_food_set(1, 100, "shake", "Protein Shake", 260)
+    row = db.calorie_food_get(1, 100, "shake")
+    assert row["kcal"] == 260 and row["protein_g"] == 30
+    # Explicit 0 clears it; a brand-new food has NULL protein.
+    db.calorie_food_set(1, 100, "shake", "Protein Shake", 260, 0)
+    assert db.calorie_food_get(1, 100, "shake")["protein_g"] == 0
+    db.calorie_food_set(1, 100, "coffee", "Coffee", 5)
+    assert db.calorie_food_get(1, 100, "coffee")["protein_g"] is None
+
+
 def test_calorie_food_scoped_per_user_and_guild(db):
     db.calorie_food_set(1, 100, "coffee", "Coffee", 5)
     db.calorie_food_set(1, 200, "coffee", "Coffee", 9)

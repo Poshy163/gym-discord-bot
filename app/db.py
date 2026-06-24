@@ -205,12 +205,13 @@ CREATE INDEX IF NOT EXISTS idx_calorie_entries_user
 -- (lowercased, whitespace-collapsed) for lookups; ``display`` keeps the
 -- original casing for output.
 CREATE TABLE IF NOT EXISTS calorie_foods (
-    guild_id INTEGER NOT NULL,
-    user_id  INTEGER NOT NULL,
-    name     TEXT    NOT NULL,
-    display  TEXT    NOT NULL,
-    kcal     REAL    NOT NULL,
-    set_at   TEXT    NOT NULL,
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    name      TEXT    NOT NULL,
+    display   TEXT    NOT NULL,
+    kcal      REAL    NOT NULL,
+    protein_g REAL,
+    set_at    TEXT    NOT NULL,
     PRIMARY KEY (guild_id, user_id, name)
 );
 
@@ -509,6 +510,18 @@ class Database:
             if member_cols and "avatar" not in member_cols:
                 self._connection.execute(
                     "ALTER TABLE members ADD COLUMN avatar TEXT"
+                )
+            # Saved foods can carry an optional protein value (grams/serving)
+            # so logging the food logs protein too. Older DBs predate it.
+            food_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(calorie_foods)"
+                )
+            }
+            if food_cols and "protein_g" not in food_cols:
+                self._connection.execute(
+                    "ALTER TABLE calorie_foods ADD COLUMN protein_g REAL"
                 )
             self._recanonicalize_equipment()
 
@@ -2969,23 +2982,31 @@ class Database:
 
     def calorie_food_set(
         self, guild_id: int, user_id: int, name: str, display: str,
-        kcal: float,
+        kcal: float, protein_g: float | None = None,
     ) -> None:
         """Create or update a saved food shortcut. ``name`` must already be
-        normalized (lowercased/whitespace-collapsed)."""
+        normalized (lowercased/whitespace-collapsed).
+
+        ``protein_g`` is optional grams-of-protein per serving. On an update,
+        passing ``None`` *preserves* any protein already stored (so re-saving a
+        food with only a new calorie amount doesn't wipe its protein); pass a
+        number — including ``0`` — to set it explicitly.
+        """
         with self._conn() as c:
             c.execute(
                 """
                 INSERT INTO calorie_foods
-                    (guild_id, user_id, name, display, kcal, set_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (guild_id, user_id, name, display, kcal, protein_g, set_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (guild_id, user_id, name) DO UPDATE SET
-                    display = excluded.display,
-                    kcal    = excluded.kcal,
-                    set_at  = excluded.set_at
+                    display   = excluded.display,
+                    kcal      = excluded.kcal,
+                    protein_g = COALESCE(excluded.protein_g, calorie_foods.protein_g),
+                    set_at    = excluded.set_at
                 """,
                 (
                     guild_id, user_id, name, display, float(kcal),
+                    None if protein_g is None else float(protein_g),
                     _normalize_iso(None),
                 ),
             )
@@ -2995,7 +3016,7 @@ class Database:
     ) -> sqlite3.Row | None:
         with self._conn() as c:
             return c.execute(
-                "SELECT name, display, kcal FROM calorie_foods "
+                "SELECT name, display, kcal, protein_g FROM calorie_foods "
                 "WHERE guild_id = ? AND user_id = ? AND name = ?",
                 (guild_id, user_id, name),
             ).fetchone()
@@ -3016,7 +3037,7 @@ class Database:
     ) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute(
-                "SELECT name, display, kcal FROM calorie_foods "
+                "SELECT name, display, kcal, protein_g FROM calorie_foods "
                 "WHERE guild_id = ? AND user_id = ? "
                 "ORDER BY display COLLATE NOCASE",
                 (guild_id, user_id),
@@ -3558,3 +3579,33 @@ class Database:
                 "calories": dict(cal) if cal else {},
                 "protein": dict(pro) if pro else {},
             }
+
+    def web_food_set(
+        self, guild_id: int, user_id: int, username: str, *,
+        name: str, display: str, kcal: float,
+        protein_g: float | None, actor_name: str,
+    ) -> None:
+        """Create/update a saved food from the dashboard, and audit it.
+        ``name`` must already be normalized."""
+        self.calorie_food_set(guild_id, user_id, name, display, kcal, protein_g)
+        detail = f"{display} = {kcal:.0f} kcal"
+        if protein_g is not None:
+            detail += f", {protein_g:.0f}g protein"
+        self.add_audit(
+            guild_id, "data", "food_set",
+            actor_name=actor_name, subject_id=user_id, subject_name=username,
+            detail=detail + " (web)",
+        )
+
+    def web_food_delete(
+        self, guild_id: int, user_id: int, username: str,
+        name: str, actor_name: str,
+    ) -> bool:
+        ok = self.calorie_food_remove(guild_id, user_id, name)
+        if ok:
+            self.add_audit(
+                guild_id, "data", "food_delete",
+                actor_name=actor_name, subject_id=user_id,
+                subject_name=username, detail=f"{name} (web)",
+            )
+        return ok

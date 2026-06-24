@@ -13,10 +13,15 @@ It is **disabled by default** and only starts once you set a login password.
 | Tab | Shows |
 | --- | --- |
 | **Overview** | Server totals (members, roles, lifts, lifters, exercises) and the latest audit activity. |
-| **Members** | Every member with display name, username, role count, join date. Click through to a per-member page with lift/nutrition counters, latest bodyweight, linked Strava/Revo status, full role list, and that member's own audit history. |
+| **Members** | Searchable list with avatars. Click through to a rich per-member page: lift/nutrition counters, **today's calories & protein vs goal** (progress bars), a **bodyweight trend sparkline**, **lift goals** with progress, the member's **saved foods** (add / edit / delete, including protein), linked Strava/Revo status, full role list, and audit history. |
 | **Roles** | Each role with its colour, position, and a live member count → list. |
-| **Audit** | A filterable (role / member / data) feed of changes — see below. |
-| **Lifts / Calories / Protein** | The raw entries (optionally filtered to one member), with inline **delete**, and **edit** for lifts. |
+| **Leaderboard** | Pick an exercise; see the ranked best lift per member, with 🥇🥈🥉 and avatars. |
+| **Audit** | A filterable (role / member / data) feed of changes, with actor + subject avatars — see below. |
+| **Lifts / Calories / Protein** | The raw entries (searchable, optionally filtered to one member), with inline **delete**, and **edit** for lifts. |
+
+Avatars (Discord profile pictures) appear throughout; a member with no avatar
+falls back to a coloured initial. All edits made here — including saved-food
+changes — are written to the audit log under `web:<ip>`.
 
 ## The audit log
 

@@ -1009,8 +1009,11 @@ async def _handle_calorie_food_message(
     message: discord.Message, target: object,
     food_row: sqlite3.Row, servings: int,
 ) -> None:
-    """Log a saved-food chat shortcut (`coffee`, `2 protein shake`). Tick-only
-    confirmation, like the other chat calorie path."""
+    """Log a saved-food chat shortcut (`coffee`, `2 protein shake`).
+
+    Always logs the food's calories. If the food was saved with a protein value
+    and the user is protein-tracking, the protein is logged too and a combined
+    reply (🥗) is posted so a ❌ removes both entries at once."""
     guild_id = message.guild.id if message.guild else 0
     target_id = int(getattr(target, "id"))
     kcal = float(food_row["kcal"]) * servings
@@ -1028,20 +1031,69 @@ async def _handle_calorie_food_message(
     goal = db.calorie_goal_get(guild_id, target_id)
     if goal is None:  # pragma: no cover - _match_calorie_food already checked
         return
+    raw = message.content.strip()[:80]
     try:
         entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
-            note=note, raw=message.content.strip()[:80],
-            message_id=message.id,
+            note=note, raw=raw, message_id=message.id,
         )
     except Exception:
         LOG.exception("Failed to store food entry for user %s", target_id)
         return
+
+    # Optionally log this food's protein too. Gated on the user actually
+    # tracking protein and the food carrying a value within sane bounds.
+    food_protein = food_row["protein_g"] if "protein_g" in food_row.keys() else None
+    pro_goal = db.protein_goal_get(guild_id, target_id)
+    grams = float(food_protein) * servings if food_protein is not None else 0.0
+    logged_protein = False
+    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
+        try:
+            db.protein_add(
+                guild_id, target_id, _display_name(target), grams,
+                note=note, raw=raw, message_id=message.id,
+            )
+            logged_protein = True
+        except Exception:
+            LOG.exception("Failed to store food protein for user %s", target_id)
+
     LOG.info(
-        "Stored food '%s' ×%d (%.0f kcal) for %s in #%s",
-        display, servings, kcal, target, message.channel,
+        "Stored food '%s' ×%d (%.0f kcal%s) for %s in #%s",
+        display, servings, kcal,
+        f", {grams:.0f}g protein" if logged_protein else "",
+        target, message.channel,
     )
-    await _reply_calorie_logged(message, target, goal, kcal, note, entry_id=entry_id)
+
+    if not logged_protein:
+        await _reply_calorie_logged(
+            message, target, goal, kcal, note, entry_id=entry_id,
+        )
+        return
+
+    # Combined reply (🥗) — mirrors _handle_combined_nutrition so the shared ❌
+    # undo path removes both the calorie and protein entries via the source id.
+    cal_total, _ = db.calorie_total_between(guild_id, target_id, *_today_window())
+    pro_total, _ = db.protein_total_between(guild_id, target_id, *_today_window())
+    suffix = _target_suffix(message.author, target)
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    try:
+        reply = await message.reply(
+            f"🥗 Logged **{calories.format_kcal(kcal)}** + "
+            f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}\n"
+            + _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+            + "\n"
+            + _protein_status_line(pro_total, float(pro_goal["daily_target_g"])),
+            mention_author=False,
+        )
+    except discord.HTTPException:
+        return
+    try:
+        await reply.add_reaction("❌")
+    except discord.HTTPException:
+        pass
 
 
 def _protein_status_line(total: float, ceiling: float) -> str:
@@ -3991,8 +4043,9 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "(`650`, `650c`, `2700kj`, or a saved food like `coffee`)\n"
             "Or just type `650kcal` / `200c` / `2700kj` on its own in chat — "
             "I'll react ✅ and reply with your running total\n"
-            "`/calories food_set <name> <amount>` — save a food shortcut, "
-            "then log it by typing `coffee` or `2 coffee` in chat\n"
+            "`/calories food_set <name> <amount> [protein]` — save a food "
+            "shortcut (optionally with protein), then log it by typing "
+            "`coffee` or `2 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories undo` — remove your last entry, or react ❌ on the "
@@ -8134,6 +8187,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         db=db,
         password=WEBUI_PASSWORD,
         resync=_webui_resync_guild,
+        today_window=_today_window,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -9944,9 +9998,12 @@ async def calories_stop_cmd(interaction: discord.Interaction) -> None:
 @app_commands.describe(
     name="Food name, e.g. coffee or protein shake.",
     amount='Calories per serving — kcal or kJ ("120", "120c", "500kj").',
+    protein='Optional protein per serving in grams ("30", "30g"). '
+            "Logged automatically when you log this food.",
 )
 async def calories_food_set_cmd(
     interaction: discord.Interaction, name: str, amount: str,
+    protein: str | None = None,
 ) -> None:
     norm = calories.normalize_food(name)
     if not norm:
@@ -9970,19 +10027,50 @@ async def calories_food_set_cmd(
             ephemeral=True,
         )
         return
+    # Optional protein. ``None`` is preserved on update by calorie_food_set, so
+    # re-saving a food with only a new calorie amount keeps its protein.
+    protein_g: float | None = None
+    if protein is not None and protein.strip():
+        protein_g = protein_mod.parse_protein_amount(protein)
+        if protein_g is None or protein_g < 0:
+            await interaction.response.send_message(
+                "Couldn't read that protein amount — try `30` or `30g`.",
+                ephemeral=True,
+            )
+            return
+        if protein_g > _MAX_PROTEIN_ENTRY_G:
+            await interaction.response.send_message(
+                f"That's over {_MAX_PROTEIN_ENTRY_G}g protein per serving — "
+                "looks like a typo.",
+                ephemeral=True,
+            )
+            return
     guild_id = interaction.guild_id or 0
     db.calorie_food_set(
-        guild_id, interaction.user.id, norm, name.strip(), kcal,
+        guild_id, interaction.user.id, norm, name.strip(), kcal, protein_g,
     )
-    tracking = db.calorie_goal_get(guild_id, interaction.user.id) is not None
-    tail = (
-        f"Log it by typing `{norm}` (or `2 {norm}`) in chat, or "
-        f"`/calories add {norm}`."
-        if tracking
-        else "Run `/calories setup` to start tracking, then log it by name."
+    # Re-read so the confirmation reflects the stored protein (which may have
+    # been preserved from a previous save when protein was omitted this time).
+    saved = db.calorie_food_get(guild_id, interaction.user.id, norm)
+    stored_protein = (
+        saved["protein_g"] if saved and saved["protein_g"] is not None else None
     )
+    cal_tracking = db.calorie_goal_get(guild_id, interaction.user.id) is not None
+    pro_tracking = db.protein_goal_get(guild_id, interaction.user.id) is not None
+    macro = calories.format_kcal(kcal)
+    if stored_protein is not None:
+        macro += f" + {protein_mod.format_grams(float(stored_protein))} protein"
+    if not cal_tracking:
+        tail = "Run `/calories setup` to start tracking, then log it by name."
+    elif stored_protein is not None and not pro_tracking:
+        tail = (
+            f"Log it by typing `{norm}` in chat. Run `/protein setup` too and "
+            "it'll log protein as well."
+        )
+    else:
+        tail = f"Log it by typing `{norm}` (or `2 {norm}`) in chat, or `/calories add {norm}`."
     await interaction.response.send_message(
-        f"🍴 Saved **{name.strip()}** = {calories.format_kcal(kcal)}. {tail}"
+        f"🍴 Saved **{name.strip()}** = {macro}. {tail}"
     )
 
 
@@ -9998,10 +10086,12 @@ async def calories_food_list_cmd(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    lines = [
-        f"• **{r['display']}** — {calories.format_kcal(float(r['kcal']))}"
-        for r in rows
-    ]
+    lines = []
+    for r in rows:
+        line = f"• **{r['display']}** — {calories.format_kcal(float(r['kcal']))}"
+        if r["protein_g"] is not None:
+            line += f" · {protein_mod.format_grams(float(r['protein_g']))} protein"
+        lines.append(line)
     embed = discord.Embed(
         title="🍴 Your saved foods",
         description="\n".join(lines)[:4000],

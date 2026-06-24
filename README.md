@@ -100,12 +100,16 @@ Calories:
 
 Saved foods (personal name → calorie shortcuts):
 
-- `/calories food_set <name> <amount>` — save a food, e.g.
-  `/calories food_set coffee 5` or `/calories food_set "protein shake" 250kj`.
+- `/calories food_set <name> <amount> [protein]` — save a food, e.g.
+  `/calories food_set coffee 5` or `/calories food_set "protein shake" 250kj 30`.
+  The optional **protein** (grams) is logged automatically whenever you log the
+  food — handy for shakes, chicken, etc. Re-running `food_set` with just a new
+  calorie amount updates the calories and **keeps** the saved protein.
 - Then log it by **just typing the name** in chat — `coffee`, or `2 coffee` /
-  `coffee x2` for multiple servings — and the bot reacts ✅. `/calories add
-  coffee` works too.
-- `/calories food_list` — show your saved foods.
+  `coffee x2` for multiple servings — and the bot reacts ✅. If the food has a
+  protein value and you're protein-tracking, it logs both at once (one ❌ undoes
+  both). `/calories add coffee` works too.
+- `/calories food_list` — show your saved foods (with protein where set).
 - `/calories food_remove <name>` — delete one.
 
 Saved foods are per-user, so your `coffee` and someone else's can be different
@@ -271,15 +275,19 @@ An authenticated operator dashboard (separate web server, default port `8081`)
 for browsing and editing everything the bot tracks without touching Discord:
 
 - **Overview** — server totals and the most recent activity.
-- **Members** — every member with their roles, join date, and linked
-  Strava/Revo accounts; drill into one member for their lift/nutrition
-  counters, bodyweight, roles, and personal history.
+- **Members** — searchable list with avatars; drill into one member for their
+  lift/nutrition counters, **today's calories & protein vs goal** (progress
+  bars), a **bodyweight trend chart**, **lift goals**, their **saved foods**
+  (add/edit/delete, with protein), roles, linked Strava/Revo, and history.
 - **Roles** — each role with its colour and live member list.
-- **Audit log** — a unified, filterable trail of role changes, member
-  join/leave/nickname/username changes, and every data edit (logs, deletes,
-  and dashboard corrections).
-- **Lifts / Calories / Protein** — the raw entries, with inline delete and
-  (for lifts) edit. Every change is written to the audit log.
+- **Leaderboard** — pick an exercise and see the ranked best lifts (with
+  medals + avatars).
+- **Audit log** — a unified, filterable trail of role changes (including *who*
+  made them), member join/leave/nickname/username changes, and every data edit.
+- **Lifts / Calories / Protein** — the raw entries, searchable, with inline
+  delete and (for lifts) edit. Every change is written to the audit log.
+
+Profile pictures appear throughout, and the whole thing is a modern dark UI.
 
 It is **off until you set `WEBUI_PASSWORD`**. Enabling it also turns on the
 privileged **Server Members** intent, which you must additionally toggle on for
