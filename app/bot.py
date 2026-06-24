@@ -14,6 +14,7 @@ import importlib
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import sqlite3
@@ -933,6 +934,30 @@ async def _reply_calorie_logged(
             pass
 
 
+# Cheeky one-liners for when someone logs exactly zero. Keyed by the macro so
+# the joke lands ("0 calories? breatharian arc"). Picked at random.
+_ZERO_CALORIE_QUIPS = (
+    "0 calories? The breatharian arc is wild. Nothing logged. 💀",
+    "Logging air, are we? 0 cal isn't a meal — skipped.",
+    "0 cal — the legendary nothing-burger. Not logging that one. 🍔",
+    "Zero calories? Bold. Photosynthesis isn't tracked here. Skipped.",
+    "0c logged would be a lie and we don't lie here. Nothing added.",
+)
+_ZERO_PROTEIN_QUIPS = (
+    "0g protein? Bold strategy for the gains, Cotton. Nothing logged. 💀",
+    "0p... so you ate vibes? Skipped.",
+    "Zero protein logged — the muscles are filing a complaint. Not added.",
+    "0g? That's not a meal, that's a meditation. Skipped.",
+    "Logging 0 protein is just typing for fun. Nothing added. 🥩❌",
+)
+
+
+def _zero_quip(kind: str) -> str:
+    """Random cheeky reply for a logged value of exactly zero."""
+    pool = _ZERO_PROTEIN_QUIPS if kind == "protein" else _ZERO_CALORIE_QUIPS
+    return random.choice(pool)
+
+
 async def _handle_calorie_message(
     message: discord.Message, target: object,
     kcal: float, unit: str, note: str | None,
@@ -957,7 +982,13 @@ async def _handle_calorie_message(
         except discord.HTTPException:
             pass
         return
-    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0:
+        try:
+            await message.reply(_zero_quip("calories"), mention_author=False)
+        except discord.HTTPException:
+            pass
+        return
+    if kcal > _MAX_ENTRY_KCAL:
         try:
             await message.reply(
                 f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks "
@@ -1129,7 +1160,13 @@ async def _handle_protein_message(
         except discord.HTTPException:
             pass
         return
-    if grams <= 0 or grams > _MAX_PROTEIN_ENTRY_G:
+    if grams <= 0:
+        try:
+            await message.reply(_zero_quip("protein"), mention_author=False)
+        except discord.HTTPException:
+            pass
+        return
+    if grams > _MAX_PROTEIN_ENTRY_G:
         try:
             await message.reply(
                 f"That's over {_MAX_PROTEIN_ENTRY_G}g of protein in one entry — "
@@ -2565,6 +2602,7 @@ async def _handle_nutrition_reaction_undo(
         original_id = crec["original_message_id"]
         r = db.delete_calorie_entry(
             guild_id, target_user_id, int(crec["calorie_id"]),
+            actor_id=payload.user_id,
         )
         if r is not None:
             removed_bits.append(calories.format_kcal(float(r["kcal"])))
@@ -2591,12 +2629,14 @@ async def _handle_nutrition_reaction_undo(
         if cal_entry is not None:
             r = db.delete_calorie_entry(
                 guild_id, target_user_id, int(cal_entry["id"]),
+                actor_id=payload.user_id,
             )
             if r is not None:
                 removed_bits.append(calories.format_kcal(float(r["kcal"])))
         if pro_entry is not None:
             r = db.delete_protein_entry(
                 guild_id, target_user_id, int(pro_entry["id"]),
+                actor_id=payload.user_id,
             )
             if r is not None:
                 removed_bits.append(
@@ -2675,10 +2715,13 @@ async def on_raw_reaction_add(
     removed = 0
     if rec["lift_ids"]:
         ids = [int(x) for x in rec["lift_ids"].split(",") if x]
-        removed = db.delete_lifts_by_ids(guild_id, target_user_id, ids)
+        removed = db.delete_lifts_by_ids(
+            guild_id, target_user_id, ids, actor_id=payload.user_id,
+        )
     elif rec["message_id"] is not None:
         removed = db.delete_lifts_for_message(
-            guild_id, target_user_id, rec["message_id"]
+            guild_id, target_user_id, rec["message_id"],
+            actor_id=payload.user_id,
         )
     # Always suppress, even when removed==0: the user's clear intent is
     # "don't keep this post". If the rows were already gone (e.g. a prior
@@ -4006,6 +4049,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/stats [user]` — personal bests\n"
             "`/summary [user]` — profile overview\n"
+            "`/coach [user] [days]` — AI progress report from all your data\n"
             "`/overview <equipment> [user]` — lift consistency\n"
             "`/checkin [user]` — copy/paste stat template\n"
             "`/stale [user] [days]` — lifts not updated lately\n"
@@ -4740,6 +4784,7 @@ async def undo_cmd(
     guild_id = interaction.guild_id or 0
     rows = db.pop_last_n_for_user(
         guild_id, interaction.user.id, n,
+        actor_id=interaction.user.id,
     )
     if not rows:
         await interaction.response.send_message(
@@ -8474,6 +8519,33 @@ async def on_audit_log_entry_create(
                     f" (by {actor_name or 'unknown'})"
                 ),
             )
+    elif action is A.kick:
+        if subject_id:
+            db.set_member_present(gid, subject_id, False)
+        db.add_audit(
+            gid, "member", "kick",
+            actor_id=actor_id, actor_name=actor_name,
+            subject_id=subject_id, subject_name=subject_name,
+            detail=f"kicked by {actor_name or 'unknown'}"
+            + (f" — {entry.reason}" if entry.reason else ""),
+        )
+    elif action is A.ban:
+        if subject_id:
+            db.set_member_present(gid, subject_id, False)
+        db.add_audit(
+            gid, "member", "ban",
+            actor_id=actor_id, actor_name=actor_name,
+            subject_id=subject_id, subject_name=subject_name,
+            detail=f"banned by {actor_name or 'unknown'}"
+            + (f" — {entry.reason}" if entry.reason else ""),
+        )
+    elif action is A.unban:
+        db.add_audit(
+            gid, "member", "unban",
+            actor_id=actor_id, actor_name=actor_name,
+            subject_id=subject_id, subject_name=subject_name,
+            detail=f"unbanned by {actor_name or 'unknown'}",
+        )
 
 
 @bot.event
@@ -9619,6 +9691,166 @@ async def track_analyze_cmd(
     )
 
 
+# ---------------------------------------------------------------------------
+# AI progress coach — hands a person's *entire* tracked dataset to Gemini for a
+# holistic strength + nutrition progress report. Reuses the same Gemini plumbing
+# as /track analyze.
+# ---------------------------------------------------------------------------
+
+_COACH_SYSTEM = (
+    "You are an experienced, encouraging strength & nutrition coach. You are "
+    "given ONE person's raw training and nutrition data as JSON (weights in kg; "
+    "'bw' true means the weight is added to bodyweight, e.g. weighted dips). "
+    "Write a concise, personalised progress report with short sections: "
+    "**Overview**, **What's going well**, **Where you're lagging / plateauing**, "
+    "**Nutrition**, and **Next steps** (2-4 concrete, specific actions). "
+    "Reference actual lifts and numbers from the data, call out plateaus, "
+    "muscle-group imbalances, training frequency, and goal progress. Be "
+    "motivating but honest. Use short bullet points. Keep the whole reply under "
+    "1800 characters so it fits in a Discord embed."
+)
+
+
+def _build_progress_payload(
+    guild_id: int, user_id: int, name: str, days: int,
+) -> dict:
+    """Assemble a compact JSON-able snapshot of everything we track for one
+    person: lifting summary/PRs/gains/goals, bodyweight trend, training
+    frequency, and calorie/protein goals + window totals."""
+    now = datetime.now(timezone.utc)
+    start_iso = (now - timedelta(days=days)).isoformat()
+    end_iso = now.isoformat()
+
+    summary = db.user_summary(guild_id, user_id)
+    tonnage, _n = db.total_tonnage(guild_id, user_id)
+    cal_goal = db.calorie_goal_get(guild_id, user_id)
+    pro_goal = db.protein_goal_get(guild_id, user_id)
+    cal_total, cal_entries = db.calorie_total_between(
+        guild_id, user_id, start_iso, end_iso,
+    )
+    pro_total, pro_entries = db.protein_total_between(
+        guild_id, user_id, start_iso, end_iso,
+    )
+    bw = db.bodyweight_history(guild_id, user_id, limit=60)
+    dates = db.user_log_dates(guild_id, user_id)
+
+    return {
+        "name": name,
+        "window_days": days,
+        "timezone": str(DISPLAY_TZ),
+        "lifting": {
+            "summary": dict(summary) if summary else None,
+            "total_tonnage_kg": round(tonnage, 1),
+            "personal_bests": [
+                dict(r) for r in db.user_top_prs(guild_id, user_id, 12)
+            ],
+            "most_trained": [
+                dict(r) for r in db.user_most_trained(guild_id, user_id, 8)
+            ],
+            "biggest_gains": [
+                dict(r) for r in db.user_biggest_gains(guild_id, user_id, 8)
+            ],
+            "latest_per_exercise": [
+                dict(r)
+                for r in db.user_latest_by_equipment(guild_id, user_id)[:40]
+            ],
+            "goals": [dict(r) for r in db.goal_list(guild_id, user_id)],
+            "training_dates_recent": dates[-60:],
+            "total_training_days": len(dates),
+        },
+        "bodyweight": {
+            "recent": [
+                {"kg": r["weight_kg"], "at": r["recorded_at"]} for r in bw
+            ],
+            "latest_kg": bw[-1]["weight_kg"] if bw else None,
+        },
+        "nutrition": {
+            "calorie_goal_kcal": (
+                cal_goal["daily_target_kcal"] if cal_goal else None
+            ),
+            "calorie_total_window": round(cal_total),
+            "calorie_entries_window": cal_entries,
+            "protein_goal_g": pro_goal["daily_target_g"] if pro_goal else None,
+            "protein_total_window": round(pro_total),
+            "protein_entries_window": pro_entries,
+        },
+    }
+
+
+@bot.tree.command(
+    name="coach",
+    description="AI progress report built from all of a member's tracked data.",
+)
+@app_commands.describe(
+    user="Whose data to analyse (defaults to you).",
+    days="Window for nutrition stats, 1-365 (default 30).",
+)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def coach_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    days: int = 30,
+) -> None:
+    target = user or interaction.user
+    if not gemini_client.available():
+        await interaction.response.send_message(
+            "Gemini isn't configured. Set `GEMINI_API_KEY` (and optionally "
+            "`GEMINI_MODEL`) in the bot's environment and restart.",
+            ephemeral=True,
+        )
+        return
+    days = max(1, min(365, days))
+    guild_id = interaction.guild_id or 0
+    # Need *something* to analyse — lifts, nutrition tracking, or bodyweight.
+    has_data = (
+        db.user_summary(guild_id, target.id) is not None
+        or db.calorie_goal_get(guild_id, target.id) is not None
+        or db.protein_goal_get(guild_id, target.id) is not None
+        or bool(db.bodyweight_history(guild_id, target.id, limit=1))
+    )
+    if not has_data:
+        await interaction.response.send_message(
+            f"{target.display_name} has no tracked data yet — log some lifts or "
+            "set up calorie/protein tracking first.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    payload = _build_progress_payload(
+        guild_id, target.id, _display_name(target), days,
+    )
+    prompt = (
+        f"Timezone: {DISPLAY_TZ}. The full tracked dataset for one person "
+        "follows as JSON:\n\n" + json.dumps(payload, indent=2, default=str)
+    )
+    try:
+        text = await asyncio.to_thread(
+            gemini_client.generate, prompt, system=_COACH_SYSTEM,
+        )
+    except gemini_client.GeminiError as exc:
+        LOG.warning("Gemini coach analysis failed: %s", exc)
+        await interaction.followup.send(
+            f"Gemini request failed: {exc}", ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📈 Progress report — {target.display_name}",
+        description=text[:4000],
+        colour=EMBED_COLOUR,
+    )
+    embed.set_footer(
+        text=(
+            f"all-time lifts · {days}d nutrition · {gemini_client.model_name()}"
+        )
+    )
+    await interaction.followup.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @track_group.command(
     name="now",
     description="(Owner) Show the live presence Discord is currently reporting for a user.",
@@ -9952,7 +10184,9 @@ async def calories_week_cmd(
 )
 async def calories_undo_cmd(interaction: discord.Interaction) -> None:
     guild_id = interaction.guild_id or 0
-    row = db.calorie_pop_last(guild_id, interaction.user.id)
+    row = db.calorie_pop_last(
+        guild_id, interaction.user.id, actor_id=interaction.user.id,
+    )
     if row is None:
         await interaction.response.send_message(
             "No calorie entries to undo.", ephemeral=True,
@@ -10049,6 +10283,13 @@ async def calories_food_set_cmd(
     db.calorie_food_set(
         guild_id, interaction.user.id, norm, name.strip(), kcal, protein_g,
     )
+    db.add_audit(
+        guild_id, "data", "food_set",
+        actor_id=interaction.user.id, subject_id=interaction.user.id,
+        detail=f"saved food {name.strip()} = {calories.format_kcal(kcal)}"
+        + (f", {protein_mod.format_grams(protein_g)} protein"
+           if protein_g is not None else ""),
+    )
     # Re-read so the confirmation reflects the stored protein (which may have
     # been preserved from a previous save when protein was omitted this time).
     saved = db.calorie_food_get(guild_id, interaction.user.id, norm)
@@ -10112,6 +10353,12 @@ async def calories_food_remove_cmd(
     removed = db.calorie_food_remove(
         interaction.guild_id or 0, interaction.user.id, norm,
     )
+    if removed:
+        db.add_audit(
+            interaction.guild_id or 0, "data", "food_delete",
+            actor_id=interaction.user.id, subject_id=interaction.user.id,
+            detail=f"removed food {name.strip()}",
+        )
     msg = (
         f"🗑️ Removed **{name.strip()}**." if removed
         else f"No saved food called **{name.strip()}**. "
@@ -10333,7 +10580,9 @@ async def protein_week_cmd(
 )
 async def protein_undo_cmd(interaction: discord.Interaction) -> None:
     guild_id = interaction.guild_id or 0
-    row = db.protein_pop_last(guild_id, interaction.user.id)
+    row = db.protein_pop_last(
+        guild_id, interaction.user.id, actor_id=interaction.user.id,
+    )
     if row is None:
         await interaction.response.send_message(
             "No protein entries to undo.", ephemeral=True,

@@ -48,6 +48,11 @@ Stats & progress:
 - `/stats [user]` — personal bests for a user.
 - `/summary [user]` — profile overview (totals, top PRs, most trained, gains,
   current weekly streak).
+- `/coach [user] [days]` — an AI progress report built from **all** of a
+  member's tracked data (lifting summary, PRs, biggest gains, goals, training
+  frequency, bodyweight trend, and calorie/protein goals + recent totals). The
+  whole dataset is handed to Gemini, which writes a personalised strength +
+  nutrition breakdown with concrete next steps. Requires `GEMINI_API_KEY`.
 - `/overview <equipment> [user]` — consistency overview for one lift: logs,
   active weeks, streak, spacing, current weight, and best.
 - `/checkin [user]` — copy/paste stat template prefilled with current bests.
@@ -282,8 +287,10 @@ for browsing and editing everything the bot tracks without touching Discord:
 - **Roles** — each role with its colour and live member list.
 - **Leaderboard** — pick an exercise and see the ranked best lifts (with
   medals + avatars).
-- **Audit log** — a unified, filterable trail of role changes (including *who*
-  made them), member join/leave/nickname/username changes, and every data edit.
+- **Audit log** — a unified, filterable, paged trail of role changes (including
+  *who* made them), member join/leave/nickname/username changes and kicks/bans,
+  and every data event: logs, **undos/reverts** (with who triggered them),
+  goals, bodyweight, saved foods, and dashboard edits.
 - **Lifts / Calories / Protein** — the raw entries, searchable, with inline
   delete and (for lifts) edit. Every change is written to the audit log.
 

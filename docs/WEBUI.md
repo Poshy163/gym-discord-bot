@@ -30,12 +30,24 @@ by the bot from gateway events and by the dashboard on every edit. It covers:
 
 - **Roles** — a member gaining or losing a role (**with the moderator who made
   the change**, when available — see below); roles created, deleted, or renamed.
-- **Members** — joins, leaves, nickname changes, and username changes.
-- **Data** — lifts / calories / protein logged through normal bot use (after
-  the startup history backfill settles, so re-imports don't flood it) and every
-  add/delete/edit performed from the dashboard. Dashboard edits are attributed
-  to `web:<ip>` since the dashboard has a single shared login rather than
-  per-user identity.
+- **Members** — joins, leaves, nickname/username changes, and **kicks/bans**
+  (with the moderator and reason, when the audit-log permission is granted).
+- **Data** — essentially everything that mutates tracked data, after the
+  startup backfill settles so re-imports don't flood it:
+  - **logs** — lifts, calories, protein logged through normal bot use;
+  - **reverts/undos** — when the bot removes an entry (the ❌ reaction undo,
+    `/undo`, `/calories undo`, `/protein undo`), recorded with *who* triggered
+    it;
+  - **goals** — lift goals set/removed, calorie & protein targets set, and
+    tracking turned off;
+  - **bodyweight** logged;
+  - **saved foods** created/removed;
+  - every **add / delete / edit** performed from the dashboard itself
+    (attributed to `web:<ip>`, since the dashboard has one shared login).
+
+  The audit tab shows friendly labelled actions (🏋️ logged, ↩️ undone, 🎯 goal
+  set, 👢 kicked …), is filterable by category, searchable, and pages through
+  the full history with **Load more**.
 
 ### Seeing *who* changed a role
 

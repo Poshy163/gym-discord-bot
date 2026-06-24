@@ -879,7 +879,21 @@ border-bottom:1px solid #1e242e;font-size:.9rem}
 const TABS=[["overview","📊"],["members","👥"],["roles","🛡️"],["leaderboard","🏆"],
   ["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
-let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[];
+const ACTION_LABEL={
+  role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
+  role_delete:"🗑️ role deleted",role_rename:"✏️ role renamed",
+  join:"📥 joined",leave:"📤 left",nick_change:"🏷️ nickname",username_change:"🏷️ username",
+  kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",
+  lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
+  calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",
+  protein_add:"🥩 protein logged",protein_undo:"↩️ protein undone",protein_delete:"🗑️ protein deleted",
+  food_set:"🍴 food saved",food_delete:"🗑️ food removed",
+  goal_set:"🎯 goal set",goal_remove:"🎯 goal removed",
+  calorie_goal_set:"🎯 calorie goal",calorie_goal_remove:"🛑 calorie tracking off",
+  protein_goal_set:"🎯 protein goal",protein_goal_remove:"🛑 protein tracking off",
+  bodyweight_log:"⚖️ bodyweight"};
+function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
+let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[];
 
 function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" oninput="filterTable(this.value)">`;}
 function filterTable(term){term=(term||"").toLowerCase();
@@ -1113,11 +1127,16 @@ async function roleView(rid,name){
       '<tr><td colspan="2" class="muted">No members.</td></tr>'}</tbody></table></div>`;
 }
 
-async function renderAudit(v){
-  const d=await api(`/api/audit?guild=${guild}&limit=200${auditCat?'&category='+auditCat:''}`);if(!d)return;
+async function renderAudit(v){auditOffset=0;auditRows=[];await loadAuditPage(v);}
+async function loadAuditPage(v){
+  const d=await api(`/api/audit?guild=${guild}&limit=100&offset=${auditOffset}${auditCat?'&category='+auditCat:''}`);if(!d)return;
+  auditRows=auditRows.concat(d.audit);auditOffset+=d.audit.length;
   v.innerHTML=`<div class="filters"><div class="seg">${["","role","member","data"].map(c=>
       `<button class="${c===auditCat?'on':''}" onclick="auditCat='${c}';render()">${c||"all"}</button>`).join("")}</div>
-      <span class="faint">${d.total} total</span></div>${auditTable(d.audit)}`;
+      <span class="sp" style="flex:1"></span>${searchBar("Search audit…")}
+      <span class="faint">${auditRows.length} / ${d.total}</span></div>${auditTable(auditRows)}
+      ${auditOffset<d.total?`<div style="text-align:center;margin-top:1rem">
+        <button class="btn" onclick="loadAuditPage(document.getElementById('view'))">Load more (${d.total-auditOffset} more)</button></div>`:''}`;
 }
 function auditTable(rows){
   if(!rows||!rows.length)return '<div class="empty">Nothing here yet.</div>';
@@ -1125,7 +1144,7 @@ function auditTable(rows){
     <th>Actor</th><th>Subject</th><th>Detail</th></tr></thead><tbody>${rows.map(a=>`<tr>
       <td class="muted" style="white-space:nowrap">${fmtTs(a.at)}</td>
       <td class="cat-${a.category}">${esc(a.category)}</td>
-      <td>${esc(a.action)}</td>
+      <td style="white-space:nowrap">${actionLabel(a.action)}</td>
       <td>${a.actor_id?`<span class="who">${avatar(a.actor_id,a.actor_name,(AV[a.actor_id]||{}).avatar,24)}
         <a class="link" onclick="memberView('${a.actor_id}')">${esc(a.actor_name)}</a></span>`
         :`<span class="muted">${esc(a.actor_name||"—")}</span>`}</td>

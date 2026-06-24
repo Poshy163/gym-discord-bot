@@ -15,6 +15,7 @@ os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
+    _build_progress_payload,
     _get_main_activity,
     _local_log_dates,
     _parse_bodyweight_message,
@@ -23,6 +24,9 @@ from app.bot import (  # noqa: E402
     _safe_label,
     _true_weight_kg,
     _true_weight_suffix,
+    _zero_quip,
+    _ZERO_CALORIE_QUIPS,
+    _ZERO_PROTEIN_QUIPS,
     db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
@@ -219,3 +223,34 @@ def test_revo_attended_dates_always_fetches_previous_month():
     assert attended == set()
     # Current + previous month, then stop (no boundary to cross).
     assert client.calls == [(6, 2026), (5, 2026)]
+
+
+def test_zero_quip_picks_from_correct_pool():
+    # Protein quips for protein, calorie quips otherwise — both non-empty.
+    assert _zero_quip("protein") in _ZERO_PROTEIN_QUIPS
+    assert _zero_quip("calories") in _ZERO_CALORIE_QUIPS
+    assert _zero_quip("anything-else") in _ZERO_CALORIE_QUIPS
+    # The pools are distinct so the joke matches the macro.
+    assert set(_ZERO_PROTEIN_QUIPS).isdisjoint(_ZERO_CALORIE_QUIPS)
+
+
+def test_build_progress_payload_is_json_serializable():
+    import json
+
+    from app.parser import Lift as _L
+
+    _bot_db.add_lifts(99, 7, "Sam", [_L("bench", 100), _L("squat", 140)])
+    _bot_db.calorie_goal_set(99, 7, "Sam", 2400)
+    _bot_db.calorie_add(99, 7, "Sam", 600)
+    _bot_db.protein_goal_set(99, 7, "Sam", 190)
+    _bot_db.set_bodyweight(99, 7, 84.0)
+    _bot_db.goal_set(99, 7, "bench", 120, False)
+
+    payload = _build_progress_payload(99, 7, "Sam", 30)
+    # Must serialize cleanly for the Gemini prompt.
+    blob = json.dumps(payload, default=str)
+    assert "lifting" in payload and "nutrition" in payload
+    assert payload["nutrition"]["calorie_goal_kcal"] == 2400
+    assert payload["bodyweight"]["latest_kg"] == 84.0
+    assert any(g["equipment"] == "bench" for g in payload["lifting"]["goals"])
+    assert len(blob) > 0

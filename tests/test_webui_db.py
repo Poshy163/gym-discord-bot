@@ -221,6 +221,50 @@ def test_leaderboard_orders_by_best(db):
     assert [(r["username"], r["best"]) for r in rows] == [("Bob", 120), ("Alice", 110)]
 
 
+def test_reverts_are_audited_with_actor(db):
+    db.audit_live = True
+    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.upsert_member(1, 999, "mod", "Mod", present=True)
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)])
+    cid = db.calorie_add(1, 100, "Alice", 500)
+    pid = db.protein_add(1, 100, "Alice", 40)
+    # Reaction/command undo paths pass the triggering user as actor_id.
+    db.pop_last_for_user(1, 100, actor_id=999)
+    db.delete_calorie_entry(1, 100, cid, actor_id=999)
+    db.delete_protein_entry(1, 100, pid, actor_id=999)
+    actions = [r["action"] for r in db.list_audit(1, category="data")]
+    assert "lift_undo" in actions
+    assert "calorie_undo" in actions
+    assert "protein_undo" in actions
+    undo = next(r for r in db.list_audit(1) if r["action"] == "lift_undo")
+    # Actor + subject names resolve from the member mirror via the join.
+    assert undo["actor_name"] == "Mod"
+    assert undo["subject_name"] == "Alice"
+
+
+def test_goals_and_bodyweight_audited(db):
+    db.audit_live = True
+    db.goal_set(1, 100, "bench", 120, False)
+    db.calorie_goal_set(1, 100, "Alice", 2200)
+    db.protein_goal_set(1, 100, "Alice", 180)
+    db.set_bodyweight(1, 100, 82.5)
+    db.goal_remove(1, 100, "bench")
+    db.calorie_goal_remove(1, 100)
+    db.protein_goal_remove(1, 100)
+    actions = {r["action"] for r in db.list_audit(1, category="data")}
+    assert {
+        "goal_set", "calorie_goal_set", "protein_goal_set", "bodyweight_log",
+        "goal_remove", "calorie_goal_remove", "protein_goal_remove",
+    } <= actions
+
+
+def test_backfill_adds_not_audited_but_goals_during_backfill_skip(db):
+    # While audit_live is False (startup backfill), data writes don't audit.
+    db.goal_set(1, 100, "bench", 120, False)
+    db.set_bodyweight(1, 100, 80)
+    assert db.count_audit(1, category="data") == 0
+
+
 def test_member_overview_aggregates(db):
     db.add_lifts(1, 100, "Alice", [_Lift("bench", 100), _Lift("squat", 140)])
     db.calorie_add(1, 100, "Alice", 500)

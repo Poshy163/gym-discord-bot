@@ -1392,7 +1392,8 @@ class Database:
             ))
 
     def pop_last_for_user(
-        self, guild_id: int, user_id: int
+        self, guild_id: int, user_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete the user's most recently logged row and return it. Returns
         None if they have no entries."""
@@ -1411,10 +1412,16 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM lifts WHERE id = ?", (row["id"],))
+            self._audit_data(
+                c, guild_id, "lift_undo", subject_id=user_id,
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"undid {row['equipment']} {row['weight_kg']:g}kg",
+            )
             return row
 
     def pop_last_n_for_user(
         self, guild_id: int, user_id: int, n: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> list[sqlite3.Row]:
         """Delete the user's N most recent rows and return them, newest first.
 
@@ -1441,6 +1448,15 @@ class Database:
             c.execute(
                 f"DELETE FROM lifts WHERE id IN ({placeholders})",
                 [r["id"] for r in rows],
+            )
+            detail = (
+                f"undid {rows[0]['equipment']} {rows[0]['weight_kg']:g}kg"
+                if len(rows) == 1
+                else f"undid {len(rows)} lifts"
+            )
+            self._audit_data(
+                c, guild_id, "lift_undo", subject_id=user_id,
+                actor_id=actor_id, actor_name=actor_name, detail=detail,
             )
             return rows
 
@@ -1676,6 +1692,11 @@ class Database:
                     _normalize_iso(None),
                 ),
             )
+            unit = "kg" + ("+BW" if bodyweight_add else "")
+            self._audit_data(
+                c, guild_id, "goal_set", subject_id=user_id,
+                detail=f"goal {equipment} → {target_kg:g}{unit}",
+            )
 
     def goal_remove(
         self, guild_id: int, user_id: int, equipment: str
@@ -1688,7 +1709,13 @@ class Database:
                 """,
                 (guild_id, user_id, equipment),
             )
-            return cur.rowcount or 0
+            n = cur.rowcount or 0
+            if n:
+                self._audit_data(
+                    c, guild_id, "goal_remove", subject_id=user_id,
+                    detail=f"removed goal {equipment}",
+                )
+            return n
 
     def goal_get(
         self, guild_id: int, user_id: int, equipment: str
@@ -1903,7 +1930,8 @@ class Database:
             return cur.rowcount or 0
 
     def delete_lifts_for_message(
-        self, guild_id: int, user_id: int, message_id: int
+        self, guild_id: int, user_id: int, message_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> int:
         """Used by reaction-undo: remove every row the bot stored for a
         specific gym post, scoped to that user so another member can't
@@ -1916,7 +1944,14 @@ class Database:
                 """,
                 (guild_id, user_id, message_id),
             )
-            return cur.rowcount or 0
+            n = cur.rowcount or 0
+            if n:
+                self._audit_data(
+                    c, guild_id, "lift_undo", subject_id=user_id,
+                    actor_id=actor_id, actor_name=actor_name,
+                    detail=f"undid {n} lift{'s' if n != 1 else ''}",
+                )
+            return n
 
     def delete_lifts_for_message_any_user(
         self, guild_id: int, message_id: int
@@ -1950,7 +1985,8 @@ class Database:
             return int(row["n"] if row else 0)
 
     def delete_lifts_by_ids(
-        self, guild_id: int, user_id: int | None, ids: list[int]
+        self, guild_id: int, user_id: int | None, ids: list[int],
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> int:
         """Delete specific lift rows by id. Scoped to (guild_id, user_id)
         for safety when a user id is supplied so a stale reply record can't
@@ -1966,7 +2002,14 @@ class Database:
                 f"WHERE guild_id = ?{user_clause} AND id IN ({placeholders})",
                 [guild_id, *user_params, *ids],
             )
-            return cur.rowcount or 0
+            n = cur.rowcount or 0
+            if n:
+                self._audit_data(
+                    c, guild_id, "lift_undo", subject_id=user_id,
+                    actor_id=actor_id, actor_name=actor_name,
+                    detail=f"undid {n} lift{'s' if n != 1 else ''}",
+                )
+            return n
 
     # ------------------------------------------------------------------
     # Revo Fitness portal linking (see app/revo_client.py)
@@ -2315,6 +2358,10 @@ class Database:
                 "VALUES (?, ?, ?, ?)",
                 (guild_id, user_id, float(weight_kg), ts),
             )
+            self._audit_data(
+                c, guild_id, "bodyweight_log", subject_id=user_id,
+                detail=f"bodyweight {float(weight_kg):g} kg",
+            )
 
     def get_latest_bodyweight(
         self, guild_id: int, user_id: int,
@@ -2590,6 +2637,11 @@ class Database:
                     float(daily_target_kcal), _normalize_iso(None),
                 ),
             )
+            self._audit_data(
+                c, guild_id, "calorie_goal_set",
+                subject_id=user_id, subject_name=username,
+                detail=f"calorie target {float(daily_target_kcal):.0f} kcal/day",
+            )
 
     def calorie_goal_get(
         self, guild_id: int, user_id: int,
@@ -2609,7 +2661,13 @@ class Database:
                 "DELETE FROM calorie_goals WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
             )
-            return (cur.rowcount or 0) > 0
+            ok = (cur.rowcount or 0) > 0
+            if ok:
+                self._audit_data(
+                    c, guild_id, "calorie_goal_remove", subject_id=user_id,
+                    detail="stopped calorie tracking",
+                )
+            return ok
 
     def calorie_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
         """Everyone with a calorie goal in this guild — the weekly AI
@@ -2661,6 +2719,7 @@ class Database:
 
     def calorie_pop_last(
         self, guild_id: int, user_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete the user's most recent intake entry and return it."""
         with self._conn() as c:
@@ -2677,6 +2736,11 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM calorie_entries WHERE id = ?", (row["id"],))
+            self._audit_data(
+                c, guild_id, "calorie_undo", subject_id=user_id,
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"undid {float(row['kcal']):.0f} kcal",
+            )
             return row
 
     def track_calorie_reply(
@@ -2763,6 +2827,7 @@ class Database:
 
     def delete_calorie_entry(
         self, guild_id: int, target_user_id: int, calorie_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete one intake entry by id, scoped to (guild, user) for safety.
         Returns the deleted row (kcal/note) or None if it was already gone."""
@@ -2775,6 +2840,11 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM calorie_entries WHERE id = ?", (calorie_id,))
+            self._audit_data(
+                c, guild_id, "calorie_undo", subject_id=target_user_id,
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"undid {float(row['kcal']):.0f} kcal",
+            )
             return row
 
     def calorie_entries_between(
@@ -2835,6 +2905,11 @@ class Database:
                     float(daily_target_g), _normalize_iso(None),
                 ),
             )
+            self._audit_data(
+                c, guild_id, "protein_goal_set",
+                subject_id=user_id, subject_name=username,
+                detail=f"protein max {float(daily_target_g):.0f} g/day",
+            )
 
     def protein_goal_get(
         self, guild_id: int, user_id: int,
@@ -2853,7 +2928,13 @@ class Database:
                 "DELETE FROM protein_goals WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
             )
-            return (cur.rowcount or 0) > 0
+            ok = (cur.rowcount or 0) > 0
+            if ok:
+                self._audit_data(
+                    c, guild_id, "protein_goal_remove", subject_id=user_id,
+                    detail="stopped protein tracking",
+                )
+            return ok
 
     def protein_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
         with self._conn() as c:
@@ -2900,6 +2981,7 @@ class Database:
 
     def protein_pop_last(
         self, guild_id: int, user_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete the user's most recent protein entry and return it."""
         with self._conn() as c:
@@ -2916,6 +2998,11 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM protein_entries WHERE id = ?", (row["id"],))
+            self._audit_data(
+                c, guild_id, "protein_undo", subject_id=user_id,
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"undid {float(row['grams']):.0f} g protein",
+            )
             return row
 
     def protein_total_between(
@@ -2948,6 +3035,7 @@ class Database:
 
     def delete_protein_entry(
         self, guild_id: int, target_user_id: int, protein_id: int,
+        *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete one protein entry by id, scoped to (guild, user). Returns the
         deleted row or None if already gone."""
@@ -2960,6 +3048,11 @@ class Database:
             if row is None:
                 return None
             c.execute("DELETE FROM protein_entries WHERE id = ?", (protein_id,))
+            self._audit_data(
+                c, guild_id, "protein_undo", subject_id=target_user_id,
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"undid {float(row['grams']):.0f} g protein",
+            )
             return row
 
     def protein_entries_between(
@@ -3103,6 +3196,28 @@ class Database:
                 detail=detail,
             )
 
+    def _audit_data(
+        self,
+        c: sqlite3.Connection,
+        guild_id: int,
+        action: str,
+        *,
+        subject_id: int | None = None,
+        subject_name: str | None = None,
+        detail: str | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
+    ) -> None:
+        """Audit a ``data`` mutation, but only once live (so the startup
+        backfill doesn't flood the log). Centralises the ``audit_live`` gate
+        used by every lift/calorie/protein/goal/bodyweight write."""
+        if self.audit_live:
+            self._audit(
+                c, guild_id, "data", action,
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=subject_id, subject_name=subject_name, detail=detail,
+            )
+
     def list_audit(
         self,
         guild_id: int,
@@ -3116,10 +3231,17 @@ class Database:
         category and/or subject user. Left-joins the member mirror so each row
         carries the subject's avatar for the dashboard."""
         sql = (
-            "SELECT a.*, m.avatar AS subject_avatar "
+            "SELECT a.id, a.guild_id, a.at, a.category, a.action, "
+            "       a.actor_id, "
+            "       COALESCE(a.actor_name, am.display_name) AS actor_name, "
+            "       a.subject_id, "
+            "       COALESCE(a.subject_name, m.display_name) AS subject_name, "
+            "       a.detail, m.avatar AS subject_avatar "
             "FROM audit_log a "
             "LEFT JOIN members m "
             "  ON m.guild_id = a.guild_id AND m.user_id = a.subject_id "
+            "LEFT JOIN members am "
+            "  ON am.guild_id = a.guild_id AND am.user_id = a.actor_id "
             "WHERE a.guild_id = ?"
         )
         params: list[object] = [guild_id]
