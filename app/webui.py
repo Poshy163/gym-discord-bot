@@ -584,6 +584,7 @@ def build_app(
         web.get("/api/foods", api_foods),
         web.get("/api/equipment", api_equipment),
         web.get("/api/leaderboard", api_leaderboard),
+        web.get("/api/activity", api_activity),
         web.post("/api/lifts/delete", api_lift_delete),
         web.post("/api/lifts/edit", api_lift_edit),
         web.post("/api/calories/delete", api_calorie_delete),
@@ -908,6 +909,36 @@ border-bottom:1px solid #1e242e;font-size:.9rem}
 
 /* medals on leaderboard */
 .rank{display:inline-flex;width:24px;justify-content:center;font-weight:700}
+
+/* activity feed */
+.act-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1.1rem}
+.act-card{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+padding:1.1rem;display:flex;flex-direction:column;gap:.9rem;position:relative;overflow:hidden}
+.act-head{display:flex;align-items:center;gap:.7rem}
+.act-av{position:relative;flex:none}
+.act-av .dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
+border-radius:50%;border:3px solid var(--panel)}
+.st-online{background:#3ba55d}.st-idle{background:#faa61a}.st-dnd{background:#ed4245}
+.st-offline{background:#747f8d}
+.act-name{font-weight:600}
+.act-sub{font-size:.78rem;color:var(--muted);text-transform:capitalize}
+.now{display:flex;align-items:center;gap:.7rem;background:#ffffff06;
+border:1px solid var(--line);border-radius:12px;padding:.6rem}
+.game-img{width:48px;height:48px;border-radius:10px;object-fit:cover;flex:none;
+box-shadow:0 0 0 1px #ffffff14}
+.game-tile{display:flex;align-items:center;justify-content:center;color:#fff;
+font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
+.now .meta{min-width:0}
+.now .g{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now .t{font-size:.74rem;color:var(--muted)}
+.top-games{display:flex;flex-direction:column;gap:.5rem}
+.tg{display:flex;align-items:center;gap:.6rem}
+.tg .gi{width:30px;height:30px;border-radius:7px;flex:none}
+.tg .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.88rem}
+.tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
+.tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
+.offline-card{opacity:.6}
 </style></head><body>
 <header>
   <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
@@ -921,8 +952,8 @@ border-bottom:1px solid #1e242e;font-size:.9rem}
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["roles","🛡️"],["leaderboard","🏆"],
-  ["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
+const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["roles","🛡️"],
+  ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
   role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
@@ -1021,6 +1052,7 @@ async function render(){
   try{
     if(tab==="overview")return renderOverview(v);
     if(tab==="members")return renderMembers(v);
+    if(tab==="activity")return renderActivity(v);
     if(tab==="roles")return renderRoles(v);
     if(tab==="leaderboard")return renderLeaderboard(v);
     if(tab==="audit")return renderAudit(v);
@@ -1245,6 +1277,60 @@ async function saveLift(id){
   const r=await post("/api/lifts/edit",{guild,id,equipment:eq,weight_kg:w,reps:rp||null});
   document.getElementById("editDlg").close();toast(r&&r.ok?"Saved ✓":"Failed");render();
 }
+// ---- activity feed -------------------------------------------------------
+const STATUS_RANK={online:0,idle:1,dnd:2,offline:3};
+function statusClass(s){return "st-"+(["online","idle","dnd"].includes(s)?s:"offline");}
+function statusLabel(s){return s||"unknown";}
+function fmtPlaytime(sec){sec=sec||0;const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);
+  if(h>=1)return h+"h "+(m?m+"m":"");return m>=1?m+"m":"<1m";}
+function gameTile(name,url,size,cls){
+  const px=`width:${size}px;height:${size}px`;
+  if(url)return `<img class="${cls}" style="${px}" src="${esc(url)}" alt="" loading="lazy"
+    onerror="this.replaceWith(Object.assign(document.createElement('span'),
+    {className:'${cls} game-tile',style:'${px};background:${idColor(name)}',textContent:'${esc((name||'?')[0]||'?').toUpperCase()}'}))">`;
+  return `<span class="${cls} game-tile" style="${px};background:${idColor(name)}">${esc((name||'?')[0]||'?').toUpperCase()}</span>`;}
+
+async function renderActivity(v){
+  const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
+  const users=d.users||[];
+  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
+    <span class="faint">Presence/activity tracking is owner-controlled via <code>/track start</code>
+    and needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
+  // online first, then by current game, then name.
+  users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
+    || (b.current_game?1:0)-(a.current_game?1:0)
+    || a.display_name.localeCompare(b.display_name));
+  const online=users.filter(u=>["online","idle","dnd"].includes(u.status)).length;
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">🎮 Activity
+      <span class="faint">· ${online}/${users.length} online · last ${d.window_days}d</span></h2>
+      <span class="sp" style="flex:1"></span>${searchBar("Search players…")}</div>
+    <div class="act-grid">${users.map(actCard).join("")}</div>`;
+}
+function actCard(u){
+  const offline=!["online","idle","dnd"].includes(u.status);
+  const maxSec=Math.max(1,...(u.top_games||[]).map(g=>g.seconds));
+  const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
+      <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
+      <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
+    : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
+      <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
+  const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
+      ${gameTile(g.name,g.image,30,"gi")}
+      <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
+      <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
+    : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
+  return `<div class="act-card${offline?' offline-card':''}">
+    <div class="act-head">
+      <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
+        <span class="dot ${statusClass(u.status)}"></span></span>
+      <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
+      <div class="act-sub">${statusLabel(u.status)}</div></div>
+    </div>
+    ${now}
+    <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
+  </div>`;
+}
+
 boot();
 </script></body></html>"""
 

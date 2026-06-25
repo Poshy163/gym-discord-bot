@@ -52,7 +52,10 @@ Stats & progress:
   member's tracked data (lifting summary, PRs, biggest gains, goals, training
   frequency, bodyweight trend, and calorie/protein goals + recent totals). The
   whole dataset is handed to Gemini, which writes a personalised strength +
-  nutrition breakdown with concrete next steps. Requires `GEMINI_API_KEY`.
+  nutrition breakdown with concrete next steps. It's told that missing/zero
+  values mean "not logged" (a tracking gap to nudge about), not real zeros — so
+  it won't claim you ate 0 calories or lost progress just because data is
+  absent. Requires `GEMINI_API_KEY`.
 - `/overview <equipment> [user]` — consistency overview for one lift: logs,
   active weeks, streak, spacing, current weight, and best.
 - `/checkin [user]` — copy/paste stat template prefilled with current bests.

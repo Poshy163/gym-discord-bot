@@ -112,3 +112,37 @@ def test_activity_log_event_records_games_and_stops(db):
 
     rows = db.activity_events_for(1, 100)
     assert [r["activity"] for r in rows] == ["Rust", None]
+
+
+# --- web-dashboard activity snapshots -------------------------------------
+
+def test_activity_image_captured_and_current(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    db.activity_log_event(1, 100, "Rocket League", t0, image_url="http://img/rl.png")
+    cur = db.activity_current(1, 100)
+    assert cur["activity"] == "Rocket League"
+    assert cur["image_url"] == "http://img/rl.png"
+    # Same game again is de-duped on name (no new row), even without an image.
+    assert db.activity_log_event(1, 100, "Rocket League", t0 + timedelta(minutes=5)) is False
+    # Stopping playing logs a null-activity row and becomes "current".
+    assert db.activity_log_event(1, 100, None, t0 + timedelta(hours=1)) is True
+    assert db.activity_current(1, 100)["activity"] is None
+
+
+def test_activity_image_map_keeps_known_art(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    # First session has art, a later "current" event for the same game doesn't.
+    db.activity_log_event(1, 100, "Halo", t0, image_url="http://img/halo.png")
+    db.activity_log_event(1, 100, None, t0 + timedelta(hours=1))
+    db.activity_log_event(1, 100, "Halo", t0 + timedelta(hours=2))  # no image now
+    assert db.activity_current(1, 100)["image_url"] is None
+    # ...but the image map still resolves the art from the earlier session.
+    assert db.activity_image_map(1, 100) == {"Halo": "http://img/halo.png"}
+
+
+def test_presence_current_returns_latest(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    db.presence_log_event(1, 100, "online", t0)
+    db.presence_log_event(1, 100, "dnd", t0 + timedelta(hours=1))
+    assert db.presence_current(1, 100)["status"] == "dnd"
+    assert db.presence_current(1, 200) is None

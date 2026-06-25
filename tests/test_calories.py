@@ -443,3 +443,13 @@ def test_calorie_pop_last_removes_newest(db):
     # Empty case.
     db.calorie_pop_last(1, 100)
     assert db.calorie_pop_last(1, 100) is None
+
+
+def test_calorie_logged_days_distinct(db):
+    db.calorie_add(1, 100, "Sam", 500, logged_at=datetime(2026, 6, 1, 8, tzinfo=timezone.utc))
+    db.calorie_add(1, 100, "Sam", 300, logged_at=datetime(2026, 6, 1, 20, tzinfo=timezone.utc))
+    db.calorie_add(1, 100, "Sam", 400, logged_at=datetime(2026, 6, 3, 9, tzinfo=timezone.utc))
+    days = db.calorie_logged_days(1, 100, "2026-06-01", "2026-06-10")
+    assert sorted(days) == ["2026-06-01", "2026-06-03"]
+    # Out-of-window entries don't count.
+    assert db.calorie_logged_days(1, 100, "2026-06-02", "2026-06-03") == []
