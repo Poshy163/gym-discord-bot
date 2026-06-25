@@ -16,7 +16,9 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
     _build_progress_payload,
+    _e1rm_progression,
     _get_main_activity,
+    _parse_recap_json,
     _local_log_dates,
     _parse_bodyweight_message,
     _rejected_lifts_note,
@@ -254,3 +256,55 @@ def test_build_progress_payload_is_json_serializable():
     assert payload["bodyweight"]["latest_kg"] == 84.0
     assert any(g["equipment"] == "bench" for g in payload["lifting"]["goals"])
     assert len(blob) > 0
+
+
+def _rep_row(equipment, weight_kg, reps, at):
+    return {"equipment": equipment, "weight_kg": weight_kg, "reps": reps, "logged_at": at}
+
+
+def test_e1rm_progression_detects_rep_gains_at_same_weight():
+    # Same top-set weight, more reps over time → real estimated-1RM gain.
+    rows = [
+        _rep_row("bench", 100, 5, "2026-06-01T00:00:00+00:00"),
+        _rep_row("bench", 100, 8, "2026-06-20T00:00:00+00:00"),
+    ]
+    out = _e1rm_progression(rows)
+    assert len(out) == 1
+    b = out[0]
+    assert b["equipment"] == "bench"
+    # Epley: 100*(1+5/30)=116.7 → 100*(1+8/30)=126.7, +10.
+    assert b["first_e1rm_kg"] == 116.7
+    assert b["latest_e1rm_kg"] == 126.7
+    assert b["gain_kg"] == 10.0
+    assert b["sets_counted"] == 2
+
+
+def test_e1rm_progression_skips_unusable_and_sorts_by_gain():
+    rows = [
+        _rep_row("ohp", 50, 20, "2026-06-01T00:00:00+00:00"),   # >12 reps → skip
+        _rep_row("squat", 140, 3, "2026-06-01T00:00:00+00:00"),
+        _rep_row("squat", 150, 5, "2026-06-20T00:00:00+00:00"),
+        _rep_row("curl", 20, 10, "2026-06-01T00:00:00+00:00"),
+    ]
+    out = _e1rm_progression(rows)
+    names = [d["equipment"] for d in out]
+    assert "ohp" not in names                 # all its sets were unusable
+    assert names[0] == "squat"                # biggest gainer first
+    assert out[0]["gain_kg"] > 0
+
+
+def test_parse_recap_json_variants():
+    assert _parse_recap_json('{"verdict":"Nice","tip":"Add protein"}') == (
+        "Nice", "Add protein"
+    )
+    # Code-fenced.
+    assert _parse_recap_json('```json\n{"verdict":"v","tip":"t"}\n```') == ("v", "t")
+    # Prose-wrapped JSON.
+    assert _parse_recap_json('Sure: {"verdict":"v2","tip":"t2"} !') == ("v2", "t2")
+    # Missing tip is fine.
+    assert _parse_recap_json('{"verdict":"only verdict"}') == ("only verdict", None)
+    # No JSON at all → whole thing becomes the verdict.
+    v, t = _parse_recap_json("totally not json")
+    assert v == "totally not json" and t is None
+    # Empty input.
+    assert _parse_recap_json("") == (None, None)

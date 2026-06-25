@@ -70,10 +70,13 @@ class _FakeRequests:
         self._responses = list(responses)
         self.calls = 0
         self.last_json = None
+        self.urls = []
 
     def post(self, *args, **kwargs):
         self.calls += 1
         self.last_json = kwargs.get("json")
+        if args:
+            self.urls.append(args[0])
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -152,6 +155,82 @@ def test_generate_omits_token_cap_when_unset(monkeypatch):
     monkeypatch.setattr(gemini_client, "requests", fake)
     gemini_client.generate("p", retries=0)
     assert "maxOutputTokens" not in fake.last_json["generationConfig"]
+
+
+def test_generate_thinking_budget_opt_in(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", thinking_budget=768, retries=0)
+    assert fake.last_json["generationConfig"]["thinkingConfig"][
+        "thinkingBudget"
+    ] == 768
+
+
+def test_generate_flash_defaults_thinking_off(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", retries=0)
+    assert fake.last_json["generationConfig"]["thinkingConfig"][
+        "thinkingBudget"
+    ] == 0
+
+
+def test_generate_json_mime_passthrough(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([_ok("{}")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", response_mime_type="application/json", retries=0)
+    assert fake.last_json["generationConfig"][
+        "responseMimeType"
+    ] == "application/json"
+
+
+def test_generate_falls_back_to_backup_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("BACKUP_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    # Primary is overloaded (no retries), backup answers.
+    fake = _FakeRequests([_err(503, "UNAVAILABLE"), _ok("from backup")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    assert gemini_client.generate("hi", retries=0) == "from backup"
+    assert fake.calls == 2
+    assert "gemini-2.5-flash:" in fake.urls[0]
+    assert "gemini-2.5-flash-lite:" in fake.urls[1]
+
+
+def test_generate_no_backup_fallback_on_client_error(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("BACKUP_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    # A 400 is the caller's fault — the backup must NOT be tried.
+    fake = _FakeRequests([_err(400, "INVALID_ARGUMENT"), _ok("unused")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError):
+        gemini_client.generate("hi", retries=0)
+    assert fake.calls == 1
+
+
+def test_generate_backup_ignored_when_same_as_primary(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("BACKUP_GEMINI_MODEL", "gemini-2.5-flash")
+    fake = _FakeRequests([_err(503, "UNAVAILABLE")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError):
+        gemini_client.generate("hi", retries=0)
+    assert fake.calls == 1  # no duplicate model attempt
+
+
+def test_retry_delay_fixed_overrides_backoff(monkeypatch):
+    monkeypatch.setenv("GEMINI_RETRY_DELAY", "2.5")
+    assert gemini_client._retry_delay(0) == 2.5
+    assert gemini_client._retry_delay(9) == 2.5  # fixed, ignores attempt
+    monkeypatch.delenv("GEMINI_RETRY_DELAY", raising=False)
+    assert gemini_client._retry_delay(0) == gemini_client._backoff(0)
 
 
 def test_friendly_message_maps_known_failures():

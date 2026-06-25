@@ -1380,6 +1380,27 @@ class Database:
                 (guild_id, user_id),
             ))
 
+    def user_rep_sets(
+        self, guild_id: int, user_id: int,
+    ) -> list[sqlite3.Row]:
+        """Every set that carries a rep count (weight + reps), oldest-first.
+
+        Used to estimate 1RM progression — strength gains often show up as more
+        reps at the same weight before the top-set weight moves, which a raw
+        weight timeline misses entirely.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT equipment, weight_kg, reps, logged_at
+                FROM lifts
+                WHERE guild_id = ? AND user_id = ?
+                  AND reps IS NOT NULL AND reps > 0 AND weight_kg > 0
+                ORDER BY equipment, logged_at, id
+                """,
+                (guild_id, user_id),
+            ))
+
     def user_latest_by_equipment(
         self, guild_id: int, user_id: int,
     ) -> list[sqlite3.Row]:

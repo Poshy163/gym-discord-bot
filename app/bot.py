@@ -1783,17 +1783,17 @@ _CALORIE_SUMMARY_SYSTEM = (
     "- highest_day / lowest_day: their biggest and smallest days\n"
     "- previous_week_avg_kcal: last week's average for trend comparison "
     "(null if they didn't log last week)\n\n"
-    "Write a recap that:\n"
-    "1. Addresses them by name in a warm, motivating opener.\n"
-    "2. Calls out 2-3 CONCRETE patterns using the real numbers — logging "
-    "consistency, how close they ran to target, weekday-vs-weekend swings, any "
-    "standout high or low day, and the trend vs last week when available.\n"
-    "3. Ends with ONE specific, actionable tip tailored to exactly what you "
-    "saw this week (not generic advice).\n\n"
+    "Respond with ONLY a compact JSON object, no markdown or text around it:\n"
+    '{"verdict": "...", "tip": "..."}\n'
+    "- verdict: 2-3 warm sentences addressing them by name, calling out 2-3 "
+    "CONCRETE patterns using the real numbers (logging consistency, how close "
+    "they ran to target, weekday-vs-weekend swings, a standout high/low day, and "
+    "the trend vs last week when available). Under 400 characters.\n"
+    "- tip: ONE specific, actionable tip tailored to exactly what you saw this "
+    "week (not generic advice). Under 150 characters.\n"
+    "Plain text inside the values (no markdown). No extra keys.\n\n"
     "Tone: friendly, encouraging, a little playful — a coach genuinely rooting "
-    "for them. Never shame them, never give medical advice or rigid rules. "
-    "3-4 sentences, plain text only (no headings, bullets, or markdown), under "
-    "550 characters.\n\n"
+    "for them. Never shame them, never give medical advice or rigid rules.\n\n"
     "Note on gaps: only logged days are included. A low days_logged or a day "
     "missing from per_day means they didn't record it, NOT that they ate "
     "nothing — treat it as a tracking gap (gently encourage logging), never as "
@@ -1879,29 +1879,68 @@ async def _calorie_ai_summaries(
             f"{calories.format_kcal(avg)}/day · target "
             f"{calories.format_kcal(target)}/day"
         )
-        blurb: str | None = None
+        verdict, tip = None, None
         if gemini_client.available():
             prev_days = _calorie_week_days(
                 guild_id, user_id, prev_start_iso, start_iso,
             )
             payload = _build_calorie_ai_payload(name, target, days, prev_days)
             try:
-                blurb = await asyncio.to_thread(
+                raw = await asyncio.to_thread(
                     gemini_client.generate,
                     f"Weekly calorie data for {name}:\n{payload}",
                     system=_CALORIE_SUMMARY_SYSTEM,
                     temperature=0.6,  # a touch warmer for a personal recap
                     max_output_tokens=400,
+                    response_mime_type="application/json",
                 )
+                verdict, tip = _parse_recap_json(raw)
             except gemini_client.GeminiError as exc:
                 LOG.warning(
                     "Gemini calorie summary failed for %s: %s", name, exc,
                 )
-        if blurb:
-            blocks.append(f"{who} ({stats})\n{blurb.strip()[:800]}")
+        if verdict:
+            block = f"{who} ({stats})\n💬 {verdict}"
+            if tip:
+                block += f"\n💡 {tip}"
+            blocks.append(block)
         else:
             blocks.append(f"{who} — {stats}")
     return blocks
+
+
+def _parse_recap_json(raw: str) -> tuple[str | None, str | None]:
+    """Pull ``(verdict, tip)`` from the model's JSON recap.
+
+    Tolerant of stray prose or code fences around the object so a slightly
+    chatty model doesn't break rendering; returns ``(None, None)`` if nothing
+    usable is found (caller falls back to the plain stats line).
+    """
+    if not raw:
+        return None, None
+    text = raw.strip()
+    # Strip a ```json ... ``` fence if the model added one.
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        # Last resort: grab the outermost {...} span and retry.
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            # No JSON at all — treat the whole thing as a verdict.
+            return text[:400] or None, None
+        try:
+            data = json.loads(text[start:end + 1])
+        except (ValueError, TypeError):
+            return text[:400] or None, None
+    if not isinstance(data, dict):
+        return None, None
+    verdict = str(data.get("verdict") or "").strip() or None
+    tip = str(data.get("tip") or "").strip() or None
+    return (verdict[:500] if verdict else None), (tip[:200] if tip else None)
 
 
 async def _post_weekly_report(
@@ -9768,9 +9807,12 @@ _COACH_SYSTEM = (
     "**Overview**, **What's going well**, **Where you're lagging / plateauing**, "
     "**Nutrition**, and **Next steps** (2-4 concrete, specific actions). "
     "Reference actual lifts and numbers from the data, call out plateaus, "
-    "muscle-group imbalances, training frequency, and goal progress. Be "
-    "motivating but honest. Use short bullet points. Keep the whole reply under "
-    "1800 characters so it fits in a Discord embed.\n\n"
+    "muscle-group imbalances, training frequency (avg_sessions_per_week), and "
+    "goal progress. Use 'estimated_1rm_progression' to spot strength gains even "
+    "when top-set weight is flat — e.g. more reps at the same load is real "
+    "progress (cite the e1RM gain in kg). Be motivating but honest. Use short "
+    "bullet points. Keep the whole reply under 1800 characters for a Discord "
+    "embed.\n\n"
     "IMPORTANT — missing data vs real zeros: this bot only has what the user "
     "manually logs. A zero, null, empty, or stale value almost always means "
     "THEY DIDN'T LOG IT, not that the true value is zero. Specifically: if "
@@ -9786,7 +9828,60 @@ _COACH_SYSTEM = (
     "number first), and make 'Next steps' genuinely actionable (a weight to "
     "chase, a lift to add, a frequency to hit) — not platitudes. Prioritise the "
     "1-2 highest-impact observations over an exhaustive list.\n\n" + _AI_GUARDRAILS
+    + "\n\nExample of the expected style and length (adapt to the real data, "
+    "never copy these numbers):\n"
+    "**📊 Overview**\n"
+    "Solid 6 weeks, Sam — 17 sessions (2.8/wk) and your e1RM is climbing on the "
+    "big lifts.\n"
+    "**✅ Going well**\n"
+    "• Bench e1RM 102→111kg (+9) — reps up at 90kg before the top set moved.\n"
+    "• Squat PR 140kg, your most-trained lift (22 logs).\n"
+    "**⚠️ Lagging**\n"
+    "• Overhead press flat at 50kg for 5 weeks.\n"
+    "• No pulling logged — rows/pull-ups missing vs all that pressing.\n"
+    "**🍽️ Nutrition**\n"
+    "• Protein only logged 3/30 days — too sparse to judge; worth tracking.\n"
+    "**🎯 Next steps**\n"
+    "• Add a weekly row variation, target 60kg×8.\n"
+    "• Push OHP with 3×5 @ 52.5kg next session.\n"
+    "• Log protein daily for one week to get a real baseline."
 )
+
+
+def _e1rm_progression(rows: list) -> list[dict]:
+    """Per-exercise estimated-1RM trend from rep-bearing sets.
+
+    ``rows`` is the output of ``db.user_rep_sets`` (oldest-first, grouped by
+    equipment). For each exercise we take the Epley 1RM of every qualifying set
+    and report the first, best, and latest estimate plus the gain — so the coach
+    can spot strength progress even when the top-set weight has been flat (e.g.
+    100kg×5 → 100kg×8 is a real e1RM jump). Returns the biggest movers first.
+    """
+    by_equip: dict[str, list[tuple[float, str]]] = {}
+    for r in rows:
+        e1 = estimated_one_rep_max(float(r["weight_kg"]), int(r["reps"]))
+        if e1 is None:
+            continue
+        by_equip.setdefault(r["equipment"], []).append((e1, r["logged_at"]))
+    out: list[dict] = []
+    for equip, vals in by_equip.items():
+        if not vals:
+            continue
+        first_e, first_at = vals[0]
+        latest_e, latest_at = vals[-1]
+        best_e, best_at = max(vals, key=lambda v: v[0])
+        out.append({
+            "equipment": equip,
+            "first_e1rm_kg": round(first_e, 1),
+            "latest_e1rm_kg": round(latest_e, 1),
+            "best_e1rm_kg": round(best_e, 1),
+            "gain_kg": round(latest_e - first_e, 1),
+            "sets_counted": len(vals),
+            "best_at": best_at,
+        })
+    # Biggest estimated-strength movers first; cap to keep the payload tight.
+    out.sort(key=lambda d: d["gain_kg"], reverse=True)
+    return out[:10]
 
 
 def _build_progress_payload(
@@ -9879,6 +9974,9 @@ def _build_progress_payload(
             "total_training_days": len(dates),
             "sessions_in_window": sessions_in_window,
             "avg_sessions_per_week": avg_sessions_per_week,
+            "estimated_1rm_progression": _e1rm_progression(
+                db.user_rep_sets(guild_id, user_id)
+            ),
             "last_lift_at": last_lift_at,
         },
         "bodyweight": {
@@ -9956,7 +10054,11 @@ async def coach_cmd(
         text = await asyncio.to_thread(
             gemini_client.generate, prompt, system=_COACH_SYSTEM,
             temperature=0.5,  # balanced — analytical but not robotic
-            max_output_tokens=1200,
+            # /coach is deferred, so we can afford a small "thinking" pass for
+            # better multi-factor analysis. Budget the token cap to cover both
+            # the reasoning and the ~1800-char answer.
+            thinking_budget=768,
+            max_output_tokens=2200,
         )
     except gemini_client.GeminiError as exc:
         LOG.warning("Gemini coach analysis failed: %s", exc)
