@@ -80,11 +80,16 @@ def generate(
     model: str | None = None,
     timeout: int = REQUEST_TIMEOUT,
     retries: int = MAX_RETRIES,
+    temperature: float = 0.4,
+    max_output_tokens: int | None = None,
 ) -> str:
     """Send ``prompt`` to Gemini and return the model's text reply.
 
-    Transient failures (HTTP 429/500/503/504 or transport errors) are retried
-    up to ``retries`` times with a short backoff before giving up.
+    ``temperature`` tunes creativity (lower = more focused/precise, higher =
+    warmer/more varied) and ``max_output_tokens`` caps the reply length — both
+    let callers shape the response per feature. Transient failures
+    (HTTP 429/500/503/504 or transport errors) are retried up to ``retries``
+    times with a short backoff before giving up.
 
     Raises :class:`GeminiError` for missing config, transport failures, non-200
     responses, or an empty/blocked completion.
@@ -96,7 +101,9 @@ def generate(
         raise GeminiError("GEMINI_API_KEY is not set.")
     mdl = model or model_name()
     url = f"{API_ROOT}/models/{mdl}:generateContent"
-    gen_config: dict = {"temperature": 0.4}
+    gen_config: dict = {"temperature": temperature}
+    if max_output_tokens is not None:
+        gen_config["maxOutputTokens"] = max_output_tokens
     # 2.5 *flash* models default to an extended "thinking" pass that adds tens
     # of seconds of latency (the usual cause of read timeouts here). A trend
     # summary doesn't need it, so switch it off. Only flash/flash-lite accept a

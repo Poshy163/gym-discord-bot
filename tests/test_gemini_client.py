@@ -69,9 +69,11 @@ class _FakeRequests:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.last_json = None
 
     def post(self, *args, **kwargs):
         self.calls += 1
+        self.last_json = kwargs.get("json")
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -127,6 +129,29 @@ def test_generate_retries_transport_error(monkeypatch):
     monkeypatch.setattr(gemini_client, "requests", fake)
     assert gemini_client.generate("hi", retries=1) == "ok"
     assert fake.calls == 2
+
+
+def test_generate_passes_temperature_and_token_cap(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate(
+        "p", temperature=0.6, max_output_tokens=400, retries=0,
+    )
+    cfg = fake.last_json["generationConfig"]
+    assert cfg["temperature"] == 0.6
+    assert cfg["maxOutputTokens"] == 400
+    # flash still gets thinking disabled for latency.
+    assert cfg["thinkingConfig"]["thinkingBudget"] == 0
+
+
+def test_generate_omits_token_cap_when_unset(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", retries=0)
+    assert "maxOutputTokens" not in fake.last_json["generationConfig"]
 
 
 def test_friendly_message_maps_known_failures():

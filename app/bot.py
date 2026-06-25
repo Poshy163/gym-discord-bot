@@ -1759,6 +1759,17 @@ def _calorie_week_days(
     return days
 
 
+# Shared guardrails appended to every AI system prompt. Keeps replies grounded
+# in the data we actually pass (no invented numbers), free of preamble, and out
+# of medical-advice territory.
+_AI_GUARDRAILS = (
+    "Ground every claim in the data provided — never invent or assume numbers; "
+    "if something isn't in the data, say so briefly instead of guessing. Don't "
+    "open with filler like 'Sure' or 'Here is' — lead with the content. Avoid "
+    "medical, diagnostic, or prescriptive health claims."
+)
+
+
 _CALORIE_SUMMARY_SYSTEM = (
     "You are an upbeat, knowledgeable nutrition coach writing a short, personal "
     "weekly recap for ONE member of a Discord gym community.\n\n"
@@ -1786,7 +1797,7 @@ _CALORIE_SUMMARY_SYSTEM = (
     "Note on gaps: only logged days are included. A low days_logged or a day "
     "missing from per_day means they didn't record it, NOT that they ate "
     "nothing — treat it as a tracking gap (gently encourage logging), never as "
-    "a 0-calorie day or fasting."
+    "a 0-calorie day or fasting.\n\n" + _AI_GUARDRAILS
 )
 
 
@@ -1879,6 +1890,8 @@ async def _calorie_ai_summaries(
                     gemini_client.generate,
                     f"Weekly calorie data for {name}:\n{payload}",
                     system=_CALORIE_SUMMARY_SYSTEM,
+                    temperature=0.6,  # a touch warmer for a personal recap
+                    max_output_tokens=400,
                 )
             except gemini_client.GeminiError as exc:
                 LOG.warning(
@@ -9645,11 +9658,14 @@ def _ai_error_embed(exc: gemini_client.GeminiError) -> discord.Embed:
 _SLEEP_ANALYSIS_SYSTEM = (
     "You are a sleep-pattern analyst. You are given a person's sleep sessions "
     "derived from their Discord online/offline presence (a proxy, not a sleep "
-    "tracker, so treat it as approximate). Identify concrete trends: typical "
-    "bedtime and wake time, average and variability of sleep duration, "
-    "weekday-vs-weekend differences, and any drift or notable changes over the "
-    "window. Be concise and use short bullet points. Note caveats only briefly. "
-    "Keep the whole reply under 1500 characters so it fits in a Discord embed."
+    "tracker, so treat it as approximate). Identify concrete trends and quantify "
+    "them with the actual numbers: typical bedtime and wake time, average and "
+    "variability (consistency) of sleep duration, weekday-vs-weekend "
+    "differences, and any drift or notable change across the window. Lead with "
+    "the single most useful insight. Use short Discord-markdown bullets with "
+    "**bold** labels; put the one-line caveat about it being a presence proxy at "
+    "the very end. Keep the whole reply under 1500 characters for a Discord "
+    "embed.\n\n" + _AI_GUARDRAILS
 )
 
 
@@ -9710,6 +9726,8 @@ async def track_analyze_cmd(
     try:
         text = await asyncio.to_thread(
             gemini_client.generate, prompt, system=_SLEEP_ANALYSIS_SYSTEM,
+            temperature=0.3,  # precise/consistent for trend analysis
+            max_output_tokens=900,
         )
     except gemini_client.GeminiError as exc:
         LOG.warning("Gemini sleep analysis failed: %s", exc)
@@ -9762,7 +9780,12 @@ _COACH_SYSTEM = (
     "'days_since_bodyweight' is large, treat it as a possible logging gap and "
     "gently nudge them to log/track, rather than concluding they stopped "
     "training or lost progress. Frame gaps as 'no data logged recently — worth "
-    "tracking again', never as a regression."
+    "tracking again', never as a regression.\n\n"
+    "Style: address them by name, lead each section with a bold emoji header "
+    "(e.g. '**📊 Overview**'), keep bullets tight (one line each, the specific "
+    "number first), and make 'Next steps' genuinely actionable (a weight to "
+    "chase, a lift to add, a frequency to hit) — not platitudes. Prioritise the "
+    "1-2 highest-impact observations over an exhaustive list.\n\n" + _AI_GUARDRAILS
 )
 
 
@@ -9806,6 +9829,16 @@ def _build_progress_payload(
     cal_days = len(db.calorie_logged_days(guild_id, user_id, start_iso, end_iso))
     pro_days = len(db.protein_logged_days(guild_id, user_id, start_iso, end_iso))
 
+    # Derived signals the model would otherwise have to (badly) infer.
+    window_cutoff = (now - timedelta(days=days)).date().isoformat()
+    sessions_in_window = sum(1 for d in dates if d >= window_cutoff)
+    weeks = max(1.0, days / 7.0)
+    avg_sessions_per_week = round(sessions_in_window / weeks, 1)
+    bw_change_kg = (
+        round(bw[-1]["weight_kg"] - bw[0]["weight_kg"], 1)
+        if len(bw) >= 2 else None
+    )
+
     return {
         "name": name,
         "window_days": days,
@@ -9844,6 +9877,8 @@ def _build_progress_payload(
             "goals": [dict(r) for r in db.goal_list(guild_id, user_id)],
             "training_dates_recent": dates[-60:],
             "total_training_days": len(dates),
+            "sessions_in_window": sessions_in_window,
+            "avg_sessions_per_week": avg_sessions_per_week,
             "last_lift_at": last_lift_at,
         },
         "bodyweight": {
@@ -9851,6 +9886,8 @@ def _build_progress_payload(
                 {"kg": r["weight_kg"], "at": r["recorded_at"]} for r in bw
             ],
             "latest_kg": bw[-1]["weight_kg"] if bw else None,
+            "change_recent_kg": bw_change_kg,
+            "measurements": len(bw),
         },
         "nutrition": {
             "calorie_goal_kcal": (
@@ -9918,6 +9955,8 @@ async def coach_cmd(
     try:
         text = await asyncio.to_thread(
             gemini_client.generate, prompt, system=_COACH_SYSTEM,
+            temperature=0.5,  # balanced — analytical but not robotic
+            max_output_tokens=1200,
         )
     except gemini_client.GeminiError as exc:
         LOG.warning("Gemini coach analysis failed: %s", exc)
