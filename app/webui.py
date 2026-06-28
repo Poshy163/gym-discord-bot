@@ -1089,16 +1089,18 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
 .tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
-/* message feed */
-.msg-feed{display:flex;flex-direction:column;gap:.35rem;max-height:220px;
+/* message feed — grouped, Discord-style */
+.msg-feed{display:flex;flex-direction:column;gap:.7rem;max-height:240px;
 overflow-y:auto;background:#ffffff06;border:1px solid var(--line);
-border-radius:12px;padding:.55rem}
-.msg-row{font-size:.82rem;line-height:1.3;border-bottom:1px solid #ffffff0a;
-padding-bottom:.3rem}
-.msg-row:last-child{border-bottom:0;padding-bottom:0}
-.msg-meta{font-size:.7rem;color:var(--muted);font-variant-numeric:tabular-nums}
+border-radius:12px;padding:.6rem .7rem}
+.msg-grp{display:flex;flex-direction:column}
+.msg-grp-head{display:flex;align-items:baseline;gap:.45rem;margin-bottom:.12rem}
+.msg-grp-head .msg-ch{font-weight:600;font-size:.8rem}
 .msg-ch{color:#7aa2f7}
-.msg-text{white-space:pre-wrap;word-break:break-word}
+.msg-time{font-size:.68rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.msg-line{font-size:.86rem;line-height:1.35;white-space:pre-wrap;word-break:break-word;
+padding:.05rem .25rem;margin:0 -.25rem;border-radius:4px}
+.msg-line:hover{background:#ffffff0c}
 .offline-card{opacity:.6}
 </style></head><body>
 <header>
@@ -1535,6 +1537,26 @@ function gameTile(name,url,size,cls){
     {className:'${cls} game-tile',style:'${px};background:${idColor(name)}',textContent:'${esc((name||'?')[0]||'?').toUpperCase()}'}))">`;
   return `<span class="${cls} game-tile" style="${px};background:${idColor(name)}">${esc((name||'?')[0]||'?').toUpperCase()}</span>`;}
 
+// Group a user's recent messages (newest-first from the API) into Discord-like
+// blocks: messages in the same channel within a few minutes share one header
+// (#channel · time), then stack as bare lines. Rendered oldest→newest so it
+// reads top-to-bottom like a chat log.
+function renderMsgFeed(msgs){
+  if(!msgs||!msgs.length)
+    return '<div class="faint" style="font-size:.84rem">No messages in this window.</div>';
+  const chron=msgs.slice().reverse();
+  const GAP=7*60*1000;  // start a fresh block after a 7-minute lull
+  const groups=[];
+  for(const m of chron){
+    const t=Date.parse(m.at), g=groups[groups.length-1];
+    if(g&&g.channel===m.channel&&(t-g.lastT)<=GAP){g.lines.push(m.content);g.lastT=t;}
+    else groups.push({channel:m.channel,at:m.at,lastT:t,lines:[m.content]});
+  }
+  return `<div class="msg-feed">${groups.map(g=>`<div class="msg-grp">
+    <div class="msg-grp-head">${g.channel?`<span class="msg-ch">#${esc(g.channel)}</span>`:""}<span class="msg-time">${fmtTs(g.at)}</span></div>
+    ${g.lines.map(l=>`<div class="msg-line">${esc(l)}</div>`).join("")}</div>`).join("")}</div>`;
+}
+
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
   const users=d.users||[];
@@ -1550,6 +1572,8 @@ async function renderActivity(v){
       <span class="faint">· ${online}/${users.length} online · last ${d.window_days}d</span></h2>
       <span class="sp" style="flex:1"></span>${searchBar("Search players…")}</div>
     <div class="act-grid">${users.map(actCard).join("")}</div>`;
+  // Land each chat log at the newest message, like opening a Discord channel.
+  v.querySelectorAll(".msg-feed").forEach(f=>{f.scrollTop=f.scrollHeight;});
 }
 function actCard(u){
   const tracked=!!u.tracked;
@@ -1572,11 +1596,7 @@ function actCard(u){
     presence=`<div class="now"><div class="meta"><div class="g faint">Presence &amp; games not tracked</div>
       <div class="t">enable with <code>/track start</code></div></div></div>`;
   }
-  const msgs=(u.recent_messages||[]).length
-    ? `<div class="msg-feed">${u.recent_messages.map(m=>`<div class="msg-row">
-        <div class="msg-meta">${fmtTs(m.at)}${m.channel?` · <span class="msg-ch">#${esc(m.channel)}</span>`:""}</div>
-        <div class="msg-text">${esc(m.content)}</div></div>`).join("")}</div>`
-    : '<div class="faint" style="font-size:.84rem">No messages in this window.</div>';
+  const msgs=renderMsgFeed(u.recent_messages);
   const msgHead=`💬 ${u.message_count||0} msg${(u.message_count||0)===1?"":"s"}${
     u.last_message_at?" · last "+fmtTs(u.last_message_at):""}`;
   return `<div class="act-card${offline?' offline-card':''}">
