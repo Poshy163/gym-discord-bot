@@ -173,6 +173,28 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_events_user
     ON activity_events (guild_id, user_id, at);
 
+-- Message logging. When presence tracking is on, every message a tracked
+-- user sends is appended here with full content so the web dashboard can show
+-- a per-member message feed alongside presence/activity. ``channel_name`` is
+-- snapshotted at write time so the dashboard needn't resolve channels, and the
+-- unique index on (guild_id, message_id) makes re-dispatches idempotent.
+CREATE TABLE IF NOT EXISTS message_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    channel_id   INTEGER,
+    channel_name TEXT,
+    message_id   INTEGER,
+    content      TEXT,
+    at           TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_log_user
+    ON message_log (guild_id, user_id, at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_log_msgid
+    ON message_log (guild_id, message_id) WHERE message_id IS NOT NULL;
+
 -- Calorie tracking. ``calorie_goals`` holds each user's daily intake target
 -- (stored in kcal — the bot converts kJ on the way in). Having a row here is
 -- what marks a user as "doing" calorie tracking for the weekly AI summary.
@@ -2512,6 +2534,11 @@ class Database:
                     "WHERE guild_id = ? AND user_id = ?",
                     (guild_id, user_id),
                 )
+                c.execute(
+                    "DELETE FROM message_log "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
             return removed
 
     def presence_track_list(self, guild_id: int) -> list[sqlite3.Row]:
@@ -2702,6 +2729,69 @@ class Database:
                 params,
             ).fetchall())
             return rows
+
+    # ------------------------------------------------------------------
+    # Message logging (web dashboard activity feed)
+    # ------------------------------------------------------------------
+
+    def message_log_add(
+        self, guild_id: int, user_id: int, content: str | None,
+        channel_id: int | None = None, channel_name: str | None = None,
+        message_id: int | None = None, at: datetime | None = None,
+    ) -> bool:
+        """Append a logged message. Idempotent on ``message_id`` (a re-dispatch
+        of the same message won't create a duplicate). Returns True if a row
+        was inserted."""
+        ts = _normalize_iso(at)
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO message_log "
+                "(guild_id, user_id, channel_id, channel_name, "
+                " message_id, content, at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, channel_id, channel_name,
+                 message_id, content, ts),
+            )
+            return cur.rowcount > 0
+
+    def message_count_since(
+        self, guild_id: int, user_id: int, since: datetime | None = None,
+    ) -> int:
+        """Number of logged messages for a user, optionally since ``since``."""
+        with self._conn() as c:
+            if since is not None:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM message_log "
+                    "WHERE guild_id = ? AND user_id = ? AND at >= ?",
+                    (guild_id, user_id, _normalize_iso(since)),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM message_log "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                ).fetchone()
+            return int(row["n"]) if row else 0
+
+    def message_log_recent(
+        self, guild_id: int, user_id: int,
+        since: datetime | None = None, limit: int = 30,
+    ) -> list[sqlite3.Row]:
+        """Most recent logged messages for a user (newest first), optionally
+        constrained to ``since`` and capped at ``limit`` rows."""
+        with self._conn() as c:
+            params: list = [guild_id, user_id]
+            where = "guild_id = ? AND user_id = ?"
+            if since is not None:
+                where += " AND at >= ?"
+                params.append(_normalize_iso(since))
+            params.append(int(limit))
+            return c.execute(
+                "SELECT channel_id, channel_name, content, at "
+                f"FROM message_log WHERE {where} "
+                "ORDER BY at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
 
     # ------------------------------------------------------------------
     # Calorie tracking

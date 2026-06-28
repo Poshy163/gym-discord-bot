@@ -2334,6 +2334,22 @@ async def _run_startup_backfill() -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or not message.guild:
         return
+    # Message logging for the web dashboard activity feed. Logged for any
+    # tracked user, in every channel (so it's recorded before the gym-channel
+    # gate below). Gated on presence tracking since that's what manages the
+    # tracked-user allow-list; failures here must never break normal handling.
+    if ENABLE_PRESENCE_TRACKING and message.content:
+        try:
+            if db.presence_is_tracked(message.guild.id, message.author.id):
+                db.message_log_add(
+                    message.guild.id, message.author.id, message.content,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, "name", None),
+                    message_id=message.id,
+                    at=message.created_at,
+                )
+        except Exception:
+            LOG.exception("Failed to log message for activity feed")
     if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
         await bot.process_commands(message)
         return

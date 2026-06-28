@@ -428,7 +428,7 @@ def build_app(
     async def api_activity(request: web.Request) -> web.Response:
         _require(request)
         gid = _guild_id(request)
-        days = _clamp_int(request.query.get("days"), 7, 1, 90)
+        days = _clamp_int(request.query.get("days"), 30, 1, 90)
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
         users = []
@@ -454,6 +454,14 @@ def build_app(
                     "image": cur["image_url"] or imgmap.get(cur["activity"]),
                     "since": cur["at"],
                 }
+            recent_messages = [
+                {
+                    "content": r["content"],
+                    "channel": r["channel_name"],
+                    "at": r["at"],
+                }
+                for r in db.message_log_recent(gid, uid, since=since, limit=30)
+            ]
             users.append({
                 "user_id": str(uid),
                 "display_name": (
@@ -464,6 +472,11 @@ def build_app(
                 "status_at": pres["at"] if pres else None,
                 "current_game": current_game,
                 "top_games": top,
+                "message_count": db.message_count_since(gid, uid, since),
+                "last_message_at": (
+                    recent_messages[0]["at"] if recent_messages else None
+                ),
+                "recent_messages": recent_messages,
             })
         return web.json_response({"users": users, "window_days": days})
 
@@ -1066,6 +1079,16 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
 .tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
+/* message feed */
+.msg-feed{display:flex;flex-direction:column;gap:.35rem;max-height:220px;
+overflow-y:auto;background:#ffffff06;border:1px solid var(--line);
+border-radius:12px;padding:.55rem}
+.msg-row{font-size:.82rem;line-height:1.3;border-bottom:1px solid #ffffff0a;
+padding-bottom:.3rem}
+.msg-row:last-child{border-bottom:0;padding-bottom:0}
+.msg-meta{font-size:.7rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.msg-ch{color:#7aa2f7}
+.msg-text{white-space:pre-wrap;word-break:break-word}
 .offline-card{opacity:.6}
 </style></head><body>
 <header>
@@ -1531,6 +1554,13 @@ function actCard(u){
       <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
       <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
     : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
+  const msgs=(u.recent_messages||[]).length
+    ? `<div class="msg-feed">${u.recent_messages.map(m=>`<div class="msg-row">
+        <div class="msg-meta">${fmtTs(m.at)}${m.channel?` · <span class="msg-ch">#${esc(m.channel)}</span>`:""}</div>
+        <div class="msg-text">${esc(m.content)}</div></div>`).join("")}</div>`
+    : '<div class="faint" style="font-size:.84rem">No messages in this window.</div>';
+  const msgHead=`💬 ${u.message_count||0} msg${(u.message_count||0)===1?"":"s"}${
+    u.last_message_at?" · last "+fmtTs(u.last_message_at):""}`;
   return `<div class="act-card${offline?' offline-card':''}">
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
@@ -1540,6 +1570,7 @@ function actCard(u){
     </div>
     ${now}
     <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
+    <div><div class="act-sub" style="margin-bottom:.4rem">${msgHead}</div>${msgs}</div>
   </div>`;
 }
 

@@ -74,9 +74,11 @@ def test_remove_with_purge_clears_history(db):
     db.presence_track_add(1, 100, started_by=1)
     db.presence_log_event(1, 100, "online", at=base)
     db.presence_log_event(1, 100, "offline", at=base + timedelta(hours=1))
+    db.message_log_add(1, 100, "hello", message_id=1, at=base)
 
     assert db.presence_track_remove(1, 100, purge=True) is True
     assert db.presence_events_for(1, 100) == []
+    assert db.message_count_since(1, 100) == 0
 
 
 def test_remove_without_purge_keeps_history(db):
@@ -146,3 +148,48 @@ def test_presence_current_returns_latest(db):
     db.presence_log_event(1, 100, "dnd", t0 + timedelta(hours=1))
     assert db.presence_current(1, 100)["status"] == "dnd"
     assert db.presence_current(1, 200) is None
+
+
+# --- message logging (web-dashboard activity feed) ------------------------
+
+def test_message_log_add_and_recent_newest_first(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    assert db.message_log_add(
+        1, 100, "first", channel_id=7, channel_name="general",
+        message_id=1001, at=t0,
+    ) is True
+    assert db.message_log_add(
+        1, 100, "second", channel_id=7, channel_name="general",
+        message_id=1002, at=t0 + timedelta(minutes=5),
+    ) is True
+
+    rows = db.message_log_recent(1, 100)
+    assert [r["content"] for r in rows] == ["second", "first"]
+    assert rows[0]["channel_name"] == "general"
+
+
+def test_message_log_add_idempotent_on_message_id(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    assert db.message_log_add(1, 100, "hi", message_id=42, at=t0) is True
+    # Re-dispatch of the same message: ignored, no duplicate row.
+    assert db.message_log_add(1, 100, "hi", message_id=42, at=t0) is False
+    assert db.message_count_since(1, 100) == 1
+
+
+def test_message_count_and_recent_respect_since_and_limit(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    for i in range(5):
+        db.message_log_add(
+            1, 100, f"m{i}", message_id=2000 + i, at=base + timedelta(days=i),
+        )
+    # Distinct user is independent.
+    db.message_log_add(1, 200, "other", message_id=3000, at=base)
+
+    # Window starting on day 2 only sees m2, m3, m4.
+    since = base + timedelta(days=2)
+    assert db.message_count_since(1, 100, since) == 3
+    assert db.message_count_since(1, 100) == 5
+    assert db.message_count_since(1, 200) == 1
+
+    limited = db.message_log_recent(1, 100, since=since, limit=2)
+    assert [r["content"] for r in limited] == ["m4", "m3"]
