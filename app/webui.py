@@ -431,29 +431,40 @@ def build_app(
         days = _clamp_int(request.query.get("days"), 30, 1, 90)
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
+        # Presence + games come from the /track opt-in list; message logs are
+        # captured for everyone. Show a card for the union: every tracked user
+        # plus every member who has chatted in the window.
+        tracked = {int(r["user_id"]) for r in db.presence_track_list(gid)}
+        msg_meta = {
+            int(r["user_id"]): (int(r["count"]), r["last_at"])
+            for r in db.message_active_users(gid, since=since)
+        }
         users = []
-        for row in db.presence_track_list(gid):
-            uid = int(row["user_id"])
+        for uid in tracked | set(msg_meta):
             member = db.get_member(gid, uid)
-            pres = db.presence_current(gid, uid)
-            cur = db.activity_current(gid, uid)
-            imgmap = db.activity_image_map(gid, uid)
-            events = [
-                (r["activity"], r["at"])
-                for r in db.activity_events_for(gid, uid, since=since)
-            ]
-            totals = presence.summarize_activities(events, since, now)
-            top = [
-                {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
-                for nm, secs in list(totals.items())[:6]
-            ]
+            is_tracked = uid in tracked
+            pres = db.presence_current(gid, uid) if is_tracked else None
             current_game = None
-            if cur and cur["activity"]:
-                current_game = {
-                    "name": cur["activity"],
-                    "image": cur["image_url"] or imgmap.get(cur["activity"]),
-                    "since": cur["at"],
-                }
+            top: list[dict] = []
+            if is_tracked:
+                cur = db.activity_current(gid, uid)
+                imgmap = db.activity_image_map(gid, uid)
+                events = [
+                    (r["activity"], r["at"])
+                    for r in db.activity_events_for(gid, uid, since=since)
+                ]
+                totals = presence.summarize_activities(events, since, now)
+                top = [
+                    {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
+                    for nm, secs in list(totals.items())[:6]
+                ]
+                if cur and cur["activity"]:
+                    current_game = {
+                        "name": cur["activity"],
+                        "image": cur["image_url"] or imgmap.get(cur["activity"]),
+                        "since": cur["at"],
+                    }
+            msg_count, last_message_at = msg_meta.get(uid, (0, None))
             recent_messages = [
                 {
                     "content": r["content"],
@@ -461,21 +472,20 @@ def build_app(
                     "at": r["at"],
                 }
                 for r in db.message_log_recent(gid, uid, since=since, limit=30)
-            ]
+            ] if msg_count else []
             users.append({
                 "user_id": str(uid),
                 "display_name": (
                     member["display_name"] if member else str(uid)
                 ),
                 "avatar": member["avatar"] if member else None,
+                "tracked": is_tracked,
                 "status": pres["status"] if pres else None,
                 "status_at": pres["at"] if pres else None,
                 "current_game": current_game,
                 "top_games": top,
-                "message_count": db.message_count_since(gid, uid, since),
-                "last_message_at": (
-                    recent_messages[0]["at"] if recent_messages else None
-                ),
+                "message_count": msg_count,
+                "last_message_at": last_message_at,
                 "recent_messages": recent_messages,
             })
         return web.json_response({"users": users, "window_days": days})
@@ -1060,7 +1070,7 @@ padding:1.1rem;display:flex;flex-direction:column;gap:.9rem;position:relative;ov
 .act-av .dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
 border-radius:50%;border:3px solid var(--panel)}
 .st-online{background:#3ba55d}.st-idle{background:#faa61a}.st-dnd{background:#ed4245}
-.st-offline{background:#747f8d}
+.st-offline{background:#747f8d}.st-untracked{background:#30363d;box-shadow:inset 0 0 0 2px #565f6b}
 .act-name{font-weight:600}
 .act-sub{font-size:.78rem;color:var(--muted);text-transform:capitalize}
 .now{display:flex;align-items:center;gap:.7rem;background:#ffffff06;
@@ -1528,9 +1538,9 @@ function gameTile(name,url,size,cls){
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
   const users=d.users||[];
-  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
-    <span class="faint">Presence/activity tracking is owner-controlled via <code>/track start</code>
-    and needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
+  if(!users.length){v.innerHTML=`<div class="empty">No activity yet.<br>
+    <span class="faint">Messages are logged for every member once they chat. Presence &amp; games also
+    need <code>ENABLE_PRESENCE_TRACKING=true</code> and <code>/track start</code>.</span></div>`;return;}
   // online first, then by current game, then name.
   users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
     || (b.current_game?1:0)-(a.current_game?1:0)
@@ -1542,18 +1552,26 @@ async function renderActivity(v){
     <div class="act-grid">${users.map(actCard).join("")}</div>`;
 }
 function actCard(u){
-  const offline=!["online","idle","dnd"].includes(u.status);
+  const tracked=!!u.tracked;
+  const offline=tracked&&!["online","idle","dnd"].includes(u.status);
   const maxSec=Math.max(1,...(u.top_games||[]).map(g=>g.seconds));
-  const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
-      <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
-      <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
-    : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
-      <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
-  const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
-      ${gameTile(g.name,g.image,30,"gi")}
-      <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
-      <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
-    : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
+  let presence;
+  if(tracked){
+    const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
+        <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
+        <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
+      : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
+        <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
+    const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
+        ${gameTile(g.name,g.image,30,"gi")}
+        <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
+        <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
+      : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
+    presence=`${now}<div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>`;
+  } else {
+    presence=`<div class="now"><div class="meta"><div class="g faint">Presence &amp; games not tracked</div>
+      <div class="t">enable with <code>/track start</code></div></div></div>`;
+  }
   const msgs=(u.recent_messages||[]).length
     ? `<div class="msg-feed">${u.recent_messages.map(m=>`<div class="msg-row">
         <div class="msg-meta">${fmtTs(m.at)}${m.channel?` · <span class="msg-ch">#${esc(m.channel)}</span>`:""}</div>
@@ -1564,12 +1582,11 @@ function actCard(u){
   return `<div class="act-card${offline?' offline-card':''}">
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
-        <span class="dot ${statusClass(u.status)}"></span></span>
+        <span class="dot ${tracked?statusClass(u.status):'st-untracked'}"></span></span>
       <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
-      <div class="act-sub">${statusLabel(u.status)}</div></div>
+      <div class="act-sub">${tracked?statusLabel(u.status):'not tracked'}</div></div>
     </div>
-    ${now}
-    <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
+    ${presence}
     <div><div class="act-sub" style="margin-bottom:.4rem">${msgHead}</div>${msgs}</div>
   </div>`;
 }

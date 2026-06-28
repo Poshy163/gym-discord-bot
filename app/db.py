@@ -2534,11 +2534,6 @@ class Database:
                     "WHERE guild_id = ? AND user_id = ?",
                     (guild_id, user_id),
                 )
-                c.execute(
-                    "DELETE FROM message_log "
-                    "WHERE guild_id = ? AND user_id = ?",
-                    (guild_id, user_id),
-                )
             return removed
 
     def presence_track_list(self, guild_id: int) -> list[sqlite3.Row]:
@@ -2790,6 +2785,36 @@ class Database:
                 "SELECT channel_id, channel_name, content, at "
                 f"FROM message_log WHERE {where} "
                 "ORDER BY at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+
+    def message_log_latest_at(self, guild_id: int) -> str | None:
+        """ISO timestamp of the most recent logged message in ``guild_id``, or
+        None if nothing has been logged yet. Lets the startup backfill resume
+        forward of what it already has instead of re-scanning history."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(at) AS last_at FROM message_log WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+            return row["last_at"] if row and row["last_at"] else None
+
+    def message_active_users(
+        self, guild_id: int, since: datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        """Users who have logged messages (optionally since ``since``), each
+        with a message ``count`` and ``last_at`` timestamp. Ordered most
+        recently active first — drives the dashboard's whole-server feed."""
+        with self._conn() as c:
+            params: list = [guild_id]
+            where = "guild_id = ?"
+            if since is not None:
+                where += " AND at >= ?"
+                params.append(_normalize_iso(since))
+            return c.execute(
+                "SELECT user_id, COUNT(*) AS count, MAX(at) AS last_at "
+                f"FROM message_log WHERE {where} "
+                "GROUP BY user_id ORDER BY last_at DESC",
                 params,
             ).fetchall()
 

@@ -74,11 +74,9 @@ def test_remove_with_purge_clears_history(db):
     db.presence_track_add(1, 100, started_by=1)
     db.presence_log_event(1, 100, "online", at=base)
     db.presence_log_event(1, 100, "offline", at=base + timedelta(hours=1))
-    db.message_log_add(1, 100, "hello", message_id=1, at=base)
 
     assert db.presence_track_remove(1, 100, purge=True) is True
     assert db.presence_events_for(1, 100) == []
-    assert db.message_count_since(1, 100) == 0
 
 
 def test_remove_without_purge_keeps_history(db):
@@ -193,3 +191,38 @@ def test_message_count_and_recent_respect_since_and_limit(db):
 
     limited = db.message_log_recent(1, 100, since=since, limit=2)
     assert [r["content"] for r in limited] == ["m4", "m3"]
+
+
+def test_message_active_users_counts_and_orders(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    # User 100: two messages, latest on day 1.
+    db.message_log_add(1, 100, "a", message_id=1, at=base)
+    db.message_log_add(1, 100, "b", message_id=2, at=base + timedelta(days=1))
+    # User 200: one message, latest on day 3 (more recent than 100).
+    db.message_log_add(1, 200, "c", message_id=3, at=base + timedelta(days=3))
+    # Different guild is independent.
+    db.message_log_add(2, 300, "d", message_id=4, at=base)
+
+    rows = db.message_active_users(1)
+    # Most recently active first: 200 (day 3) then 100 (day 1).
+    assert [int(r["user_id"]) for r in rows] == [200, 100]
+    by_uid = {int(r["user_id"]): r for r in rows}
+    assert by_uid[100]["count"] == 2
+    assert by_uid[200]["count"] == 1
+
+    # `since` filters out user 100's older window.
+    recent = db.message_active_users(1, since=base + timedelta(days=2))
+    assert [int(r["user_id"]) for r in recent] == [200]
+
+
+def test_message_log_latest_at_tracks_newest(db):
+    assert db.message_log_latest_at(1) is None
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.message_log_add(1, 100, "old", message_id=1, at=base)
+    db.message_log_add(1, 200, "new", message_id=2, at=base + timedelta(days=2))
+    # Older message in a different guild doesn't bleed through.
+    db.message_log_add(2, 300, "other", message_id=3, at=base + timedelta(days=9))
+
+    latest = db.message_log_latest_at(1)
+    assert latest == (base + timedelta(days=2)).isoformat()
+    assert db.message_log_latest_at(99) is None

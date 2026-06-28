@@ -77,6 +77,53 @@ def test_invite_happy_path_passes_args_through(tmp_path):
     _run(go())
 
 
+def test_activity_lists_tracked_and_message_active_members(tmp_path):
+    """The activity feed unions /track opt-ins with everyone who has chatted:
+    tracked users carry presence/games, untracked ones appear from logs alone."""
+    async def go():
+        from datetime import datetime, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.upsert_member(1, 200, "bob", "Bob")
+        # Alice is tracked (presence + a game) and has chatted.
+        db.presence_track_add(1, 100, started_by=9)
+        db.presence_log_event(1, 100, "online", at=now)
+        db.activity_log_event(1, 100, "Rust", at=now)
+        db.message_log_add(1, 100, "hi all", message_id=1, channel_name="general", at=now)
+        # Bob is NOT tracked but has messages — should still get a card.
+        db.message_log_add(1, 200, "yo", message_id=2, channel_name="gym", at=now)
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/activity?guild=1&days=30")
+            assert r.status == 200
+            body = await r.json()
+            assert body["window_days"] == 30
+            by_id = {u["user_id"]: u for u in body["users"]}
+            assert set(by_id) == {"100", "200"}
+
+            alice = by_id["100"]
+            assert alice["tracked"] is True
+            assert alice["status"] == "online"
+            assert alice["current_game"]["name"] == "Rust"
+            assert alice["message_count"] == 1
+
+            bob = by_id["200"]
+            assert bob["tracked"] is False
+            assert bob["status"] is None
+            assert bob["current_game"] is None
+            assert bob["message_count"] == 1
+            assert bob["recent_messages"][0]["content"] == "yo"
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_invite_503_when_not_wired(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

@@ -249,6 +249,25 @@ ENABLE_PRESENCE_TRACKING = os.getenv(
     "ENABLE_PRESENCE_TRACKING", "false"
 ).lower() in ("1", "true", "yes", "y", "on")
 
+# Message logging for the web dashboard (app/webui.py). Captures every member's
+# messages — full content — across all channels, independent of the /track
+# opt-in list, so the dashboard can show a per-member message feed for the whole
+# server. Needs only the message_content intent (enabled below). Default ON;
+# set to a false-y value to disable.
+ENABLE_MESSAGE_LOGGING = os.getenv(
+    "ENABLE_MESSAGE_LOGGING", "true"
+).lower() in ("1", "true", "yes", "y", "on")
+
+# How many days of channel history to scan on startup to seed the message log,
+# so the dashboard's activity feed has data the moment the bot comes up rather
+# than only from messages seen live. 0 disables the seed. Re-runs are cheap:
+# logging dedupes on message id and each boot only scans forward of the newest
+# already-logged message.
+try:
+    MESSAGE_LOG_BACKFILL_DAYS = int(os.getenv("MESSAGE_LOG_BACKFILL_DAYS", "30"))
+except ValueError:
+    MESSAGE_LOG_BACKFILL_DAYS = 30
+
 # Web dashboard (app/webui.py). Enabled only when WEBUI_PASSWORD is set — the
 # dashboard exposes member/role/nutrition data so it must never run without a
 # login secret. It needs the Server Members privileged intent to mirror the
@@ -1514,6 +1533,12 @@ async def on_ready() -> None:
         # No backfill to wait on — start auditing live data changes now.
         db.audit_live = True
 
+    # Seed the dashboard message log from recent history (all channels), so the
+    # activity feed isn't empty on a fresh deploy. Independent of the lift/calorie
+    # backfill above and of GYM_CHANNEL_IDS.
+    if ENABLE_MESSAGE_LOGGING and MESSAGE_LOG_BACKFILL_DAYS > 0:
+        bot.loop.create_task(_backfill_message_logs())
+
     if WEBUI_ENABLED:
         LOG.info(
             "Web dashboard ENABLED on port %d (Server Members intent in use). "
@@ -2330,24 +2355,81 @@ async def _run_startup_backfill() -> None:
     db.audit_live = True
 
 
+async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtime
+    """Seed the message log from recent channel history.
+
+    Scans every readable text channel in every guild for the last
+    ``MESSAGE_LOG_BACKFILL_DAYS`` days so the dashboard's activity feed has data
+    immediately on startup. Idempotent — logging dedupes on message id — and on
+    reboots we only scan forward of the newest already-logged message, so it's
+    cheap after the first run.
+    """
+    if not ENABLE_MESSAGE_LOGGING or MESSAGE_LOG_BACKFILL_DAYS <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=MESSAGE_LOG_BACKFILL_DAYS
+    )
+    for guild in bot.guilds:
+        # Resume forward of what we already stored, but never earlier than the
+        # cutoff — so the first run seeds the full window and later runs only
+        # fill the gap since the bot was last up.
+        after = cutoff
+        latest = db.message_log_latest_at(guild.id)
+        if latest:
+            try:
+                latest_dt = datetime.fromisoformat(latest)
+                if latest_dt.tzinfo is None:
+                    latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+                after = max(after, latest_dt)
+            except ValueError:
+                pass
+        logged = 0
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(guild.me)
+            if not (perms.read_messages and perms.read_message_history):
+                continue
+            try:
+                async for msg in channel.history(
+                    limit=None, after=after, oldest_first=True,
+                ):
+                    if msg.author.bot or not msg.content:
+                        continue
+                    if db.message_log_add(
+                        guild.id, msg.author.id, msg.content,
+                        channel_id=channel.id, channel_name=channel.name,
+                        message_id=msg.id, at=msg.created_at,
+                    ):
+                        logged += 1
+            except discord.Forbidden:
+                continue
+            except discord.HTTPException:
+                LOG.warning(
+                    "Message-log backfill: HTTP error scanning #%s", channel,
+                )
+                continue
+        LOG.info(
+            "Message-log backfill for %s: %d new messages (since %s)",
+            guild, logged, after.isoformat(timespec="seconds"),
+        )
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or not message.guild:
         return
-    # Message logging for the web dashboard activity feed. Logged for any
-    # tracked user, in every channel (so it's recorded before the gym-channel
-    # gate below). Gated on presence tracking since that's what manages the
-    # tracked-user allow-list; failures here must never break normal handling.
-    if ENABLE_PRESENCE_TRACKING and message.content:
+    # Message logging for the web dashboard. Every member's messages are logged
+    # (independent of the /track opt-in list), in every channel — so it runs
+    # before the gym-channel gate below. Failures here must never break normal
+    # message handling.
+    if ENABLE_MESSAGE_LOGGING and message.content:
         try:
-            if db.presence_is_tracked(message.guild.id, message.author.id):
-                db.message_log_add(
-                    message.guild.id, message.author.id, message.content,
-                    channel_id=message.channel.id,
-                    channel_name=getattr(message.channel, "name", None),
-                    message_id=message.id,
-                    at=message.created_at,
-                )
+            db.message_log_add(
+                message.guild.id, message.author.id, message.content,
+                channel_id=message.channel.id,
+                channel_name=getattr(message.channel, "name", None),
+                message_id=message.id,
+                at=message.created_at,
+            )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
     if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
