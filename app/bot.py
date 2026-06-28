@@ -8853,14 +8853,47 @@ async def _webui_invite_user(
     return {"ok": True, "link": invite.url, "dmed": dmed, "error": dm_error}
 
 
+def _role_forbidden_reason(guild: "discord.Guild", role) -> str:  # pragma: no cover
+    """Explain *why* Discord refused a role change, in operator-actionable terms.
+
+    The usual culprit isn't a missing permission but role hierarchy: a bot can
+    only manage roles positioned **below its own highest role** — and crucially
+    **Administrator does NOT bypass this**. So an admin bot still can't grant a
+    role that sits at or above its own role in Server Settings → Roles.
+    """
+    me = guild.me
+    if me is not None and not (
+        me.guild_permissions.manage_roles or me.guild_permissions.administrator
+    ):
+        return "I don't have the Manage Roles permission in this server."
+    if getattr(role, "managed", False):
+        return (
+            f"“{role.name}” is managed by an integration, bot, or "
+            "Server Boost, so it can't be assigned manually."
+        )
+    if me is not None and role >= me.top_role:
+        return (
+            f"“{role.name}” is at or above my own highest role "
+            f"(“{me.top_role.name}”). Discord won't let me manage it "
+            "even with Administrator. In Server Settings → Roles, drag my "
+            "role above it, then try again."
+        )
+    return (
+        "Discord refused the change — this is almost always role hierarchy. "
+        "Make sure my role is dragged above the target role in Server Settings "
+        "→ Roles (Administrator doesn't override this)."
+    )
+
+
 async def _webui_set_member_role(
     guild_id: int, user_id: int, role_id: int, add: bool, actor_name: str,
 ) -> dict:  # pragma: no cover
     """Add or remove one role on a guild member (dashboard role editor).
 
     Members only — the user must already be in the guild. Discord enforces role
-    hierarchy at apply time, so a role above the bot's top role surfaces here as
-    a permission error. Audited as ``role_add`` / ``role_remove``.
+    hierarchy at apply time (a role at/above the bot's top role is refused even
+    with Administrator), surfaced here as a specific, actionable error. Audited
+    as ``role_add`` / ``role_remove``.
     """
     guild = bot.get_guild(guild_id)
     if guild is None:
@@ -8884,11 +8917,18 @@ async def _webui_set_member_role(
         else:
             await member.remove_roles(role, reason=f"Dashboard by {actor_name}")
     except discord.Forbidden:
-        return {
-            "ok": False,
-            "error": "I can't manage that role — it's above my highest role or "
-                     "I'm missing Manage Roles.",
-        }
+        me = guild.me
+        LOG.warning(
+            "Role change forbidden: role '%s' pos=%s, bot top role '%s' pos=%s, "
+            "manage_roles=%s admin=%s managed=%s",
+            role.name, role.position,
+            me.top_role.name if me else "?",
+            me.top_role.position if me else "?",
+            me.guild_permissions.manage_roles if me else "?",
+            me.guild_permissions.administrator if me else "?",
+            getattr(role, "managed", False),
+        )
+        return {"ok": False, "error": _role_forbidden_reason(guild, role)}
     except discord.HTTPException as exc:
         return {"ok": False, "error": f"Discord rejected the change: {exc}"}
 
