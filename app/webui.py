@@ -1209,6 +1209,10 @@ display:flex;align-items:center;gap:.25rem}
 .dc-gh{display:flex;align-items:baseline;gap:.5rem;margin-bottom:.1rem}
 .dc-au{font-weight:600;font-size:.92rem;color:#fff}
 .dc-ts{font-size:.7rem;color:var(--muted)}
+.dc-bl{margin-left:auto;background:transparent;border:0;cursor:pointer;opacity:0;
+font-size:.8rem;line-height:1;padding:.1rem .35rem;border-radius:5px;transition:opacity .12s}
+.dc-grp:hover .dc-bl{opacity:.5}
+.dc-bl:hover{opacity:1;background:#ffffff12}
 .dc-msg{font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;
 padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
 .dc-msg:hover{background:#ffffff08}
@@ -1713,8 +1717,17 @@ function renderChat(msgs){
   if(!msgs||!msgs.length)return '<div class="faint" style="padding:1.2rem">No messages logged in this channel.</div>';
   return msgGroups(msgs).map(g=>`<div class="dc-grp">
     ${avatar(g.user_id,g.name,g.avatar,40)}
-    <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a><span class="dc-ts">${fmtTs(g.at)}</span></div>
+    <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a>
+      <span class="dc-ts">${fmtTs(g.at)}</span>
+      <button class="dc-bl" title="Blacklist this user from message logging" onclick="blacklistUser('${g.user_id}')">🚫</button></div>
     ${g.lines.map(l=>`<div class="dc-msg">${esc(l)}</div>`).join("")}</div></div>`).join("");
+}
+// Open the blacklist dialog pre-filled with a user picked straight from a chat
+// message — no need to hunt down their numeric ID.
+function blacklistUser(uid){
+  openBlacklist();
+  const i=document.getElementById("bl_uid");if(i)i.value=uid;
+  const r=document.getElementById("bl_reason");if(r)r.focus();
 }
 async function openChan(cid){
   msgChannel=cid;let name="";

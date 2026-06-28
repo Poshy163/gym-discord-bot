@@ -2393,7 +2393,7 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                 async for msg in channel.history(
                     limit=None, after=after, oldest_first=True,
                 ):
-                    if msg.author.bot or not msg.content:
+                    if not msg.content:
                         continue
                     if msg.author.id in blacklisted:
                         continue
@@ -2418,13 +2418,11 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not message.guild:
-        return
-    # Message logging for the web dashboard. Every member's messages are logged
-    # (independent of the /track opt-in list), in every channel — so it runs
-    # before the gym-channel gate below. Failures here must never break normal
-    # message handling.
-    if ENABLE_MESSAGE_LOGGING and message.content:
+    # Message logging for the web dashboard. Logs every author (including bots,
+    # so the bot's own announcements show up) in every channel — runs before the
+    # bot/guild and gym-channel gates below. Failures here must never break
+    # normal message handling.
+    if ENABLE_MESSAGE_LOGGING and message.guild is not None and message.content:
         try:
             if not db.message_is_blacklisted(
                 message.guild.id, message.author.id
@@ -2438,6 +2436,8 @@ async def on_message(message: discord.Message) -> None:
                 )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
+    if message.author.bot or not message.guild:
+        return
     if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
         await bot.process_commands(message)
         return
