@@ -276,6 +276,19 @@ if WEBUI_ENABLED:
     intents.members = True
 bot = commands.Bot(command_prefix="!gym ", intents=intents)
 
+# Make every slash command usable in DMs and as a user-installed app, not just
+# in guild channels. These tree-level defaults are inherited by all commands
+# that don't carry their own @app_commands.allowed_contexts / allowed_installs
+# decorator (explicit per-command decorators still win). DM commands also
+# require the "User Install" integration to be enabled for the app in the
+# Discord Developer Portal — that's a portal toggle, not something code can set.
+bot.tree.allowed_contexts = app_commands.AppCommandContext(
+    guild=True, dm_channel=True, private_channel=True,
+)
+bot.tree.allowed_installs = app_commands.AppInstallationType(
+    guild=True, user=True,
+)
+
 
 def _format_weight(weight: float, bw: bool) -> str:
     if bw and weight == 0:
@@ -665,6 +678,165 @@ def _resolve(guild_id: int, name: str) -> str:
     return canonicalize(name)
 
 
+# ---------------------------------------------------------------------------
+# DM command context resolution.
+#
+# Slash commands are now usable in DMs (see the tree defaults above), but a DM
+# interaction has no ``guild_id`` — yet almost every command's data is keyed by
+# guild. We resolve an "effective" guild for DM interactions in a single place
+# (``_tree_interaction_check``) and stash it on ``interaction.extras`` so the
+# command bodies can read it via ``_ctx_guild_id`` / ``_ctx_guild`` exactly as
+# if it had come from the interaction.
+# ---------------------------------------------------------------------------
+
+# Commands that are useful in a DM even when we can't resolve a server (they
+# don't read guild-scoped data, or they set the default themselves). These are
+# allowed through ``_tree_interaction_check`` without a resolved guild.
+_CONTEXT_FREE: frozenset[str] = frozenset({
+    "ping", "help", "version", "server",
+    "revo_link", "revo_unlink", "help_revo_link",
+    "strava_link", "strava_unlink",
+})
+
+
+def _shared_guild_ids(user_id: int) -> list[int]:
+    """Guild IDs the bot shares with ``user_id``.
+
+    Prefers the live member cache (no API calls); falls back to the SQLite
+    member mirror so it still resolves when the members intent is off. The
+    result is restricted to guilds the bot is currently in.
+    """
+    ids: set[int] = set()
+    bot_guild_ids = {g.id for g in bot.guilds}
+    for g in bot.guilds:
+        if g.get_member(user_id) is not None:
+            ids.add(g.id)
+    for gid in db.member_guild_ids(user_id):
+        if not bot_guild_ids or gid in bot_guild_ids:
+            ids.add(gid)
+    return sorted(ids)
+
+
+def _effective_guild_for_dm(user_id: int) -> int | None:
+    """Pick which server a DM command should act on for ``user_id``.
+
+    Their stored default wins (when they still share it); otherwise the single
+    server they share with the bot is used automatically. Returns ``None`` when
+    the choice is ambiguous (multiple shared servers, no default) or when no
+    shared server is known — the caller decides how to handle that.
+    """
+    shared = _shared_guild_ids(user_id)
+    if not shared:
+        return None
+    stored = db.dm_guild_get(user_id)
+    if stored is not None and stored in shared:
+        return stored
+    if len(shared) == 1:
+        return shared[0]
+    return None
+
+
+async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+    """Resolve a guild for DM interactions before any command runs.
+
+    Guild interactions pass straight through. For DMs we stash the effective
+    guild on ``interaction.extras['guild_id']``; if we can't determine one we
+    let context-free commands (and autocomplete) through but ask everyone else
+    to disambiguate with ``/server``.
+    """
+    if interaction.guild_id is not None:
+        return True
+
+    gid = _effective_guild_for_dm(interaction.user.id)
+    if gid is not None:
+        interaction.extras["guild_id"] = gid
+        return True
+
+    # Autocomplete can't render a normal reply — just allow it (callbacks fall
+    # back to an empty guild and return no suggestions).
+    if interaction.type is discord.InteractionType.autocomplete:
+        return True
+
+    cmd = interaction.command
+    name = getattr(cmd, "qualified_name", None) or getattr(cmd, "name", "")
+    if name in _CONTEXT_FREE:
+        return True
+
+    await interaction.response.send_message(
+        "I couldn't tell which server you mean. DM me from a server we share, "
+        "or set your default with `/server`.",
+        ephemeral=True,
+    )
+    return False
+
+
+bot.tree.interaction_check = _tree_interaction_check  # type: ignore[method-assign]
+
+
+def _ctx_guild_id(interaction: discord.Interaction) -> int:
+    """The guild a command should act on: the interaction's own guild, or the
+    DM-resolved one stashed by ``_tree_interaction_check`` (0 if neither)."""
+    if interaction.guild_id is not None:
+        return interaction.guild_id
+    gid = interaction.extras.get("guild_id")
+    return int(gid) if gid else 0
+
+
+def _ctx_guild(interaction: discord.Interaction) -> "discord.Guild | None":
+    """The resolved :class:`discord.Guild` object, or ``None`` in an
+    unresolved DM context."""
+    gid = _ctx_guild_id(interaction)
+    return bot.get_guild(gid) if gid else None
+
+
+async def _target_visible(interaction: discord.Interaction, target) -> bool:
+    """Cross-server privacy guard: True if the caller may look up ``target``.
+
+    You can always look up yourself. In a real in-guild invocation a
+    ``discord.Member`` option is, by construction, already a member of that
+    guild, so there's nothing to verify (and this avoids depending on the
+    optional member mirror). In a DM we must confirm the target actually
+    belongs to the effective guild before exposing their info — you can't
+    query someone you don't share a server with.
+    """
+    if target.id == interaction.user.id:
+        return True
+    gid = _ctx_guild_id(interaction)
+    if not gid:
+        return False
+    if interaction.guild_id is not None:
+        return True
+    guild = bot.get_guild(gid)
+    if guild is not None and guild.get_member(target.id) is not None:
+        return True
+    if db.member_present(gid, target.id):
+        return True
+    # Cache/mirror can be sparse (members intent off) — confirm with a live
+    # lookup before refusing.
+    if guild is not None:
+        try:
+            return await guild.fetch_member(target.id) is not None
+        except (discord.NotFound, discord.HTTPException):
+            return False
+    return False
+
+
+async def _deny_invisible_target(interaction: discord.Interaction, target) -> bool:
+    """Send the standard refusal when ``target`` isn't visible to the caller.
+
+    Returns True (and replies ephemerally) when the lookup must be blocked, so
+    callers can ``if await _deny_invisible_target(...): return``.
+    """
+    if await _target_visible(interaction, target):
+        return False
+    msg = "You don't share a server with that user, so I can't look up their info."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+    return True
+
+
 def _should_auto_store(lifts: list[Lift]) -> bool:
     return should_auto_store_lifts(lifts, MIN_LIFTS_FOR_AUTO)
 
@@ -698,7 +870,7 @@ async def _resolve_or_warn(
             f"Please provide an {kind} name.", ephemeral=True
         )
         return None
-    canon = _resolve(interaction.guild_id or 0, name)
+    canon = _resolve(_ctx_guild_id(interaction), name)
     if not canon:
         await interaction.response.send_message(
             f"Couldn't read `{name}` as an {kind} name.", ephemeral=True
@@ -730,7 +902,7 @@ async def _equipment_autocomplete(
     actually used, so users can autocomplete custom-aliased names too.
     Returns up to 25 choices (Discord's hard cap).
     """
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     pool = sorted(set(all_canonicals()) | set(db.known_equipment(guild_id)))
     needle = (current or "").lower().strip()
     if needle:
@@ -2018,20 +2190,22 @@ async def _before_weekly_report() -> None:  # pragma: no cover - discord runtime
     description="Post the weekly gym + calorie report for the past 7 days.",
 )
 async def weekly_report_cmd(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None or interaction.channel is None:
+    guild_id = _ctx_guild_id(interaction)
+    if not guild_id or interaction.channel is None:
         await interaction.response.send_message(
-            "This command only works in a server channel.", ephemeral=True,
+            "This command needs a server. DM me from one we share, or set your "
+            "default with `/server`.", ephemeral=True,
         )
         return
     # Gemini round-trips (one per tracked member) can take a while.
     await interaction.response.defer(thinking=True)
     label, start_iso, end_iso = _week_window()
-    text = _weekly_gym_text(interaction.guild_id, label, start_iso, end_iso)
+    text = _weekly_gym_text(guild_id, label, start_iso, end_iso)
     await interaction.followup.send(
         text, allowed_mentions=discord.AllowedMentions.none(),
     )
     cal_blocks = await _calorie_ai_summaries(
-        interaction.guild_id, start_iso, end_iso,
+        guild_id, start_iso, end_iso,
     )
     if not cal_blocks:
         return
@@ -2831,7 +3005,9 @@ async def stats_cmd(
     interaction: discord.Interaction, user: discord.Member | None = None
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     rows = db.personal_bests(guild_id, target.id)
     if not rows:
         await interaction.response.send_message(
@@ -2861,7 +3037,9 @@ async def progress_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.progress(guild_id, target.id, canon)
     if not rows:
@@ -2894,7 +3072,7 @@ async def progress_cmd(
 async def leaderboard_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.leaderboard(guild_id, canon)
     if not rows:
@@ -2937,8 +3115,10 @@ async def bodyweight_cmd(
     weight_kg: float | None = None,
     user: discord.Member | None = None,
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     # If no value supplied, just report the latest entry. Useful for sanity
     # checking what the bot is using to compute true weights.
     if weight_kg is None:
@@ -3020,8 +3200,10 @@ async def log_cmd(
         )
         return
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     canon = _resolve(guild_id, equipment)
     if not canon:
         await interaction.response.send_message(
@@ -3134,7 +3316,9 @@ async def history_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.history(guild_id, target.id, canon)
     if not rows:
@@ -3190,7 +3374,7 @@ async def parse_cmd(
     target, content = _message_lift_target(msg)
     lifts = parse_message(
         content,
-        custom_aliases=_custom_alias_map(interaction.guild_id or 0),
+        custom_aliases=_custom_alias_map(_ctx_guild_id(interaction)),
     )
     lifts, rejected_lifts = _split_reasonable_lifts(lifts)
     if not lifts:
@@ -3224,7 +3408,7 @@ async def parse_cmd(
 async def machine_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.machine_history(guild_id, canon)
     if not rows:
@@ -3306,6 +3490,95 @@ async def ping_cmd(interaction: discord.Interaction) -> None:
     rtt_ms = round((datetime.now(timezone.utc) - sent_at).total_seconds() * 1000)
     await interaction.response.send_message(
         f"Pong! 🏓  gateway: {gateway_ms} ms · round-trip: {rtt_ms} ms"
+    )
+
+
+def _guild_name(guild_id: int) -> str:
+    """Best-effort display name for a guild id (live object, then DB mirror)."""
+    g = bot.get_guild(guild_id)
+    if g is not None:
+        return g.name
+    for row in db.list_guilds():
+        if int(row["guild_id"]) == guild_id and row["name"]:
+            return row["name"]
+    return f"Server {guild_id}"
+
+
+async def _server_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Offer the servers the caller shares with the bot for /server."""
+    current = (current or "").lower()
+    out: list[app_commands.Choice[str]] = []
+    for gid in _shared_guild_ids(interaction.user.id):
+        name = _guild_name(gid)
+        if current and current not in name.lower() and current not in str(gid):
+            continue
+        out.append(app_commands.Choice(name=name[:100], value=str(gid)))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@bot.tree.command(
+    name="server",
+    description="Pick which server your DM commands use (when you share several with me).",
+)
+@app_commands.describe(
+    server="The server to use by default in DMs. Leave empty to see your current choice.",
+)
+@app_commands.autocomplete(server=_server_autocomplete)
+async def server_cmd(
+    interaction: discord.Interaction, server: str | None = None,
+) -> None:
+    shared = _shared_guild_ids(interaction.user.id)
+    if not shared:
+        await interaction.response.send_message(
+            "I don't share any servers with you yet, so there's nothing to set. "
+            "Add me to a server (or join one I'm in) first.",
+            ephemeral=True,
+        )
+        return
+
+    # No argument: report the current default and the available servers.
+    if server is None:
+        stored = db.dm_guild_get(interaction.user.id)
+        effective = _effective_guild_for_dm(interaction.user.id)
+        lines = ["**Your DM server**"]
+        if stored is not None and stored in shared:
+            lines.append(f"• Default: **{_guild_name(stored)}**")
+        elif effective is not None:
+            lines.append(
+                f"• Default: **{_guild_name(effective)}** "
+                "_(auto — the only server we share)_"
+            )
+        else:
+            lines.append(
+                "• Default: _none set_ — pick one below so DM commands know "
+                "which server to use."
+            )
+        lines.append("")
+        lines.append("**Servers we share:**")
+        for gid in shared:
+            lines.append(f"• {_guild_name(gid)} (`{gid}`)")
+        lines.append("")
+        lines.append("Run `/server server:<name>` to set your default.")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        return
+
+    # Setting: validate the choice is a server we actually share.
+    if not server.isdigit() or int(server) not in shared:
+        await interaction.response.send_message(
+            "Pick one of the servers we share (use the autocomplete).",
+            ephemeral=True,
+        )
+        return
+    gid = int(server)
+    db.dm_guild_set(interaction.user.id, gid)
+    await interaction.response.send_message(
+        f"✅ Your DM commands will now use **{_guild_name(gid)}**. "
+        "Change it any time with `/server`.",
+        ephemeral=True,
     )
 
 
@@ -3421,7 +3694,7 @@ async def cleanup_resurrected_cmd(
         )
         return
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     total_scanned = 0
     total_sources = 0
     total_removable = 0
@@ -3549,7 +3822,7 @@ async def suppress_message_cmd(
             ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     mid = int(message_id)
     removed = 0
     if delete_existing:
@@ -3782,7 +4055,7 @@ async def purge_cmd(
     interaction: discord.Interaction, equipment: str,
     confirm: bool = False,
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     if not canon:
         await interaction.response.send_message(
@@ -3859,7 +4132,7 @@ async def rename_cmd(
         target_user_id = interaction.user.id
         target_label = "your"
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     src = _resolve(guild_id, old)
     dst = _resolve(guild_id, new)
     if not src or not dst:
@@ -3943,10 +4216,12 @@ async def delete_entry_cmd(
         return
 
     target = user or interaction.user
-    canon = _resolve(interaction.guild_id or 0, equipment)
+    if await _deny_invisible_target(interaction, target):
+        return
+    canon = _resolve(_ctx_guild_id(interaction), equipment)
     start_iso, end_iso = _local_date_window(date)
     n = db.delete_entry_between(
-        interaction.guild_id or 0, canon, start_iso, end_iso, user_id=target.id
+        _ctx_guild_id(interaction), canon, start_iso, end_iso, user_id=target.id
     )
     await interaction.response.send_message(
         f"Deleted {n} entry(ies) for {target.display_name} — `{canon}` on {date}.",
@@ -3992,8 +4267,10 @@ async def change_weight_cmd(
         )
         return
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     canon = _resolve(guild_id, equipment)
     start_iso = end_iso = None
     if date:
@@ -4044,8 +4321,10 @@ async def swap_weights_cmd(
         )
         return
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     first = _resolve(guild_id, first_equipment)
     second = _resolve(guild_id, second_equipment)
     if not first or not second:
@@ -4257,7 +4536,9 @@ async def summary_cmd(
     interaction: discord.Interaction, user: discord.Member | None = None
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     totals = db.user_summary(guild_id, target.id)
     if not totals:
         await interaction.response.send_message(
@@ -4335,8 +4616,10 @@ async def recent_cmd(
     limit: int = 10,
 ) -> None:
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     lim = max(1, min(25, limit))
-    rows = db.user_recent(interaction.guild_id or 0, target.id, lim)
+    rows = db.user_recent(_ctx_guild_id(interaction), target.id, lim)
     if not rows:
         await interaction.response.send_message(
             f"No lifts logged for {target.display_name} yet.", ephemeral=True
@@ -4364,7 +4647,9 @@ async def export_lifts_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     rows = db.user_all_lifts(guild_id, target.id)
     if not rows:
         await interaction.response.send_message(
@@ -4526,7 +4811,9 @@ async def streak_cmd(
 ) -> None:
     from .training_math import daily_streak, weekly_streak
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     log_dates = _local_log_dates(guild_id, target.id)
 
     # Daily streak is gym attendance from Revo when the target has linked an
@@ -4597,7 +4884,9 @@ async def tonnage_cmd(
     days: int = 7,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     days = max(0, min(365, days))
     if days == 0:
         since_iso = None
@@ -4634,7 +4923,9 @@ async def session_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     day, rows = db.last_session_for_user(guild_id, target.id)
     if not rows or day is None:
         await interaction.response.send_message(
@@ -4683,7 +4974,9 @@ async def projection_cmd(
 ) -> None:
     from .training_math import project_goal_eta
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     # Fall back to the user's set goal if no explicit target was given —
     # /projection plays nicely with the existing goals workflow.
@@ -4744,7 +5037,9 @@ async def checkin_cmd(
     include_missing: bool = True,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     rows = db.personal_bests(guild_id, target.id)
     bests = {r["equipment"]: r for r in rows}
 
@@ -4790,8 +5085,10 @@ async def stale_cmd(
     days: int = 30,
 ) -> None:
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     threshold = max(1, min(365, days))
-    rows = db.user_latest_by_equipment(interaction.guild_id or 0, target.id)
+    rows = db.user_latest_by_equipment(_ctx_guild_id(interaction), target.id)
     stale_rows = []
     for row in rows:
         local_date, age_days = _format_local_day_age(row["logged_at"])
@@ -4837,7 +5134,7 @@ async def undo_cmd(
     interaction: discord.Interaction, count: int = 1,
 ) -> None:
     n = max(1, min(10, count))
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     rows = db.pop_last_n_for_user(
         guild_id, interaction.user.id, n,
         actor_id=interaction.user.id,
@@ -4891,7 +5188,7 @@ async def compare_cmd(
         )
         return
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     a_rows = {r["equipment"]: r for r in db.personal_bests(guild_id, interaction.user.id)}
     b_rows = {r["equipment"]: r for r in db.personal_bests(guild_id, user.id)}
 
@@ -4958,7 +5255,7 @@ async def compare_cmd(
     description="Server-wide totals, top lifters, and most popular equipment.",
 )
 async def serverstats_cmd(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     totals = db.server_totals(guild_id)
     if not totals:
         await interaction.response.send_message(
@@ -4968,7 +5265,8 @@ async def serverstats_cmd(interaction: discord.Interaction) -> None:
     top_users = db.server_top_users(guild_id, limit=5)
     popular = db.server_popular_equipment(guild_id, limit=5)
 
-    name = interaction.guild.name if interaction.guild else "this server"
+    _g = _ctx_guild(interaction)
+    name = _g.name if _g else "this server"
     embed = discord.Embed(
         title=f"🏟 {name} — gym stats",
         colour=EMBED_COLOUR,
@@ -5018,7 +5316,9 @@ async def export_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    rows = db.export_rows(interaction.guild_id or 0, user_id=target.id)
+    if await _deny_invisible_target(interaction, target):
+        return
+    rows = db.export_rows(_ctx_guild_id(interaction), user_id=target.id)
     if not rows:
         await interaction.response.send_message(
             f"No lifts to export for {target.display_name}.", ephemeral=True
@@ -5053,7 +5353,7 @@ async def export_cmd(
 async def aliases_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     al = aliases_for(canon)
     # Also surface any server-local custom aliases that resolve to the same
@@ -5127,7 +5427,7 @@ async def goal_set_cmd(
             "Target must be a positive number of kg.", ephemeral=True
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     if not canon:
         await interaction.response.send_message(
@@ -5160,7 +5460,7 @@ async def goal_set_cmd(
 async def goal_remove_cmd(
     interaction: discord.Interaction, equipment: str
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     n = db.goal_remove(guild_id, interaction.user.id, canon)
     if n:
@@ -5182,7 +5482,9 @@ async def goals_cmd(
     interaction: discord.Interaction, user: discord.Member | None = None
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     rows = db.goal_list(guild_id, target.id)
     if not rows:
         await interaction.response.send_message(
@@ -5233,7 +5535,7 @@ async def goals_cmd(
 async def alias_add_cmd(
     interaction: discord.Interaction, phrase: str, equipment: str
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     key = normalize_token(phrase)
     if not key:
         await interaction.response.send_message(
@@ -5266,7 +5568,7 @@ async def alias_remove_cmd(
     interaction: discord.Interaction, phrase: str
 ) -> None:
     key = normalize_token(phrase)
-    n = db.alias_remove(interaction.guild_id or 0, key)
+    n = db.alias_remove(_ctx_guild_id(interaction), key)
     if n:
         await interaction.response.send_message(
             f"Removed alias `{key}`.", ephemeral=True
@@ -5282,7 +5584,7 @@ async def alias_remove_cmd(
     description="List custom aliases configured in this server.",
 )
 async def alias_list_cmd(interaction: discord.Interaction) -> None:
-    rows = db.alias_list(interaction.guild_id or 0)
+    rows = db.alias_list(_ctx_guild_id(interaction))
     if not rows:
         await interaction.response.send_message(
             "No custom aliases configured. Add one with `/alias_add`.",
@@ -5314,7 +5616,7 @@ async def daily_update_cmd(
 ) -> None:
     date_label, start_iso, end_iso = _daily_window(days_ago=days_ago)
     text = _daily_update_text(
-        interaction.guild_id or 0,
+        _ctx_guild_id(interaction),
         date_label,
         start_iso,
         end_iso,
@@ -5345,7 +5647,9 @@ async def overview_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.history(guild_id, target.id, canon, limit=1000)
     if not rows:
@@ -5448,7 +5752,9 @@ async def graph_cmd(
         return
 
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.history(guild_id, target.id, canon, limit=1000)
     if not rows:
@@ -5597,7 +5903,9 @@ async def bodyweight_history_cmd(
     limit: int | None = None,
 ) -> None:
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     cap = max(1, min(100, int(limit) if limit else 20))
     rows = db.bodyweight_history(guild_id, target.id, limit=1000)
     if not rows:
@@ -5672,7 +5980,9 @@ async def bodyweight_graph_cmd(
         return
 
     target = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target):
+        return
+    guild_id = _ctx_guild_id(interaction)
     rows = db.bodyweight_history(guild_id, target.id, limit=1000)
     if not rows:
         await interaction.response.send_message(
@@ -5789,7 +6099,7 @@ async def _equipment_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     """Suggest equipment names, prioritising ones the invoking user has
     logged recently so their own lifts are a single key-tap away."""
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     cur = current.lower().strip()
 
     # User's own recent equipment first (empty list for new users).
@@ -6213,6 +6523,8 @@ async def revo_streak_cmd(
         return
 
     target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     row = db.get_revo_account(target.id)
     if row is None:
         if target == interaction.user:
@@ -6279,10 +6591,13 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    # Only makes sense in a guild — we need member context to filter accounts.
-    if interaction.guild is None:
+    # Only makes sense against a server — we need member context to filter
+    # accounts. In a DM this is the resolved/default server.
+    guild = _ctx_guild(interaction)
+    if guild is None:
         await interaction.response.send_message(
-            "This command only works in a server.", ephemeral=True,
+            "This command needs a server. DM me from one we share, or set your "
+            "default with `/server`.", ephemeral=True,
         )
         return
 
@@ -6299,10 +6614,10 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
     guild_member_names: dict[int, str] = {}
     for r in accounts:
         uid = int(r["user_id"])
-        member = interaction.guild.get_member(uid)
+        member = guild.get_member(uid)
         if member is None:
             try:
-                member = await interaction.guild.fetch_member(uid)
+                member = await guild.fetch_member(uid)
             except (discord.NotFound, discord.HTTPException):
                 member = None
         if member is not None:
@@ -6389,6 +6704,8 @@ async def revo_calendar_cmd(
     y = year or today.year
 
     target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     row = db.get_revo_account(target.id)
     if row is None:
         if target == interaction.user:
@@ -6499,9 +6816,11 @@ async def revo_calendar_compare_cmd(
             ephemeral=True,
         )
         return
-    if interaction.guild is None:
+    guild = _ctx_guild(interaction)
+    if guild is None:
         await interaction.response.send_message(
-            "This command only works in a server.", ephemeral=True,
+            "This command needs a server. DM me from one we share, or set your "
+            "default with `/server`.", ephemeral=True,
         )
         return
 
@@ -6517,10 +6836,10 @@ async def revo_calendar_compare_cmd(
     guild_member_names: dict[int, str] = {}
     for r in accounts:
         uid = int(r["user_id"])
-        member = interaction.guild.get_member(uid)
+        member = guild.get_member(uid)
         if member is None:
             try:
-                member = await interaction.guild.fetch_member(uid)
+                member = await guild.fetch_member(uid)
             except (discord.NotFound, discord.HTTPException):
                 member = None
         if member is not None:
@@ -6666,6 +6985,8 @@ async def revo_tickets_cmd(
         return
 
     target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     row = db.get_revo_account(target.id)
     if row is None:
         if target == interaction.user:
@@ -6824,6 +7145,8 @@ async def revo_summary_cmd(
         return
 
     target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     row = db.get_revo_account(target.id)
     if row is None:
         if target == interaction.user:
@@ -8289,6 +8612,11 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         password=WEBUI_PASSWORD,
         resync=_webui_resync_guild,
         today_window=_today_window,
+        list_channels=_webui_list_channels,
+        invite_user=_webui_invite_user,
+        set_member_role=_webui_set_member_role,
+        member_moderation=_webui_member_moderation,
+        remove_timeout=_webui_remove_timeout,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -8418,6 +8746,255 @@ async def _webui_resync_guild(guild_id: int) -> bool:  # pragma: no cover
         LOG.info("fetch_members failed for %s", guild_id, exc_info=True)
     _sync_guild_snapshot(guild)
     return True
+
+
+async def _webui_list_channels(guild_id: int) -> list[dict]:  # pragma: no cover
+    """Text channels of a guild the bot could create an invite in.
+
+    Channels aren't mirrored into SQLite, so this reads the live guild. Returns
+    a name/id list ordered the way Discord shows them.
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return []
+    me = guild.me
+    out: list[dict] = []
+    for ch in guild.text_channels:
+        perms = ch.permissions_for(me) if me is not None else None
+        if perms is not None and not perms.create_instant_invite:
+            continue
+        out.append({"id": str(ch.id), "name": ch.name})
+    return out
+
+
+def _invite_channel(guild: "discord.Guild"):
+    """Pick a channel to mint an invite from: the system channel if usable,
+    else the first text channel the bot can invite into."""
+    me = guild.me
+    sysc = guild.system_channel
+    if sysc is not None and (
+        me is None or sysc.permissions_for(me).create_instant_invite
+    ):
+        return sysc
+    for ch in guild.text_channels:
+        if me is None or ch.permissions_for(me).create_instant_invite:
+            return ch
+    return None
+
+
+async def _webui_invite_user(
+    guild_id: int, user_id: int, channel_id: int | None, actor_name: str,
+) -> dict:  # pragma: no cover
+    """Create an invite for ``guild_id`` and try to DM it to ``user_id``.
+
+    Discord can't force-add a user by ID (that needs their OAuth consent), so we
+    mint an invite link and attempt to DM it. The link is always returned so the
+    operator can share it manually if the DM can't be delivered (closed DMs / no
+    shared server). Audited as ``invite_create``.
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+
+    channel = None
+    if channel_id is not None:
+        channel = guild.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "create_invite"):
+            return {"ok": False, "error": "Invite channel not found."}
+    else:
+        channel = _invite_channel(guild)
+    if channel is None:
+        return {
+            "ok": False,
+            "error": "No channel I can create an invite in (need the "
+                     "Create Invite permission).",
+        }
+
+    try:
+        invite = await channel.create_invite(
+            max_age=7 * 24 * 3600, max_uses=1, unique=True,
+            reason=f"Dashboard invite by {actor_name}",
+        )
+    except discord.Forbidden:
+        return {"ok": False, "error": "I lack permission to create invites here."}
+    except discord.HTTPException as exc:
+        return {"ok": False, "error": f"Discord rejected the invite: {exc}"}
+
+    dmed = False
+    dm_error = None
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+    except (discord.NotFound, discord.HTTPException):
+        user = None
+        dm_error = "No Discord user with that ID."
+    if user is not None:
+        try:
+            await user.send(
+                f"You've been invited to **{guild.name}**: {invite.url}"
+            )
+            dmed = True
+        except discord.Forbidden:
+            dm_error = "Their DMs are closed, or we share no server yet."
+        except discord.HTTPException as exc:
+            dm_error = f"DM failed: {exc}"
+
+    subject_name = None
+    if user is not None:
+        subject_name = getattr(user, "display_name", None) or user.name
+    db.add_audit(
+        guild_id, "member", "invite_create",
+        actor_name=actor_name,
+        subject_id=user_id, subject_name=subject_name,
+        detail=(
+            f"invite {invite.url} for #{getattr(channel, 'name', channel_id)}"
+            + (" (DM sent)" if dmed else " (link only)")
+        ),
+    )
+    return {"ok": True, "link": invite.url, "dmed": dmed, "error": dm_error}
+
+
+async def _webui_set_member_role(
+    guild_id: int, user_id: int, role_id: int, add: bool, actor_name: str,
+) -> dict:  # pragma: no cover
+    """Add or remove one role on a guild member (dashboard role editor).
+
+    Members only — the user must already be in the guild. Discord enforces role
+    hierarchy at apply time, so a role above the bot's top role surfaces here as
+    a permission error. Audited as ``role_add`` / ``role_remove``.
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    role = guild.get_role(role_id)
+    if role is None:
+        return {"ok": False, "error": "Role not found."}
+    if role.is_default():
+        return {"ok": False, "error": "Can't assign the @everyone role."}
+
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return {"ok": False, "error": "That user isn't a member of this server."}
+
+    try:
+        if add:
+            await member.add_roles(role, reason=f"Dashboard by {actor_name}")
+        else:
+            await member.remove_roles(role, reason=f"Dashboard by {actor_name}")
+    except discord.Forbidden:
+        return {
+            "ok": False,
+            "error": "I can't manage that role — it's above my highest role or "
+                     "I'm missing Manage Roles.",
+        }
+    except discord.HTTPException as exc:
+        return {"ok": False, "error": f"Discord rejected the change: {exc}"}
+
+    # Mirror into SQLite immediately so the dashboard reflects it without waiting
+    # for the gateway event, and audit under the web operator.
+    db.set_member_roles(
+        guild_id, user_id,
+        [r.id for r in member.roles if not r.is_default()],
+    )
+    db.add_audit(
+        guild_id, "role", "role_add" if add else "role_remove",
+        actor_name=actor_name,
+        subject_id=user_id, subject_name=_member_display(member),
+        detail=(
+            f"{'gained' if add else 'lost'} role {role.name} (by {actor_name})"
+        ),
+    )
+    return {"ok": True}
+
+
+async def _webui_resolve_member(guild, user_id):  # pragma: no cover
+    """get_member with a live fetch_member fallback for a sparse cache."""
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            member = None
+    return member
+
+
+def _bot_can_moderate(guild: "discord.Guild", member: "discord.Member") -> bool:
+    """Whether the bot could currently time-out / un-time-out ``member``.
+
+    Mirrors Discord's rules: needs Moderate Members, must outrank the target by
+    role position, and can't act on the guild owner. Best-effort — the action
+    itself still handles a Forbidden gracefully.
+    """
+    me = guild.me
+    if me is None or not me.guild_permissions.moderate_members:
+        return False
+    if guild.owner_id == member.id:
+        return False
+    return me.top_role > member.top_role
+
+
+async def _webui_member_moderation(guild_id: int, user_id: int) -> dict:  # pragma: no cover
+    """Live moderation state for a member: any active timeout + whether the bot
+    can act on it. Read from the cache so the dashboard can show/hide the
+    "Remove timeout" control accurately."""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    member = await _webui_resolve_member(guild, user_id)
+    if member is None:
+        return {
+            "ok": True, "timed_out_until": None, "timed_out": False,
+            "can_moderate": False,
+        }
+    until = member.timed_out_until
+    active = until is not None and until > datetime.now(timezone.utc)
+    return {
+        "ok": True,
+        "timed_out_until": until.isoformat() if until else None,
+        "timed_out": active,
+        "can_moderate": _bot_can_moderate(guild, member),
+    }
+
+
+async def _webui_remove_timeout(
+    guild_id: int, user_id: int, actor_name: str,
+) -> dict:  # pragma: no cover
+    """Clear a member's timeout (the dashboard's "Remove timeout" button).
+
+    Requires the bot to have Moderate Members and to outrank the member;
+    Discord enforces both, surfaced here as an error. Audited as
+    ``timeout_remove``."""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    member = await _webui_resolve_member(guild, user_id)
+    if member is None:
+        return {"ok": False, "error": "That user isn't a member of this server."}
+
+    until = member.timed_out_until
+    if until is None or until <= datetime.now(timezone.utc):
+        return {"ok": True, "changed": False, "error": "Member isn't timed out."}
+
+    try:
+        await member.timeout(None, reason=f"Dashboard by {actor_name}")
+    except discord.Forbidden:
+        return {
+            "ok": False,
+            "error": "I can't moderate that member — I need Moderate Members "
+                     "and a higher role than them.",
+        }
+    except discord.HTTPException as exc:
+        return {"ok": False, "error": f"Discord rejected the change: {exc}"}
+
+    db.add_audit(
+        guild_id, "member", "timeout_remove",
+        actor_name=actor_name,
+        subject_id=user_id, subject_name=_member_display(member),
+        detail=f"timeout removed (by {actor_name})",
+    )
+    return {"ok": True, "changed": True}
 
 
 @bot.event
@@ -8791,6 +9368,8 @@ async def strava_latest_cmd(
         )
         return
     target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     row = db.get_strava_account(target.id)
     if row is None:
         if target.id == interaction.user.id:
@@ -9141,17 +9720,15 @@ async def track_start_cmd(
             "I won't track other bots.", ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     inserted = db.presence_track_add(guild_id, user.id, interaction.user.id)
     # Seed status + activity so /track has something useful immediately,
     # even if the user was already playing a game before tracking started.
     # Re-fetch from the guild cache: slash-command Member args come from
     # interaction.resolved which lacks presence data, so user.status would
     # always be offline and user.activities always empty here.
-    cached = (
-        interaction.guild.get_member(user.id)
-        if interaction.guild is not None else None
-    )
+    _g = _ctx_guild(interaction)
+    cached = _g.get_member(user.id) if _g is not None else None
     try:
         _seed_presence_snapshot(guild_id, cached or user)
     except Exception:
@@ -9185,7 +9762,7 @@ async def track_stop_cmd(
             "Only bot owners can stop presence tracking.", ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     removed = db.presence_track_remove(guild_id, user.id, purge=purge)
     if not removed and not purge:
         await interaction.response.send_message(
@@ -9212,7 +9789,7 @@ async def track_list_cmd(interaction: discord.Interaction) -> None:
             "Only bot owners can view the tracking list.", ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     rows = db.presence_track_list(guild_id)
     if not rows:
         await interaction.response.send_message(
@@ -9344,7 +9921,7 @@ async def track_schedule_cmd(
             "`days` must be between 1 and 90.", ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(days=days)
     rows = db.presence_events_for(
@@ -9409,7 +9986,7 @@ async def track_raw_cmd(
             "`days` must be between 1 and 90.", ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(days=days)
     rows = db.presence_events_for(
@@ -9602,7 +10179,7 @@ async def track_export_cmd(
     fmt_value = fmt.value if fmt is not None else "csv"
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     sessions, raw_events, window_start, window_end = _collect_sleep_export(
         guild_id, user.id, days,
     )
@@ -9744,7 +10321,7 @@ async def track_analyze_cmd(
     # failed call doesn't clutter the channel.
     await interaction.response.defer(thinking=True)
 
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     sessions, raw_events, _, _ = _collect_sleep_export(guild_id, user.id, days)
     if not sessions:
         await interaction.followup.send(
@@ -10017,6 +10594,8 @@ async def coach_cmd(
     days: int = 30,
 ) -> None:
     target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
     if not gemini_client.available():
         await interaction.response.send_message(
             "Gemini isn't configured. Set `GEMINI_API_KEY` (and optionally "
@@ -10025,7 +10604,7 @@ async def coach_cmd(
         )
         return
     days = max(1, min(365, days))
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     # Need *something* to analyse — lifts, nutrition tracking, or bodyweight.
     has_data = (
         db.user_summary(guild_id, target.id) is not None
@@ -10110,10 +10689,8 @@ async def track_now_cmd(
     # Slash-command Member args are resolved from interaction.resolved,
     # which Discord's API does NOT populate with presence/activity. Always
     # re-fetch from the guild cache or this diagnostic will lie.
-    cached = (
-        interaction.guild.get_member(user.id)
-        if interaction.guild is not None else None
-    )
+    _g = _ctx_guild(interaction)
+    cached = _g.get_member(user.id) if _g is not None else None
     member = cached or user
     status = _discord_status_to_str(member.status)
     parsed = _get_main_activity(member)
@@ -10220,7 +10797,7 @@ async def calories_setup_cmd(
             ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     db.calorie_goal_set(
         guild_id, interaction.user.id, _display_name(interaction.user), kcal,
     )
@@ -10249,7 +10826,7 @@ async def calories_add_cmd(
     amount: str,
     note: str | None = None,
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
@@ -10316,7 +10893,9 @@ async def calories_today_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target_user = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
         msg = (
@@ -10365,7 +10944,9 @@ async def calories_week_cmd(
     user: discord.Member | None = None,
 ) -> None:
     target_user = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
         msg = (
@@ -10414,7 +10995,7 @@ async def calories_week_cmd(
     description="Remove your most recent calorie entry.",
 )
 async def calories_undo_cmd(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     row = db.calorie_pop_last(
         guild_id, interaction.user.id, actor_id=interaction.user.id,
     )
@@ -10443,7 +11024,7 @@ async def calories_undo_cmd(interaction: discord.Interaction) -> None:
     description="Stop tracking calories (your logged history is kept).",
 )
 async def calories_stop_cmd(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     removed = db.calorie_goal_remove(guild_id, interaction.user.id)
     if not removed:
         await interaction.response.send_message(
@@ -10510,7 +11091,7 @@ async def calories_food_set_cmd(
                 ephemeral=True,
             )
             return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     db.calorie_food_set(
         guild_id, interaction.user.id, norm, name.strip(), kcal, protein_g,
     )
@@ -10550,7 +11131,7 @@ async def calories_food_set_cmd(
     name="food_list", description="List your saved food shortcuts.",
 )
 async def calories_food_list_cmd(interaction: discord.Interaction) -> None:
-    rows = db.calorie_food_list(interaction.guild_id or 0, interaction.user.id)
+    rows = db.calorie_food_list(_ctx_guild_id(interaction), interaction.user.id)
     if not rows:
         await interaction.response.send_message(
             "You haven't saved any foods yet. Add one with "
@@ -10582,11 +11163,11 @@ async def calories_food_remove_cmd(
 ) -> None:
     norm = calories.normalize_food(name)
     removed = db.calorie_food_remove(
-        interaction.guild_id or 0, interaction.user.id, norm,
+        _ctx_guild_id(interaction), interaction.user.id, norm,
     )
     if removed:
         db.add_audit(
-            interaction.guild_id or 0, "data", "food_delete",
+            _ctx_guild_id(interaction), "data", "food_delete",
             actor_id=interaction.user.id, subject_id=interaction.user.id,
             detail=f"removed food {name.strip()}",
         )
@@ -10653,7 +11234,7 @@ async def protein_setup_cmd(
             ephemeral=True,
         )
         return
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     db.protein_goal_set(
         guild_id, interaction.user.id, _display_name(interaction.user), grams,
     )
@@ -10674,7 +11255,7 @@ async def protein_setup_cmd(
 async def protein_add_cmd(
     interaction: discord.Interaction, grams: str, note: str | None = None,
 ) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
@@ -10716,7 +11297,9 @@ async def protein_today_cmd(
     interaction: discord.Interaction, user: discord.Member | None = None,
 ) -> None:
     target_user = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
     if goal is None:
         msg = (
@@ -10761,7 +11344,9 @@ async def protein_week_cmd(
     interaction: discord.Interaction, user: discord.Member | None = None,
 ) -> None:
     target_user = user or interaction.user
-    guild_id = interaction.guild_id or 0
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
     if goal is None:
         msg = (
@@ -10810,7 +11395,7 @@ async def protein_week_cmd(
     name="undo", description="Remove your most recent protein entry.",
 )
 async def protein_undo_cmd(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     row = db.protein_pop_last(
         guild_id, interaction.user.id, actor_id=interaction.user.id,
     )
@@ -10837,7 +11422,7 @@ async def protein_undo_cmd(interaction: discord.Interaction) -> None:
     name="stop", description="Stop tracking protein (your history is kept).",
 )
 async def protein_stop_cmd(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild_id or 0
+    guild_id = _ctx_guild_id(interaction)
     removed = db.protein_goal_remove(guild_id, interaction.user.id)
     if not removed:
         await interaction.response.send_message(

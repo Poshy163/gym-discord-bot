@@ -375,6 +375,17 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_subject
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_category
     ON audit_log (guild_id, category, at);
+
+-- Per-user preferences for DM command context. When someone runs a command in
+-- a DM with the bot there is no guild_id on the interaction, so we resolve one:
+-- their stored ``default_guild_id`` (if they're still a member) wins, otherwise
+-- the single server they share with the bot is used automatically. Set via the
+-- ``/server`` command.
+CREATE TABLE IF NOT EXISTS user_dm_prefs (
+    user_id          INTEGER PRIMARY KEY,
+    default_guild_id INTEGER,
+    updated_at       TEXT    NOT NULL
+);
 """
 
 
@@ -3555,6 +3566,59 @@ class Database:
                 "SELECT * FROM members WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
             ).fetchone()
+
+    def member_present(self, guild_id: int, user_id: int) -> bool:
+        """True if the user is a current (present=1) member of the guild.
+
+        Backs the cross-server privacy guard: you may only look up another
+        user's info when they share the (effective) guild with you.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT present FROM members "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone()
+        return bool(row) and bool(row["present"])
+
+    def member_guild_ids(self, user_id: int) -> list[int]:
+        """Guild IDs where this user is mirrored as a present member.
+
+        Fallback for DM guild-resolution when the live member cache is sparse
+        (members intent off). Ordered for stable single-match behaviour.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT guild_id FROM members "
+                "WHERE user_id = ? AND present = 1 ORDER BY guild_id",
+                (user_id,),
+            ).fetchall()
+        return [int(r["guild_id"]) for r in rows]
+
+    def dm_guild_get(self, user_id: int) -> int | None:
+        """The user's stored default guild for DM commands, if any."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT default_guild_id FROM user_dm_prefs WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None or row["default_guild_id"] is None:
+            return None
+        return int(row["default_guild_id"])
+
+    def dm_guild_set(self, user_id: int, guild_id: int | None) -> None:
+        """Set (or clear, with ``None``) the user's default DM guild."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO user_dm_prefs (user_id, default_guild_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    default_guild_id = excluded.default_guild_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, guild_id, _normalize_iso(None)),
+            )
 
     def list_members(
         self, guild_id: int, include_absent: bool = True,

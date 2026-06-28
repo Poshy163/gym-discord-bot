@@ -42,9 +42,15 @@ per `(message_id, equipment)` so edits / re-parses won't double-count.
 
 ## Slash commands
 
+Every command also works in a **DM with the bot** (and as a user-installed app),
+not just in a server channel — see [Direct messages](#direct-messages) below.
+
 Stats & progress:
 
 - `/help` — in-bot command reference.
+- `/server [server]` — only useful in DMs: pick which server your DM commands
+  act on when you're in more than one with the bot. With no argument it shows
+  your current default and the servers you share.
 - `/stats [user]` — personal bests for a user.
 - `/summary [user]` — profile overview (totals, top PRs, most trained, gains,
   current weekly streak).
@@ -277,6 +283,26 @@ Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, `/strava_latest`
 (show the most recent activity on demand), and owner-only `/strava_subscribe`,
 `/strava_subscription`, `/strava_unsubscribe`.
 
+## Direct messages
+
+You can run **any** command in a DM with the bot, not just in a server channel.
+Because a DM has no server attached, the bot has to work out *which* server's
+data to use:
+
+- If you share exactly **one** server with the bot, it's used automatically.
+- If you share **several**, run `/server` once to pick a default (it has
+  autocomplete). Change it any time with `/server` again.
+- If the bot can't tell, it asks you to set one with `/server`.
+
+**Privacy:** you can only look up another user's info if you **share a server**
+with them. Looking up someone you don't share a server with is refused — this
+holds in DMs and in servers alike.
+
+For DM commands to appear, the app must be enabled as a **User Install**
+integration in the Discord Developer Portal (Installation → enable *User
+Install*), and each person re-authorises the app to their account. Guild-only
+installs keep working in servers exactly as before.
+
 ## Web dashboard
 
 An authenticated operator dashboard (separate web server, default port `8081`)
@@ -287,6 +313,15 @@ for browsing and editing everything the bot tracks without touching Discord:
   lift/nutrition counters, **today's calories & protein vs goal** (progress
   bars), a **bodyweight trend chart**, **lift goals**, their **saved foods**
   (add/edit/delete, with protein), roles, linked Strava/Revo, and history.
+  You can **grant or remove roles** on a member (the ✕ on a role chip, or the
+  **+ Add role** picker), **remove a timeout** (the Moderation box shows an
+  active timeout and a **Remove timeout** button when the bot can act), and
+  **invite a user by ID** (➕ Invite by ID): the bot mints a one-use invite and
+  DMs it to them, falling back to a copyable link if their DMs are closed. All
+  three are written to the audit log. They need the bot to have **Manage Roles**
+  / **Moderate Members** / **Create Invite** in the target server, and Discord
+  still enforces role hierarchy (it can't assign a role above its own top role,
+  or moderate someone who outranks it).
 - **Roles** — each role with its colour and live member list.
 - **Leaderboard** — pick an exercise and see the ranked best lifts (with
   medals + avatars).
@@ -311,7 +346,12 @@ the bot in the Discord Developer Portal. Full setup is in
 2. Copy the bot token.
 3. Invite the bot to your server with scopes `bot` + `applications.commands`
    and at minimum these permissions: View Channels, Send Messages,
-   Read Message History, Add Reactions, Use Slash Commands.
+   Read Message History, Add Reactions, Use Slash Commands. To use the
+   dashboard's **role grants** add **Manage Roles**, for **remove timeout** add
+   **Moderate Members**, and for **invite by ID** add **Create Invite**. To let
+   commands run in DMs, enable the **User Install**
+   integration under *Installation* in the Developer Portal (see
+   [Direct messages](#direct-messages)).
 4. Clone this repo on your server and create `.env` from the template:
 
    ```bash

@@ -58,6 +58,19 @@ SESSION_TTL_SECONDS = 7 * 24 * 3600  # a week
 # demand (the "Refresh" button). Optional — None disables the button.
 ResyncHandler = Callable[[int], Awaitable[bool]]
 
+# Live Discord actions the bot injects. All optional — when None the matching
+# endpoint returns 503. They run on the bot's event loop and exchange plain
+# dicts (no Discord objects cross this boundary).
+ChannelsHandler = Callable[[int], Awaitable[list[dict]]]
+# (guild_id, user_id, channel_id|None, actor_name) -> result dict
+InviteHandler = Callable[[int, int, "int | None", str], Awaitable[dict]]
+# (guild_id, user_id, role_id, add, actor_name) -> result dict
+RoleHandler = Callable[[int, int, int, bool, str], Awaitable[dict]]
+# (guild_id, user_id) -> moderation state dict
+ModerationHandler = Callable[[int, int], Awaitable[dict]]
+# (guild_id, user_id, actor_name) -> result dict
+TimeoutHandler = Callable[[int, int, str], Awaitable[dict]]
+
 
 class _Sessions:
     """Tiny in-process session store: token -> expiry epoch."""
@@ -92,6 +105,11 @@ def build_app(
     password: str,
     resync: ResyncHandler | None = None,
     today_window: Callable[[], tuple[str, str]] | None = None,
+    list_channels: ChannelsHandler | None = None,
+    invite_user: InviteHandler | None = None,
+    set_member_role: RoleHandler | None = None,
+    member_moderation: ModerationHandler | None = None,
+    remove_timeout: TimeoutHandler | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -99,7 +117,10 @@ def build_app(
     login secret. ``resync`` (optional) re-pulls member/role state from Discord.
     ``today_window`` (optional) returns the ``(start_iso, end_iso)`` of "today"
     in the bot's display timezone — used for today's nutrition totals; falls
-    back to a UTC calendar day.
+    back to a UTC calendar day. ``list_channels`` / ``invite_user`` /
+    ``set_member_role`` / ``member_moderation`` / ``remove_timeout`` (optional)
+    are live Discord actions powering the invite, role-grant and timeout
+    controls; when not injected those endpoints return 503.
     """
     sessions = _Sessions()
 
@@ -541,6 +562,104 @@ def build_app(
         ok = await resync(gid)
         return web.json_response({"ok": bool(ok)})
 
+    async def api_channels(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        if list_channels is None:
+            return web.json_response(
+                {"channels": [], "error": "unavailable"}, status=503,
+            )
+        chans = await list_channels(gid)
+        return web.json_response({"channels": chans})
+
+    async def api_invite(request: web.Request) -> web.Response:
+        _require(request)
+        if invite_user is None:
+            return web.json_response(
+                {"ok": False, "error": "invites unavailable"}, status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user_id"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user_id required")
+        channel_id = None
+        raw_ch = body.get("channel_id")
+        if raw_ch not in (None, "", "null"):
+            try:
+                channel_id = int(raw_ch)
+            except (ValueError, TypeError):
+                raise web.HTTPBadRequest(text="invalid channel_id")
+        # Note: invites deliberately accept user IDs that are NOT members of the
+        # guild (that's the point) — and we never query their stored info here,
+        # which keeps the cross-server privacy rule intact.
+        result = await invite_user(gid, uid, channel_id, _actor(request))
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
+    async def api_member_role(request: web.Request) -> web.Response:
+        _require(request)
+        if set_member_role is None:
+            return web.json_response(
+                {"ok": False, "error": "role editing unavailable"}, status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+            rid = int(body["role_id"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild, user, role_id required")
+        action = str(body.get("action", "add")).lower()
+        if action not in ("add", "remove"):
+            raise web.HTTPBadRequest(text="action must be add or remove")
+        result = await set_member_role(
+            gid, uid, rid, action == "add", _actor(request),
+        )
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
+    async def api_member_moderation(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        if member_moderation is None:
+            return web.json_response(
+                {"ok": False, "error": "moderation unavailable"}, status=503,
+            )
+        try:
+            uid = int(request.query["user"])
+        except (KeyError, ValueError):
+            raise web.HTTPBadRequest(text="missing or invalid ?user")
+        result = await member_moderation(gid, uid)
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
+    async def api_member_untimeout(request: web.Request) -> web.Response:
+        _require(request)
+        if remove_timeout is None:
+            return web.json_response(
+                {"ok": False, "error": "timeout removal unavailable"}, status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user required")
+        result = await remove_timeout(gid, uid, _actor(request))
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
     async def _edit_ctx(request: web.Request) -> tuple[int, dict]:
         try:
             body = await request.json()
@@ -592,6 +711,11 @@ def build_app(
         web.post("/api/foods/set", api_food_set),
         web.post("/api/foods/delete", api_food_delete),
         web.post("/api/resync", api_resync),
+        web.get("/api/channels", api_channels),
+        web.post("/api/invite", api_invite),
+        web.post("/api/member/role", api_member_role),
+        web.get("/api/member/moderation", api_member_moderation),
+        web.post("/api/member/untimeout", api_member_untimeout),
         web.get("/healthz", health),
     ])
     return app
@@ -838,6 +962,10 @@ color:#fff;font-weight:600;font-size:.8em}
 border-radius:999px;font-size:.78rem;border:1px solid var(--line);margin:2px 1px;
 background:#ffffff08}
 .pill .dot{width:8px;height:8px;border-radius:50%}
+.pill a.rmrole{cursor:pointer;color:var(--faint);margin-left:.15rem;font-size:.8em}
+.pill a.rmrole:hover{color:#f85149}
+.rolectl{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
+.rolectl select{max-width:280px}
 .tag{padding:.12rem .5rem;border-radius:6px;font-size:.72rem;font-weight:600}
 .link{color:var(--indigo);cursor:pointer;text-decoration:none}
 .link:hover{text-decoration:underline}
@@ -959,7 +1087,8 @@ const ACTION_LABEL={
   role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
   role_delete:"🗑️ role deleted",role_rename:"✏️ role renamed",
   join:"📥 joined",leave:"📤 left",nick_change:"🏷️ nickname",username_change:"🏷️ username",
-  kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",
+  kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",invite_create:"✉️ invite sent",
+  timeout_remove:"⏳ timeout removed",
   lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
   calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",
   protein_add:"🥩 protein logged",protein_undo:"↩️ protein undone",protein_delete:"🗑️ protein deleted",
@@ -969,7 +1098,7 @@ const ACTION_LABEL={
   protein_goal_set:"🎯 protein goal",protein_goal_remove:"🛑 protein tracking off",
   bodyweight_log:"⚖️ bodyweight"};
 function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
-let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[];
+let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[],ALL_ROLES=[];
 
 function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" oninput="filterTable(this.value)">`;}
 function filterTable(term){term=(term||"").toLowerCase();
@@ -1028,10 +1157,12 @@ function spinner(){return '<div class="center"><div class="spin"></div></div>';}
 function renderNav(){document.getElementById("nav").innerHTML=
   TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" onclick="go('${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
 function go(t){tab=t;dataUserFilter=null;renderNav();render();}
-async function onGuild(){guild=document.getElementById("guild").value;await loadAvatars();render();}
+async function onGuild(){guild=document.getElementById("guild").value;await loadAvatars();await loadRoles();render();}
 
 async function loadAvatars(){AV={};try{const d=await api(`/api/members?guild=${guild}`);
   if(d)for(const m of d.members)AV[m.user_id]={avatar:m.avatar,name:m.display_name};}catch(e){}}
+async function loadRoles(){try{const d=await api(`/api/roles?guild=${guild}`);
+  ALL_ROLES=(d&&d.roles)||[];}catch(e){ALL_ROLES=[];}}
 
 async function boot(){
   const g=await api("/api/guilds");if(!g)return;
@@ -1039,7 +1170,7 @@ async function boot(){
   if(!g.guilds.length){document.getElementById("view").innerHTML=
     '<div class="empty">No guilds tracked yet. Once the bot syncs a server it appears here.</div>';return;}
   sel.innerHTML=g.guilds.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join("");
-  guild=g.guilds[0].id;renderNav();await loadAvatars();render();
+  guild=g.guilds[0].id;renderNav();await loadAvatars();await loadRoles();render();
 }
 async function resync(){if(!guild)return;toast("Syncing…");
   const r=await post("/api/resync",{guild});await loadAvatars();
@@ -1075,6 +1206,7 @@ async function renderMembers(v){
   if(!d.members.length){v.innerHTML='<div class="empty">No members synced yet. Hit ↻ Sync.</div>';return;}
   v.innerHTML=`<div class="filters"><h2 style="margin:0">Members
       <span class="faint">· ${d.members.length}</span></h2><span class="sp" style="flex:1"></span>
+      <button class="btn" onclick="inviteDialog()">➕ Invite by ID</button>
       ${searchBar("Search members…")}</div>
     <div class="tcard"><table><thead><tr><th>Member</th><th>Username</th><th>Roles</th>
     <th>Joined</th></tr></thead><tbody>${d.members.map(m=>`<tr>
@@ -1125,14 +1257,36 @@ async function memberView(uid){
           <div class="ptrack"><div class="pfill" style="width:${p}%;background:${done?'#10b981':'linear-gradient(90deg,#6366f1,#22d3ee)'}"></div></div></div>`;
         }).join(""):'<div class="faint">No goals set.</div>'}</div>
     </div>
-    <h2>Roles</h2><div class="chips">${d.roles.length?d.roles.map(r=>
-      `<span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}</span>`
-      ).join(""):'<span class="muted">No roles.</span>'}</div>
+    <h2>Roles</h2><div class="chips">${d.roles.length?d.roles.map(r=>roleChip(uid,r)).join("")
+      :'<span class="muted">No roles.</span>'}</div>
+    ${m.present?roleAdder(uid,d.roles):''}
+    ${m.present?`<h2 style="margin-top:1.6rem">Moderation</h2><div id="modbox" class="faint">Checking timeout…</div>`:''}
     <h2 style="margin-top:1.6rem">History</h2>${auditTable(d.audit)}
     <p style="margin-top:1rem" class="muted">View this member's
       <a class="link" onclick="go2('lifts','${uid}')">lifts</a>,
       <a class="link" onclick="go2('calories','${uid}')">calories</a> or
       <a class="link" onclick="go2('protein','${uid}')">protein</a>.</p>`;
+  if(m.present)loadModeration(uid);
+}
+
+// ---- moderation (remove timeout) ----
+async function loadModeration(uid){
+  const box=document.getElementById("modbox");if(!box)return;
+  let d;try{d=await api(`/api/member/moderation?guild=${guild}&user=${uid}`);}catch(e){box.remove();return;}
+  if(!d||!d.ok){box.remove();return;}
+  if(d.timed_out){
+    box.classList.remove("faint");
+    box.innerHTML=`<span class="pill" style="border-color:#5c2b2b">⏳ Timed out until ${fmtTs(d.timed_out_until)}</span>
+      <button class="btn sm danger" ${d.can_moderate?'':'disabled title="Bot lacks Moderate Members or is outranked"'}
+        onclick="removeTimeout('${uid}')">Remove timeout</button>`;
+  }else{
+    box.innerHTML='<span class="faint">No active timeout.</span>';
+  }
+}
+async function removeTimeout(uid){
+  const r=await post("/api/member/untimeout",{guild,user:uid});
+  if(r&&r.ok){toast(r.changed===false?"Wasn't timed out":"Timeout removed ✓");memberView(uid);}
+  else{toast((r&&r.error)||"Failed");}
 }
 
 function foodEditIdx(uid,i){foodDialog(uid,currentFoods[i]);}
@@ -1159,6 +1313,64 @@ async function foodDelete(uid,name){
   if(!confirm("Delete this saved food?"))return;
   const r=await post("/api/foods/delete",{guild,user:uid,name});
   toast(r&&r.ok?"Deleted ✓":"Failed");memberView(uid);
+}
+
+// ---- role grants (member detail) ----
+function roleChip(uid,r){
+  return `<span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}
+    <a class="rmrole" title="Remove role" onclick="setRole('${uid}','${r.role_id}','remove')">✕</a></span>`;
+}
+function roleAdder(uid,have){
+  const had=new Set((have||[]).map(r=>String(r.role_id)));
+  const opts=ALL_ROLES.filter(r=>!had.has(String(r.role_id)));
+  if(!opts.length)return '<div class="faint" style="margin-top:.5rem">Member has every role.</div>';
+  return `<div class="rolectl"><select id="addRoleSel">${opts.map(r=>
+    `<option value="${r.role_id}">${esc(r.name)}${r.managed?' (managed)':''}</option>`).join("")}</select>
+    <button class="btn sm" onclick="addRole('${uid}')">+ Add role</button></div>`;
+}
+function addRole(uid){const sel=document.getElementById("addRoleSel");
+  if(!sel||!sel.value){toast("Pick a role");return;}setRole(uid,sel.value,'add');}
+async function setRole(uid,rid,action){
+  const r=await post("/api/member/role",{guild,user:uid,role_id:rid,action});
+  if(r&&r.ok){toast(action==='add'?"Role added ✓":"Role removed ✓");
+    await loadRoles();memberView(uid);}
+  else{toast((r&&r.error)||"Failed");}
+}
+
+// ---- invite a user by ID ----
+async function inviteDialog(){
+  const dlg=document.getElementById("editDlg");
+  dlg.innerHTML=`<h2>Invite a user by ID</h2>
+    <p class="muted" style="margin:.2rem 0 .6rem;font-size:.85rem">Creates a one-use
+    invite and tries to DM it to the user. If their DMs are closed you can copy the
+    link and send it yourself.</p>
+    <label>User ID</label><input id="inv_uid" placeholder="e.g. 123456789012345678" inputmode="numeric">
+    <label>Channel</label><select id="inv_ch"><option value="">Loading…</option></select>
+    <div id="inv_result" style="margin-top:.8rem"></div>
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Close</button>
+    <button class="btn primary" onclick="sendInvite()">Create &amp; send</button></div>`;
+  dlg.showModal();
+  let chans=[];try{const d=await api(`/api/channels?guild=${guild}`);chans=(d&&d.channels)||[];}catch(e){}
+  const sel=document.getElementById("inv_ch");
+  sel.innerHTML=chans.length?chans.map(c=>`<option value="${c.id}">#${esc(c.name)}</option>`).join("")
+    :'<option value="">(bot picks a channel)</option>';
+}
+async function sendInvite(){
+  const uid=(document.getElementById("inv_uid").value||"").trim();
+  const ch=document.getElementById("inv_ch").value;
+  if(!/^\d+$/.test(uid)){toast("Enter a numeric user ID");return;}
+  const res=document.getElementById("inv_result");res.innerHTML='<span class="muted">Creating invite…</span>';
+  const r=await post("/api/invite",{guild,user_id:uid,channel_id:ch||null});
+  if(!r)return;
+  if(r.ok){
+    res.innerHTML=`<div class="kv"><span>Invite</span><span><a class="link" href="${esc(r.link)}" target="_blank">${esc(r.link)}</a>
+      <button class="btn sm" onclick="navigator.clipboard.writeText('${esc(r.link)}');toast('Copied')">Copy</button></span></div>
+      <div style="margin-top:.5rem" class="${r.dmed?'':'faint'}">${r.dmed?'✅ DM sent to the user.'
+        :'⚠️ Could not DM them'+(r.error?': '+esc(r.error):'')+'. Share the link manually.'}</div>`;
+    toast(r.dmed?"Invite sent ✓":"Invite link ready");
+  }else{
+    res.innerHTML=`<span style="color:#f85149">${esc(r.error||"Failed")}</span>`;
+  }
 }
 
 async function renderLeaderboard(v){
