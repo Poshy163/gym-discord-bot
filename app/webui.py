@@ -1764,8 +1764,8 @@ function blButton(){return `<button class="btn sm" onclick="openBlacklist()">�
 function openBlacklist(){
   const dlg=document.getElementById("editDlg");
   dlg.innerHTML=`<h3 style="margin:.2rem 0 .6rem">🚫 Message-log blacklist</h3>
-    <p class="faint" style="font-size:.82rem;margin:.2rem 0 .9rem">Blacklisted members aren't logged and their stored
-      messages are purged. The bot posts a public message pinging them with the reason.</p>
+    <p class="faint" style="font-size:.82rem;margin:.2rem 0 .9rem">Blacklisted members can no longer add anything to the
+      bot (lifts, calories, commands) — their chat is still logged and kept. The bot posts a public message pinging them with the reason.</p>
     <div class="bl-list">${BLACKLIST.length?BLACKLIST.map(b=>`<div class="bl-row">
         <div><b>${esc(b.display_name)}</b> <span class="faint">${esc(b.user_id)}</span>
           <div class="faint" style="font-size:.8rem">${b.reason?esc(b.reason):"<i>no reason given</i>"}</div></div>

@@ -195,10 +195,10 @@ CREATE INDEX IF NOT EXISTS idx_message_log_user
 CREATE UNIQUE INDEX IF NOT EXISTS idx_message_log_msgid
     ON message_log (guild_id, message_id) WHERE message_id IS NOT NULL;
 
--- Operators can blacklist members from message logging via the dashboard.
--- Blacklisted users are never logged (live or backfill) and are hidden from the
--- activity feed; blacklisting someone also purges their existing logged
--- messages. ``reason`` is operator-supplied and shown publicly when the bot
+-- Operators can blacklist members via the dashboard. A blacklisted user can't
+-- add anything to the bot (lifts, calories, protein, bodyweight, slash/prefix
+-- commands), but their chat is still logged and kept — blacklisting deletes
+-- nothing. ``reason`` is operator-supplied and shown publicly when the bot
 -- announces the blacklisting in chat.
 CREATE TABLE IF NOT EXISTS message_log_blacklist (
     guild_id  INTEGER NOT NULL,
@@ -2804,8 +2804,7 @@ class Database:
 
     def message_log_latest_at(self, guild_id: int) -> str | None:
         """ISO timestamp of the most recent logged message in ``guild_id``, or
-        None if nothing has been logged yet. Lets the startup backfill resume
-        forward of what it already has instead of re-scanning history."""
+        None if nothing has been logged yet."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT MAX(at) AS last_at FROM message_log WHERE guild_id = ?",
@@ -2881,9 +2880,10 @@ class Database:
         self, guild_id: int, user_id: int,
         reason: str | None = None, added_by: str | None = None,
     ) -> bool:
-        """Blacklist ``user_id`` from message logging and purge any messages
-        already logged for them. Upserts (re-adding updates the reason).
-        Returns True."""
+        """Blacklist ``user_id`` from contributing to the bot (lifts, calories,
+        protein, bodyweight, commands). Their chat is still logged and kept —
+        blacklisting does not delete any messages. Upserts (re-adding updates the
+        reason). Returns True."""
         with self._conn() as c:
             c.execute(
                 "INSERT INTO message_log_blacklist "
@@ -2894,15 +2894,10 @@ class Database:
                 "added_at = excluded.added_at",
                 (guild_id, user_id, reason, added_by, _normalize_iso(None)),
             )
-            c.execute(
-                "DELETE FROM message_log WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
             return True
 
     def message_blacklist_remove(self, guild_id: int, user_id: int) -> bool:
-        """Remove ``user_id`` from the blacklist. Returns True if a row existed.
-        Does not retroactively restore purged messages."""
+        """Remove ``user_id`` from the blacklist. Returns True if a row existed."""
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM message_log_blacklist "

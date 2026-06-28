@@ -762,18 +762,42 @@ async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
     guild on ``interaction.extras['guild_id']``; if we can't determine one we
     let context-free commands (and autocomplete) through but ask everyone else
     to disambiguate with ``/server``.
+
+    Blacklisted members are blocked from running any command here (their chat is
+    still logged, but they can't add anything to the bot).
     """
+    is_autocomplete = interaction.type is discord.InteractionType.autocomplete
+
+    # Resolve the effective guild (own guild, or DM-resolved default) up front so
+    # the blacklist gate applies to both guild and DM interactions.
+    eff_gid = interaction.guild_id
+    if eff_gid is None:
+        eff_gid = _effective_guild_for_dm(interaction.user.id)
+        if eff_gid is not None:
+            interaction.extras["guild_id"] = eff_gid
+
+    if eff_gid is not None and not is_autocomplete:
+        try:
+            blocked = db.message_is_blacklisted(eff_gid, interaction.user.id)
+        except Exception:
+            LOG.exception("Blacklist check failed in tree check")
+            blocked = False
+        if blocked:
+            await interaction.response.send_message(
+                "You've been blacklisted from using this bot in this server.",
+                ephemeral=True,
+            )
+            return False
+
     if interaction.guild_id is not None:
         return True
 
-    gid = _effective_guild_for_dm(interaction.user.id)
-    if gid is not None:
-        interaction.extras["guild_id"] = gid
+    if eff_gid is not None:
         return True
 
     # Autocomplete can't render a normal reply — just allow it (callbacks fall
     # back to an empty guild and return no suggestions).
-    if interaction.type is discord.InteractionType.autocomplete:
+    if is_autocomplete:
         return True
 
     cmd = interaction.command
@@ -2360,30 +2384,17 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
 
     Scans every readable text channel in every guild for the last
     ``MESSAGE_LOG_BACKFILL_DAYS`` days so the dashboard's activity feed has data
-    immediately on startup. Idempotent — logging dedupes on message id — and on
-    reboots we only scan forward of the newest already-logged message, so it's
-    cheap after the first run.
+    immediately on startup. The full window is re-scanned every boot (rather than
+    resuming from the newest stored message) so any messages that were previously
+    deleted are restored — logging dedupes on message id, so re-scans are cheap
+    and never duplicate.
     """
     if not ENABLE_MESSAGE_LOGGING or MESSAGE_LOG_BACKFILL_DAYS <= 0:
         return
-    cutoff = datetime.now(timezone.utc) - timedelta(
+    after = datetime.now(timezone.utc) - timedelta(
         days=MESSAGE_LOG_BACKFILL_DAYS
     )
     for guild in bot.guilds:
-        # Resume forward of what we already stored, but never earlier than the
-        # cutoff — so the first run seeds the full window and later runs only
-        # fill the gap since the bot was last up.
-        after = cutoff
-        latest = db.message_log_latest_at(guild.id)
-        if latest:
-            try:
-                latest_dt = datetime.fromisoformat(latest)
-                if latest_dt.tzinfo is None:
-                    latest_dt = latest_dt.replace(tzinfo=timezone.utc)
-                after = max(after, latest_dt)
-            except ValueError:
-                pass
-        blacklisted = db.message_blacklisted_ids(guild.id)
         logged = 0
         for channel in guild.text_channels:
             perms = channel.permissions_for(guild.me)
@@ -2394,8 +2405,6 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                     limit=None, after=after, oldest_first=True,
                 ):
                     if not msg.content:
-                        continue
-                    if msg.author.id in blacklisted:
                         continue
                     if db.message_log_add(
                         guild.id, msg.author.id, msg.content,
@@ -2419,25 +2428,30 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # Message logging for the web dashboard. Logs every author (including bots,
-    # so the bot's own announcements show up) in every channel — runs before the
-    # bot/guild and gym-channel gates below. Failures here must never break
-    # normal message handling.
+    # so the bot's own announcements show up, and blacklisted users — blacklist
+    # only blocks adding data, not logging) in every channel. Runs before the
+    # bot/guild and gym-channel gates. Failures here must never break handling.
     if ENABLE_MESSAGE_LOGGING and message.guild is not None and message.content:
         try:
-            if not db.message_is_blacklisted(
-                message.guild.id, message.author.id
-            ):
-                db.message_log_add(
-                    message.guild.id, message.author.id, message.content,
-                    channel_id=message.channel.id,
-                    channel_name=getattr(message.channel, "name", None),
-                    message_id=message.id,
-                    at=message.created_at,
-                )
+            db.message_log_add(
+                message.guild.id, message.author.id, message.content,
+                channel_id=message.channel.id,
+                channel_name=getattr(message.channel, "name", None),
+                message_id=message.id,
+                at=message.created_at,
+            )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
     if message.author.bot or not message.guild:
         return
+    # Blacklisted members can't add anything to the bot — their message is still
+    # logged above, but we ignore it for all data entry (lifts, calories,
+    # protein, bodyweight, saved foods) and prefix commands.
+    try:
+        if db.message_is_blacklisted(message.guild.id, message.author.id):
+            return
+    except Exception:
+        LOG.exception("Blacklist check failed in on_message")
     if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
         await bot.process_commands(message)
         return
@@ -8998,8 +9012,8 @@ async def _webui_announce_blacklist(
     reason_txt = (reason or "").strip() or "No reason given."
     try:
         await channel.send(
-            f"🚫 <@{user_id}> has been blacklisted from message logging.\n"
-            f"**Reason:** {reason_txt}",
+            f"🚫 <@{user_id}> has been blacklisted — they can no longer log "
+            f"anything to the bot.\n**Reason:** {reason_txt}",
             allowed_mentions=discord.AllowedMentions(
                 everyone=False, roles=False,
                 users=[discord.Object(id=user_id)],

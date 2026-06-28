@@ -116,16 +116,17 @@ def test_messages_channels_and_log(tmp_path):
     _run(go())
 
 
-def test_blacklist_add_purges_logs_announces_and_excludes(tmp_path):
-    """Blacklisting via the dashboard purges the user's logs, fires the public
-    announce callable, and hides them from the channel feed; removal works too."""
+def test_blacklist_add_keeps_messages_and_announces(tmp_path):
+    """Blacklisting via the dashboard blocks the user from adding to the bot,
+    fires the public announce callable, and keeps their logged messages; removal
+    works too."""
     async def go():
         from datetime import datetime, timezone
 
         db = Database(tmp_path / "g.sqlite3")
         now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         db.upsert_member(1, 300, "carol", "Carol")
-        db.message_log_add(1, 300, "spam", message_id=9, channel_id=7,
+        db.message_log_add(1, 300, "hello", message_id=9, channel_id=7,
                            channel_name="general", at=now)
 
         sink = []
@@ -141,14 +142,15 @@ def test_blacklist_add_purges_logs_announces_and_excludes(tmp_path):
                                   json={"guild": "1", "user_id": "300", "reason": "bot spam"})
             body = await r.json()
             assert body["ok"] and body["announced"] is True
-            # Announce callable got the reason; logs purged; audited.
             assert sink == [(1, 300, "bot spam", sink[0][3])]
-            assert db.message_count_since(1, 300) == 0
+            # Messages are NOT deleted; the user is just blacklisted.
+            assert db.message_count_since(1, 300) == 1
             assert db.message_is_blacklisted(1, 300) is True
 
-            # Channel 7 had only Carol's now-purged message → no channels left.
+            # Their messages still show in the channel feed.
             chans = await (await client.get("/api/messages/channels?guild=1")).json()
-            assert chans["channels"] == []
+            assert chans["channels"][0]["channel_id"] == "7"
+            assert chans["channels"][0]["count"] == 1
             assert chans["blacklist"][0]["user_id"] == "300"
             assert chans["blacklist"][0]["reason"] == "bot spam"
 

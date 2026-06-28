@@ -252,15 +252,15 @@ def test_message_channels_and_channel_log(db):
     assert rows[1]["display_name"] is None  # user 200 not mirrored
 
 
-def test_message_blacklist_add_purges_and_filters(db):
+def test_message_blacklist_add_keeps_messages(db):
     base = datetime(2026, 6, 1, tzinfo=timezone.utc)
     db.message_log_add(1, 100, "keep", message_id=1, at=base)
-    db.message_log_add(1, 200, "purge me", message_id=2, at=base)
+    db.message_log_add(1, 200, "still here", message_id=2, at=base)
 
     assert db.message_is_blacklisted(1, 200) is False
     assert db.message_blacklist_add(1, 200, "spamming", "web:1.2.3.4") is True
-    # Existing messages for the blacklisted user are purged; others remain.
-    assert db.message_count_since(1, 200) == 0
+    # Blacklisting blocks the user from adding data but never deletes messages.
+    assert db.message_count_since(1, 200) == 1
     assert db.message_count_since(1, 100) == 1
     assert db.message_is_blacklisted(1, 200) is True
     assert db.message_blacklisted_ids(1) == {200}
