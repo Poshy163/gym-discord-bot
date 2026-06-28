@@ -2383,6 +2383,7 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                 after = max(after, latest_dt)
             except ValueError:
                 pass
+        blacklisted = db.message_blacklisted_ids(guild.id)
         logged = 0
         for channel in guild.text_channels:
             perms = channel.permissions_for(guild.me)
@@ -2393,6 +2394,8 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                     limit=None, after=after, oldest_first=True,
                 ):
                     if msg.author.bot or not msg.content:
+                        continue
+                    if msg.author.id in blacklisted:
                         continue
                     if db.message_log_add(
                         guild.id, msg.author.id, msg.content,
@@ -2423,13 +2426,16 @@ async def on_message(message: discord.Message) -> None:
     # message handling.
     if ENABLE_MESSAGE_LOGGING and message.content:
         try:
-            db.message_log_add(
-                message.guild.id, message.author.id, message.content,
-                channel_id=message.channel.id,
-                channel_name=getattr(message.channel, "name", None),
-                message_id=message.id,
-                at=message.created_at,
-            )
+            if not db.message_is_blacklisted(
+                message.guild.id, message.author.id
+            ):
+                db.message_log_add(
+                    message.guild.id, message.author.id, message.content,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, "name", None),
+                    message_id=message.id,
+                    at=message.created_at,
+                )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
     if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
@@ -8715,6 +8721,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         set_member_role=_webui_set_member_role,
         member_moderation=_webui_member_moderation,
         remove_timeout=_webui_remove_timeout,
+        announce_blacklist=_webui_announce_blacklist,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -8949,6 +8956,60 @@ async def _webui_invite_user(
         ),
     )
     return {"ok": True, "link": invite.url, "dmed": dmed, "error": dm_error}
+
+
+def _announce_channel(guild: "discord.Guild"):  # pragma: no cover - discord runtime
+    """Pick a public channel to post a blacklist notice in: a configured gym
+    channel if one is in this guild, else the system channel, else the first text
+    channel the bot can send in."""
+    me = guild.me
+
+    def _sendable(ch) -> bool:
+        return ch is not None and (
+            me is None or ch.permissions_for(me).send_messages
+        )
+
+    for cid in GYM_CHANNEL_IDS:
+        ch = guild.get_channel(cid)
+        if ch is not None and _sendable(ch):
+            return ch
+    if _sendable(guild.system_channel):
+        return guild.system_channel
+    for ch in guild.text_channels:
+        if _sendable(ch):
+            return ch
+    return None
+
+
+async def _webui_announce_blacklist(
+    guild_id: int, user_id: int, reason: str | None, actor_name: str,
+) -> dict:  # pragma: no cover - discord runtime
+    """Post a public message pinging a just-blacklisted user with the reason, so
+    the action is visible to the server. Only the target user is mentionable
+    (everyone/role pings are disabled regardless of the reason text). Returns
+    ``{ok, error, channel}``.
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    channel = _announce_channel(guild)
+    if channel is None:
+        return {"ok": False, "error": "No channel I can post in."}
+    reason_txt = (reason or "").strip() or "No reason given."
+    try:
+        await channel.send(
+            f"🚫 <@{user_id}> has been blacklisted from message logging.\n"
+            f"**Reason:** {reason_txt}",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False,
+                users=[discord.Object(id=user_id)],
+            ),
+        )
+    except discord.Forbidden:
+        return {"ok": False, "error": "I lack permission to post there."}
+    except discord.HTTPException as exc:
+        return {"ok": False, "error": f"Discord rejected the message: {exc}"}
+    return {"ok": True, "channel": getattr(channel, "name", str(channel))}
 
 
 def _role_forbidden_reason(guild: "discord.Guild", role) -> str:  # pragma: no cover

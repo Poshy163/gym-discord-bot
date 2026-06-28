@@ -77,47 +77,85 @@ def test_invite_happy_path_passes_args_through(tmp_path):
     _run(go())
 
 
-def test_activity_lists_tracked_and_message_active_members(tmp_path):
-    """The activity feed unions /track opt-ins with everyone who has chatted:
-    tracked users carry presence/games, untracked ones appear from logs alone."""
+def test_messages_channels_and_log(tmp_path):
+    """The Messages tab lists channels with counts and serves a channel's log in
+    chat order, carrying each author's mirrored name/avatar."""
     async def go():
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
 
         db = Database(tmp_path / "g.sqlite3")
-        now = datetime.now(timezone.utc)
-        db.upsert_member(1, 100, "alice", "Alice")
-        db.upsert_member(1, 200, "bob", "Bob")
-        # Alice is tracked (presence + a game) and has chatted.
-        db.presence_track_add(1, 100, started_by=9)
-        db.presence_log_event(1, 100, "online", at=now)
-        db.activity_log_event(1, 100, "Rust", at=now)
-        db.message_log_add(1, 100, "hi all", message_id=1, channel_name="general", at=now)
-        # Bob is NOT tracked but has messages — should still get a card.
-        db.message_log_add(1, 200, "yo", message_id=2, channel_name="gym", at=now)
+        base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice", avatar="http://a/alice.png")
+        db.message_log_add(1, 100, "first", message_id=1, channel_id=7,
+                           channel_name="general", at=base)
+        db.message_log_add(1, 200, "second", message_id=2, channel_id=7,
+                           channel_name="general", at=base + timedelta(minutes=1))
+        db.message_log_add(1, 100, "elsewhere", message_id=3, channel_id=8,
+                           channel_name="gym", at=base + timedelta(minutes=2))
 
         app = build_app(db=db, password="secret")
         client = await _client(app)
         try:
             await _login(client)
-            r = await client.get("/api/activity?guild=1&days=30")
-            assert r.status == 200
+            chans = await (await client.get("/api/messages/channels?guild=1")).json()
+            by_cid = {c["channel_id"]: c for c in chans["channels"]}
+            assert by_cid["7"]["count"] == 2 and by_cid["7"]["channel_name"] == "general"
+            assert by_cid["8"]["count"] == 1
+            # Most recently active channel (gym) sorts first.
+            assert chans["channels"][0]["channel_id"] == "8"
+
+            log = await (await client.get("/api/messages/log?guild=1&channel=7")).json()
+            assert [m["content"] for m in log["messages"]] == ["first", "second"]
+            assert log["messages"][0]["display_name"] == "Alice"
+            assert log["messages"][0]["avatar"] == "http://a/alice.png"
+            # Unknown author falls back to the id, no avatar.
+            assert log["messages"][1]["display_name"] == "200"
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_blacklist_add_purges_logs_announces_and_excludes(tmp_path):
+    """Blacklisting via the dashboard purges the user's logs, fires the public
+    announce callable, and hides them from the channel feed; removal works too."""
+    async def go():
+        from datetime import datetime, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        db.upsert_member(1, 300, "carol", "Carol")
+        db.message_log_add(1, 300, "spam", message_id=9, channel_id=7,
+                           channel_name="general", at=now)
+
+        sink = []
+        async def fake_announce(gid, uid, reason, actor):
+            sink.append((gid, uid, reason, actor))
+            return {"ok": True, "channel": "general"}
+
+        app = build_app(db=db, password="secret", announce_blacklist=fake_announce)
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/blacklist/add",
+                                  json={"guild": "1", "user_id": "300", "reason": "bot spam"})
             body = await r.json()
-            assert body["window_days"] == 30
-            by_id = {u["user_id"]: u for u in body["users"]}
-            assert set(by_id) == {"100", "200"}
+            assert body["ok"] and body["announced"] is True
+            # Announce callable got the reason; logs purged; audited.
+            assert sink == [(1, 300, "bot spam", sink[0][3])]
+            assert db.message_count_since(1, 300) == 0
+            assert db.message_is_blacklisted(1, 300) is True
 
-            alice = by_id["100"]
-            assert alice["tracked"] is True
-            assert alice["status"] == "online"
-            assert alice["current_game"]["name"] == "Rust"
-            assert alice["message_count"] == 1
+            # Channel 7 had only Carol's now-purged message → no channels left.
+            chans = await (await client.get("/api/messages/channels?guild=1")).json()
+            assert chans["channels"] == []
+            assert chans["blacklist"][0]["user_id"] == "300"
+            assert chans["blacklist"][0]["reason"] == "bot spam"
 
-            bob = by_id["200"]
-            assert bob["tracked"] is False
-            assert bob["status"] is None
-            assert bob["current_game"] is None
-            assert bob["message_count"] == 1
-            assert bob["recent_messages"][0]["content"] == "yo"
+            rm = await client.post("/api/blacklist/remove",
+                                  json={"guild": "1", "user_id": "300"})
+            assert (await rm.json())["ok"] is True
+            assert db.message_is_blacklisted(1, 300) is False
         finally:
             await client.close()
             db.close()

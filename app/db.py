@@ -195,6 +195,20 @@ CREATE INDEX IF NOT EXISTS idx_message_log_user
 CREATE UNIQUE INDEX IF NOT EXISTS idx_message_log_msgid
     ON message_log (guild_id, message_id) WHERE message_id IS NOT NULL;
 
+-- Operators can blacklist members from message logging via the dashboard.
+-- Blacklisted users are never logged (live or backfill) and are hidden from the
+-- activity feed; blacklisting someone also purges their existing logged
+-- messages. ``reason`` is operator-supplied and shown publicly when the bot
+-- announces the blacklisting in chat.
+CREATE TABLE IF NOT EXISTS message_log_blacklist (
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    reason    TEXT,
+    added_by  TEXT,
+    added_at  TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
 -- Calorie tracking. ``calorie_goals`` holds each user's daily intake target
 -- (stored in kcal — the bot converts kJ on the way in). Having a row here is
 -- what marks a user as "doing" calorie tracking for the weekly AI summary.
@@ -2817,6 +2831,114 @@ class Database:
                 "GROUP BY user_id ORDER BY last_at DESC",
                 params,
             ).fetchall()
+
+    def message_channels(self, guild_id: int) -> list[sqlite3.Row]:
+        """Channels that have logged messages, each with a message ``count`` and
+        ``last_at``. Most-recently-active channel first — powers the Discord-style
+        channel sidebar. Uses the newest seen ``channel_name`` per channel id."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT channel_id,
+                       (SELECT channel_name FROM message_log m2
+                        WHERE m2.guild_id = m.guild_id
+                          AND m2.channel_id = m.channel_id
+                        ORDER BY at DESC, id DESC LIMIT 1) AS channel_name,
+                       COUNT(*) AS count, MAX(at) AS last_at
+                FROM message_log m
+                WHERE guild_id = ?
+                GROUP BY channel_id
+                ORDER BY last_at DESC
+                """,
+                (guild_id,),
+            ))
+
+    def message_channel_log(
+        self, guild_id: int, channel_id: int, limit: int = 300,
+    ) -> list[sqlite3.Row]:
+        """The most recent ``limit`` messages in a channel, returned oldest-first
+        (chat order). Each row carries the author's mirrored ``display_name`` and
+        ``avatar`` (NULL if the member isn't mirrored)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT ml.user_id, ml.content, ml.at,
+                       mem.display_name AS display_name, mem.avatar AS avatar
+                FROM message_log ml
+                LEFT JOIN members mem
+                       ON mem.guild_id = ml.guild_id AND mem.user_id = ml.user_id
+                WHERE ml.guild_id = ? AND ml.channel_id = ?
+                ORDER BY ml.at DESC, ml.id DESC
+                LIMIT ?
+                """,
+                (guild_id, channel_id, int(limit)),
+            ).fetchall()
+            return list(reversed(rows))
+
+    # ---- message-log blacklist (dashboard-managed) -----------------------
+
+    def message_blacklist_add(
+        self, guild_id: int, user_id: int,
+        reason: str | None = None, added_by: str | None = None,
+    ) -> bool:
+        """Blacklist ``user_id`` from message logging and purge any messages
+        already logged for them. Upserts (re-adding updates the reason).
+        Returns True."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO message_log_blacklist "
+                "(guild_id, user_id, reason, added_by, added_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                "reason = excluded.reason, added_by = excluded.added_by, "
+                "added_at = excluded.added_at",
+                (guild_id, user_id, reason, added_by, _normalize_iso(None)),
+            )
+            c.execute(
+                "DELETE FROM message_log WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return True
+
+    def message_blacklist_remove(self, guild_id: int, user_id: int) -> bool:
+        """Remove ``user_id`` from the blacklist. Returns True if a row existed.
+        Does not retroactively restore purged messages."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM message_log_blacklist "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def message_blacklist_list(self, guild_id: int) -> list[sqlite3.Row]:
+        """Blacklisted users in a guild, newest first, with reason/who/when."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, reason, added_by, added_at "
+                "FROM message_log_blacklist WHERE guild_id = ? "
+                "ORDER BY added_at DESC",
+                (guild_id,),
+            ))
+
+    def message_is_blacklisted(self, guild_id: int, user_id: int) -> bool:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM message_log_blacklist "
+                "WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone() is not None
+
+    def message_blacklisted_ids(self, guild_id: int) -> set[int]:
+        """All blacklisted user ids for a guild (for bulk filtering)."""
+        with self._conn() as c:
+            return {
+                int(r["user_id"]) for r in c.execute(
+                    "SELECT user_id FROM message_log_blacklist "
+                    "WHERE guild_id = ?",
+                    (guild_id,),
+                )
+            }
 
     # ------------------------------------------------------------------
     # Calorie tracking

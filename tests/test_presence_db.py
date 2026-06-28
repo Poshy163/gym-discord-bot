@@ -226,3 +226,56 @@ def test_message_log_latest_at_tracks_newest(db):
     latest = db.message_log_latest_at(1)
     assert latest == (base + timedelta(days=2)).isoformat()
     assert db.message_log_latest_at(99) is None
+
+
+def test_message_channels_and_channel_log(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.upsert_member(1, 100, "alice", "Alice", avatar="http://a.png")
+    db.message_log_add(1, 100, "g1", message_id=1, channel_id=7,
+                       channel_name="general", at=base)
+    db.message_log_add(1, 200, "g2", message_id=2, channel_id=7,
+                       channel_name="general", at=base + timedelta(minutes=1))
+    db.message_log_add(1, 100, "gym1", message_id=3, channel_id=8,
+                       channel_name="gym", at=base + timedelta(minutes=5))
+
+    chans = {int(r["channel_id"]): r for r in db.message_channels(1)}
+    assert chans[7]["count"] == 2 and chans[7]["channel_name"] == "general"
+    assert chans[8]["count"] == 1
+    # Most recently active channel first.
+    assert int(db.message_channels(1)[0]["channel_id"]) == 8
+
+    rows = db.message_channel_log(1, 7)
+    # Chat order (oldest first), with author info joined from members.
+    assert [r["content"] for r in rows] == ["g1", "g2"]
+    assert rows[0]["display_name"] == "Alice"
+    assert rows[0]["avatar"] == "http://a.png"
+    assert rows[1]["display_name"] is None  # user 200 not mirrored
+
+
+def test_message_blacklist_add_purges_and_filters(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.message_log_add(1, 100, "keep", message_id=1, at=base)
+    db.message_log_add(1, 200, "purge me", message_id=2, at=base)
+
+    assert db.message_is_blacklisted(1, 200) is False
+    assert db.message_blacklist_add(1, 200, "spamming", "web:1.2.3.4") is True
+    # Existing messages for the blacklisted user are purged; others remain.
+    assert db.message_count_since(1, 200) == 0
+    assert db.message_count_since(1, 100) == 1
+    assert db.message_is_blacklisted(1, 200) is True
+    assert db.message_blacklisted_ids(1) == {200}
+
+    rows = db.message_blacklist_list(1)
+    assert len(rows) == 1
+    assert int(rows[0]["user_id"]) == 200
+    assert rows[0]["reason"] == "spamming"
+    assert rows[0]["added_by"] == "web:1.2.3.4"
+
+    # Re-adding updates the reason (upsert), not a second row.
+    assert db.message_blacklist_add(1, 200, "still spamming") is True
+    rows = db.message_blacklist_list(1)
+    assert len(rows) == 1 and rows[0]["reason"] == "still spamming"
+
+    assert db.message_blacklist_remove(1, 200) is True
+    assert db.message_blacklist_remove(1, 200) is False
+    assert db.message_blacklisted_ids(1) == set()

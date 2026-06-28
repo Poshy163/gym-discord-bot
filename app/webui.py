@@ -70,6 +70,9 @@ RoleHandler = Callable[[int, int, int, bool, str], Awaitable[dict]]
 ModerationHandler = Callable[[int, int], Awaitable[dict]]
 # (guild_id, user_id, actor_name) -> result dict
 TimeoutHandler = Callable[[int, int, str], Awaitable[dict]]
+# (guild_id, user_id, reason|None, actor_name) -> result dict — posts a public
+# chat message pinging the blacklisted user with the reason.
+BlacklistAnnouncer = Callable[[int, int, "str | None", str], Awaitable[dict]]
 
 
 class _Sessions:
@@ -110,6 +113,7 @@ def build_app(
     set_member_role: RoleHandler | None = None,
     member_moderation: ModerationHandler | None = None,
     remove_timeout: TimeoutHandler | None = None,
+    announce_blacklist: BlacklistAnnouncer | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -121,6 +125,9 @@ def build_app(
     ``set_member_role`` / ``member_moderation`` / ``remove_timeout`` (optional)
     are live Discord actions powering the invite, role-grant and timeout
     controls; when not injected those endpoints return 503.
+    ``announce_blacklist`` (optional) posts a public chat message pinging a
+    just-blacklisted user with the reason; when not injected blacklisting still
+    works silently (no announcement).
     """
     sessions = _Sessions()
 
@@ -431,64 +438,145 @@ def build_app(
         days = _clamp_int(request.query.get("days"), 30, 1, 90)
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
-        # Presence + games come from the /track opt-in list; message logs are
-        # captured for everyone. Show a card for the union: every tracked user
-        # plus every member who has chatted in the window.
-        tracked = {int(r["user_id"]) for r in db.presence_track_list(gid)}
-        msg_meta = {
-            int(r["user_id"]): (int(r["count"]), r["last_at"])
-            for r in db.message_active_users(gid, since=since)
-        }
         users = []
-        for uid in tracked | set(msg_meta):
+        for row in db.presence_track_list(gid):
+            uid = int(row["user_id"])
             member = db.get_member(gid, uid)
-            is_tracked = uid in tracked
-            pres = db.presence_current(gid, uid) if is_tracked else None
+            pres = db.presence_current(gid, uid)
+            cur = db.activity_current(gid, uid)
+            imgmap = db.activity_image_map(gid, uid)
+            events = [
+                (r["activity"], r["at"])
+                for r in db.activity_events_for(gid, uid, since=since)
+            ]
+            totals = presence.summarize_activities(events, since, now)
+            top = [
+                {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
+                for nm, secs in list(totals.items())[:6]
+            ]
             current_game = None
-            top: list[dict] = []
-            if is_tracked:
-                cur = db.activity_current(gid, uid)
-                imgmap = db.activity_image_map(gid, uid)
-                events = [
-                    (r["activity"], r["at"])
-                    for r in db.activity_events_for(gid, uid, since=since)
-                ]
-                totals = presence.summarize_activities(events, since, now)
-                top = [
-                    {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
-                    for nm, secs in list(totals.items())[:6]
-                ]
-                if cur and cur["activity"]:
-                    current_game = {
-                        "name": cur["activity"],
-                        "image": cur["image_url"] or imgmap.get(cur["activity"]),
-                        "since": cur["at"],
-                    }
-            msg_count, last_message_at = msg_meta.get(uid, (0, None))
-            recent_messages = [
-                {
-                    "content": r["content"],
-                    "channel": r["channel_name"],
-                    "at": r["at"],
+            if cur and cur["activity"]:
+                current_game = {
+                    "name": cur["activity"],
+                    "image": cur["image_url"] or imgmap.get(cur["activity"]),
+                    "since": cur["at"],
                 }
-                for r in db.message_log_recent(gid, uid, since=since, limit=30)
-            ] if msg_count else []
             users.append({
                 "user_id": str(uid),
                 "display_name": (
                     member["display_name"] if member else str(uid)
                 ),
                 "avatar": member["avatar"] if member else None,
-                "tracked": is_tracked,
                 "status": pres["status"] if pres else None,
                 "status_at": pres["at"] if pres else None,
                 "current_game": current_game,
                 "top_games": top,
-                "message_count": msg_count,
-                "last_message_at": last_message_at,
-                "recent_messages": recent_messages,
             })
         return web.json_response({"users": users, "window_days": days})
+
+    # ---- JSON API: message history (Discord-style "Messages" tab) --------
+
+    async def api_messages_channels(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        channels = [
+            {
+                "channel_id": str(r["channel_id"]) if r["channel_id"] else "",
+                "channel_name": r["channel_name"],
+                "count": int(r["count"]),
+                "last_at": r["last_at"],
+            }
+            for r in db.message_channels(gid)
+        ]
+        blacklist = [
+            {
+                "user_id": str(r["user_id"]),
+                "display_name": (
+                    (m["display_name"]
+                     if (m := db.get_member(gid, int(r["user_id"]))) else None)
+                    or str(r["user_id"])
+                ),
+                "reason": r["reason"],
+                "added_by": r["added_by"],
+                "added_at": r["added_at"],
+            }
+            for r in db.message_blacklist_list(gid)
+        ]
+        return web.json_response({"channels": channels, "blacklist": blacklist})
+
+    async def api_messages_log(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        try:
+            cid = int(request.query["channel"])
+        except (KeyError, ValueError):
+            raise web.HTTPBadRequest(text="missing or invalid ?channel")
+        limit = _clamp_int(request.query.get("limit"), 300, 1, 1000)
+        rows = db.message_channel_log(gid, cid, limit=limit)
+        messages = [
+            {
+                "user_id": str(r["user_id"]),
+                "display_name": r["display_name"] or str(r["user_id"]),
+                "avatar": r["avatar"],
+                "content": r["content"],
+                "at": r["at"],
+            }
+            for r in rows
+        ]
+        return web.json_response({"messages": messages})
+
+    async def api_blacklist_add(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user_id"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user_id required")
+        reason = str(body.get("reason", "")).strip() or None
+        actor = _actor(request)
+        db.message_blacklist_add(gid, uid, reason, actor)
+        member = db.get_member(gid, uid)
+        db.add_audit(
+            gid, "member", "message_blacklist_add", actor_name=actor,
+            subject_id=uid,
+            subject_name=member["display_name"] if member else None,
+            detail=reason or "no reason given",
+        )
+        # Announce publicly (ping + reason) when wired to a live bot.
+        announced, announce_error = False, None
+        if announce_blacklist is not None:
+            result = await announce_blacklist(gid, uid, reason, actor)
+            announced = bool(result.get("ok"))
+            announce_error = result.get("error")
+        return web.json_response(
+            {"ok": True, "announced": announced, "error": announce_error}
+        )
+
+    async def api_blacklist_remove(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user_id"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user_id required")
+        actor = _actor(request)
+        removed = db.message_blacklist_remove(gid, uid)
+        if removed:
+            member = db.get_member(gid, uid)
+            db.add_audit(
+                gid, "member", "message_blacklist_remove", actor_name=actor,
+                subject_id=uid,
+                subject_name=member["display_name"] if member else None,
+            )
+        return web.json_response({"ok": removed})
 
     # ---- JSON API: edits (audited) --------------------------------------
 
@@ -727,6 +815,10 @@ def build_app(
         web.get("/api/equipment", api_equipment),
         web.get("/api/leaderboard", api_leaderboard),
         web.get("/api/activity", api_activity),
+        web.get("/api/messages/channels", api_messages_channels),
+        web.get("/api/messages/log", api_messages_log),
+        web.post("/api/blacklist/add", api_blacklist_add),
+        web.post("/api/blacklist/remove", api_blacklist_remove),
         web.post("/api/lifts/delete", api_lift_delete),
         web.post("/api/lifts/edit", api_lift_edit),
         web.post("/api/calories/delete", api_calorie_delete),
@@ -1070,7 +1162,7 @@ padding:1.1rem;display:flex;flex-direction:column;gap:.9rem;position:relative;ov
 .act-av .dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
 border-radius:50%;border:3px solid var(--panel)}
 .st-online{background:#3ba55d}.st-idle{background:#faa61a}.st-dnd{background:#ed4245}
-.st-offline{background:#747f8d}.st-untracked{background:#30363d;box-shadow:inset 0 0 0 2px #565f6b}
+.st-offline{background:#747f8d}
 .act-name{font-weight:600}
 .act-sub{font-size:.78rem;color:var(--muted);text-transform:capitalize}
 .now{display:flex;align-items:center;gap:.7rem;background:#ffffff06;
@@ -1089,19 +1181,43 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
 .tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
-/* message feed — grouped, Discord-style */
-.msg-feed{display:flex;flex-direction:column;gap:.7rem;max-height:240px;
-overflow-y:auto;background:#ffffff06;border:1px solid var(--line);
-border-radius:12px;padding:.6rem .7rem}
-.msg-grp{display:flex;flex-direction:column}
-.msg-grp-head{display:flex;align-items:baseline;gap:.45rem;margin-bottom:.12rem}
-.msg-grp-head .msg-ch{font-weight:600;font-size:.8rem}
-.msg-ch{color:#7aa2f7}
-.msg-time{font-size:.68rem;color:var(--muted);font-variant-numeric:tabular-nums}
-.msg-line{font-size:.86rem;line-height:1.35;white-space:pre-wrap;word-break:break-word;
-padding:.05rem .25rem;margin:0 -.25rem;border-radius:4px}
-.msg-line:hover{background:#ffffff0c}
 .offline-card{opacity:.6}
+/* messages — Discord-style channel browser */
+.dc{display:flex;height:calc(100vh - 200px);min-height:420px;border:1px solid var(--line);
+border-radius:14px;overflow:hidden;background:var(--panel)}
+.dc-side{width:240px;flex:none;background:#0d1117;border-right:1px solid var(--line);
+display:flex;flex-direction:column}
+.dc-side-h{display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+padding:.6rem .7rem;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em;
+color:var(--muted);border-bottom:1px solid var(--line)}
+.dc-chans{flex:1;overflow-y:auto;padding:.4rem}
+.dc-chan{display:flex;align-items:center;gap:.4rem;width:100%;text-align:left;
+background:transparent;border:0;color:var(--muted);border-radius:7px;
+padding:.4rem .5rem;cursor:pointer;font-size:.9rem}
+.dc-chan:hover{background:#ffffff0a;color:#e6edf3}
+.dc-chan.active{background:#ffffff14;color:#fff}
+.dc-hash{color:#6b7280;font-weight:700}
+.dc-cn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-cc{font-size:.72rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.dc-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.dc-main-h{padding:.7rem .9rem;border-bottom:1px solid var(--line);font-weight:600;
+display:flex;align-items:center;gap:.25rem}
+.dc-chat{flex:1;overflow-y:auto;padding:1rem .9rem;display:flex;flex-direction:column;gap:1.1rem}
+.dc-grp{display:flex;gap:.7rem;align-items:flex-start}
+.dc-grp .av{flex:none;border-radius:50%}
+.dc-gb{min-width:0;flex:1}
+.dc-gh{display:flex;align-items:baseline;gap:.5rem;margin-bottom:.1rem}
+.dc-au{font-weight:600;font-size:.92rem;color:#fff}
+.dc-ts{font-size:.7rem;color:var(--muted)}
+.dc-msg{font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;
+padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
+.dc-msg:hover{background:#ffffff08}
+.btn.sm{padding:.25rem .55rem;font-size:.8rem}
+.bl-list{display:flex;flex-direction:column;gap:.5rem;max-height:240px;overflow-y:auto;margin-bottom:.8rem}
+.bl-row{display:flex;align-items:center;justify-content:space-between;gap:.7rem;
+background:#ffffff06;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem}
+.bl-form{display:flex;gap:.5rem;flex-wrap:wrap}
+.bl-form .search{flex:1;min-width:120px}
 </style></head><body>
 <header>
   <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
@@ -1115,7 +1231,7 @@ padding:.05rem .25rem;margin:0 -.25rem;border-radius:4px}
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["roles","🛡️"],
+const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["messages","💬"],["roles","🛡️"],
   ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
@@ -1124,6 +1240,7 @@ const ACTION_LABEL={
   join:"📥 joined",leave:"📤 left",nick_change:"🏷️ nickname",username_change:"🏷️ username",
   kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",invite_create:"✉️ invite sent",
   timeout_remove:"⏳ timeout removed",
+  message_blacklist_add:"🚫 msg blacklisted",message_blacklist_remove:"♻️ msg unblacklisted",
   lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
   calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",
   protein_add:"🥩 protein logged",protein_undo:"↩️ protein undone",protein_delete:"🗑️ protein deleted",
@@ -1219,6 +1336,7 @@ async function render(){
     if(tab==="overview")return renderOverview(v);
     if(tab==="members")return renderMembers(v);
     if(tab==="activity")return renderActivity(v);
+    if(tab==="messages")return renderMessages(v);
     if(tab==="roles")return renderRoles(v);
     if(tab==="leaderboard")return renderLeaderboard(v);
     if(tab==="audit")return renderAudit(v);
@@ -1537,32 +1655,12 @@ function gameTile(name,url,size,cls){
     {className:'${cls} game-tile',style:'${px};background:${idColor(name)}',textContent:'${esc((name||'?')[0]||'?').toUpperCase()}'}))">`;
   return `<span class="${cls} game-tile" style="${px};background:${idColor(name)}">${esc((name||'?')[0]||'?').toUpperCase()}</span>`;}
 
-// Group a user's recent messages (newest-first from the API) into Discord-like
-// blocks: messages in the same channel within a few minutes share one header
-// (#channel · time), then stack as bare lines. Rendered oldest→newest so it
-// reads top-to-bottom like a chat log.
-function renderMsgFeed(msgs){
-  if(!msgs||!msgs.length)
-    return '<div class="faint" style="font-size:.84rem">No messages in this window.</div>';
-  const chron=msgs.slice().reverse();
-  const GAP=7*60*1000;  // start a fresh block after a 7-minute lull
-  const groups=[];
-  for(const m of chron){
-    const t=Date.parse(m.at), g=groups[groups.length-1];
-    if(g&&g.channel===m.channel&&(t-g.lastT)<=GAP){g.lines.push(m.content);g.lastT=t;}
-    else groups.push({channel:m.channel,at:m.at,lastT:t,lines:[m.content]});
-  }
-  return `<div class="msg-feed">${groups.map(g=>`<div class="msg-grp">
-    <div class="msg-grp-head">${g.channel?`<span class="msg-ch">#${esc(g.channel)}</span>`:""}<span class="msg-time">${fmtTs(g.at)}</span></div>
-    ${g.lines.map(l=>`<div class="msg-line">${esc(l)}</div>`).join("")}</div>`).join("")}</div>`;
-}
-
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
   const users=d.users||[];
-  if(!users.length){v.innerHTML=`<div class="empty">No activity yet.<br>
-    <span class="faint">Messages are logged for every member once they chat. Presence &amp; games also
-    need <code>ENABLE_PRESENCE_TRACKING=true</code> and <code>/track start</code>.</span></div>`;return;}
+  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
+    <span class="faint">Presence/activity tracking is owner-controlled via <code>/track start</code>
+    and needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
   // online first, then by current game, then name.
   users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
     || (b.current_game?1:0)-(a.current_game?1:0)
@@ -1572,43 +1670,112 @@ async function renderActivity(v){
       <span class="faint">· ${online}/${users.length} online · last ${d.window_days}d</span></h2>
       <span class="sp" style="flex:1"></span>${searchBar("Search players…")}</div>
     <div class="act-grid">${users.map(actCard).join("")}</div>`;
-  // Land each chat log at the newest message, like opening a Discord channel.
-  v.querySelectorAll(".msg-feed").forEach(f=>{f.scrollTop=f.scrollHeight;});
 }
 function actCard(u){
-  const tracked=!!u.tracked;
-  const offline=tracked&&!["online","idle","dnd"].includes(u.status);
+  const offline=!["online","idle","dnd"].includes(u.status);
   const maxSec=Math.max(1,...(u.top_games||[]).map(g=>g.seconds));
-  let presence;
-  if(tracked){
-    const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
-        <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
-        <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
-      : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
-        <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
-    const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
-        ${gameTile(g.name,g.image,30,"gi")}
-        <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
-        <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
-      : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
-    presence=`${now}<div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>`;
-  } else {
-    presence=`<div class="now"><div class="meta"><div class="g faint">Presence &amp; games not tracked</div>
-      <div class="t">enable with <code>/track start</code></div></div></div>`;
-  }
-  const msgs=renderMsgFeed(u.recent_messages);
-  const msgHead=`💬 ${u.message_count||0} msg${(u.message_count||0)===1?"":"s"}${
-    u.last_message_at?" · last "+fmtTs(u.last_message_at):""}`;
+  const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
+      <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
+      <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
+    : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
+      <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
+  const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
+      ${gameTile(g.name,g.image,30,"gi")}
+      <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
+      <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
+    : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
   return `<div class="act-card${offline?' offline-card':''}">
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
-        <span class="dot ${tracked?statusClass(u.status):'st-untracked'}"></span></span>
+        <span class="dot ${statusClass(u.status)}"></span></span>
       <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
-      <div class="act-sub">${tracked?statusLabel(u.status):'not tracked'}</div></div>
+      <div class="act-sub">${statusLabel(u.status)}</div></div>
     </div>
-    ${presence}
-    <div><div class="act-sub" style="margin-bottom:.4rem">${msgHead}</div>${msgs}</div>
+    ${now}
+    <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
   </div>`;
+}
+
+// ---- messages (Discord-style channel browser) ----------------------------
+let msgChannel=null, BLACKLIST=[];
+function msgGroups(msgs){
+  // msgs are chronological (oldest→newest); group consecutive messages from the
+  // same author within a few minutes, like Discord collapses a sender's run.
+  const GAP=7*60*1000, groups=[];
+  for(const m of msgs){
+    const t=Date.parse(m.at), g=groups[groups.length-1];
+    if(g&&g.user_id===m.user_id&&(t-g.lastT)<=GAP){g.lines.push(m.content);g.lastT=t;}
+    else groups.push({user_id:m.user_id,name:m.display_name,avatar:m.avatar,at:m.at,lastT:t,lines:[m.content]});
+  }
+  return groups;
+}
+function renderChat(msgs){
+  if(!msgs||!msgs.length)return '<div class="faint" style="padding:1.2rem">No messages logged in this channel.</div>';
+  return msgGroups(msgs).map(g=>`<div class="dc-grp">
+    ${avatar(g.user_id,g.name,g.avatar,40)}
+    <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a><span class="dc-ts">${fmtTs(g.at)}</span></div>
+    ${g.lines.map(l=>`<div class="dc-msg">${esc(l)}</div>`).join("")}</div></div>`).join("");
+}
+async function openChan(cid){
+  msgChannel=cid;let name="";
+  document.querySelectorAll(".dc-chan").forEach(b=>{const on=b.dataset.cid===cid;
+    b.classList.toggle("active",on);if(on)name=b.dataset.cn||"";});
+  const head=document.getElementById("dcHead");if(head)head.innerHTML=`<span class="dc-hash">#</span>${esc(name)}`;
+  const chat=document.getElementById("dcChat");if(chat)chat.innerHTML=spinner();
+  const d=await api(`/api/messages/log?guild=${guild}&channel=${cid}`);
+  if(!d||!chat)return;
+  chat.innerHTML=renderChat(d.messages);chat.scrollTop=chat.scrollHeight;
+}
+async function renderMessages(v){
+  const d=await api(`/api/messages/channels?guild=${guild}`);if(!d)return;
+  const chans=d.channels||[];BLACKLIST=d.blacklist||[];
+  if(!chans.length){v.innerHTML=`<div class="empty">No messages logged yet.<br>
+    <span class="faint">Messages are logged for every member once they chat
+    (<code>ENABLE_MESSAGE_LOGGING</code>, on by default); the bot also back-scans recent history on startup.</span>
+    <div style="margin-top:1rem">${blButton()}</div></div>`;return;}
+  const sel=chans.find(c=>c.channel_id===msgChannel)||chans[0];msgChannel=sel.channel_id;
+  v.innerHTML=`<div class="dc">
+    <div class="dc-side">
+      <div class="dc-side-h"><span>Channels</span>${blButton()}</div>
+      <div class="dc-chans">${chans.map(c=>`<button class="dc-chan${c.channel_id===msgChannel?' active':''}"
+        data-cid="${c.channel_id}" data-cn="${esc(c.channel_name||'')}" onclick="openChan('${c.channel_id}')">
+        <span class="dc-hash">#</span><span class="dc-cn">${esc(c.channel_name||c.channel_id)}</span>
+        <span class="dc-cc">${c.count}</span></button>`).join("")}</div>
+    </div>
+    <div class="dc-main"><div class="dc-main-h" id="dcHead"></div>
+      <div class="dc-chat" id="dcChat">${spinner()}</div></div>
+  </div>`;
+  await openChan(sel.channel_id);
+}
+function blButton(){return `<button class="btn sm" onclick="openBlacklist()">🚫 Blacklist${BLACKLIST.length?` (${BLACKLIST.length})`:""}</button>`;}
+function openBlacklist(){
+  const dlg=document.getElementById("editDlg");
+  dlg.innerHTML=`<h3 style="margin:.2rem 0 .6rem">🚫 Message-log blacklist</h3>
+    <p class="faint" style="font-size:.82rem;margin:.2rem 0 .9rem">Blacklisted members aren't logged and their stored
+      messages are purged. The bot posts a public message pinging them with the reason.</p>
+    <div class="bl-list">${BLACKLIST.length?BLACKLIST.map(b=>`<div class="bl-row">
+        <div><b>${esc(b.display_name)}</b> <span class="faint">${esc(b.user_id)}</span>
+          <div class="faint" style="font-size:.8rem">${b.reason?esc(b.reason):"<i>no reason given</i>"}</div></div>
+        <button class="btn sm" onclick="removeBlacklist('${b.user_id}')">Remove</button></div>`).join(""):'<div class="faint">Nobody blacklisted.</div>'}</div>
+    <div class="bl-form">
+      <input id="bl_uid" class="search" placeholder="User ID" inputmode="numeric">
+      <input id="bl_reason" class="search" placeholder="Reason (shown publicly)">
+      <button class="btn primary" onclick="addBlacklist()">Blacklist</button></div>
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Close</button></div>`;
+  dlg.showModal();
+}
+async function addBlacklist(){
+  const uid=document.getElementById("bl_uid").value.trim();
+  const reason=document.getElementById("bl_reason").value.trim();
+  if(!uid){toast("User ID required");return;}
+  const r=await post("/api/blacklist/add",{guild,user_id:uid,reason});
+  if(r&&r.ok){toast(r.announced?"Blacklisted ✓ (announced in chat)":"Blacklisted ✓");
+    document.getElementById("editDlg").close();render();}
+  else toast("Failed");
+}
+async function removeBlacklist(uid){
+  const r=await post("/api/blacklist/remove",{guild,user_id:uid});
+  toast(r&&r.ok?"Removed ✓":"Failed");document.getElementById("editDlg").close();render();
 }
 
 boot();
