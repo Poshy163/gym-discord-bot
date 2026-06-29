@@ -20,6 +20,7 @@ from app.bot import (  # noqa: E402
     _get_main_activity,
     _parse_recap_json,
     _local_log_dates,
+    _looks_like_log_attempt,
     _parse_bodyweight_message,
     _rejected_lifts_note,
     _render_revo_calendar,
@@ -32,6 +33,20 @@ from app.bot import (  # noqa: E402
     db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
+
+
+def test_looks_like_log_attempt_detects_shortcuts():
+    # Each freeform logging shortcut should be recognised as a log attempt.
+    assert _looks_like_log_attempt("bodyweight 80kg") is True
+    assert _looks_like_log_attempt("650kcal") is True
+    assert _looks_like_log_attempt("40g protein") is True
+    assert _looks_like_log_attempt("bench 100kg") is True
+
+
+def test_looks_like_log_attempt_ignores_casual_text():
+    assert _looks_like_log_attempt("") is False
+    assert _looks_like_log_attempt("hey how's it going") is False
+    assert _looks_like_log_attempt("gym was good today") is False
 
 
 def test_safe_label_escapes_mentions():

@@ -1044,6 +1044,15 @@ def _new_prs_for_lifts(
     return prs
 
 
+def _msg_guild_id(message: discord.Message) -> int:
+    """The server a chat message logs to: its own guild, or — for a DM — the
+    sender's effective server (their ``/server`` default, or the single server
+    we share). 0 when neither resolves."""
+    if message.guild is not None:
+        return message.guild.id
+    return _effective_guild_for_dm(message.author.id) or 0
+
+
 async def _store_lifts(
     message: discord.Message, lifts: list[Lift], target_user: object | None = None,
     *, logged_at: datetime | None = None,
@@ -1051,7 +1060,7 @@ async def _store_lifts(
     target = target_user or message.author
     when = logged_at or message.created_at.astimezone(timezone.utc)
     return db.add_lifts(
-        guild_id=message.guild.id if message.guild else 0,
+        guild_id=_msg_guild_id(message),
         user_id=int(getattr(target, "id")),
         username=_display_name(target),
         lifts=lifts,
@@ -1070,7 +1079,7 @@ async def _handle_bodyweight_message(
     capped by ``MAX_WEIGHT_KG`` so a fat-fingered "1500" can't poison
     every leaderboard line.
     """
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     if weight_kg <= 0:
         try:
@@ -1132,7 +1141,7 @@ async def _reply_calorie_logged(
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
     label_part = f" — {label}" if label else ""
@@ -1191,7 +1200,7 @@ async def _handle_calorie_message(
     first, and the per-entry typo cap applies. Replies with a ✅ reaction and
     today's running total; `/calories undo` reverses it.
     """
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     goal = db.calorie_goal_get(guild_id, target_id)
     if goal is None:
@@ -1245,7 +1254,7 @@ def _match_calorie_food(
     with a serving count), return ``(food_row, servings)``. Requires the user
     to be calorie-tracking; returns None otherwise so the message falls
     through to the lift parser."""
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     if db.calorie_goal_get(guild_id, target_id) is None:
         return None
@@ -1268,7 +1277,7 @@ async def _handle_calorie_food_message(
     Always logs the food's calories. If the food was saved with a protein value
     and the user is protein-tracking, the protein is logged too and a combined
     reply (🥗) is posted so a ❌ removes both entries at once."""
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     kcal = float(food_row["kcal"]) * servings
     if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
@@ -1369,7 +1378,7 @@ async def _handle_protein_message(
     message: discord.Message, target: object, grams: float,
 ) -> None:
     """Persist a chat-message protein entry (`40p`, `40g protein`)."""
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     goal = db.protein_goal_get(guild_id, target_id)
     if goal is None:
@@ -1419,7 +1428,7 @@ async def _reply_protein_logged(
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     total, _n = db.protein_total_between(guild_id, target_id, *_today_window())
     suffix = _target_suffix(message.author, target)
@@ -1445,7 +1454,7 @@ async def _handle_combined_nutrition(
     """Log a message that carries BOTH a calorie and a protein amount
     (`500c and 40p`) — stores each entry the user is tracking and posts one
     combined reply."""
-    guild_id = message.guild.id if message.guild else 0
+    guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     cal_goal = db.calorie_goal_get(guild_id, target_id)
     pro_goal = db.protein_goal_get(guild_id, target_id)
@@ -2433,6 +2442,24 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
         )
 
 
+def _looks_like_log_attempt(text: str) -> bool:
+    """True if a DM message looks like one of the freeform logging shortcuts.
+    Used to decide whether to nudge a user about ``/server`` when we can't pin
+    their DM to a guild, instead of replying to every casual DM."""
+    if not text:
+        return False
+    if _parse_bodyweight_message(text) is not None:
+        return True
+    if calories.parse_chat_message(text) is not None:
+        return True
+    if protein_mod.parse_protein_chat_message(text) is not None:
+        return True
+    if nutrition.parse_combined(text) is not None:
+        return True
+    lifts, _ = _split_reasonable_lifts(parse_message(text))
+    return bool(lifts and _should_auto_store(lifts))
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # Message logging for the web dashboard. Logs every author (including bots,
@@ -2450,30 +2477,60 @@ async def on_message(message: discord.Message) -> None:
             )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
-    if message.author.bot or not message.guild:
+    if message.author.bot:
+        return
+    in_dm = message.guild is None
+    # Resolve which server this message logs to: its own guild, or — for a DM —
+    # the sender's effective server (their /server default, or the one server we
+    # share). This is what makes the freeform shortcuts work in DMs too.
+    gid = message.guild.id if message.guild else _effective_guild_for_dm(
+        message.author.id
+    )
+    if gid is None:
+        # A DM we can't pin to a server. Nudge only when it looks like a real
+        # logging attempt, so casual DMs don't get a wall of text.
+        if in_dm and _looks_like_log_attempt(message.content):
+            try:
+                await message.reply(
+                    "I couldn't tell which server to log that in — we either "
+                    "share no server, or you're in several. Set one with "
+                    "`/server`, then try again.",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
         return
     # Blacklisted members can't add anything to the bot — their message is still
     # logged above, but we ignore it for all data entry (lifts, calories,
     # protein, bodyweight, saved foods) and prefix commands.
     try:
-        if db.message_is_blacklisted(message.guild.id, message.author.id):
+        if db.message_is_blacklisted(gid, message.author.id):
             return
     except Exception:
         LOG.exception("Blacklist check failed in on_message")
-    if GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
+    # The gym-channel gate only applies in servers; DMs always go through.
+    if not in_dm and GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
         await bot.process_commands(message)
         return
 
-    guild_aliases = _custom_alias_map(message.guild.id)
-    target, content = _message_lift_target(message)
-    # Nickname-prefix targeting: "Sean bench 30kg" resolves to the user
-    # nicknamed Sean, exactly like a leading @mention would.
-    if target == message.author and message.guild:
-        nick_target, nick_content = await _resolve_nickname_target(
-            message.content, message.guild
-        )
-        if nick_target is not None:
-            target, content = nick_target, nick_content
+    guild_aliases = _custom_alias_map(gid)
+    if in_dm:
+        # DMs always log for the sender themselves — no @mention / nickname
+        # re-targeting (there's nobody else in a DM). Prefer their guild member
+        # object so we store their server nickname rather than their handle.
+        guild_obj = bot.get_guild(gid)
+        member = guild_obj.get_member(message.author.id) if guild_obj else None
+        target, content = (member or message.author), message.content
+    else:
+        target, content = _message_lift_target(message)
+        # Nickname-prefix targeting: "Sean bench 30kg" resolves to the user
+        # nicknamed Sean, exactly like a leading @mention would.
+        if target == message.author:
+            nick_target, nick_content = await _resolve_nickname_target(
+                message.content, message.guild
+            )
+            if nick_target is not None:
+                target, content = nick_target, nick_content
 
     # Quick bodyweight update path: `bodyweight 100kg`, `body weight: 95.5`,
     # `bw 80`, or `@dos bodyweight 100kg` (leading mention re-targets just
@@ -2535,7 +2592,7 @@ async def on_message(message: discord.Message) -> None:
     should_store = _should_auto_store(lifts)
     if lifts and should_store:
         # Detect PRs BEFORE inserting, so we can compare against the prior state.
-        guild_id = message.guild.id if message.guild else 0
+        guild_id = _msg_guild_id(message)
         target_user_id = int(getattr(target, "id"))
         prs = _new_prs_for_lifts(guild_id, target_user_id, lifts)
 
