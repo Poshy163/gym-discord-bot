@@ -173,6 +173,23 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_events_user
     ON activity_events (guild_id, user_id, at);
 
+-- Voice-channel tracking. Append-only log of voice transitions: ``event`` is
+-- one of 'join', 'leave', 'move'. ``channel_id`` / ``channel_name`` is the
+-- channel involved (the destination for join/move, the channel left for leave),
+-- snapshotted at write time so the dashboard needn't resolve channels.
+CREATE TABLE IF NOT EXISTS voice_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    event        TEXT    NOT NULL,
+    channel_id   INTEGER,
+    channel_name TEXT,
+    at           TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_events_guild
+    ON voice_events (guild_id, at);
+
 -- Message logging. When presence tracking is on, every message a tracked
 -- user sends is appended here with full content so the web dashboard can show
 -- a per-member message feed alongside presence/activity. ``channel_name`` is
@@ -2738,6 +2755,48 @@ class Database:
                 params,
             ).fetchall())
             return rows
+
+    # ------------------------------------------------------------------
+    # Voice-channel tracking
+    # ------------------------------------------------------------------
+
+    def voice_log_event(
+        self, guild_id: int, user_id: int, event: str,
+        channel_id: int | None = None, channel_name: str | None = None,
+        at: datetime | None = None,
+    ) -> None:
+        """Append a voice transition ('join' / 'leave' / 'move')."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO voice_events "
+                "(guild_id, user_id, event, channel_id, channel_name, at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, event, channel_id, channel_name,
+                 _normalize_iso(at)),
+            )
+
+    def voice_events_recent(
+        self, guild_id: int, since: datetime | None = None, limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        """Recent voice transitions (newest first), capped at ``limit``, each
+        carrying the member's mirrored ``display_name`` and ``avatar``."""
+        with self._conn() as c:
+            params: list = [guild_id]
+            where = "ve.guild_id = ?"
+            if since is not None:
+                where += " AND ve.at >= ?"
+                params.append(_normalize_iso(since))
+            params.append(int(limit))
+            return c.execute(
+                "SELECT ve.user_id, ve.event, ve.channel_id, ve.channel_name, "
+                "ve.at, mem.display_name AS display_name, mem.avatar AS avatar "
+                "FROM voice_events ve "
+                "LEFT JOIN members mem "
+                "  ON mem.guild_id = ve.guild_id AND mem.user_id = ve.user_id "
+                f"WHERE {where} "
+                "ORDER BY ve.at DESC, ve.id DESC LIMIT ?",
+                params,
+            ).fetchall()
 
     # ------------------------------------------------------------------
     # Message logging (web dashboard activity feed)

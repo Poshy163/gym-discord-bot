@@ -268,6 +268,14 @@ try:
 except ValueError:
     MESSAGE_LOG_BACKFILL_DAYS = 30
 
+# Voice-channel tracking (app/webui.py "Voice" tab). Records join / leave / move
+# transitions and powers the live "who's in VC" view. Uses only the non-privileged
+# voice_states intent (already enabled below). Default ON; set to a false-y value
+# to disable.
+ENABLE_VOICE_TRACKING = os.getenv(
+    "ENABLE_VOICE_TRACKING", "true"
+).lower() in ("1", "true", "yes", "y", "on")
+
 # Web dashboard (app/webui.py). Enabled only when WEBUI_PASSWORD is set — the
 # dashboard exposes member/role/nutrition data so it must never run without a
 # login secret. It needs the Server Members privileged intent to mirror the
@@ -8736,6 +8744,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         member_moderation=_webui_member_moderation,
         remove_timeout=_webui_remove_timeout,
         announce_blacklist=_webui_announce_blacklist,
+        voice_snapshot=_webui_voice_snapshot,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -8883,6 +8892,35 @@ async def _webui_list_channels(guild_id: int) -> list[dict]:  # pragma: no cover
         if perms is not None and not perms.create_instant_invite:
             continue
         out.append({"id": str(ch.id), "name": ch.name})
+    return out
+
+
+async def _webui_voice_snapshot(guild_id: int) -> list[dict]:  # pragma: no cover
+    """Live "who's in VC right now" for a guild: each voice channel that has
+    members, with the occupants. Reads the live guild (voice state isn't
+    mirrored into SQLite), so it's always accurate even across bot restarts.
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return []
+    out: list[dict] = []
+    for ch in guild.voice_channels:
+        members = [
+            {
+                "user_id": str(m.id),
+                "display_name": m.display_name,
+                "self_mute": bool(m.voice and m.voice.self_mute),
+                "self_deaf": bool(m.voice and m.voice.self_deaf),
+                "streaming": bool(m.voice and m.voice.self_stream),
+            }
+            for m in ch.members
+        ]
+        if members:
+            out.append({
+                "channel_id": str(ch.id),
+                "channel_name": ch.name,
+                "members": members,
+            })
     return out
 
 
@@ -9896,6 +9934,42 @@ async def on_presence_update(
             )
     except Exception:
         LOG.exception("Failed to record presence update")
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:  # pragma: no cover - discord runtime path
+    """Log voice-channel join / leave / move transitions for all members.
+
+    Only channel changes are recorded — mute/deafen/stream toggles (which also
+    fire this event with the same channel) are ignored.
+    """
+    if not ENABLE_VOICE_TRACKING:
+        return
+    try:
+        if member.guild is None:
+            return
+        bc, ac = before.channel, after.channel
+        bid = bc.id if bc else None
+        aid = ac.id if ac else None
+        if bid == aid:
+            return  # mute/deafen/etc. — no channel change
+        if bc is None:
+            event, ch = "join", ac
+        elif ac is None:
+            event, ch = "leave", bc
+        else:
+            event, ch = "move", ac
+        db.voice_log_event(
+            member.guild.id, member.id, event,
+            channel_id=ch.id if ch else None,
+            channel_name=ch.name if ch else None,
+        )
+    except Exception:
+        LOG.exception("Failed to record voice state update")
 
 
 track_group = app_commands.Group(

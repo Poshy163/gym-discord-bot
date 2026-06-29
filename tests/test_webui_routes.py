@@ -164,6 +164,62 @@ def test_blacklist_add_keeps_messages_and_announces(tmp_path):
     _run(go())
 
 
+def test_voice_returns_live_occupancy_and_logged_events(tmp_path):
+    """The Voice tab serves live occupancy (from the injected snapshot) plus the
+    logged join/leave history (newest first, with member info)."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.voice_log_event(1, 100, "join", channel_id=5, channel_name="General",
+                           at=base)
+        db.voice_log_event(1, 100, "leave", channel_id=5, channel_name="General",
+                           at=base + timedelta(minutes=3))
+
+        async def fake_snapshot(gid):
+            return [{"channel_id": "5", "channel_name": "General",
+                     "members": [{"user_id": "100", "display_name": "Alice"}]}]
+
+        app = build_app(db=db, password="secret", voice_snapshot=fake_snapshot)
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/voice?guild=1")).json()
+            assert d["occupancy"][0]["channel_name"] == "General"
+            assert d["occupancy"][0]["members"][0]["display_name"] == "Alice"
+            # Newest first; member name joined from the mirror.
+            assert [e["event"] for e in d["events"]] == ["leave", "join"]
+            assert d["events"][0]["display_name"] == "Alice"
+            assert d["events"][0]["channel"] == "General"
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_voice_without_snapshot_still_serves_events(tmp_path):
+    """No injected snapshot → empty occupancy, but the logged history still loads."""
+    async def go():
+        from datetime import datetime, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        db.voice_log_event(1, 100, "join", channel_id=5, channel_name="General",
+                           at=datetime(2026, 6, 1, tzinfo=timezone.utc))
+        app = build_app(db=db, password="secret")  # no voice_snapshot
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/voice?guild=1")).json()
+            assert d["occupancy"] == []
+            assert [e["event"] for e in d["events"]] == ["join"]
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_invite_503_when_not_wired(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

@@ -279,3 +279,28 @@ def test_message_blacklist_add_keeps_messages(db):
     assert db.message_blacklist_remove(1, 200) is True
     assert db.message_blacklist_remove(1, 200) is False
     assert db.message_blacklisted_ids(1) == set()
+
+
+def test_voice_events_logged_newest_first_with_member(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.upsert_member(1, 100, "alice", "Alice", avatar="http://a.png")
+    db.voice_log_event(1, 100, "join", channel_id=5, channel_name="General",
+                       at=base)
+    db.voice_log_event(1, 100, "move", channel_id=6, channel_name="Gym",
+                       at=base + timedelta(minutes=2))
+    db.voice_log_event(1, 100, "leave", channel_id=6, channel_name="Gym",
+                       at=base + timedelta(minutes=5))
+    # Different guild is independent.
+    db.voice_log_event(2, 200, "join", channel_id=9, channel_name="Other",
+                       at=base)
+
+    rows = db.voice_events_recent(1)
+    assert [r["event"] for r in rows] == ["leave", "move", "join"]
+    assert rows[0]["channel_name"] == "Gym"
+    assert rows[0]["display_name"] == "Alice"
+    assert rows[0]["avatar"] == "http://a.png"
+
+    # `limit` and `since` both narrow the result.
+    assert len(db.voice_events_recent(1, limit=1)) == 1
+    recent = db.voice_events_recent(1, since=base + timedelta(minutes=3))
+    assert [r["event"] for r in recent] == ["leave"]

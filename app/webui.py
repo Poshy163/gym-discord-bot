@@ -73,6 +73,8 @@ TimeoutHandler = Callable[[int, int, str], Awaitable[dict]]
 # (guild_id, user_id, reason|None, actor_name) -> result dict — posts a public
 # chat message pinging the blacklisted user with the reason.
 BlacklistAnnouncer = Callable[[int, int, "str | None", str], Awaitable[dict]]
+# (guild_id) -> list of {channel_id, channel_name, members:[…]} currently in VC.
+VoiceSnapshotHandler = Callable[[int], Awaitable[list[dict]]]
 
 
 class _Sessions:
@@ -114,6 +116,7 @@ def build_app(
     member_moderation: ModerationHandler | None = None,
     remove_timeout: TimeoutHandler | None = None,
     announce_blacklist: BlacklistAnnouncer | None = None,
+    voice_snapshot: VoiceSnapshotHandler | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -127,7 +130,9 @@ def build_app(
     controls; when not injected those endpoints return 503.
     ``announce_blacklist`` (optional) posts a public chat message pinging a
     just-blacklisted user with the reason; when not injected blacklisting still
-    works silently (no announcement).
+    works silently (no announcement). ``voice_snapshot`` (optional) returns the
+    live "who's in VC now" occupancy for the Voice tab; when not injected the
+    tab shows only the logged join/leave history.
     """
     sessions = _Sessions()
 
@@ -525,6 +530,23 @@ def build_app(
         ]
         return web.json_response({"messages": messages})
 
+    async def api_voice(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        occupancy = await voice_snapshot(gid) if voice_snapshot else []
+        events = [
+            {
+                "user_id": str(r["user_id"]),
+                "display_name": r["display_name"] or str(r["user_id"]),
+                "avatar": r["avatar"],
+                "event": r["event"],
+                "channel": r["channel_name"],
+                "at": r["at"],
+            }
+            for r in db.voice_events_recent(gid, limit=100)
+        ]
+        return web.json_response({"occupancy": occupancy, "events": events})
+
     async def api_blacklist_add(request: web.Request) -> web.Response:
         _require(request)
         try:
@@ -817,6 +839,7 @@ def build_app(
         web.get("/api/activity", api_activity),
         web.get("/api/messages/channels", api_messages_channels),
         web.get("/api/messages/log", api_messages_log),
+        web.get("/api/voice", api_voice),
         web.post("/api/blacklist/add", api_blacklist_add),
         web.post("/api/blacklist/remove", api_blacklist_remove),
         web.post("/api/lifts/delete", api_lift_delete),
@@ -1222,6 +1245,22 @@ padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
 background:#ffffff06;border:1px solid var(--line);border-radius:9px;padding:.5rem .6rem}
 .bl-form{display:flex;gap:.5rem;flex-wrap:wrap}
 .bl-form .search{flex:1;min-width:120px}
+/* voice tab */
+.vc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:1rem}
+.vc-chan{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.8rem .9rem}
+.vc-chan-h{font-weight:600;margin-bottom:.6rem}
+.vc-members{display:flex;flex-direction:column;gap:.45rem}
+.vc-mem{display:flex;align-items:center;gap:.5rem;font-size:.9rem}
+.vc-mem .av{flex:none}
+.vc-ic{font-size:.8rem}
+.vc-log{display:flex;flex-direction:column;gap:.3rem}
+.vc-ev{display:flex;align-items:center;gap:.6rem;padding:.4rem .6rem;border:1px solid var(--line);
+background:var(--panel);border-radius:9px;font-size:.86rem}
+.vc-ev .av{flex:none}
+.vc-ev-who{font-weight:600;min-width:110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vc-ev-act{flex:1;color:var(--muted)}
+.vc-ch{color:#7aa2f7}
+.vc-ev-ts{font-size:.72rem;color:var(--muted);font-variant-numeric:tabular-nums;flex:none}
 </style></head><body>
 <header>
   <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
@@ -1235,7 +1274,7 @@ background:#ffffff06;border:1px solid var(--line);border-radius:9px;padding:.5re
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["messages","💬"],["roles","🛡️"],
+const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["messages","💬"],["voice","🔊"],["roles","🛡️"],
   ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
@@ -1341,6 +1380,7 @@ async function render(){
     if(tab==="members")return renderMembers(v);
     if(tab==="activity")return renderActivity(v);
     if(tab==="messages")return renderMessages(v);
+    if(tab==="voice")return renderVoice(v);
     if(tab==="roles")return renderRoles(v);
     if(tab==="leaderboard")return renderLeaderboard(v);
     if(tab==="audit")return renderAudit(v);
@@ -1789,6 +1829,36 @@ async function addBlacklist(){
 async function removeBlacklist(uid){
   const r=await post("/api/blacklist/remove",{guild,user_id:uid});
   toast(r&&r.ok?"Removed ✓":"Failed");document.getElementById("editDlg").close();render();
+}
+
+// ---- voice (who's in VC + join/leave log) --------------------------------
+const VC_EV={join:["📥","joined"],leave:["📤","left"],move:["🔀","moved to"]};
+async function renderVoice(v){
+  const d=await api(`/api/voice?guild=${guild}`);if(!d)return;
+  const occ=d.occupancy||[], events=d.events||[];
+  const inVc=occ.reduce((n,c)=>n+(c.members||[]).length,0);
+  const occHtml=occ.length?occ.map(c=>`<div class="vc-chan">
+      <div class="vc-chan-h">🔊 ${esc(c.channel_name)} <span class="faint">· ${(c.members||[]).length}</span></div>
+      <div class="vc-members">${(c.members||[]).map(m=>`<div class="vc-mem">
+        ${avFor(m.user_id,m.display_name,26)}
+        <a class="link" onclick="memberView('${m.user_id}')">${esc(m.display_name)}</a>
+        ${m.streaming?'<span class="vc-ic" title="Streaming">🔴</span>':""}
+        ${m.self_deaf?'<span class="vc-ic" title="Deafened">🔇</span>':(m.self_mute?'<span class="vc-ic" title="Muted">🔈</span>':"")}
+      </div>`).join("")}</div></div>`).join("")
+    : '<div class="faint">Nobody is in a voice channel right now.</div>';
+  const logHtml=events.length?events.map(e=>{const m=VC_EV[e.event]||["•",e.event];
+    return `<div class="vc-ev">${avFor(e.user_id,e.display_name,24)}
+      <span class="vc-ev-who"><a class="link" onclick="memberView('${e.user_id}')">${esc(e.display_name)}</a></span>
+      <span class="vc-ev-act">${m[0]} ${m[1]}${e.channel?` <span class="vc-ch">🔊 ${esc(e.channel)}</span>`:""}</span>
+      <span class="vc-ev-ts">${fmtTs(e.at)}</span></div>`;}).join("")
+    : '<div class="faint">No voice activity logged yet.</div>';
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">🔊 Voice
+      <span class="faint">· ${inVc} in voice now</span></h2>
+      <span class="sp" style="flex:1"></span>
+      <button class="btn" onclick="render()" title="Refresh">↻ Refresh</button></div>
+    <div class="vc-grid">${occHtml}</div>
+    <h3 style="margin:1.4rem 0 .6rem">Recent voice activity</h3>
+    <div class="vc-log">${logHtml}</div>`;
 }
 
 boot();
