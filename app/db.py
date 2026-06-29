@@ -3123,8 +3123,17 @@ class Database:
         self, guild_id: int, user_id: int, username: str,
         daily_target_kcal: float,
     ) -> None:
-        """Create or update a user's daily calorie target (kcal)."""
+        """Create or update a user's daily calorie target (kcal).
+
+        Tracking is **per-user / global**: setting it consolidates to a single
+        row (any copy under another server is cleared first), so the goal applies
+        in every server and in DMs.
+        """
         with self._conn() as c:
+            c.execute(
+                "DELETE FROM calorie_goals WHERE user_id = ? AND guild_id <> ?",
+                (user_id, guild_id),
+            )
             c.execute(
                 """
                 INSERT INTO calorie_goals
@@ -3149,20 +3158,24 @@ class Database:
     def calorie_goal_get(
         self, guild_id: int, user_id: int,
     ) -> sqlite3.Row | None:
+        """The user's calorie goal, resolved **per-user** so it applies in every
+        server + DMs (prefers the current guild's row, else the most recent)."""
         with self._conn() as c:
             return c.execute(
                 "SELECT username, daily_target_kcal, set_at "
-                "FROM calorie_goals WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "FROM calorie_goals WHERE user_id = ? "
+                "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
+                (user_id, guild_id),
             ).fetchone()
 
     def calorie_goal_remove(self, guild_id: int, user_id: int) -> bool:
-        """Stop tracking. Entry history is kept so re-enabling later still
-        has the back data; only the goal row (the opt-in marker) goes."""
+        """Stop tracking everywhere (tracking is global). Entry history is kept
+        so re-enabling later still has the back data; only the goal row (the
+        opt-in marker) goes."""
         with self._conn() as c:
             cur = c.execute(
-                "DELETE FROM calorie_goals WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "DELETE FROM calorie_goals WHERE user_id = ?",
+                (user_id,),
             )
             ok = (cur.rowcount or 0) > 0
             if ok:
@@ -3385,16 +3398,21 @@ class Database:
     def calorie_total_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> tuple[float, int]:
-        """Sum of kcal and entry count in [start_iso, end_iso)."""
+        """Sum of kcal and entry count in [start_iso, end_iso).
+
+        Tracking is global, so this aggregates the user's intake across **every
+        server** (a calorie logged in any server / DM counts toward the same
+        daily total). ``guild_id`` is accepted for signature compatibility but
+        intentionally not filtered on."""
         with self._conn() as c:
             row = c.execute(
                 """
                 SELECT COALESCE(SUM(kcal), 0) AS total, COUNT(*) AS n
                 FROM calorie_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND logged_at >= ? AND logged_at < ?
                 """,
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
 
@@ -3404,8 +3422,15 @@ class Database:
         self, guild_id: int, user_id: int, username: str,
         daily_target_g: float,
     ) -> None:
-        """Create or update a user's daily protein ceiling (grams)."""
+        """Create or update a user's daily protein ceiling (grams).
+
+        Tracking is **per-user / global**: setting it consolidates to a single
+        row, so the goal applies in every server and in DMs."""
         with self._conn() as c:
+            c.execute(
+                "DELETE FROM protein_goals WHERE user_id = ? AND guild_id <> ?",
+                (user_id, guild_id),
+            )
             c.execute(
                 """
                 INSERT INTO protein_goals
@@ -3430,19 +3455,22 @@ class Database:
     def protein_goal_get(
         self, guild_id: int, user_id: int,
     ) -> sqlite3.Row | None:
+        """The user's protein goal, resolved **per-user** so it applies in every
+        server + DMs (prefers the current guild's row, else the most recent)."""
         with self._conn() as c:
             return c.execute(
                 "SELECT username, daily_target_g, set_at "
-                "FROM protein_goals WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "FROM protein_goals WHERE user_id = ? "
+                "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
+                (user_id, guild_id),
             ).fetchone()
 
     def protein_goal_remove(self, guild_id: int, user_id: int) -> bool:
-        """Stop protein tracking; logged history is kept."""
+        """Stop protein tracking everywhere (global); logged history is kept."""
         with self._conn() as c:
             cur = c.execute(
-                "DELETE FROM protein_goals WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "DELETE FROM protein_goals WHERE user_id = ?",
+                (user_id,),
             )
             ok = (cur.rowcount or 0) > 0
             if ok:
@@ -3536,16 +3564,19 @@ class Database:
     def protein_total_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> tuple[float, int]:
-        """Sum of grams and entry count in [start_iso, end_iso)."""
+        """Sum of grams and entry count in [start_iso, end_iso).
+
+        Aggregated across **every server** (tracking is global). ``guild_id`` is
+        accepted for signature compatibility but intentionally not filtered on."""
         with self._conn() as c:
             row = c.execute(
                 """
                 SELECT COALESCE(SUM(grams), 0) AS total, COUNT(*) AS n
                 FROM protein_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND logged_at >= ? AND logged_at < ?
                 """,
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
 

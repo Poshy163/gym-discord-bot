@@ -214,6 +214,33 @@ def test_calorie_tracked_users_scoped_to_guild(db):
     assert [r["username"] for r in users] == ["alice", "bob"]
 
 
+def test_calorie_goal_is_global_per_user(db):
+    db.calorie_goal_set(1, 100, "alice", 2500)
+    # The goal resolves from any server (and DMs, which resolve to a server).
+    assert db.calorie_goal_get(1, 100)["daily_target_kcal"] == 2500
+    assert db.calorie_goal_get(2, 100)["daily_target_kcal"] == 2500
+    assert db.calorie_goal_get(999, 100)["daily_target_kcal"] == 2500
+    # Re-setting from another server consolidates to one row (no per-guild drift).
+    db.calorie_goal_set(2, 100, "alice", 2200)
+    assert db.calorie_goal_get(1, 100)["daily_target_kcal"] == 2200
+    # A different user is unaffected.
+    db.calorie_goal_set(1, 200, "bob", 3000)
+    assert db.calorie_goal_get(5, 200)["daily_target_kcal"] == 3000
+    # Removing stops tracking everywhere.
+    assert db.calorie_goal_remove(2, 100) is True
+    assert db.calorie_goal_get(1, 100) is None
+
+
+def test_calorie_total_aggregates_across_servers(db):
+    base = datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc)
+    db.calorie_add(1, 100, "alice", 500, logged_at=base)
+    db.calorie_add(2, 100, "alice", 700, logged_at=base)  # other server, same day
+    total, n = db.calorie_total_between(
+        1, 100, "2026-06-01T00:00:00+00:00", "2026-06-02T00:00:00+00:00",
+    )
+    assert total == 1200 and n == 2
+
+
 def test_calorie_total_between_window(db):
     db.calorie_add(
         1, 100, "alice", 500,

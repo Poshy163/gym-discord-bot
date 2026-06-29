@@ -73,6 +73,26 @@ def test_protein_goal_set_get_remove(db):
     assert db.protein_goal_remove(1, 100) is False
 
 
+def test_protein_goal_and_total_are_global_per_user(db):
+    db.protein_goal_set(1, 100, "alice", 180)
+    # Goal resolves from any server / DM.
+    assert db.protein_goal_get(2, 100)["daily_target_g"] == 180.0
+    assert db.protein_goal_get(999, 100)["daily_target_g"] == 180.0
+    # Re-setting elsewhere consolidates to one row.
+    db.protein_goal_set(2, 100, "alice", 200)
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 200.0
+    # Totals aggregate across servers.
+    db.protein_add(1, 100, "alice", 40, message_id=1)
+    db.protein_add(2, 100, "alice", 30, message_id=2)
+    total, n = db.protein_total_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert total == 70.0 and n == 2
+    # Removing stops tracking everywhere.
+    assert db.protein_goal_remove(2, 100) is True
+    assert db.protein_goal_get(1, 100) is None
+
+
 def test_protein_add_total_and_dedupe(db):
     db.protein_add(1, 100, "alice", 40, message_id=10)
     db.protein_add(1, 100, "alice", 30, message_id=11)
