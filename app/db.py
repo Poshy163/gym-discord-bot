@@ -346,6 +346,27 @@ CREATE TABLE IF NOT EXISTS strava_pending_auth (
     created_at TEXT    NOT NULL
 );
 
+-- Linked Hevy (hevyapp.com) accounts. Hevy uses a per-user API key (no OAuth),
+-- stored Fernet-encrypted in ``api_key_enc`` — plaintext is never persisted.
+-- ``guild_id`` is where polled workouts are imported as lifts and where the feed
+-- embed is posted. ``hevy_imported`` records which Hevy workout ids have already
+-- been imported so repeated polls never double-log.
+CREATE TABLE IF NOT EXISTS hevy_account (
+    user_id        INTEGER PRIMARY KEY,
+    guild_id       INTEGER NOT NULL,
+    api_key_enc    TEXT    NOT NULL,
+    hevy_username  TEXT,
+    last_synced_at TEXT,
+    linked_at      TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hevy_imported (
+    user_id     INTEGER NOT NULL,
+    workout_id  TEXT    NOT NULL,
+    imported_at TEXT    NOT NULL,
+    PRIMARY KEY (user_id, workout_id)
+);
+
 -- ---------------------------------------------------------------------------
 -- Web dashboard support: a mirror of the guild's member/role state plus a
 -- unified audit log. These are populated by the bot (members intent required)
@@ -2311,6 +2332,81 @@ class Database:
     def list_strava_accounts(self) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute("SELECT * FROM strava_account"))
+
+    # ------------------------------------------------------------------
+    # Hevy (hevyapp.com) linked accounts
+    # ------------------------------------------------------------------
+
+    def hevy_link(
+        self, user_id: int, guild_id: int, api_key_enc: str,
+        hevy_username: str | None = None,
+    ) -> None:
+        """Link (or re-link) a Hevy account. ``api_key_enc`` must already be a
+        Fernet token — this layer never sees the plaintext key."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO hevy_account
+                    (user_id, guild_id, api_key_enc, hevy_username,
+                     last_synced_at, linked_at)
+                VALUES (?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    guild_id      = excluded.guild_id,
+                    api_key_enc   = excluded.api_key_enc,
+                    hevy_username = excluded.hevy_username,
+                    linked_at     = excluded.linked_at
+                """,
+                (user_id, guild_id, api_key_enc, hevy_username,
+                 _normalize_iso(None)),
+            )
+
+    def hevy_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM hevy_account WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+    def list_hevy_accounts(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute("SELECT * FROM hevy_account"))
+
+    def hevy_unlink(self, user_id: int) -> bool:
+        """Remove a linked Hevy account and its import history. Returns True if a
+        row existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM hevy_account WHERE user_id = ?", (user_id,)
+            )
+            c.execute(
+                "DELETE FROM hevy_imported WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def hevy_mark_synced(self, user_id: int, at: datetime | None = None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET last_synced_at = ? WHERE user_id = ?",
+                (_normalize_iso(at), user_id),
+            )
+
+    def hevy_workout_imported(self, user_id: int, workout_id: str) -> bool:
+        """True if ``workout_id`` has already been imported for this user."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM hevy_imported WHERE user_id = ? AND workout_id = ?",
+                (user_id, str(workout_id)),
+            ).fetchone() is not None
+
+    def hevy_mark_workout(self, user_id: int, workout_id: str) -> bool:
+        """Record ``workout_id`` as imported. Returns True if newly recorded
+        (False if it was already present), so callers can skip duplicates."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO hevy_imported "
+                "(user_id, workout_id, imported_at) VALUES (?, ?, ?)",
+                (user_id, str(workout_id), _normalize_iso(None)),
+            )
+            return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------
     # Bot-wide user nicknames

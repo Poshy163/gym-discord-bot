@@ -64,6 +64,7 @@ from .presence import (
 from . import __version__
 from . import calories
 from . import gemini_client
+from . import hevy_client
 from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
@@ -1635,6 +1636,14 @@ async def on_ready() -> None:
         LOG.info(
             "Revo attendance poll scheduled every %d minutes",
             REVO_POLL_MINUTES,
+        )
+
+    if _hevy_enabled() and not hevy_poll.is_running():
+        hevy_poll.start()
+        LOG.info(
+            "Hevy workout poll scheduled every %d minutes%s",
+            HEVY_POLL_MINUTES,
+            f" → feed <#{HEVY_FEED_CHANNEL_ID}>" if HEVY_FEED_CHANNEL_ID else "",
         )
 
 
@@ -4703,6 +4712,16 @@ async def help_cmd(interaction: discord.Interaction) -> None:
                 "`/strava_status` — check if you're linked\n"
                 "`/strava_latest [member]` — show the most recent activity\n"
                 "`/strava_unlink` — revoke access & remove your tokens"
+            ),
+            inline=False,
+        )
+    if _hevy_enabled():
+        embed.add_field(
+            name="🏋️ Hevy",
+            value=(
+                "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
+                "`/hevy_status` — check if you're linked\n"
+                "`/hevy_unlink` — remove your stored API key"
             ),
             inline=False,
         )
@@ -8030,6 +8049,23 @@ except ValueError:
 
 STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
 
+# ---------------------------------------------------------------------------
+# Hevy (hevyapp.com) integration. Per-user API key (no OAuth, no public server)
+# — the bot polls each linked member's recent workouts, imports them as lifts
+# and posts a feed embed. Enabled by default when deps + a Fernet key are present
+# and a feed channel is set; HEVY_DISABLED=1 turns it off entirely.
+# ---------------------------------------------------------------------------
+HEVY_DISABLED = os.getenv("HEVY_DISABLED", "0").lower() in (
+    "1", "true", "yes", "y", "on",
+)
+_hevy_ch = os.getenv("HEVY_FEED_CHANNEL_ID", "").strip()
+HEVY_FEED_CHANNEL_ID: int | None = int(_hevy_ch) if _hevy_ch.isdigit() else None
+try:
+    HEVY_POLL_MINUTES = max(1, int(os.getenv("HEVY_POLL_MINUTES", "15")))
+except ValueError:
+    HEVY_POLL_MINUTES = 15
+HEVY_COLOUR = discord.Colour.from_str("#1d2330")  # Hevy's dark brand tone
+
 # Optional Mapbox token. When set, route maps are rendered over a real basemap
 # (streets/terrain) via Mapbox's Static Images API instead of the local
 # bare-line silhouette. Free tier covers far more than a hobby server needs.
@@ -8091,6 +8127,17 @@ def _strava_enabled() -> bool:
         not STRAVA_DISABLED
         and strava_client.available()
         and _strava_cfg().configured
+    )
+
+
+def _hevy_enabled() -> bool:
+    """True when Hevy is switched on, deps + a Fernet key are present. Linking
+    works without a feed channel (lifts still import); the feed embed is just
+    skipped when HEVY_FEED_CHANNEL_ID isn't set."""
+    return (
+        not HEVY_DISABLED
+        and hevy_client.available()
+        and hevy_client.fernet_ready()
     )
 
 
@@ -9657,6 +9704,231 @@ async def strava_status_cmd(interaction: discord.Interaction) -> None:
         f"✅ Linked as **{name}** (athlete id `{row['athlete_id']}`).{feed}",
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Hevy slash commands + poll loop
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="hevy_link",
+    description="Link your Hevy account so your workouts import as lifts + post to the feed.",
+)
+@app_commands.describe(
+    api_key="Your Hevy API key (Hevy app → Settings → API; requires Hevy Pro).",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_link_cmd(
+    interaction: discord.Interaction, api_key: str,
+) -> None:
+    if not _hevy_enabled():
+        await interaction.response.send_message(
+            "Hevy integration isn't available (disabled, or the host is missing "
+            "`requests`/`cryptography` or a Fernet key).",
+            ephemeral=True,
+        )
+        return
+    gid = _ctx_guild_id(interaction)
+    if not gid:
+        await interaction.response.send_message(
+            "I couldn't tell which server to link this to — DM me from a server "
+            "we share, or set your default with `/server`.",
+            ephemeral=True,
+        )
+        return
+    api_key = api_key.strip()
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _verify() -> dict:
+        return hevy_client.verify_key(api_key)
+
+    try:
+        result = await bot.loop.run_in_executor(None, _verify)
+    except hevy_client.HevyAuthError:
+        await interaction.followup.send(
+            "❌ Hevy rejected that API key. Copy it again from the Hevy app → "
+            "Settings → API (you'll need Hevy Pro).",
+            ephemeral=True,
+        )
+        return
+    except hevy_client.HevyError as exc:
+        await interaction.followup.send(
+            f"⚠️ Couldn't reach Hevy to verify the key: {exc}", ephemeral=True,
+        )
+        return
+    try:
+        db.hevy_link(
+            interaction.user.id, gid, hevy_client.encrypt_key(api_key),
+        )
+    except hevy_client.HevyUnavailable as exc:
+        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+        return
+    feed = (
+        f" New workouts will import as lifts and post to <#{HEVY_FEED_CHANNEL_ID}>."
+        if HEVY_FEED_CHANNEL_ID else
+        " New workouts will import as lifts (no feed channel configured)."
+    )
+    await interaction.followup.send(
+        f"✅ Hevy linked ({result.get('count', 0)} workouts found). Your key is "
+        f"stored **encrypted**.{feed}\nWorkouts sync about every "
+        f"{HEVY_POLL_MINUTES} min. Unlink any time with `/hevy_unlink`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="hevy_unlink",
+    description="Unlink your Hevy account and delete your stored API key.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_unlink_cmd(interaction: discord.Interaction) -> None:
+    removed = db.hevy_unlink(interaction.user.id)
+    await interaction.response.send_message(
+        "🗑️ Hevy unlinked — your encrypted API key was removed."
+        if removed else "You don't have a linked Hevy account.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="hevy_status",
+    description="Show whether your Hevy account is linked.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_status_cmd(interaction: discord.Interaction) -> None:
+    row = db.hevy_get(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "No Hevy account linked. Use `/hevy_link` to connect one.",
+            ephemeral=True,
+        )
+        return
+    feed = (
+        f"\nWorkouts import as lifts and post to <#{HEVY_FEED_CHANNEL_ID}>."
+        if HEVY_FEED_CHANNEL_ID else
+        "\nWorkouts import as lifts (no feed channel configured)."
+    )
+    last = row["last_synced_at"] or "not yet"
+    await interaction.response.send_message(
+        f"✅ Hevy linked. Last sync: {last}.{feed}", ephemeral=True,
+    )
+
+
+def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
+    """Build the feed embed for a completed Hevy workout."""
+    embed = discord.Embed(
+        title=summary["title"],
+        colour=HEVY_COLOUR,
+        description=(
+            f"**{summary['exercise_count']}** exercises · "
+            f"**{summary['set_count']}** sets · "
+            f"**{summary['volume_kg']:,} kg** volume"
+        ),
+    )
+    embed.set_author(name=f"🏋️ {member_name} finished a Hevy workout")
+    top = summary.get("top")
+    if top:
+        reps = f" × {top['reps']}" if top.get("reps") else ""
+        embed.add_field(
+            name="Top set",
+            value=f"{top['title']} — {top['weight_kg']:g}kg{reps}",
+            inline=False,
+        )
+    embed.set_footer(text="via Hevy")
+    return embed
+
+
+async def _hevy_sync_account(row) -> None:
+    """Import a linked member's new Hevy workouts as lifts and post feed embeds."""
+    user_id = int(row["user_id"])
+    guild_id = int(row["guild_id"])
+    try:
+        api_key = hevy_client.decrypt_key(row["api_key_enc"])
+    except hevy_client.HevyError:
+        LOG.warning("Hevy: unreadable API key for user %s — skipping", user_id)
+        return
+
+    def _fetch() -> list[dict]:
+        return hevy_client.fetch_workouts(api_key, page=1, page_size=10)
+
+    try:
+        workouts = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyAuthError:
+        LOG.warning("Hevy: API key for user %s was rejected (revoked?)", user_id)
+        return
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: fetch failed for user %s: %s", user_id, exc)
+        return
+
+    first_sync = row["last_synced_at"] is None
+    member = None
+    guild = bot.get_guild(guild_id)
+    if guild is not None:
+        member = guild.get_member(user_id)
+    username = _display_name(member) if member else str(user_id)
+    feed_channel = (
+        bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
+    )
+
+    # Hevy returns newest-first; import oldest-first so logs read chronologically.
+    for workout in reversed(workouts):
+        wid = str(workout.get("id") or "")
+        if not wid or db.hevy_workout_imported(user_id, wid):
+            continue
+        if not db.hevy_mark_workout(user_id, wid):
+            continue  # raced with another poll
+        lifts = hevy_client.workout_to_lifts(workout)
+        when = _parse_hevy_time(workout.get("start_time"))
+        if lifts:
+            try:
+                db.add_lifts(
+                    guild_id=guild_id, user_id=user_id, username=username,
+                    lifts=lifts, logged_at=when,
+                )
+            except Exception:  # pragma: no cover - defensive
+                LOG.exception("Hevy: failed to import workout %s", wid)
+        # The very first sync after linking is silent for the feed (no backfill
+        # spam); lifts still import so history is captured.
+        if feed_channel is not None and not first_sync and lifts:
+            try:
+                summary = hevy_client.summarize_workout(workout)
+                await feed_channel.send(embed=_hevy_workout_embed(username, summary))
+            except discord.HTTPException:  # pragma: no cover - best effort
+                LOG.info("Hevy: failed to post feed embed for %s", wid)
+
+    db.hevy_mark_synced(user_id)
+
+
+def _parse_hevy_time(value: object) -> datetime | None:
+    """Parse a Hevy ISO-8601 timestamp into a tz-aware datetime, or None."""
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+@tasks.loop(minutes=HEVY_POLL_MINUTES)
+async def hevy_poll() -> None:
+    """Poll every linked Hevy account for new workouts."""
+    if not _hevy_enabled():
+        return
+    for row in db.list_hevy_accounts():
+        try:
+            await _hevy_sync_account(row)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Hevy poll failed for user %s", row["user_id"])
+
+
+@hevy_poll.before_loop
+async def _hevy_poll_before() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
 
 
 @bot.tree.command(
