@@ -3587,8 +3587,28 @@ class Database:
         passing ``None`` *preserves* any protein already stored (so re-saving a
         food with only a new calorie amount doesn't wipe its protein); pass a
         number — including ``0`` — to set it explicitly.
+
+        Saved foods are **per-user and shared across every server + DMs**: setting
+        a food consolidates it to a single row (any copy under another guild is
+        cleared first), so it resolves the same everywhere.
         """
         with self._conn() as c:
+            if protein_g is None:
+                # Preserve protein across guilds (the prior copy may live under a
+                # different server we're about to consolidate away).
+                prev = c.execute(
+                    "SELECT protein_g FROM calorie_foods "
+                    "WHERE user_id = ? AND name = ? AND protein_g IS NOT NULL "
+                    "ORDER BY set_at DESC LIMIT 1",
+                    (user_id, name),
+                ).fetchone()
+                if prev is not None:
+                    protein_g = prev["protein_g"]
+            c.execute(
+                "DELETE FROM calorie_foods "
+                "WHERE user_id = ? AND name = ? AND guild_id <> ?",
+                (user_id, name, guild_id),
+            )
             c.execute(
                 """
                 INSERT INTO calorie_foods
@@ -3610,34 +3630,45 @@ class Database:
     def calorie_food_get(
         self, guild_id: int, user_id: int, name: str,
     ) -> sqlite3.Row | None:
+        """A saved food, resolved **per-user** so one set in any server (or via
+        DM) is found everywhere. Prefers the current guild's copy, else the most
+        recently saved."""
         with self._conn() as c:
             return c.execute(
                 "SELECT name, display, kcal, protein_g FROM calorie_foods "
-                "WHERE guild_id = ? AND user_id = ? AND name = ?",
-                (guild_id, user_id, name),
+                "WHERE user_id = ? AND name = ? "
+                "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
+                (user_id, name, guild_id),
             ).fetchone()
 
     def calorie_food_remove(
         self, guild_id: int, user_id: int, name: str,
     ) -> bool:
+        """Remove a saved food for the user **everywhere** (foods are shared
+        across servers, so deletion isn't guild-scoped)."""
         with self._conn() as c:
             cur = c.execute(
-                "DELETE FROM calorie_foods "
-                "WHERE guild_id = ? AND user_id = ? AND name = ?",
-                (guild_id, user_id, name),
+                "DELETE FROM calorie_foods WHERE user_id = ? AND name = ?",
+                (user_id, name),
             )
             return (cur.rowcount or 0) > 0
 
     def calorie_food_list(
         self, guild_id: int, user_id: int,
     ) -> list[sqlite3.Row]:
+        """All of a user's saved foods (shared across servers), one row per name
+        — the current guild's copy wins, else the most recent."""
         with self._conn() as c:
-            return list(c.execute(
+            rows = c.execute(
                 "SELECT name, display, kcal, protein_g FROM calorie_foods "
-                "WHERE guild_id = ? AND user_id = ? "
-                "ORDER BY display COLLATE NOCASE",
-                (guild_id, user_id),
-            ))
+                "WHERE user_id = ? "
+                "ORDER BY (guild_id = ?) DESC, set_at DESC",
+                (user_id, guild_id),
+            ).fetchall()
+        seen: dict[str, sqlite3.Row] = {}
+        for r in rows:
+            seen.setdefault(r["name"], r)
+        return sorted(seen.values(), key=lambda r: (r["display"] or "").lower())
 
     # ====================================================================
     # Web dashboard: audit log, member/role mirror, and editing helpers.

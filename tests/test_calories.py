@@ -345,17 +345,36 @@ def test_calorie_food_protein_optional_and_preserved(db):
     assert db.calorie_food_get(1, 100, "coffee")["protein_g"] is None
 
 
-def test_calorie_food_scoped_per_user_and_guild(db):
+def test_calorie_food_is_per_user_global_across_guilds(db):
+    # Saved foods are shared across servers for a given user, but isolated
+    # between users.
     db.calorie_food_set(1, 100, "coffee", "Coffee", 5)
-    db.calorie_food_set(1, 200, "coffee", "Coffee", 9)
+    db.calorie_food_set(1, 200, "coffee", "Coffee", 9)   # different user
+    # Same user re-sets the food from another server → it carries (one row).
     db.calorie_food_set(2, 100, "coffee", "Coffee", 1)
-    assert db.calorie_food_get(1, 100, "coffee")["kcal"] == 5
-    assert db.calorie_food_get(1, 200, "coffee")["kcal"] == 9
+    # User 100 sees the same food (latest value) in *both* guilds and elsewhere.
+    assert db.calorie_food_get(1, 100, "coffee")["kcal"] == 1
     assert db.calorie_food_get(2, 100, "coffee")["kcal"] == 1
-    # food_list is scoped to one (guild, user).
+    assert db.calorie_food_get(999, 100, "coffee")["kcal"] == 1  # any server
+    # User 200 is unaffected.
+    assert db.calorie_food_get(1, 200, "coffee")["kcal"] == 9
+
+    # A food set in guild 1 is listed from guild 2 too (global per user).
     db.calorie_food_set(1, 100, "protein shake", "Protein Shake", 250)
-    names = [r["display"] for r in db.calorie_food_list(1, 100)]
-    assert names == ["Coffee", "Protein Shake"]  # ordered by display
+    names = [r["display"] for r in db.calorie_food_list(2, 100)]
+    assert names == ["Coffee", "Protein Shake"]  # deduped, ordered by display
+
+    # Removing from any server removes it everywhere.
+    assert db.calorie_food_remove(2, 100, "coffee") is True
+    assert db.calorie_food_get(1, 100, "coffee") is None
+
+
+def test_calorie_food_preserves_protein_across_guilds(db):
+    db.calorie_food_set(1, 100, "shake", "Shake", 250, 30)
+    # Re-saving from another server with only kcal keeps the protein value.
+    db.calorie_food_set(2, 100, "shake", "Shake", 260)
+    row = db.calorie_food_get(1, 100, "shake")
+    assert row["kcal"] == 260 and row["protein_g"] == 30
 
 
 def test_calorie_reply_tracking_roundtrip(db):

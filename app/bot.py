@@ -2514,6 +2514,10 @@ async def on_message(message: discord.Message) -> None:
     # protein, bodyweight, saved foods) and prefix commands.
     try:
         if db.message_is_blacklisted(gid, message.author.id):
+            LOG.info(
+                "Blacklist: ignored message from %s in guild %s",
+                message.author.id, gid,
+            )
             return
     except Exception:
         LOG.exception("Blacklist check failed in on_message")
@@ -2540,6 +2544,18 @@ async def on_message(message: discord.Message) -> None:
             )
             if nick_target is not None:
                 target, content = nick_target, nick_content
+
+    # Don't let anyone log *for* a blacklisted member either (e.g. "@dos 100kg"
+    # or a nickname-prefixed line). The author was already checked above.
+    target_id = int(getattr(target, "id", 0) or 0)
+    if (
+        target_id and target_id != message.author.id
+        and db.message_is_blacklisted(gid, target_id)
+    ):
+        LOG.info(
+            "Blacklist: ignored log targeting %s in guild %s", target_id, gid,
+        )
+        return
 
     # Quick bodyweight update path: `bodyweight 100kg`, `body weight: 95.5`,
     # `bw 80`, or `@dos bodyweight 100kg` (leading mention re-targets just
@@ -2853,6 +2869,14 @@ async def on_message_edit(
         return  # ignore embed/attachment-only edits
 
     guild_id = after.guild.id
+    # Blacklisted members can't add anything to the bot — including by *editing*
+    # a message into a lift/calorie (mirrors the on_message gate).
+    if db.message_is_blacklisted(guild_id, after.author.id):
+        LOG.info(
+            "Blacklist: ignored edit from %s in guild %s",
+            after.author.id, guild_id,
+        )
+        return
     aliases = _custom_alias_map(guild_id)
     target, content = _message_lift_target(after)
     # Nickname-prefix targeting consistent with on_message.
@@ -2863,6 +2887,16 @@ async def on_message_edit(
         if nick_target is not None:
             target, content = nick_target, nick_content
     target_user_id = int(getattr(target, "id"))
+    # ...and not *for* a blacklisted member either.
+    if (
+        target_user_id != after.author.id
+        and db.message_is_blacklisted(guild_id, target_user_id)
+    ):
+        LOG.info(
+            "Blacklist: ignored edit targeting %s in guild %s",
+            target_user_id, guild_id,
+        )
+        return
     # Editing a post is a fresh signal of intent — clear any prior
     # backfill suppression so the corrected version can be re-imported.
     db.unsuppress_message(guild_id, after.id)
