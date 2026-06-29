@@ -39,6 +39,7 @@ GET  /healthz          Liveness probe (no auth).
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import secrets
 import time
@@ -518,12 +519,22 @@ def build_app(
             raise web.HTTPBadRequest(text="missing or invalid ?channel")
         limit = _clamp_int(request.query.get("limit"), 300, 1, 1000)
         rows = db.message_channel_log(gid, cid, limit=limit)
+        def _media(raw: str | None) -> list:
+            if not raw:
+                return []
+            try:
+                items = json.loads(raw)
+                return items if isinstance(items, list) else []
+            except (ValueError, TypeError):
+                return []
+
         messages = [
             {
                 "user_id": str(r["user_id"]),
                 "display_name": r["display_name"] or str(r["user_id"]),
                 "avatar": r["avatar"],
                 "content": r["content"],
+                "media": _media(r["attachments"]),
                 "at": r["at"],
             }
             for r in rows
@@ -1240,6 +1251,10 @@ font-size:.8rem;line-height:1;padding:.1rem .35rem;border-radius:5px;transition:
 padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
 .dc-msg:hover{background:#ffffff08}
 .mention{background:rgba(88,101,242,.3);color:#c9d1ff;border-radius:4px;padding:0 2px;font-weight:500}
+.dc-media{display:flex;flex-wrap:wrap;gap:.4rem;margin:.25rem 0}
+.dc-att{max-width:260px;max-height:260px;border-radius:8px;background:#0d1117;
+border:1px solid var(--line);object-fit:cover;cursor:pointer}
+video.dc-att{cursor:default}
 .btn.sm{padding:.25rem .55rem;font-size:.8rem}
 .bl-list{display:flex;flex-direction:column;gap:.5rem;max-height:240px;overflow-y:auto;margin-bottom:.8rem}
 .bl-row{display:flex;align-items:center;justify-content:space-between;gap:.7rem;
@@ -1768,10 +1783,17 @@ function msgGroups(msgs){
   const GAP=7*60*1000, groups=[];
   for(const m of msgs){
     const t=Date.parse(m.at), g=groups[groups.length-1];
-    if(g&&g.user_id===m.user_id&&(t-g.lastT)<=GAP){g.lines.push(m.content);g.lastT=t;}
-    else groups.push({user_id:m.user_id,name:m.display_name,avatar:m.avatar,at:m.at,lastT:t,lines:[m.content]});
+    if(g&&g.user_id===m.user_id&&(t-g.lastT)<=GAP){g.items.push(m);g.lastT=t;}
+    else groups.push({user_id:m.user_id,name:m.display_name,avatar:m.avatar,at:m.at,lastT:t,items:[m]});
   }
   return groups;
+}
+function mediaHtml(media){
+  if(!media||!media.length)return"";
+  return `<div class="dc-media">${media.map(m=>m.kind==="video"
+    ? `<video class="dc-att" src="${esc(m.url)}" autoplay loop muted playsinline></video>`
+    : `<img class="dc-att" src="${esc(m.url)}" loading="lazy" alt="" onclick="window.open('${esc(m.url)}','_blank')">`
+  ).join("")}</div>`;
 }
 function renderChat(msgs){
   if(!msgs||!msgs.length)return '<div class="faint" style="padding:1.2rem">No messages logged in this channel.</div>';
@@ -1780,7 +1802,7 @@ function renderChat(msgs){
     <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a>
       <span class="dc-ts">${fmtTs(g.at)}</span>
       <button class="dc-bl" title="Blacklist this user from message logging" onclick="blacklistUser('${g.user_id}')">🚫</button></div>
-    ${g.lines.map(l=>`<div class="dc-msg">${renderContent(l)}</div>`).join("")}</div></div>`).join("");
+    ${g.items.map(it=>`${it.content?`<div class="dc-msg">${renderContent(it.content)}</div>`:""}${mediaHtml(it.media)}`).join("")}</div></div>`).join("");
 }
 // Open the blacklist dialog pre-filled with a user picked straight from a chat
 // message — no need to hunt down their numeric ID.

@@ -215,6 +215,30 @@ def test_message_active_users_counts_and_orders(db):
     assert [int(r["user_id"]) for r in recent] == [200]
 
 
+def test_message_log_attachments_stored_and_backfilled(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    img = '[{"url": "http://x/a.png", "kind": "image"}]'
+    gif = '[{"url": "http://x/b.mp4", "kind": "video"}]'
+    # A message logged with media stores it.
+    assert db.message_log_add(1, 100, "pic", message_id=1, channel_id=7,
+                              attachments=img, at=base) is True
+    assert db.message_channel_log(1, 7)[0]["attachments"] == img
+
+    # A previously text-only message...
+    assert db.message_log_add(1, 100, "hi", message_id=2, channel_id=7,
+                              at=base) is True
+    # ...gets its media backfilled on a re-scan (returns False — not a new row).
+    assert db.message_log_add(1, 100, "hi", message_id=2, channel_id=7,
+                              attachments=gif, at=base) is False
+    rows = {r["content"]: r["attachments"] for r in db.message_channel_log(1, 7)}
+    assert rows["hi"] == gif
+    # Existing media is never overwritten by a later re-scan.
+    assert db.message_log_add(1, 100, "hi", message_id=2, channel_id=7,
+                              attachments=img, at=base) is False
+    rows = {r["content"]: r["attachments"] for r in db.message_channel_log(1, 7)}
+    assert rows["hi"] == gif
+
+
 def test_message_log_latest_at_tracks_newest(db):
     assert db.message_log_latest_at(1) is None
     base = datetime(2026, 6, 1, tzinfo=timezone.utc)

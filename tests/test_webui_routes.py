@@ -92,6 +92,10 @@ def test_messages_channels_and_log(tmp_path):
                            channel_name="general", at=base + timedelta(minutes=1))
         db.message_log_add(1, 100, "elsewhere", message_id=3, channel_id=8,
                            channel_name="gym", at=base + timedelta(minutes=2))
+        db.message_log_add(1, 100, "look", message_id=4, channel_id=7,
+                           channel_name="general",
+                           attachments='[{"url": "http://x/a.png", "kind": "image"}]',
+                           at=base + timedelta(minutes=3))
 
         app = build_app(db=db, password="secret")
         client = await _client(app)
@@ -99,17 +103,22 @@ def test_messages_channels_and_log(tmp_path):
             await _login(client)
             chans = await (await client.get("/api/messages/channels?guild=1")).json()
             by_cid = {c["channel_id"]: c for c in chans["channels"]}
-            assert by_cid["7"]["count"] == 2 and by_cid["7"]["channel_name"] == "general"
+            assert by_cid["7"]["count"] == 3 and by_cid["7"]["channel_name"] == "general"
             assert by_cid["8"]["count"] == 1
-            # Most recently active channel (gym) sorts first.
-            assert chans["channels"][0]["channel_id"] == "8"
+            # Channel 7 has the most recent message ("look"), so it sorts first.
+            assert chans["channels"][0]["channel_id"] == "7"
 
             log = await (await client.get("/api/messages/log?guild=1&channel=7")).json()
-            assert [m["content"] for m in log["messages"]] == ["first", "second"]
+            assert [m["content"] for m in log["messages"]] == ["first", "second", "look"]
             assert log["messages"][0]["display_name"] == "Alice"
             assert log["messages"][0]["avatar"] == "http://a/alice.png"
+            assert log["messages"][0]["media"] == []
             # Unknown author falls back to the id, no avatar.
             assert log["messages"][1]["display_name"] == "200"
+            # Media is parsed back into a list of {url, kind}.
+            assert log["messages"][2]["media"] == [
+                {"url": "http://x/a.png", "kind": "image"}
+            ]
         finally:
             await client.close()
             db.close()

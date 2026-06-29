@@ -2430,12 +2430,14 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                 async for msg in channel.history(
                     limit=None, after=after, oldest_first=True,
                 ):
-                    if not msg.content:
+                    media = _message_media(msg)
+                    if not msg.content and not media:
                         continue
                     if db.message_log_add(
                         guild.id, msg.author.id, msg.content,
                         channel_id=channel.id, channel_name=channel.name,
                         message_id=msg.id, at=msg.created_at,
+                        attachments=media,
                     ):
                         logged += 1
             except discord.Forbidden:
@@ -2469,21 +2471,63 @@ def _looks_like_log_attempt(text: str) -> bool:
     return bool(lifts and _should_auto_store(lifts))
 
 
+def _message_media(message: discord.Message) -> str | None:
+    """Collect image/video/GIF media from a message's attachments and embeds,
+    as a JSON list of ``{"url", "kind"}`` (kind: ``image`` or ``video``), or None
+    when there's none. Powers the photos/GIFs shown in the dashboard Messages tab
+    — Tenor/Giphy GIFs come through as ``gifv`` embeds (an mp4 that loops).
+    """
+    items: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(url: str | None, kind: str) -> None:
+        if url and url not in seen:
+            seen.add(url)
+            items.append({"url": url, "kind": kind})
+
+    for att in message.attachments:
+        ct = (att.content_type or "").lower()
+        name = (att.filename or "").lower()
+        if ct.startswith("image/") or name.endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".webp")
+        ):
+            _add(att.url, "image")
+        elif ct.startswith("video/") or name.endswith(
+            (".mp4", ".webm", ".mov")
+        ):
+            _add(att.url, "video")
+    for emb in message.embeds:
+        etype = (getattr(emb, "type", "") or "").lower()
+        vid = getattr(getattr(emb, "video", None), "url", None)
+        thumb = getattr(getattr(emb, "thumbnail", None), "url", None)
+        img = getattr(getattr(emb, "image", None), "url", None)
+        if etype == "gifv":
+            # Animated GIF (Tenor/Giphy): the mp4 loops like a GIF; fall back to
+            # the still thumbnail if there's no video url.
+            _add(vid, "video") if vid else _add(thumb, "image")
+        elif etype == "image":
+            _add(img or thumb or getattr(emb, "url", None), "image")
+    return json.dumps(items) if items else None
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # Message logging for the web dashboard. Logs every author (including bots,
     # so the bot's own announcements show up, and blacklisted users — blacklist
     # only blocks adding data, not logging) in every channel. Runs before the
     # bot/guild and gym-channel gates. Failures here must never break handling.
-    if ENABLE_MESSAGE_LOGGING and message.guild is not None and message.content:
+    if ENABLE_MESSAGE_LOGGING and message.guild is not None:
         try:
-            db.message_log_add(
-                message.guild.id, message.author.id, message.content,
-                channel_id=message.channel.id,
-                channel_name=getattr(message.channel, "name", None),
-                message_id=message.id,
-                at=message.created_at,
-            )
+            media = _message_media(message)
+            if message.content or media:
+                db.message_log_add(
+                    message.guild.id, message.author.id, message.content,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, "name", None),
+                    message_id=message.id,
+                    at=message.created_at,
+                    attachments=media,
+                )
         except Exception:
             LOG.exception("Failed to log message for activity feed")
     if message.author.bot:

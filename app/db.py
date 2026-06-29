@@ -203,6 +203,7 @@ CREATE TABLE IF NOT EXISTS message_log (
     channel_name TEXT,
     message_id   INTEGER,
     content      TEXT,
+    attachments  TEXT,
     at           TEXT    NOT NULL
 );
 
@@ -622,6 +623,16 @@ class Database:
             if act_cols and "image_url" not in act_cols:
                 self._connection.execute(
                     "ALTER TABLE activity_events ADD COLUMN image_url TEXT"
+                )
+            msg_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(message_log)"
+                )
+            }
+            if msg_cols and "attachments" not in msg_cols:
+                self._connection.execute(
+                    "ALTER TABLE message_log ADD COLUMN attachments TEXT"
                 )
             self._recanonicalize_equipment()
 
@@ -2902,21 +2913,35 @@ class Database:
         self, guild_id: int, user_id: int, content: str | None,
         channel_id: int | None = None, channel_name: str | None = None,
         message_id: int | None = None, at: datetime | None = None,
+        attachments: str | None = None,
     ) -> bool:
         """Append a logged message. Idempotent on ``message_id`` (a re-dispatch
-        of the same message won't create a duplicate). Returns True if a row
-        was inserted."""
+        of the same message won't create a duplicate). ``attachments`` is an
+        optional JSON string of media items (images / videos / GIF embeds).
+        Returns True if a row was inserted."""
         ts = _normalize_iso(at)
         with self._conn() as c:
             cur = c.execute(
                 "INSERT OR IGNORE INTO message_log "
                 "(guild_id, user_id, channel_id, channel_name, "
-                " message_id, content, at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " message_id, content, attachments, at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (guild_id, user_id, channel_id, channel_name,
-                 message_id, content, ts),
+                 message_id, content, attachments, ts),
             )
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                return True
+            # The message was already logged. If it predates media capture (or
+            # was logged text-only) and we now have media, backfill it in — this
+            # is how a re-scan adds photos/GIFs to existing rows.
+            if attachments and message_id is not None:
+                c.execute(
+                    "UPDATE message_log SET attachments = ? "
+                    "WHERE guild_id = ? AND message_id = ? "
+                    "AND attachments IS NULL",
+                    (attachments, guild_id, message_id),
+                )
+            return False
 
     def message_count_since(
         self, guild_id: int, user_id: int, since: datetime | None = None,
@@ -3016,7 +3041,7 @@ class Database:
         with self._conn() as c:
             rows = c.execute(
                 """
-                SELECT ml.user_id, ml.content, ml.at,
+                SELECT ml.user_id, ml.content, ml.attachments, ml.at,
                        mem.display_name AS display_name, mem.avatar AS avatar
                 FROM message_log ml
                 LEFT JOIN members mem
