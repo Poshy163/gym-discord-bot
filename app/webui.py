@@ -1239,6 +1239,7 @@ font-size:.8rem;line-height:1;padding:.1rem .35rem;border-radius:5px;transition:
 .dc-msg{font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;
 padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
 .dc-msg:hover{background:#ffffff08}
+.mention{background:rgba(88,101,242,.3);color:#c9d1ff;border-radius:4px;padding:0 2px;font-weight:500}
 .btn.sm{padding:.25rem .55rem;font-size:.8rem}
 .bl-list{display:flex;flex-direction:column;gap:.5rem;max-height:240px;overflow-y:auto;margin-bottom:.8rem}
 .bl-row{display:flex;align-items:center;justify-content:space-between;gap:.7rem;
@@ -1741,7 +1742,26 @@ function actCard(u){
 }
 
 // ---- messages (Discord-style channel browser) ----------------------------
-let msgChannel=null, BLACKLIST=[];
+let msgChannel=null, BLACKLIST=[], MSG_CHANS={};
+function roleName(id){const r=ALL_ROLES.find(r=>String(r.role_id)===String(id));return r&&r.name;}
+// Turn raw Discord mention tokens in message content into readable, escaped
+// chips: <@id>/<@!id> → @name, <@&id> → @role, <#id> → #channel. Everything
+// outside a token is HTML-escaped so message text can never inject markup.
+function renderContent(text){
+  if(text==null)return"";
+  let out="",last=0,m;const re=/<(#|@[!&]?)(\d+)>/g;
+  while((m=re.exec(text))){
+    out+=esc(text.slice(last,m.index));
+    const kind=m[1],id=m[2];let label;
+    if(kind==="#")label="#"+(MSG_CHANS[id]||"channel");
+    else if(kind==="@&")label="@"+(roleName(id)||"role");
+    else label="@"+(((AV[id]||{}).name)||"unknown");
+    out+=`<span class="mention" title="${esc(id)}">${esc(label)}</span>`;
+    last=re.lastIndex;
+  }
+  out+=esc(text.slice(last));
+  return out;
+}
 function msgGroups(msgs){
   // msgs are chronological (oldest→newest); group consecutive messages from the
   // same author within a few minutes, like Discord collapses a sender's run.
@@ -1760,7 +1780,7 @@ function renderChat(msgs){
     <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a>
       <span class="dc-ts">${fmtTs(g.at)}</span>
       <button class="dc-bl" title="Blacklist this user from message logging" onclick="blacklistUser('${g.user_id}')">🚫</button></div>
-    ${g.lines.map(l=>`<div class="dc-msg">${esc(l)}</div>`).join("")}</div></div>`).join("");
+    ${g.lines.map(l=>`<div class="dc-msg">${renderContent(l)}</div>`).join("")}</div></div>`).join("");
 }
 // Open the blacklist dialog pre-filled with a user picked straight from a chat
 // message — no need to hunt down their numeric ID.
@@ -1782,6 +1802,7 @@ async function openChan(cid){
 async function renderMessages(v){
   const d=await api(`/api/messages/channels?guild=${guild}`);if(!d)return;
   const chans=d.channels||[];BLACKLIST=d.blacklist||[];
+  MSG_CHANS={};chans.forEach(c=>{MSG_CHANS[c.channel_id]=c.channel_name;});
   if(!chans.length){v.innerHTML=`<div class="empty">No messages logged yet.<br>
     <span class="faint">Messages are logged for every member once they chat
     (<code>ENABLE_MESSAGE_LOGGING</code>, on by default); the bot also back-scans recent history on startup.</span>
