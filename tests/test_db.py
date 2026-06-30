@@ -100,6 +100,37 @@ def test_rename_repoints_user_scoped_goal(db):
     assert goal["target_kg"] == 120
 
 
+def test_rename_per_user_is_global_across_servers(db):
+    # A user-scoped rename re-labels their rows in every server; others' and the
+    # guild-wide path are unaffected.
+    _add(db, 1, 100, "leg press", 80, msg_id=1)
+    _add(db, 2, 100, "leg press", 85, msg_id=2)  # another server
+    _add(db, 1, 200, "leg press", 90, msg_id=3)  # different user
+    n = db.rename_equipment(1, "leg press", "angled leg press", user_id=100)
+    assert n == 2
+    assert db.count_equipment_rows(0, "angled leg press", user_id=100) == 2
+    assert db.count_equipment_rows(1, "leg press", user_id=200) == 1
+
+
+def test_delete_entry_per_user_is_global(db):
+    day = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    _add(db, 1, 100, "bench", 100, msg_id=1, logged_at=day)
+    _add(db, 2, 100, "bench", 110, msg_id=2, logged_at=day)  # another server
+    n = db.delete_entry_between(
+        1, "bench",
+        "2026-05-01T00:00:00+00:00", "2026-05-02T00:00:00+00:00",
+        user_id=100,
+    )
+    assert n == 2  # both servers' entries that day removed
+
+
+def test_change_latest_weight_is_global(db):
+    _add(db, 2, 100, "bench", 100, msg_id=1)  # logged in another server
+    prev = db.update_latest_lift_weight(1, 100, "bench", 105, False)
+    assert prev is not None and prev["weight_kg"] == 100
+    assert db.previous_best(1, 100, "bench") == 105
+
+
 def test_rename_merges_goal_collisions_using_higher_target(db):
     db.goal_set(1, 100, "leg press", 120, False)
     db.goal_set(1, 100, "angled leg press", 150, False)
@@ -316,8 +347,8 @@ def test_user_latest_by_equipment_returns_latest_rows(db):
 
 def test_user_all_lifts_returns_every_row_chronologically(db):
     """``/export_lifts`` relies on this for the CSV — so we need every row
-    for the user (no ``LIMIT``), in time order, and scoped to the right
-    user/guild."""
+    for the user (no ``LIMIT``), in time order. Lifts are global per-user, so
+    rows from every server are included; only other *users* are excluded."""
     _add(
         db, 1, 100, "bench", 80, msg_id=1,
         logged_at=datetime(2026, 4, 20, tzinfo=timezone.utc),
@@ -330,13 +361,46 @@ def test_user_all_lifts_returns_every_row_chronologically(db):
         db, 1, 100, "squat", 100, msg_id=3,
         logged_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
     )
-    # Other user / other guild rows must be ignored.
+    # Another user's row is excluded; the same user's row in another server is
+    # now included (global), filed by its own timestamp.
     _add(db, 1, 200, "bench", 70, msg_id=4)
-    _add(db, 2, 100, "bench", 70, msg_id=5)
+    _add(
+        db, 2, 100, "ohp", 50, msg_id=5,
+        logged_at=datetime(2026, 4, 15, tzinfo=timezone.utc),
+    )
 
     rows = db.user_all_lifts(1, 100)
-    assert [r["weight_kg"] for r in rows] == [60, 100, 80]
-    assert [r["equipment"] for r in rows] == ["bench", "squat", "bench"]
+    assert [r["weight_kg"] for r in rows] == [60, 100, 50, 80]
+    assert [r["equipment"] for r in rows] == ["bench", "squat", "ohp", "bench"]
+
+
+def test_lifts_are_global_per_user(db):
+    # A lift in any server counts toward the user's bests, PRs, tonnage, summary.
+    _add(db, 1, 100, "bench", 100, msg_id=1)
+    _add(db, 2, 100, "bench", 120, msg_id=2)  # heavier, another server
+    pbs = {r["equipment"]: r["best"] for r in db.personal_bests(1, 100)}
+    assert pbs["bench"] == 120
+    assert db.previous_best(1, 100, "bench") == 120
+    total, n = db.total_tonnage(1, 100)
+    assert n == 2 and total == 220
+    assert db.user_summary(1, 100)["total_lifts"] == 2
+    # A different user is unaffected.
+    assert db.user_summary(1, 200) is None
+
+
+def test_lift_goal_is_global_per_user(db):
+    db.goal_set(1, 100, "bench", 140, False)
+    assert db.goal_get(2, 100, "bench")["target_kg"] == 140
+    # Re-setting from another server consolidates to one row.
+    db.goal_set(2, 100, "bench", 150, False)
+    rows = db.goal_list(5, 100)
+    assert len(rows) == 1 and rows[0]["target_kg"] == 150
+    # current_best reflects the user's global lifts.
+    _add(db, 9, 100, "bench", 130, msg_id=1)
+    assert db.goal_list(1, 100)[0]["current_best"] == 130
+    # Remove is global.
+    assert db.goal_remove(2, 100, "bench") == 1
+    assert db.goal_get(1, 100, "bench") is None
 
 
 def test_pop_last_n_for_user_returns_newest_first(db):

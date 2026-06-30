@@ -638,24 +638,27 @@ class Database:
             self._recanonicalize_equipment()
 
     def _consolidate_global_goals(self) -> None:
-        """Collapse calorie/protein goals to one row per user.
+        """Collapse calorie/protein/lift goals to one row per user.
 
         Tracking is per-user/global, but databases written before that change
-        could hold a separate goal row per server. Logged *entries* are already
-        read globally (by user_id), so no entry migration is needed — only the
-        goal rows (the opt-in marker + daily target) need de-duplicating. We
-        keep each user's most-recently-set row and drop the rest. Idempotent:
-        a DB that already has one row per user is left untouched.
+        could hold a separate goal row per server. Logged *entries/lifts* are
+        already read globally (by user_id), so no row migration is needed for
+        those — only the goal rows (targets) need de-duplicating. We keep each
+        user's most-recently-set row and drop the rest. Idempotent: a DB that
+        already has one row per group is left untouched.
         """
-        for table in ("calorie_goals", "protein_goals"):
+        # Calorie/protein goals are one-per-user; lift goals are one per
+        # (user, equipment). The bare-column-with-MAX() trick gives, per group,
+        # the rowid of the latest set_at row to keep.
+        for table, group in (
+            ("calorie_goals", "user_id"),
+            ("protein_goals", "user_id"),
+            ("goals", "user_id, equipment"),
+        ):
             self._connection.execute(
-                # The inner GROUP BY with a single MAX() picks, per user, the
-                # rowid belonging to the latest set_at (a documented SQLite
-                # bare-column guarantee); everything else for that user is
-                # deleted.
                 f"DELETE FROM {table} WHERE rowid NOT IN ("
                 f"  SELECT rowid FROM ("
-                f"    SELECT rowid, MAX(set_at) FROM {table} GROUP BY user_id"
+                f"    SELECT rowid, MAX(set_at) FROM {table} GROUP BY {group}"
                 f"  )"
                 f")"
             )
@@ -898,6 +901,8 @@ class Database:
     def personal_bests(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
         # For each equipment, pick the row with the highest weight_kg, and
         # return the date that PR was set on (earliest date at that weight).
+        # Lifts are global per-user, so bests span every server (``guild_id`` is
+        # kept for signature compatibility but not filtered on).
         with self._conn() as c:
             return list(c.execute(
                 """
@@ -909,17 +914,23 @@ class Database:
                 JOIN (
                     SELECT equipment, MAX(weight_kg) AS mx
                     FROM lifts
-                    WHERE guild_id = ? AND user_id = ?
+                    WHERE user_id = ?
                     GROUP BY equipment
                 ) m ON m.equipment = l.equipment AND m.mx = l.weight_kg
-                WHERE l.guild_id = ? AND l.user_id = ?
+                WHERE l.user_id = ?
                 GROUP BY l.equipment
                 ORDER BY l.equipment
                 """,
-                (guild_id, user_id, guild_id, user_id),
+                (user_id, user_id),
             ))
 
     def leaderboard(self, guild_id: int, equipment: str) -> list[sqlite3.Row]:
+        """Top lifts on one equipment for **this guild's current members**.
+
+        Lifts are global per-user, so each member is ranked by their all-time
+        best across every server — but the board itself stays per-community
+        (only present members of ``guild_id`` appear), matched via the members
+        mirror rather than where the lift happened to be logged."""
         with self._conn() as c:
             return list(c.execute(
                 """
@@ -930,17 +941,20 @@ class Database:
                        MIN(l.logged_at)  AS set_on
                 FROM lifts l
                 JOIN (
-                    SELECT user_id, MAX(weight_kg) AS mx
-                    FROM lifts
-                    WHERE guild_id = ? AND equipment = ?
-                    GROUP BY user_id
+                    SELECT l2.user_id, MAX(l2.weight_kg) AS mx
+                    FROM lifts l2
+                    JOIN members mem
+                      ON mem.user_id = l2.user_id
+                     AND mem.guild_id = ? AND mem.present = 1
+                    WHERE l2.equipment = ?
+                    GROUP BY l2.user_id
                 ) m ON m.user_id = l.user_id AND m.mx = l.weight_kg
-                WHERE l.guild_id = ? AND l.equipment = ?
+                WHERE l.equipment = ?
                 GROUP BY l.user_id
                 ORDER BY best DESC
                 LIMIT 25
                 """,
-                (guild_id, equipment, guild_id, equipment),
+                (guild_id, equipment, equipment),
             ))
 
     def progress(
@@ -961,7 +975,7 @@ class Database:
                                ORDER BY weight_kg DESC, logged_at ASC, id ASC
                            ) AS rn
                     FROM lifts
-                    WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                    WHERE user_id = ? AND equipment = ?
                 )
                 SELECT month,
                        weight_kg      AS best,
@@ -971,7 +985,7 @@ class Database:
                 WHERE rn = 1
                 ORDER BY month
                 """,
-                (guild_id, user_id, equipment),
+                (user_id, equipment),
             ))
 
     def known_equipment(self, guild_id: int) -> list[str]:
@@ -1000,42 +1014,41 @@ class Database:
         is respected: if the destination already exists for a given message,
         the duplicate source row is dropped instead of renamed.
 
-        If ``user_id`` is provided, the rename is scoped to only that user's
-        rows — useful when one lifter mislabels their entry without affecting
-        anyone else's history.
-
-        When the rename is guild-wide (no user filter), any custom_aliases
-        whose canonical pointed at ``src`` are repointed at ``dst`` so the
-        alias table doesn't go stale. Per-user renames don't touch aliases
-        because aliases are guild-scoped, not user-scoped.
+        If ``user_id`` is provided, the rename is **global** for that user — it
+        re-labels their rows in every server, since lifts are global per-user.
+        A guild-wide rename (no user filter) stays scoped to ``guild_id`` and
+        also repoints that guild's custom aliases whose canonical pointed at
+        ``src`` (aliases are guild-scoped, not user-scoped).
         """
-        user_clause = " AND user_id = ?" if user_id is not None else ""
-        user_params: tuple[object, ...] = (
-            (user_id,) if user_id is not None else ()
-        )
+        # Per-user rename → global (by user_id); guild-wide → this guild only.
+        if user_id is not None:
+            scope_clause = "user_id = ?"
+            scope_params: tuple[object, ...] = (user_id,)
+        else:
+            scope_clause = "guild_id = ?"
+            scope_params = (guild_id,)
         with self._conn() as c:
-            # Remove rows that would collide with the dedupe index after rename.
-            # When scoped to a single user, the collision check is also scoped
-            # so we don't drop someone else's row.
+            # Remove rows that would collide with the (message_id, equipment)
+            # dedupe index after the rename. message_id is unique to one
+            # message, so matching on it + user_id finds the collision without
+            # needing a guild filter.
             c.execute(
                 f"""
                 DELETE FROM lifts
-                WHERE guild_id = ? AND equipment = ?{user_clause}
+                WHERE {scope_clause} AND equipment = ?
                   AND message_id IS NOT NULL
                   AND EXISTS (
                       SELECT 1 FROM lifts b
-                      WHERE b.guild_id = lifts.guild_id
-                        AND b.message_id = lifts.message_id
+                      WHERE b.message_id = lifts.message_id
                         AND b.equipment = ?
                         AND b.user_id = lifts.user_id
                   )
                 """,
-                (guild_id, src, *user_params, dst),
+                (*scope_params, src, dst),
             )
             cur = c.execute(
-                "UPDATE lifts SET equipment = ? "
-                f"WHERE guild_id = ? AND equipment = ?{user_clause}",
-                (dst, guild_id, src, *user_params),
+                f"UPDATE lifts SET equipment = ? WHERE {scope_clause} AND equipment = ?",
+                (dst, *scope_params, src),
             )
             if user_id is None:
                 # Repoint guild aliases so future parses land on the new
@@ -1045,16 +1058,16 @@ class Database:
                     "WHERE guild_id = ? AND canonical = ?",
                     (dst, guild_id, src),
                 )
+            # Move/merge affected lift goals to match the rename. Scope mirrors
+            # the lifts rename (per-user = global, guild-wide = this guild). The
+            # inner writes key by (user, equipment) since goals are global —
+            # exactly one row per user+equipment.
             goal_sql = (
-                "SELECT user_id, equipment, target_kg, bodyweight_add, set_at "
-                "FROM goals WHERE guild_id = ? AND equipment IN (?, ?)"
+                f"SELECT user_id, equipment, target_kg, bodyweight_add, set_at "
+                f"FROM goals WHERE {scope_clause} AND equipment IN (?, ?)"
             )
-            goal_params: list[object] = [guild_id, src, dst]
-            if user_id is not None:
-                goal_sql += " AND user_id = ?"
-                goal_params.append(user_id)
             goals_by_user: dict[int, dict[str, sqlite3.Row]] = {}
-            for row in c.execute(goal_sql, goal_params):
+            for row in c.execute(goal_sql, (*scope_params, src, dst)):
                 goals_by_user.setdefault(row["user_id"], {})[row["equipment"]] = row
             for goal_user_id, goals in goals_by_user.items():
                 src_goal = goals.get(src)
@@ -1064,8 +1077,8 @@ class Database:
                 if dst_goal is None:
                     c.execute(
                         "UPDATE goals SET equipment = ? "
-                        "WHERE guild_id = ? AND user_id = ? AND equipment = ?",
-                        (dst, guild_id, goal_user_id, src),
+                        "WHERE user_id = ? AND equipment = ?",
+                        (dst, goal_user_id, src),
                     )
                     continue
                 if src_goal["target_kg"] > dst_goal["target_kg"]:
@@ -1073,21 +1086,20 @@ class Database:
                         """
                         UPDATE goals
                         SET target_kg = ?, bodyweight_add = ?, set_at = ?
-                        WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                        WHERE user_id = ? AND equipment = ?
                         """,
                         (
                             src_goal["target_kg"],
                             src_goal["bodyweight_add"],
                             src_goal["set_at"],
-                            guild_id,
                             goal_user_id,
                             dst,
                         ),
                     )
                 c.execute(
                     "DELETE FROM goals "
-                    "WHERE guild_id = ? AND user_id = ? AND equipment = ?",
-                    (guild_id, goal_user_id, src),
+                    "WHERE user_id = ? AND equipment = ?",
+                    (goal_user_id, src),
                 )
             return cur.rowcount or 0
 
@@ -1096,15 +1108,15 @@ class Database:
         user_id: int | None = None,
     ) -> int:
         """How many rows match equipment (optionally for one user). Used for
-        rename previews / dry-runs."""
-        sql = (
-            "SELECT COUNT(*) FROM lifts "
-            "WHERE guild_id = ? AND equipment = ?"
-        )
-        params: list[object] = [guild_id, equipment]
+        rename previews / dry-runs. A per-user count is **global** (lifts are
+        global per-user); a guild-wide count stays scoped to the guild — so each
+        preview matches what the corresponding rename/purge will actually do."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
+            sql = "SELECT COUNT(*) FROM lifts WHERE user_id = ? AND equipment = ?"
+            params: list[object] = [user_id, equipment]
+        else:
+            sql = "SELECT COUNT(*) FROM lifts WHERE guild_id = ? AND equipment = ?"
+            params = [guild_id, equipment]
         with self._conn() as c:
             row = c.execute(sql, params).fetchone()
             return int(row[0]) if row else 0
@@ -1116,17 +1128,22 @@ class Database:
         date: str,
         user_id: int | None = None,
     ) -> int:
-        """Delete entries matching equipment + YYYY-MM-DD date, optionally
-        scoped to a specific user. Returns rows deleted."""
-        sql = (
-            "DELETE FROM lifts "
-            "WHERE guild_id = ? AND equipment = ? "
-            "AND substr(logged_at, 1, 10) = ?"
-        )
-        params: list[object] = [guild_id, equipment, date]
+        """Delete entries matching equipment + YYYY-MM-DD date. A per-user
+        delete is **global** (the user's matching rows in every server); a
+        guild-wide delete (no user) stays scoped to the guild. Returns rows
+        deleted."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
+            sql = (
+                "DELETE FROM lifts WHERE user_id = ? AND equipment = ? "
+                "AND substr(logged_at, 1, 10) = ?"
+            )
+            params: list[object] = [user_id, equipment, date]
+        else:
+            sql = (
+                "DELETE FROM lifts WHERE guild_id = ? AND equipment = ? "
+                "AND substr(logged_at, 1, 10) = ?"
+            )
+            params = [guild_id, equipment, date]
         with self._conn() as c:
             cur = c.execute(sql, params)
             return cur.rowcount or 0
@@ -1139,16 +1156,21 @@ class Database:
         end_iso: str,
         user_id: int | None = None,
     ) -> int:
-        """Delete entries matching equipment inside a UTC timestamp range."""
-        sql = (
-            "DELETE FROM lifts "
-            "WHERE guild_id = ? AND equipment = ? "
-            "AND logged_at >= ? AND logged_at < ?"
-        )
-        params: list[object] = [guild_id, equipment, start_iso, end_iso]
+        """Delete entries matching equipment inside a UTC timestamp range. A
+        per-user delete is **global**; a guild-wide delete stays scoped to the
+        guild."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
+            sql = (
+                "DELETE FROM lifts WHERE user_id = ? AND equipment = ? "
+                "AND logged_at >= ? AND logged_at < ?"
+            )
+            params: list[object] = [user_id, equipment, start_iso, end_iso]
+        else:
+            sql = (
+                "DELETE FROM lifts WHERE guild_id = ? AND equipment = ? "
+                "AND logged_at >= ? AND logged_at < ?"
+            )
+            params = [guild_id, equipment, start_iso, end_iso]
         with self._conn() as c:
             cur = c.execute(sql, params)
             return cur.rowcount or 0
@@ -1162,11 +1184,13 @@ class Database:
         start_iso: str | None = None,
         end_iso: str | None = None,
     ) -> sqlite3.Row | None:
+        # Per-user edit helper → global (lifts are global per-user); ``guild_id``
+        # is kept for signature compatibility but not filtered on.
         sql = (
             "SELECT id, equipment, weight_kg, bodyweight_add AS bw, reps, logged_at "
-            "FROM lifts WHERE guild_id = ? AND user_id = ? AND equipment = ?"
+            "FROM lifts WHERE user_id = ? AND equipment = ?"
         )
-        params: list[object] = [guild_id, user_id, equipment]
+        params: list[object] = [user_id, equipment]
         if start_iso is not None and end_iso is not None:
             sql += " AND logged_at >= ? AND logged_at < ?"
             params.extend([start_iso, end_iso])
@@ -1268,10 +1292,11 @@ class Database:
         as 0kg (pure pull-ups) contribute nothing, which matches the way
         every other surface treats them.
         """
-        params: list[object] = [guild_id, user_id]
+        # Global per-user: tonnage spans every server (``guild_id`` unused).
+        params: list[object] = [user_id]
         sql = (
             "SELECT COALESCE(SUM(weight_kg), 0) AS total, COUNT(*) AS n "
-            "FROM lifts WHERE guild_id = ? AND user_id = ?"
+            "FROM lifts WHERE user_id = ?"
         )
         if since_iso is not None:
             sql += " AND logged_at >= ?"
@@ -1296,11 +1321,11 @@ class Database:
                 """
                 SELECT substr(logged_at, 1, 10) AS d
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT 1
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             if not row:
                 return None, []
@@ -1310,11 +1335,11 @@ class Database:
                 SELECT equipment, weight_kg, bodyweight_add AS bw,
                        logged_at, reps
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND substr(logged_at, 1, 10) = ?
                 ORDER BY logged_at ASC, id ASC
                 """,
-                (guild_id, user_id, day),
+                (user_id, day),
             ))
             return day, rows
 
@@ -1345,9 +1370,9 @@ class Database:
                        MIN(logged_at)                    AS first_at,
                        MAX(logged_at)                    AS last_at
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             if not row or row["total_lifts"] == 0:
                 return None
@@ -1364,12 +1389,12 @@ class Database:
                        MAX(weight_kg) AS best,
                        MAX(bodyweight_add) AS bw
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 GROUP BY equipment
                 ORDER BY best DESC
                 LIMIT ?
                 """,
-                (guild_id, user_id, limit),
+                (user_id, limit),
             ))
 
     def user_most_trained(
@@ -1381,12 +1406,12 @@ class Database:
                 """
                 SELECT equipment, COUNT(*) AS n
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 GROUP BY equipment
                 ORDER BY n DESC, equipment
                 LIMIT ?
                 """,
-                (guild_id, user_id, limit),
+                (user_id, limit),
             ))
 
     def user_biggest_gains(
@@ -1404,7 +1429,7 @@ class Database:
                            ROW_NUMBER() OVER (PARTITION BY equipment
                                               ORDER BY logged_at ASC) AS rn
                     FROM lifts
-                    WHERE guild_id = ? AND user_id = ?
+                    WHERE user_id = ?
                 ),
                 lasts AS (
                     SELECT equipment,
@@ -1413,7 +1438,7 @@ class Database:
                            ROW_NUMBER() OVER (PARTITION BY equipment
                                               ORDER BY logged_at DESC) AS rn
                     FROM lifts
-                    WHERE guild_id = ? AND user_id = ?
+                    WHERE user_id = ?
                 )
                 SELECT f.equipment,
                        f.first_w, f.first_at,
@@ -1425,7 +1450,7 @@ class Database:
                 ORDER BY delta DESC
                 LIMIT ?
                 """,
-                (guild_id, user_id, guild_id, user_id, limit),
+                (user_id, user_id, limit),
             ))
 
     def recent_user_equipment(
@@ -1435,12 +1460,12 @@ class Database:
             return [r[0] for r in c.execute(
                 """
                 SELECT equipment FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 GROUP BY equipment
                 ORDER BY MAX(logged_at) DESC
                 LIMIT ?
                 """,
-                (guild_id, user_id, limit),
+                (user_id, limit),
             )]
 
     def previous_best(
@@ -1448,12 +1473,15 @@ class Database:
         before_id: int | None = None,
     ) -> float | None:
         """Highest weight the user had recorded for this equipment, optionally
-        strictly before a given row id. Returns None if no prior entry."""
+        strictly before a given row id. Returns None if no prior entry.
+
+        Global per-user: a PR is an all-time best across **every** server
+        (``guild_id`` kept for signature compatibility but not filtered on)."""
         sql = (
             "SELECT MAX(weight_kg) AS best FROM lifts "
-            "WHERE guild_id = ? AND user_id = ? AND equipment = ?"
+            "WHERE user_id = ? AND equipment = ?"
         )
-        params: list[object] = [guild_id, user_id, equipment]
+        params: list[object] = [user_id, equipment]
         if before_id is not None:
             sql += " AND id < ?"
             params.append(before_id)
@@ -1471,11 +1499,11 @@ class Database:
                 SELECT id, equipment, weight_kg,
                        bodyweight_add AS bw, logged_at
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT ?
                 """,
-                (guild_id, user_id, limit),
+                (user_id, limit),
             ))
 
     def user_all_lifts(
@@ -1494,10 +1522,10 @@ class Database:
                        bodyweight_add AS bw, reps,
                        logged_at, message_id, channel_id, raw
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at, id
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ))
 
     def user_rep_sets(
@@ -1514,11 +1542,11 @@ class Database:
                 """
                 SELECT equipment, weight_kg, reps, logged_at
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND reps IS NOT NULL AND reps > 0 AND weight_kg > 0
                 ORDER BY equipment, logged_at, id
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ))
 
     def user_latest_by_equipment(
@@ -1537,14 +1565,14 @@ class Database:
                                ORDER BY logged_at DESC, id DESC
                            ) AS rn
                     FROM lifts
-                    WHERE guild_id = ? AND user_id = ?
+                    WHERE user_id = ?
                 )
                 SELECT equipment, weight_kg, bw, logged_at, n
                 FROM ranked
                 WHERE rn = 1
                 ORDER BY logged_at ASC, equipment
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ))
 
     def pop_last_for_user(
@@ -1552,18 +1580,19 @@ class Database:
         *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete the user's most recently logged row and return it. Returns
-        None if they have no entries."""
+        None if they have no entries. Global per-user: undoes the latest lift
+        from **any** server (``guild_id`` is kept only for the audit record)."""
         with self._conn() as c:
             row = c.execute(
                 """
                 SELECT id, equipment, weight_kg,
                        bodyweight_add AS bw, logged_at
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT 1
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -1592,11 +1621,11 @@ class Database:
                 SELECT id, equipment, weight_kg,
                        bodyweight_add AS bw, logged_at, message_id
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT ?
                 """,
-                (guild_id, user_id, n),
+                (user_id, n),
             ))
             if not rows:
                 return []
@@ -1802,10 +1831,10 @@ class Database:
                 """
                 SELECT DISTINCT substr(logged_at, 1, 10)
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY 1
                 """,
-                (guild_id, user_id),
+                (user_id,),
             )]
 
     def user_log_timestamps(
@@ -1819,10 +1848,10 @@ class Database:
                 """
                 SELECT logged_at
                 FROM lifts
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at
                 """,
-                (guild_id, user_id),
+                (user_id,),
             )]
 
     # ---- goals -----------------------------------------------------------
@@ -1831,7 +1860,15 @@ class Database:
         self, guild_id: int, user_id: int, equipment: str,
         target_kg: float, bodyweight_add: bool,
     ) -> None:
+        """Set a lift goal. Goals are **per-user / global** like lifts — setting
+        one consolidates to a single row per (user, equipment), so it applies in
+        every server."""
         with self._conn() as c:
+            c.execute(
+                "DELETE FROM goals WHERE user_id = ? AND equipment = ? "
+                "AND guild_id <> ?",
+                (user_id, equipment, guild_id),
+            )
             c.execute(
                 """
                 INSERT INTO goals (guild_id, user_id, equipment,
@@ -1857,13 +1894,15 @@ class Database:
     def goal_remove(
         self, guild_id: int, user_id: int, equipment: str
     ) -> int:
+        # Goals are global — remove the user's goal for this equipment
+        # everywhere (``guild_id`` only labels the audit entry).
         with self._conn() as c:
             cur = c.execute(
                 """
                 DELETE FROM goals
-                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                WHERE user_id = ? AND equipment = ?
                 """,
-                (guild_id, user_id, equipment),
+                (user_id, equipment),
             )
             n = cur.rowcount or 0
             if n:
@@ -1876,20 +1915,24 @@ class Database:
     def goal_get(
         self, guild_id: int, user_id: int, equipment: str
     ) -> sqlite3.Row | None:
+        """A lift goal, resolved **per-user** so it applies in every server
+        (prefers the current guild's row, else the most recent)."""
         with self._conn() as c:
             return c.execute(
                 """
                 SELECT equipment, target_kg, bodyweight_add AS bw, set_at
                 FROM goals
-                WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                WHERE user_id = ? AND equipment = ?
+                ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1
                 """,
-                (guild_id, user_id, equipment),
+                (user_id, equipment, guild_id),
             ).fetchone()
 
     def goal_list(
         self, guild_id: int, user_id: int
     ) -> list[sqlite3.Row]:
-        """Each goal joined with the user's current best on that equipment."""
+        """Each goal joined with the user's current (global) best on that
+        equipment. Goals and bests are both per-user/global."""
         with self._conn() as c:
             return list(c.execute(
                 """
@@ -1898,16 +1941,15 @@ class Database:
                        g.set_at,
                        COALESCE(
                            (SELECT MAX(weight_kg) FROM lifts l
-                            WHERE l.guild_id = g.guild_id
-                              AND l.user_id  = g.user_id
+                            WHERE l.user_id  = g.user_id
                               AND l.equipment = g.equipment),
                            0
                        ) AS current_best
                 FROM goals g
-                WHERE g.guild_id = ? AND g.user_id = ?
+                WHERE g.user_id = ?
                 ORDER BY g.equipment
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ))
 
     # ---- custom aliases --------------------------------------------------
@@ -4312,29 +4354,41 @@ class Database:
         self, guild_id: int, user_id: int | None = None,
         limit: int = 100, offset: int = 0,
     ) -> list[sqlite3.Row]:
-        sql = (
-            "SELECT id, user_id, username, equipment, weight_kg, "
-            "bodyweight_add AS bw, reps, logged_at FROM lifts WHERE guild_id = ?"
-        )
-        params: list[object] = [guild_id]
+        """Lifts for the dashboard. Lifts are global per-user, so a specific
+        user's list spans **every** server; the guild-wide list (no user) shows
+        lifts from that guild's current members."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
-        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+            sql = (
+                "SELECT id, user_id, username, equipment, weight_kg, "
+                "bodyweight_add AS bw, reps, logged_at FROM lifts "
+                "WHERE user_id = ? "
+                "ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            params: list[object] = [user_id, limit, offset]
+        else:
+            sql = (
+                "SELECT l.id, l.user_id, l.username, l.equipment, l.weight_kg, "
+                "l.bodyweight_add AS bw, l.reps, l.logged_at FROM lifts l "
+                "JOIN members m ON m.user_id = l.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 "
+                "ORDER BY l.logged_at DESC, l.id DESC LIMIT ? OFFSET ?"
+            )
+            params = [guild_id, limit, offset]
         with self._conn() as c:
             return list(c.execute(sql, params))
 
     def web_delete_lift(
         self, guild_id: int, lift_id: int, actor_name: str,
     ) -> bool:
-        """Delete one lift by id (scoped to guild) and audit it. Returns True
-        if a row was removed."""
+        """Delete one lift by id and audit it. Returns True if a row was removed.
+
+        Lifts are global, so a row shown in any guild's dashboard is deletable by
+        its id; ``guild_id`` only labels the audit entry."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT user_id, username, equipment, weight_kg "
-                "FROM lifts WHERE id = ? AND guild_id = ?",
-                (lift_id, guild_id),
+                "FROM lifts WHERE id = ?",
+                (lift_id,),
             ).fetchone()
             if row is None:
                 return False
@@ -4352,12 +4406,14 @@ class Database:
         weight_kg: float, reps: int | None, equipment: str,
         actor_name: str,
     ) -> bool:
-        """Edit a lift's weight/reps/equipment from the dashboard and audit it."""
+        """Edit a lift's weight/reps/equipment from the dashboard and audit it.
+
+        By id (lifts are global) — ``guild_id`` only labels the audit entry."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT user_id, username, equipment, weight_kg, reps "
-                "FROM lifts WHERE id = ? AND guild_id = ?",
-                (lift_id, guild_id),
+                "FROM lifts WHERE id = ?",
+                (lift_id,),
             ).fetchone()
             if row is None:
                 return False
@@ -4479,16 +4535,17 @@ class Database:
         """Compact per-member snapshot for the dashboard member page: lift
         counters, latest bodyweight, and total nutrition counts.
 
-        Nutrition and bodyweight are global (they span every server), so those
-        totals/latest are by user across all guilds; lifts stay guild-scoped."""
+        Lifts, nutrition and bodyweight are all global (they span every
+        server), so these counters/latest are summed by user across all
+        guilds."""
         with self._conn() as c:
             lifts = c.execute(
                 """
                 SELECT COUNT(*) AS n, COUNT(DISTINCT equipment) AS equip,
                        MAX(logged_at) AS last_at
-                FROM lifts WHERE guild_id = ? AND user_id = ?
+                FROM lifts WHERE user_id = ?
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             bw = c.execute(
                 "SELECT weight_kg, recorded_at FROM bodyweights "

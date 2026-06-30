@@ -178,7 +178,7 @@ def test_web_update_lift_audits_change(db):
         actor_name="web:op",
     )
     assert ok
-    rows = db.web_list_lifts(1)
+    rows = db.web_list_lifts(1, user_id=100)  # per-user list is global
     assert rows[0]["weight_kg"] == 110 and rows[0]["equipment"] == "bench press"
     assert db.list_audit(1, category="data")[0]["action"] == "lift_edit"
 
@@ -214,11 +214,18 @@ def test_web_food_set_and_delete_audited(db):
 
 
 def test_leaderboard_orders_by_best(db):
+    # The board lists this guild's current members, ranked by global best.
+    db.upsert_member(1, 100, "alice", "Alice")
+    db.upsert_member(1, 200, "bob", "Bob")
     db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)])
     db.add_lifts(1, 200, "Bob", [_Lift("bench", 120)])
-    db.add_lifts(1, 100, "Alice", [_Lift("bench", 110)])  # Alice PR
+    db.add_lifts(2, 100, "Alice", [_Lift("bench", 110)])  # Alice PR in another server
     rows = db.leaderboard(1, "bench")
     assert [(r["username"], r["best"]) for r in rows] == [("Bob", 120), ("Alice", 110)]
+    # A non-member with a bigger lift doesn't appear on this guild's board.
+    db.add_lifts(3, 300, "Carol", [_Lift("bench", 200)])
+    rows = db.leaderboard(1, "bench")
+    assert "Carol" not in [r["username"] for r in rows]
 
 
 def test_reverts_are_audited_with_actor(db):
@@ -287,7 +294,7 @@ def test_member_overview_nutrition_is_global(db):
     ov = db.web_member_overview(1, 100)
     assert ov["calories"]["total"] == 800   # both servers
     assert ov["protein"]["total"] == 70     # both servers
-    assert ov["lifts"]["n"] == 1            # only guild 1's lift
+    assert ov["lifts"]["n"] == 2            # lifts are global too
 
 
 def test_web_list_calories_global_per_user_but_guild_for_all(db):

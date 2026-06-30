@@ -71,7 +71,9 @@ Stats & progress:
   running-best reference line.
 - `/history <equipment> [user]` — per-entry timeline for one user.
 - `/recent [user] [limit]` — most recent entries across all equipment.
-- `/leaderboard <equipment>` — top 25 in the server for that lift.
+- `/leaderboard <equipment>` — top 25 of **this server's members** for that
+  lift. Lifts are global per user, so each member is ranked by their all-time
+  best across every server, but the board itself only lists this community.
 - `/machine <equipment>` — everyone's timeline on one lift.
 - `/compare <user> [equipment]` — head-to-head PRs with a win tally.
 - `/serverstats` — server-wide totals, top lifters, and popular equipment.
@@ -86,6 +88,15 @@ Goals:
 
 When a logged lift reaches a goal, the bot celebrates with 🎯 in its reply and
 clears the goal automatically.
+
+Lifts, PRs and goals are **global per user** — everything you log follows you
+across every server the bot is in (and DMs): your bests, history, tonnage,
+streaks, `/progress`, `/coach`, goals and `/stats` all aggregate every server.
+Only the *social* surfaces stay per-community: `/leaderboard`, `/machine` and
+`/serverstats` show this server's members/activity (ranked by global bests).
+Editing/cleanup of **your own** data is global too (`/change_weight`,
+`/rename scope:mine`, `/delete_entry`), while guild-wide admin ops
+(`/rename scope:all`, `/purge`) deliberately stay scoped to the current server.
 
 Calories:
 
@@ -208,8 +219,11 @@ Discovery & utilities:
 Maintenance (available to everyone):
 
 - `/backfill [limit]` — rescan this channel's history.
-- `/rename <old> <new>` — merge one equipment name into another.
-- `/purge <equipment>` — delete every row for a lift name.
+- `/rename <old> <new>` — merge one equipment name into another. Defaults to
+  *your* rows and applies **globally** (every server); `scope:all` renames the
+  whole server's rows (and repoints its aliases) and stays scoped to it.
+- `/purge <equipment>` — delete every row for a lift name in **this server**
+  (guild-wide admin op; doesn't reach other servers).
 - `/alias_add <phrase> <equipment>` — teach the bot a server-specific alias
   (e.g. "hack sled" → "leg press"). Custom aliases apply to both
   slash-command inputs and auto-parsed chat messages.
@@ -217,8 +231,10 @@ Maintenance (available to everyone):
 
 Auto-parsing also celebrates PRs: when a stored lift beats your previous best
 for that equipment, the bot's reply tags it with 🎉 and shows the old → new
-weight. Duplicate posts (same `message_id` + equipment) get a 🔁 reaction
-instead of a second ✅ so nothing is double-counted.
+weight. PRs are **all-time across every server** (lifts are global per user), so
+beating a best you set elsewhere still counts. Duplicate posts (same
+`message_id` + equipment) get a 🔁 reaction instead of a second ✅ so nothing is
+double-counted.
 
 Long stat dumps are compacted in bot replies after `PARSE_REPLY_MAX_ITEMS`
 rows so check-ins don't flood the channel. The entries are still stored; the

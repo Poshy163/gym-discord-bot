@@ -1346,12 +1346,13 @@ const ACTION_LABEL={
   timeout_remove:"⏳ timeout removed",
   message_blacklist_add:"🚫 msg blacklisted",message_blacklist_remove:"♻️ msg unblacklisted",
   lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
-  calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",
-  protein_add:"🥩 protein logged",protein_undo:"↩️ protein undone",protein_delete:"🗑️ protein deleted",
+  calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",calorie_edit:"✏️ calories edited",
+  protein_add:"🥩 protein logged",protein_undo:"↩️ protein undone",protein_delete:"🗑️ protein deleted",protein_edit:"✏️ protein edited",
   food_set:"🍴 food saved",food_delete:"🗑️ food removed",
   goal_set:"🎯 goal set",goal_remove:"🎯 goal removed",
   calorie_goal_set:"🎯 calorie goal",calorie_goal_remove:"🛑 calorie tracking off",
   protein_goal_set:"🎯 protein goal",protein_goal_remove:"🛑 protein tracking off",
+  presence_track_start:"🎮 tracking started",presence_track_stop:"🛑 tracking stopped",
   bodyweight_log:"⚖️ bodyweight"};
 function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
 let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[],ALL_ROLES=[];
