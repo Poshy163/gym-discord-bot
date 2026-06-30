@@ -600,3 +600,50 @@ def test_media_route_404_when_storage_disabled(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+def test_member_autountimeout_toggle(tmp_path):
+    """The per-member protection toggle routes through the injected handler and
+    503s when it isn't wired up."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        sink = []
+
+        async def fake_set(gid, uid, enable, actor):
+            sink.append((gid, uid, enable, actor))
+            return {"ok": True, "protected": enable, "changed": True}
+
+        app = build_app(db=db, password="secret", set_auto_untimeout=fake_set)
+        client = await _client(app)
+        try:
+            # Auth required.
+            r = await client.post("/api/member/autountimeout",
+                                  json={"guild": "1", "user": "5", "enable": True})
+            assert r.status == 401
+            await _login(client)
+            r = await client.post("/api/member/autountimeout",
+                                  json={"guild": "1", "user": "5", "enable": True})
+            assert r.status == 200
+            assert (await r.json())["protected"] is True
+            assert sink[0][0] == 1 and sink[0][1] == 5 and sink[0][2] is True
+            assert sink[0][3].startswith("web:")
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_autountimeout_503_when_unwired(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")  # no handler injected
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/member/autountimeout",
+                                  json={"guild": "1", "user": "5", "enable": True})
+            assert r.status == 503
+        finally:
+            await client.close()
+            db.close()
+    _run(go())

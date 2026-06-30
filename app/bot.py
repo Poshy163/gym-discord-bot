@@ -9490,6 +9490,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         set_member_role=_webui_set_member_role,
         member_moderation=_webui_member_moderation,
         remove_timeout=_webui_remove_timeout,
+        set_auto_untimeout=_webui_set_auto_untimeout,
         announce_blacklist=_webui_announce_blacklist,
         voice_snapshot=_webui_voice_snapshot,
         presence_track=_webui_presence_track,
@@ -9939,26 +9940,65 @@ def _bot_can_moderate(guild: "discord.Guild", member: "discord.Member") -> bool:
 
 
 async def _webui_member_moderation(guild_id: int, user_id: int) -> dict:  # pragma: no cover
-    """Live moderation state for a member: any active timeout + whether the bot
-    can act on it. Read from the cache so the dashboard can show/hide the
-    "Remove timeout" control accurately."""
+    """Live moderation state for a member: any active timeout, whether the bot
+    can act on it, and whether the member is on the auto un-timeout protected
+    list. Read from the cache so the dashboard can show/hide the "Remove
+    timeout" control and the protection toggle accurately."""
+    protected = db.auto_untimeout_is_protected(guild_id, user_id)
+    base = {
+        "ok": True,
+        "auto_untimeout_available": AUTO_UNTIMEOUT,
+        "auto_untimeout": protected,
+    }
     guild = bot.get_guild(guild_id)
     if guild is None:
         return {"ok": False, "error": "Server not found or bot not in it."}
     member = await _webui_resolve_member(guild, user_id)
     if member is None:
         return {
-            "ok": True, "timed_out_until": None, "timed_out": False,
+            **base, "timed_out_until": None, "timed_out": False,
             "can_moderate": False,
         }
     until = member.timed_out_until
     active = until is not None and until > datetime.now(timezone.utc)
     return {
-        "ok": True,
+        **base,
         "timed_out_until": until.isoformat() if until else None,
         "timed_out": active,
         "can_moderate": _bot_can_moderate(guild, member),
     }
+
+
+async def _webui_set_auto_untimeout(
+    guild_id: int, user_id: int, enable: bool, actor_name: str,
+) -> dict:  # pragma: no cover
+    """Add/remove a member from the auto un-timeout protected list (the
+    dashboard's per-member Moderation toggle). Audited as
+    ``auto_untimeout_enable`` / ``auto_untimeout_disable``."""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    member = await _webui_resolve_member(guild, user_id)
+    subject_name = _member_display(member) if member else str(user_id)
+    if enable:
+        changed = db.auto_untimeout_add(guild_id, user_id, added_by=actor_name)
+        if changed:
+            db.add_audit(
+                guild_id, "member", "auto_untimeout_enable",
+                actor_name=actor_name,
+                subject_id=user_id, subject_name=subject_name,
+                detail=f"auto un-timeout protection enabled (by {actor_name})",
+            )
+        return {"ok": True, "protected": True, "changed": changed}
+    changed = db.auto_untimeout_remove(guild_id, user_id)
+    if changed:
+        db.add_audit(
+            guild_id, "member", "auto_untimeout_disable",
+            actor_name=actor_name,
+            subject_id=user_id, subject_name=subject_name,
+            detail=f"auto un-timeout protection disabled (by {actor_name})",
+        )
+    return {"ok": True, "protected": False, "changed": changed}
 
 
 async def _webui_remove_timeout(
@@ -10101,12 +10141,15 @@ def _can_read_audit_log(guild: "discord.Guild") -> bool:
 async def _maybe_auto_untimeout(
     before: "discord.Member", after: "discord.Member",
 ) -> None:  # pragma: no cover - discord runtime
-    """If ``after`` just became (or had extended) an active timeout, clear it.
+    """If a *protected* member just became (or had extended) an active timeout,
+    clear it.
 
     Fires on the not-timed-out → timed-out transition (and on a re-applied /
     extended timeout, since the ``until`` value changes). Our own clearing makes
-    the next update timed-out → none, which this skips. Best-effort: a missing
-    permission or a target we don't outrank is recorded, not raised.
+    the next update timed-out → none, which this skips. Only members on the
+    guild's per-user protected list (managed from the dashboard's Moderation
+    panel) are acted on. Best-effort: a missing permission or a target we don't
+    outrank is recorded, not raised.
     """
     if not AUTO_UNTIMEOUT:
         return
@@ -10119,6 +10162,9 @@ async def _maybe_auto_untimeout(
     if after_until is None or after_until <= now or after_until == before_until:
         return
     guild = after.guild
+    # Per-user opt-in: only auto-remove timeouts for protected members.
+    if not db.auto_untimeout_is_protected(guild.id, after.id):
+        return
     name = _member_display(after)
     if not _bot_can_moderate(guild, after):
         db.add_audit(

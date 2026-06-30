@@ -331,3 +331,25 @@ def test_web_delete_entry_works_across_guilds(db):
     assert db.web_delete_calorie(1, cid, "web:op") is True
     assert db.web_list_calories(2, user_id=100) == []
     assert db.list_audit(1, category="data")[0]["action"] == "calorie_delete"
+
+
+# ---- auto un-timeout protected list ---------------------------------------
+
+def test_auto_untimeout_add_remove_and_check(db):
+    # Nobody protected initially.
+    assert db.auto_untimeout_is_protected(1, 100) is False
+    # Adding is idempotent and reports newness.
+    assert db.auto_untimeout_add(1, 100, added_by="web:op") is True
+    assert db.auto_untimeout_add(1, 100, added_by="web:op") is False
+    assert db.auto_untimeout_is_protected(1, 100) is True
+    # Scoped per guild + per user.
+    assert db.auto_untimeout_is_protected(2, 100) is False
+    assert db.auto_untimeout_is_protected(1, 200) is False
+    # Listed with who added them.
+    rows = db.auto_untimeout_list(1)
+    assert [int(r["user_id"]) for r in rows] == [100]
+    assert rows[0]["added_by"] == "web:op"
+    # Removal reports whether a row existed.
+    assert db.auto_untimeout_remove(1, 100) is True
+    assert db.auto_untimeout_remove(1, 100) is False
+    assert db.auto_untimeout_is_protected(1, 100) is False

@@ -375,10 +375,13 @@ for browsing and editing everything the bot tracks without touching Discord:
 
 Profile pictures appear throughout, and the whole thing is a modern dark UI.
 
-**Auto un-timeout** (`AUTO_UNTIMEOUT=true`, on by default): the bot immediately
-clears any timeout placed on a member, recording each removal in the audit log.
-It needs **Moderate Members** and a role above the target (Discord enforces both),
-and never acts on the guild owner or anyone it doesn't outrank.
+**Auto un-timeout** (`AUTO_UNTIMEOUT=true`, the master switch, on by default):
+the bot immediately clears any timeout placed on a **protected** member,
+recording each removal in the audit log. Protection is opt-in **per user** — open
+a member in the dashboard → **Moderation** → **Protect from timeouts** (toggle it
+back off there too). With nobody protected, nothing happens. It needs **Moderate
+Members** and a role above the target (Discord enforces both), and never acts on
+the guild owner or anyone it doesn't outrank.
 
 It is **off until you set `WEBUI_PASSWORD`**. Enabling it also turns on the
 privileged **Server Members** intent, which you must additionally toggle on for

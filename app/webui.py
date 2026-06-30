@@ -72,6 +72,9 @@ RoleHandler = Callable[[int, int, int, bool, str], Awaitable[dict]]
 ModerationHandler = Callable[[int, int], Awaitable[dict]]
 # (guild_id, user_id, actor_name) -> result dict
 TimeoutHandler = Callable[[int, int, str], Awaitable[dict]]
+# (guild_id, user_id, enable, actor_name) -> result dict — add/remove a member
+# from the auto un-timeout protected list (the per-member Moderation toggle).
+AutoUntimeoutHandler = Callable[[int, int, bool, str], Awaitable[dict]]
 # (guild_id, user_id, reason|None, actor_name) -> result dict — posts a public
 # chat message pinging the blacklisted user with the reason.
 BlacklistAnnouncer = Callable[[int, int, "str | None", str], Awaitable[dict]]
@@ -123,6 +126,7 @@ def build_app(
     set_member_role: RoleHandler | None = None,
     member_moderation: ModerationHandler | None = None,
     remove_timeout: TimeoutHandler | None = None,
+    set_auto_untimeout: AutoUntimeoutHandler | None = None,
     announce_blacklist: BlacklistAnnouncer | None = None,
     voice_snapshot: VoiceSnapshotHandler | None = None,
     presence_track: PresenceTrackHandler | None = None,
@@ -827,6 +831,27 @@ def build_app(
         status = 200 if result.get("ok") else 400
         return web.json_response(result, status=status)
 
+    async def api_member_autountimeout(request: web.Request) -> web.Response:
+        _require(request)
+        if set_auto_untimeout is None:
+            return web.json_response(
+                {"ok": False, "error": "auto un-timeout unavailable"},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user required")
+        enable = bool(body.get("enable", True))
+        result = await set_auto_untimeout(gid, uid, enable, _actor(request))
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
     async def api_member_track(request: web.Request) -> web.Response:
         _require(request)
         if presence_track is None:
@@ -934,6 +959,7 @@ def build_app(
         web.post("/api/member/role", api_member_role),
         web.get("/api/member/moderation", api_member_moderation),
         web.post("/api/member/untimeout", api_member_untimeout),
+        web.post("/api/member/autountimeout", api_member_autountimeout),
         web.post("/api/member/track", api_member_track),
         web.get("/media/{path:.*}", media),
         web.get("/healthz", health),
@@ -1182,6 +1208,7 @@ color:#fff;font-weight:600;font-size:.8em}
 border-radius:999px;font-size:.78rem;border:1px solid var(--line);margin:2px 1px;
 background:#ffffff08}
 .pill .dot{width:8px;height:8px;border-radius:50%}
+.modrow{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:.35rem 0}
 .pill a.rmrole{cursor:pointer;color:var(--faint);margin-left:.15rem;font-size:.8em}
 .pill a.rmrole:hover{color:#f85149}
 .rolectl{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
@@ -1378,6 +1405,7 @@ const ACTION_LABEL={
   kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",invite_create:"✉️ invite sent",
   timeout_remove:"⏳ timeout removed",
   timeout_auto_removed:"⏳ timeout auto-removed",timeout_auto_skip:"⚠️ timeout (couldn't auto-remove)",
+  auto_untimeout_enable:"🛡️ auto un-timeout on",auto_untimeout_disable:"🛡️ auto un-timeout off",
   message_blacklist_add:"🚫 msg blacklisted",message_blacklist_remove:"♻️ msg unblacklisted",
   lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
   calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",calorie_edit:"✏️ calories edited",
@@ -1565,23 +1593,36 @@ async function memberView(uid){
   if(m.present)loadModeration(uid);
 }
 
-// ---- moderation (remove timeout) ----
+// ---- moderation (remove timeout + auto un-timeout protection) ----
 async function loadModeration(uid){
   const box=document.getElementById("modbox");if(!box)return;
   let d;try{d=await api(`/api/member/moderation?guild=${guild}&user=${uid}`);}catch(e){box.remove();return;}
   if(!d||!d.ok){box.remove();return;}
-  if(d.timed_out){
-    box.classList.remove("faint");
-    box.innerHTML=`<span class="pill" style="border-color:#5c2b2b">⏳ Timed out until ${fmtTs(d.timed_out_until)}</span>
-      <button class="btn sm danger" ${d.can_moderate?'':'disabled title="Bot lacks Moderate Members or is outranked"'}
-        onclick="removeTimeout('${uid}')">Remove timeout</button>`;
-  }else{
-    box.innerHTML='<span class="faint">No active timeout.</span>';
+  box.classList.remove("faint");
+  const timeoutLine=d.timed_out
+    ? `<div class="modrow"><span class="pill" style="border-color:#5c2b2b">⏳ Timed out until ${fmtTs(d.timed_out_until)}</span>
+        <button class="btn sm danger" ${d.can_moderate?'':'disabled title="Bot lacks Moderate Members or is outranked"'}
+          onclick="removeTimeout('${uid}')">Remove timeout</button></div>`
+    : `<div class="modrow"><span class="faint">No active timeout.</span></div>`;
+  // Auto un-timeout protection toggle (only when the feature's master switch is on).
+  let protLine="";
+  if(d.auto_untimeout_available){
+    protLine=d.auto_untimeout
+      ? `<div class="modrow"><span class="pill">🛡️ Auto un-timeout: ON — timeouts are removed automatically</span>
+          <button class="btn sm danger" onclick="setAutoUntimeout('${uid}',false)">Turn off</button></div>`
+      : `<div class="modrow"><span class="faint">🛡️ Auto un-timeout: off for this member.</span>
+          <button class="btn sm" onclick="setAutoUntimeout('${uid}',true)">Protect from timeouts</button></div>`;
   }
+  box.innerHTML=timeoutLine+protLine;
 }
 async function removeTimeout(uid){
   const r=await post("/api/member/untimeout",{guild,user:uid});
   if(r&&r.ok){toast(r.changed===false?"Wasn't timed out":"Timeout removed ✓");memberView(uid);}
+  else{toast((r&&r.error)||"Failed");}
+}
+async function setAutoUntimeout(uid,enable){
+  const r=await post("/api/member/autountimeout",{guild,user:uid,enable});
+  if(r&&r.ok){toast(enable?"Auto un-timeout enabled 🛡️":"Auto un-timeout disabled");loadModeration(uid);}
   else{toast((r&&r.error)||"Failed");}
 }
 

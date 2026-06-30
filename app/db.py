@@ -229,6 +229,17 @@ CREATE TABLE IF NOT EXISTS message_log_blacklist (
     PRIMARY KEY (guild_id, user_id)
 );
 
+-- Per-user auto un-timeout protection. When the AUTO_UNTIMEOUT master switch is
+-- on, the bot only auto-removes timeouts for members listed here (added via the
+-- dashboard's per-member Moderation toggle). Empty list => nobody is protected.
+CREATE TABLE IF NOT EXISTS auto_untimeout (
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    added_by  TEXT,
+    added_at  TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
 -- Calorie tracking. ``calorie_goals`` holds each user's daily intake target
 -- (stored in kcal — the bot converts kJ on the way in). Having a row here is
 -- what marks a user as "doing" calorie tracking for the weekly AI summary.
@@ -3234,6 +3245,48 @@ class Database:
                     (guild_id,),
                 )
             }
+
+    # ---- per-user auto un-timeout protection -----------------------------
+
+    def auto_untimeout_add(
+        self, guild_id: int, user_id: int, added_by: str | None = None,
+    ) -> bool:
+        """Protect ``user_id`` so the bot auto-removes their timeouts (while the
+        AUTO_UNTIMEOUT master switch is on). Idempotent. Returns True if newly
+        added (False if already protected)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO auto_untimeout "
+                "(guild_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+                (guild_id, user_id, added_by, _normalize_iso(None)),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def auto_untimeout_remove(self, guild_id: int, user_id: int) -> bool:
+        """Stop protecting ``user_id``. Returns True if a row existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM auto_untimeout WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def auto_untimeout_is_protected(self, guild_id: int, user_id: int) -> bool:
+        """Whether ``user_id`` is on the guild's auto un-timeout protected list."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM auto_untimeout WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            ).fetchone() is not None
+
+    def auto_untimeout_list(self, guild_id: int) -> list[sqlite3.Row]:
+        """Protected users in a guild, newest first, with who/when."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT user_id, added_by, added_at FROM auto_untimeout "
+                "WHERE guild_id = ? ORDER BY added_at DESC",
+                (guild_id,),
+            ))
 
     # ------------------------------------------------------------------
     # Calorie tracking
