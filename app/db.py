@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -156,18 +157,24 @@ CREATE TABLE IF NOT EXISTS presence_events (
 CREATE INDEX IF NOT EXISTS idx_presence_events_user
     ON presence_events (guild_id, user_id, at);
 
--- Activity tracking. ``activity`` is the game/app name, or NULL when the
--- user stops playing. We de-dupe consecutive identical values. ``image_url``
--- is the Discord rich-presence large image for that activity when one is
--- available (many plain "playing X" presences have none) — used by the web
--- dashboard to show real game art.
+-- Activity tracking. A user can run several games/apps at once (e.g. a game
+-- plus a launcher), so each row snapshots the *full set* currently active:
+-- ``activities`` is a JSON array of ``{"n": name, "i": image_url|null}`` in
+-- Discord's reported order. ``activity``/``image_url`` mirror the primary
+-- (first) entry for backward compatibility with the snapshot helpers and rows
+-- written before concurrent tracking existed; ``activity`` is NULL and
+-- ``activities`` is ``[]``/NULL when the user stops everything. We de-dupe
+-- against the previous snapshot. ``image_url`` is the Discord rich-presence
+-- large image when the activity exposes one (many plain "playing X" presences
+-- don't) — used by the web dashboard to show real game art.
 CREATE TABLE IF NOT EXISTS activity_events (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id  INTEGER NOT NULL,
-    user_id   INTEGER NOT NULL,
-    activity  TEXT,
-    image_url TEXT,
-    at        TEXT    NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    activity   TEXT,
+    image_url  TEXT,
+    activities TEXT,
+    at         TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_activity_events_user
@@ -636,6 +643,13 @@ class Database:
             if act_cols and "image_url" not in act_cols:
                 self._connection.execute(
                     "ALTER TABLE activity_events ADD COLUMN image_url TEXT"
+                )
+            # Concurrent-activity snapshots: rows written before this hold only
+            # the single primary game in ``activity``; the reader treats a NULL
+            # ``activities`` column as "[{primary}]" so old data still aggregates.
+            if act_cols and "activities" not in act_cols:
+                self._connection.execute(
+                    "ALTER TABLE activity_events ADD COLUMN activities TEXT"
                 )
             msg_cols = {
                 row["name"]
@@ -2855,33 +2869,83 @@ class Database:
     # Activity helpers
     # ------------------------------------------------------------------
 
-    def activity_log_event(
-        self, guild_id: int, user_id: int, activity: str | None,
-        at: datetime | None = None, image_url: str | None = None,
+    @staticmethod
+    def _activity_set(row: sqlite3.Row) -> list[dict]:
+        """Decode a row's concurrent-activity snapshot into ``[{"n","i"}]``.
+
+        Falls back to the legacy single ``activity``/``image_url`` columns for
+        rows written before the ``activities`` JSON column existed, so old and
+        new data aggregate the same way."""
+        keys = row.keys()
+        raw = row["activities"] if "activities" in keys else None
+        if raw:
+            try:
+                items = json.loads(raw)
+            except (ValueError, TypeError):
+                items = None
+            if isinstance(items, list):
+                return [
+                    {"n": str(it["n"]), "i": it.get("i")}
+                    for it in items
+                    if isinstance(it, dict) and it.get("n")
+                ]
+        name = row["activity"]
+        if name:
+            img = row["image_url"] if "image_url" in keys else None
+            return [{"n": name, "i": img}]
+        return []
+
+    def activity_log_set(
+        self, guild_id: int, user_id: int,
+        activities: list[tuple[str, str | None]],
+        at: datetime | None = None,
     ) -> bool:
-        """Append an activity event (game/app name or None = stopped).
-        De-duplicates against the most recent stored value (on name only, so a
-        late-arriving image for the same game doesn't spam a new row). Returns
-        True if a row was inserted."""
+        """Append a snapshot of *all* games/apps a user is running at once.
+
+        ``activities`` is an ordered list of ``(name, image_url)`` for every
+        concurrent activity (empty = stopped everything). De-duplicates against
+        the previous snapshot on the ordered list of names — so a late-arriving
+        image for an unchanged set doesn't spam a new row. The legacy
+        ``activity``/``image_url`` columns mirror the primary (first) entry.
+        Returns True if a row was inserted."""
         ts = _normalize_iso(at)
+        names = [str(n) for n, _img in activities if n]
         with self._conn() as c:
             last = c.execute(
-                "SELECT activity FROM activity_events "
+                "SELECT activity, image_url, activities FROM activity_events "
                 "WHERE guild_id = ? AND user_id = ? "
                 "ORDER BY at DESC, id DESC LIMIT 1",
                 (guild_id, user_id),
             ).fetchone()
-            if last is None and activity is None:
+            if last is None and not names:
                 return False
-            if last is not None and last["activity"] == activity:
-                return False
+            if last is not None:
+                last_names = [d["n"] for d in self._activity_set(last)]
+                if last_names == names:
+                    return False
+            primary = names[0] if names else None
+            primary_img = activities[0][1] if names else None
+            payload = (
+                json.dumps([{"n": str(n), "i": img} for n, img in activities
+                            if n])
+                if names else None
+            )
             c.execute(
                 "INSERT INTO activity_events "
-                "(guild_id, user_id, activity, image_url, at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (guild_id, user_id, activity, image_url, ts),
+                "(guild_id, user_id, activity, image_url, activities, at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, primary, primary_img, payload, ts),
             )
             return True
+
+    def activity_log_event(
+        self, guild_id: int, user_id: int, activity: str | None,
+        at: datetime | None = None, image_url: str | None = None,
+    ) -> bool:
+        """Append a single-activity event (back-compat wrapper around
+        :meth:`activity_log_set`). ``activity`` of None means stopped."""
+        acts = [(activity, image_url)] if activity else []
+        return self.activity_log_set(guild_id, user_id, acts, at=at)
 
     # ---- web dashboard: current presence/activity snapshots --------------
 
@@ -2900,30 +2964,48 @@ class Database:
     def activity_current(
         self, guild_id: int, user_id: int,
     ) -> sqlite3.Row | None:
-        """Latest activity event for a user (activity may be NULL = stopped)."""
+        """Latest activity event for a user (activity may be NULL = stopped).
+        Carries the ``activities`` JSON so callers can list every concurrent
+        game; :meth:`_activity_set` decodes it."""
         with self._conn() as c:
             return c.execute(
-                "SELECT activity, image_url, at FROM activity_events "
+                "SELECT activity, image_url, activities, at FROM activity_events "
                 "WHERE guild_id = ? AND user_id = ? "
                 "ORDER BY at DESC, id DESC LIMIT 1",
                 (guild_id, user_id),
             ).fetchone()
+
+    def activity_current_set(
+        self, guild_id: int, user_id: int,
+    ) -> tuple[list[dict], str] | None:
+        """Latest snapshot decoded as ``(activities, iso_timestamp)`` where
+        ``activities`` is a list of ``{"n","i"}`` (empty when stopped), or None
+        if the user has no recorded activity events."""
+        row = self.activity_current(guild_id, user_id)
+        if row is None:
+            return None
+        return self._activity_set(row), row["at"]
 
     def activity_image_map(
         self, guild_id: int, user_id: int,
     ) -> dict[str, str]:
         """Best-known image URL per game name for a user (most recent wins).
         Lets the activity feed show art for games whose current event has none
-        but an earlier session captured one."""
+        but an earlier session captured one. Reads every concurrent activity in
+        each snapshot, not just the primary."""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT activity, image_url FROM activity_events "
+                "SELECT activity, image_url, activities FROM activity_events "
                 "WHERE guild_id = ? AND user_id = ? "
-                "AND activity IS NOT NULL AND image_url IS NOT NULL "
                 "ORDER BY at ASC, id ASC",
                 (guild_id, user_id),
             )
-            return {r["activity"]: r["image_url"] for r in rows}
+            out: dict[str, str] = {}
+            for r in rows:
+                for d in self._activity_set(r):
+                    if d["i"]:
+                        out[d["n"]] = d["i"]
+            return out
 
     def activity_events_for(
         self, guild_id: int, user_id: int,
@@ -2938,7 +3020,8 @@ class Database:
             if since is not None:
                 start_iso = _normalize_iso(since)
                 prior = c.execute(
-                    "SELECT activity, at FROM activity_events "
+                    "SELECT activity, image_url, activities, at "
+                    "FROM activity_events "
                     "WHERE guild_id = ? AND user_id = ? AND at < ? "
                     "ORDER BY at DESC, id DESC LIMIT 1",
                     (guild_id, user_id, start_iso),
@@ -2954,11 +3037,28 @@ class Database:
                 where += " AND at <= ?"
                 params.append(_normalize_iso(until))
             rows.extend(c.execute(
-                f"SELECT activity, at FROM activity_events WHERE {where} "
+                f"SELECT activity, image_url, activities, at "
+                f"FROM activity_events WHERE {where} "
                 "ORDER BY at ASC, id ASC",
                 params,
             ).fetchall())
             return rows
+
+    def activity_sets_for(
+        self, guild_id: int, user_id: int,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[tuple[list[str], str]]:
+        """Like :meth:`activity_events_for` but each event is decoded into
+        ``(active_names, iso_timestamp)`` — the full set of games/apps running
+        at that moment. Feeds the overlap-aware activity totals so concurrent
+        play (e.g. a game plus a launcher) counts toward every title."""
+        return [
+            ([d["n"] for d in self._activity_set(r)], r["at"])
+            for r in self.activity_events_for(
+                guild_id, user_id, since=since, until=until,
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Voice-channel tracking

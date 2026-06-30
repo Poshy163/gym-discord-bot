@@ -8,6 +8,8 @@ from app.presence import (
     format_duration,
     is_online,
     nightly_sleep_sessions,
+    summarize_activities,
+    summarize_activity_sets,
     summarize_presence,
 )
 
@@ -171,3 +173,44 @@ def test_nightly_sleep_sessions_merges_brief_online_flicker():
 def test_nightly_sleep_sessions_empty_window():
     start = datetime(2026, 5, 1, tzinfo=UTC)
     assert nightly_sleep_sessions([], start, start) == []
+
+
+# --- concurrent-activity aggregation --------------------------------------
+
+def test_summarize_activity_sets_credits_each_overlapping_game():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    # Plays tModLoader for the full 2h; Excel joins for the middle hour.
+    events = [
+        (["tModLoader"], _iso(start)),
+        (["tModLoader", "Excel"], _iso(start + timedelta(minutes=30))),
+        (["tModLoader"], _iso(start + timedelta(minutes=90))),
+    ]
+    totals = summarize_activity_sets(events, start, end)
+    assert totals["tModLoader"] == 2 * 3600  # whole window
+    assert totals["Excel"] == 3600           # only the overlapping hour
+    # Sorted descending by time.
+    assert list(totals) == ["tModLoader", "Excel"]
+
+
+def test_summarize_activity_sets_carry_in_and_stop():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    events = [
+        (["Rust"], _iso(start - timedelta(hours=1))),   # carry-in
+        ([], _iso(start + timedelta(hours=1))),          # stopped at the 1h mark
+    ]
+    totals = summarize_activity_sets(events, start, end)
+    assert totals == {"Rust": 3600}  # 1h inside the window, none after stop
+
+
+def test_summarize_activities_adapter_matches_single_track():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    events = [("Halo", _iso(start)), (None, _iso(start + timedelta(hours=1)))]
+    assert summarize_activities(events, start, end) == {"Halo": 3600}
+
+
+def test_summarize_activity_sets_empty_window():
+    start = datetime(2026, 5, 1, tzinfo=UTC)
+    assert summarize_activity_sets([(["X"], _iso(start))], start, start) == {}

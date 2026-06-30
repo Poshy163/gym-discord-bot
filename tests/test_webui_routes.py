@@ -229,6 +229,80 @@ def test_voice_without_snapshot_still_serves_events(tmp_path):
     _run(go())
 
 
+def test_activity_overlaps_and_resolves_icons(tmp_path):
+    """The Activity tab credits overlapping games to each title, lists every
+    currently-running game, honours the ?days window, and falls back to the
+    curated icon map when an activity carries no rich-presence image."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        db.presence_log_event(1, 100, "online", at=now - timedelta(hours=3))
+        # tModLoader for 2h; Excel overlaps the last hour; both still running.
+        db.activity_log_set(1, 100, [("tModLoader", None)],
+                            at=now - timedelta(hours=2))
+        db.activity_log_set(1, 100, [("tModLoader", None), ("Excel", None)],
+                            at=now - timedelta(hours=1))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/activity?guild=1&days=7")).json()
+            assert d["window_days"] == 7
+            u = d["users"][0]
+            games = {g["name"]: g for g in u["top_games"]}
+            # Overlap: tModLoader ~2h, Excel ~1h (both credited).
+            assert games["tModLoader"]["seconds"] > games["Excel"]["seconds"]
+            assert games["Excel"]["seconds"] >= 3000
+            # tModLoader resolves a curated icon despite no stored image.
+            assert games["tModLoader"]["image"]
+            # Both currently-running games are reported.
+            assert {g["name"] for g in u["current_games"]} == {"tModLoader", "Excel"}
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_sleep_tab_reports_nightly_sessions(tmp_path):
+    """The Sleep tab derives nightly sessions from presence and summarises them
+    (count + average) per tracked user."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        # Anchor to "now" so the night always lands inside the 7-day window:
+        # awake 2 days ago, ~8h offline, then awake again.
+        db.presence_log_event(1, 100, "online", at=now - timedelta(days=2))
+        db.presence_log_event(1, 100, "offline",
+                              at=now - timedelta(days=2) + timedelta(hours=2))
+        db.presence_log_event(1, 100, "online",
+                              at=now - timedelta(days=2) + timedelta(hours=10))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/sleep?guild=1")).json()
+            assert d["window_days"] == 7  # 7-day default
+            u = d["users"][0]
+            assert u["display_name"] == "Alice"
+            assert u["nights"] == 1
+            assert u["avg_hours"] == 8.0
+            assert u["sessions"][0]["duration_hours"] == 8.0
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_invite_503_when_not_wired(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

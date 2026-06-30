@@ -359,3 +359,68 @@ def test_voice_events_logged_newest_first_with_member(db):
     assert len(db.voice_events_recent(1, limit=1)) == 1
     recent = db.voice_events_recent(1, since=base + timedelta(minutes=3))
     assert [r["event"] for r in recent] == ["leave"]
+
+
+# --- concurrent activity snapshots ----------------------------------------
+
+def test_activity_log_set_records_concurrent_games(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    # Two games at once, the second carrying art.
+    assert db.activity_log_set(
+        1, 100, [("tModLoader", None), ("Excel", "http://img/xl.png")], at=t0,
+    ) is True
+    # Same set of names again is de-duped even though images could differ.
+    assert db.activity_log_set(
+        1, 100, [("tModLoader", "http://img/tml.png"), ("Excel", None)],
+        at=t0 + timedelta(minutes=5),
+    ) is False
+    # Dropping one game is a change -> new row.
+    assert db.activity_log_set(
+        1, 100, [("tModLoader", None)], at=t0 + timedelta(minutes=10),
+    ) is True
+
+    sets = db.activity_sets_for(1, 100)
+    assert [names for names, _at in sets] == [
+        ["tModLoader", "Excel"], ["tModLoader"],
+    ]
+    # Primary (first) game mirrors into the legacy column for back-compat.
+    cur = db.activity_current(1, 100)
+    assert cur["activity"] == "tModLoader"
+
+
+def test_activity_current_set_decodes_snapshot(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    db.activity_log_set(1, 100, [("Rust", "http://img/rust.png"), ("Discord", None)], at=t0)
+    acts, at = db.activity_current_set(1, 100)
+    assert acts == [
+        {"n": "Rust", "i": "http://img/rust.png"},
+        {"n": "Discord", "i": None},
+    ]
+    assert at == t0.isoformat()
+    # Stopping everything yields an empty set, not None.
+    db.activity_log_set(1, 100, [], at=t0 + timedelta(hours=1))
+    acts2, _ = db.activity_current_set(1, 100)
+    assert acts2 == []
+
+
+def test_activity_image_map_spans_concurrent_activities(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    # Art arrives for a *secondary* activity in one snapshot...
+    db.activity_log_set(
+        1, 100, [("Rust", None), ("Crosshair X", "http://img/cx.png")], at=t0,
+    )
+    # ...and for the primary in a later one.
+    db.activity_log_set(
+        1, 100, [("Rust", "http://img/rust.png")], at=t0 + timedelta(hours=1),
+    )
+    assert db.activity_image_map(1, 100) == {
+        "Crosshair X": "http://img/cx.png",
+        "Rust": "http://img/rust.png",
+    }
+
+
+def test_activity_log_event_still_drives_set_storage(db):
+    # The legacy single-activity wrapper round-trips through the set model.
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    assert db.activity_log_event(1, 100, "Halo", at=t0) is True
+    assert db.activity_sets_for(1, 100) == [(["Halo"], t0.isoformat())]

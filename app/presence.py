@@ -194,17 +194,20 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
-def summarize_activities(
-    events: list[tuple[str | None, str]],
+def summarize_activity_sets(
+    events: list[tuple[list[str], str]],
     window_start: "datetime",
     window_end: "datetime",
 ) -> dict[str, float]:
-    """Aggregate activity events into ``{activity_name: total_seconds}``.
+    """Aggregate concurrent-activity snapshots into ``{name: total_seconds}``.
 
-    ``events`` is an ordered list of ``(activity_name_or_None, iso_timestamp)``
-    tuples (same carry-in convention as ``summarize_presence``).  Returns a
-    dict mapping each non-None activity name to the total seconds spent in it
-    within the window, sorted descending by time.
+    ``events`` is an ordered list of ``(active_names, iso_timestamp)`` tuples,
+    where ``active_names`` is the full set of games/apps running from that
+    moment (same carry-in convention as :func:`summarize_presence`; an empty
+    list means "stopped everything"). Because a user can run several at once,
+    *every* name active in a segment accrues that segment's full duration — so
+    overlapping play counts toward each title rather than only one. Returns the
+    totals sorted descending by time.
     """
     if window_end <= window_start:
         return {}
@@ -217,28 +220,49 @@ def summarize_activities(
     window_end = window_end.astimezone(timezone.utc)
 
     totals: dict[str, float] = {}
-    current_activity: str | None = None
+    current: list[str] = []
     current_start = window_start
+    started = False  # have we seen the opening (carry-in or in-window) state?
 
-    for activity, ts_str in events:
+    def _credit(end: "datetime") -> None:
+        if not started or end <= current_start:
+            return
+        secs = (end - current_start).total_seconds()
+        for name in current:
+            totals[name] = totals.get(name, 0.0) + secs
+
+    for names, ts_str in events:
         ts = _parse_iso(ts_str)
         if ts < window_start:
-            current_activity = activity
+            current = list(names)
+            started = True
             continue
         if ts >= window_end:
             break
-        if current_activity is not None and ts > current_start:
-            secs = (ts - current_start).total_seconds()
-            totals[current_activity] = totals.get(current_activity, 0.0) + secs
-        current_activity = activity
+        _credit(ts)
+        current = list(names)
+        started = True
         current_start = ts
 
-    # Tail segment
-    if current_activity is not None and window_end > current_start:
-        secs = (window_end - current_start).total_seconds()
-        totals[current_activity] = totals.get(current_activity, 0.0) + secs
-
+    _credit(window_end)
     return dict(sorted(totals.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def summarize_activities(
+    events: list[tuple[str | None, str]],
+    window_start: "datetime",
+    window_end: "datetime",
+) -> dict[str, float]:
+    """Single-activity adapter over :func:`summarize_activity_sets`.
+
+    ``events`` is an ordered list of ``(activity_name_or_None, iso_timestamp)``
+    tuples; each non-None name becomes a one-element active set. Kept for
+    callers that only have a single activity per event.
+    """
+    return summarize_activity_sets(
+        [([name] if name else [], ts) for name, ts in events],
+        window_start, window_end,
+    )
 
 
 def estimate_sleep_window(

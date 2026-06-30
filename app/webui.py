@@ -32,6 +32,8 @@ GET  /api/audit        Filterable audit log slice.
 GET  /api/lifts        Lift rows (optionally one user).
 GET  /api/calories     Calorie rows.
 GET  /api/protein      Protein rows.
+GET  /api/activity     Per-tracked-user game/app activity (overlap-aware totals).
+GET  /api/sleep        Per-tracked-user nightly sleep sessions from presence.
 POST /api/lifts/delete, /api/lifts/edit, /api/calories/delete,
      /api/protein/delete   Edit endpoints (audited).
 GET  /healthz          Liveness probe (no auth).
@@ -49,7 +51,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from . import presence
+from . import game_icons, presence
 
 LOG = logging.getLogger("gymbot.webui")
 
@@ -134,6 +136,7 @@ def build_app(
     calorie_streak: StreakHandler | None = None,
     protein_streak: StreakHandler | None = None,
     media_dir: str | None = None,
+    display_tz=timezone.utc,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -153,6 +156,9 @@ def build_app(
     starts/stops recording a member's presence + activity from the member panel;
     ``presence_enabled`` mirrors the bot's ENABLE_PRESENCE_TRACKING flag so the
     dashboard only offers the control when the feature is actually on.
+    ``display_tz`` is the timezone the Sleep tab attributes nightly sessions to
+    (defaults to UTC); pass the bot's display timezone so wake-up dates match
+    the operator's local sense of time.
     """
     sessions = _Sessions()
 
@@ -463,10 +469,16 @@ def build_app(
             for r in rows
         ]})
 
+    def _act_icon(name: str, stored: str | None) -> str | None:
+        """Resolve an activity's art: its own rich-presence image (or one
+        captured for it in an earlier session) first, then the curated
+        game-icon fallback, then None (the UI draws a coloured tile)."""
+        return stored or game_icons.icon_for(name)
+
     async def api_activity(request: web.Request) -> web.Response:
         _require(request)
         gid = _guild_id(request)
-        days = _clamp_int(request.query.get("days"), 30, 1, 90)
+        days = _clamp_int(request.query.get("days"), 7, 1, 90)
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
         users = []
@@ -474,24 +486,32 @@ def build_app(
             uid = int(row["user_id"])
             member = db.get_member(gid, uid)
             pres = db.presence_current(gid, uid)
-            cur = db.activity_current(gid, uid)
+            cur = db.activity_current_set(gid, uid)
             imgmap = db.activity_image_map(gid, uid)
-            events = [
-                (r["activity"], r["at"])
-                for r in db.activity_events_for(gid, uid, since=since)
-            ]
-            totals = presence.summarize_activities(events, since, now)
+            totals = presence.summarize_activity_sets(
+                db.activity_sets_for(gid, uid, since=since), since, now,
+            )
             top = [
-                {"name": nm, "seconds": round(secs), "image": imgmap.get(nm)}
+                {
+                    "name": nm,
+                    "seconds": round(secs),
+                    "image": _act_icon(nm, imgmap.get(nm)),
+                }
                 for nm, secs in list(totals.items())[:6]
             ]
-            current_game = None
-            if cur and cur["activity"]:
-                current_game = {
-                    "name": cur["activity"],
-                    "image": cur["image_url"] or imgmap.get(cur["activity"]),
-                    "since": cur["at"],
-                }
+            # Everything the user is running right now (a game plus a launcher,
+            # two games, …), all sharing the snapshot's timestamp as "since".
+            current_games = []
+            if cur is not None:
+                acts, at = cur
+                current_games = [
+                    {
+                        "name": d["n"],
+                        "image": _act_icon(d["n"], d["i"] or imgmap.get(d["n"])),
+                        "since": at,
+                    }
+                    for d in acts
+                ]
             users.append({
                 "user_id": str(uid),
                 "display_name": (
@@ -500,8 +520,41 @@ def build_app(
                 "avatar": member["avatar"] if member else None,
                 "status": pres["status"] if pres else None,
                 "status_at": pres["at"] if pres else None,
-                "current_game": current_game,
+                "current_games": current_games,
                 "top_games": top,
+            })
+        return web.json_response({"users": users, "window_days": days})
+
+    async def api_sleep(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        days = _clamp_int(request.query.get("days"), 7, 1, 90)
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=days)
+        users = []
+        for row in db.presence_track_list(gid):
+            uid = int(row["user_id"])
+            member = db.get_member(gid, uid)
+            pres = db.presence_current(gid, uid)
+            events = [
+                (r["status"], r["at"])
+                for r in db.presence_events_for(gid, uid, since=since, until=now)
+            ]
+            sessions = presence.nightly_sleep_sessions(
+                events, since, now, display_tz=display_tz,
+            )
+            durations = [s["duration_hours"] for s in sessions]
+            avg = round(sum(durations) / len(durations), 2) if durations else None
+            users.append({
+                "user_id": str(uid),
+                "display_name": (
+                    member["display_name"] if member else str(uid)
+                ),
+                "avatar": member["avatar"] if member else None,
+                "status": pres["status"] if pres else None,
+                "sessions": sessions,
+                "nights": len(sessions),
+                "avg_hours": avg,
             })
         return web.json_response({"users": users, "window_days": days})
 
@@ -942,6 +995,7 @@ def build_app(
         web.get("/api/equipment", api_equipment),
         web.get("/api/leaderboard", api_leaderboard),
         web.get("/api/activity", api_activity),
+        web.get("/api/sleep", api_sleep),
         web.get("/api/messages/channels", api_messages_channels),
         web.get("/api/messages/log", api_messages_log),
         web.get("/api/voice", api_voice),
@@ -1314,6 +1368,25 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
 .tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
 .offline-card{opacity:.6}
+.nowlist{display:flex;flex-direction:column;gap:.4rem}
+/* day-window segmented control (Activity + Sleep tabs) */
+.dayseg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.dayseg button{background:var(--panel);border:0;color:var(--muted);cursor:pointer;
+font:inherit;font-size:.84rem;padding:.32rem .7rem}
+.dayseg button:hover{background:#ffffff0a;color:#e6edf3}
+.dayseg button.on{background:var(--accent);color:#fff;font-weight:600}
+/* sleep feed */
+.slplist{display:flex;flex-direction:column;gap:.45rem}
+.slprow{display:flex;align-items:center;gap:.6rem}
+.slot{position:relative;flex:1;min-width:0;height:14px;background:#0d1117;
+border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.slotbar{position:absolute;top:0;bottom:0;border-radius:6px;
+background:linear-gradient(90deg,#6366f1,#8b5cf6)}
+.slpmeta{flex:none;width:118px;line-height:1.15}
+.slpd{font-size:.82rem;font-variant-numeric:tabular-nums}
+.slpt{font-size:.72rem}
+.slph{flex:none;width:62px;text-align:right;font-size:.82rem;font-weight:600;
+font-variant-numeric:tabular-nums}
 /* messages — Discord-style channel browser */
 .dc{display:flex;height:calc(100vh - 200px);min-height:420px;border:1px solid var(--line);
 border-radius:14px;overflow:hidden;background:var(--panel)}
@@ -1395,7 +1468,7 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["messages","💬"],["voice","🔊"],["roles","🛡️"],
+const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["sleep","💤"],["messages","💬"],["voice","🔊"],["roles","🛡️"],
   ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
@@ -1503,6 +1576,7 @@ async function render(){
     if(tab==="overview")return renderOverview(v);
     if(tab==="members")return renderMembers(v);
     if(tab==="activity")return renderActivity(v);
+    if(tab==="sleep")return renderSleep(v);
     if(tab==="messages")return renderMessages(v);
     if(tab==="voice")return renderVoice(v);
     if(tab==="roles")return renderRoles(v);
@@ -1854,28 +1928,38 @@ function gameTile(name,url,size,cls){
     {className:'${cls} game-tile',style:'${px};background:${idColor(name)}',textContent:'${esc((name||'?')[0]||'?').toUpperCase()}'}))">`;
   return `<span class="${cls} game-tile" style="${px};background:${idColor(name)}">${esc((name||'?')[0]||'?').toUpperCase()}</span>`;}
 
+// Day-window filter shared by the Activity and Sleep tabs. Defaults to 7 days
+// (re-renders the active tab on change).
+let WIN_DAYS=7;
+function setWinDays(d){WIN_DAYS=d;render();}
+function daySeg(){return `<span class="dayseg">`+
+  [7,30].map(d=>`<button class="${WIN_DAYS===d?'on':''}" onclick="setWinDays(${d})">${d}d</button>`).join("")+
+  `</span>`;}
+
 async function renderActivity(v){
-  const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
+  const d=await api(`/api/activity?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;
   const users=d.users||[];
   if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
     <span class="faint">Open a member and hit <b>Start tracking</b>, or use <code>/track start</code>.
     Needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
-  // online first, then by current game, then name.
+  // online first, then by whether currently playing, then name.
   users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
-    || (b.current_game?1:0)-(a.current_game?1:0)
+    || ((b.current_games||[]).length?1:0)-((a.current_games||[]).length?1:0)
     || a.display_name.localeCompare(b.display_name));
   const online=users.filter(u=>["online","idle","dnd"].includes(u.status)).length;
   v.innerHTML=`<div class="filters"><h2 style="margin:0">🎮 Activity
       <span class="faint">· ${online}/${users.length} online · last ${d.window_days}d</span></h2>
-      <span class="sp" style="flex:1"></span>${searchBar("Search players…")}</div>
+      <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players…")}</div>
     <div class="act-grid">${users.map(actCard).join("")}</div>`;
 }
 function actCard(u){
   const offline=!["online","idle","dnd"].includes(u.status);
   const maxSec=Math.max(1,...(u.top_games||[]).map(g=>g.seconds));
-  const now=u.current_game?`<div class="now">${gameTile(u.current_game.name,u.current_game.image,48,"game-img")}
-      <div class="meta"><div class="g">${esc(u.current_game.name)}</div>
-      <div class="t">▶ playing now${u.current_game.since?" · since "+fmtTs(u.current_game.since):""}</div></div></div>`
+  const cur=u.current_games||[];
+  const now=cur.length?`<div class="nowlist">${cur.map((g,i)=>`<div class="now">
+      ${gameTile(g.name,g.image,48,"game-img")}
+      <div class="meta"><div class="g">${esc(g.name)}</div>
+      <div class="t">${i===0?"▶ playing now":"＋ also playing"}${g.since?" · since "+fmtTs(g.since):""}</div></div></div>`).join("")}</div>`
     : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
       <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
   const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
@@ -1892,6 +1976,54 @@ function actCard(u){
     </div>
     ${now}
     <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
+  </div>`;
+}
+
+// ---- sleep feed ----------------------------------------------------------
+function fmtHours(h){if(h==null)return"—";const hr=Math.floor(h),m=Math.round((h-hr)*60);
+  return hr+"h"+(m?" "+m+"m":"");}
+// Render a night as a horizontal bar positioned on a 24h clock (local time),
+// so consecutive nights line up visually. Wraps across midnight when needed.
+function sleepBar(s){
+  const start=new Date(s.start_local.replace(" ","T")), end=new Date(s.end_local.replace(" ","T"));
+  const sh=isNaN(start)?0:start.getHours()+start.getMinutes()/60;
+  const eh=isNaN(end)?sh:end.getHours()+end.getMinutes()/60;
+  // Anchor the clock at 18:00 so a typical night sits in the middle, not split.
+  const off=h=>((h-18+24)%24)/24*100;
+  const a=off(sh); let w=(off(eh)-a+100)%100; if(w<=0)w=100;
+  return `<div class="slot"><div class="slotbar" style="left:${a.toFixed(1)}%;width:${Math.max(2,w).toFixed(1)}%"
+    title="${esc(s.start_local)} → ${esc(s.end_local)}"></div></div>`;
+}
+async function renderSleep(v){
+  const d=await api(`/api/sleep?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;
+  const users=d.users||[];
+  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
+    <span class="faint">Sleep is estimated from recorded online/offline presence —
+    open a member and hit <b>Start tracking</b> or use <code>/track start</code>.</span></div>`;return;}
+  // Most data first: nights tracked, then name.
+  users.sort((a,b)=>(b.nights-a.nights)||a.display_name.localeCompare(b.display_name));
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">💤 Sleep
+      <span class="faint">· estimated from presence · last ${d.window_days}d</span></h2>
+      <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players…")}</div>
+    <div class="act-grid">${users.map(sleepCard).join("")}</div>`;
+}
+function sleepCard(u){
+  const offline=!["online","idle","dnd"].includes(u.status);
+  const sessions=(u.sessions||[]).slice().reverse(); // newest first
+  const rows=sessions.length?`<div class="slplist">${sessions.slice(0,10).map(s=>`<div class="slprow">
+      ${sleepBar(s)}
+      <div class="slpmeta"><div class="slpd">${esc(s.date)}</div>
+      <div class="slpt faint">${esc(s.start_local.slice(11))}–${esc(s.end_local.slice(11))}</div></div>
+      <div class="slph">${fmtHours(s.duration_hours)}</div></div>`).join("")}</div>`
+    : '<div class="faint" style="font-size:.84rem">No sleep sessions detected in this window.</div>';
+  return `<div class="act-card${offline?' offline-card':''}">
+    <div class="act-head">
+      <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
+        <span class="dot ${statusClass(u.status)}"></span></span>
+      <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
+      <div class="act-sub">${u.nights} night${u.nights===1?"":"s"} · avg ${fmtHours(u.avg_hours)}</div></div>
+    </div>
+    ${rows}
   </div>`;
 }
 

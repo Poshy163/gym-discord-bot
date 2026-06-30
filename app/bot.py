@@ -58,11 +58,12 @@ from .presence import (
     format_duration,
     is_online as _presence_is_online,
     nightly_sleep_sessions,
-    summarize_activities,
+    summarize_activity_sets,
     summarize_presence,
 )
 from . import __version__
 from . import calories
+from . import game_icons
 from . import gemini_client
 from . import hevy_client
 from . import nutrition
@@ -294,6 +295,21 @@ except ValueError:
 MEDIA_DIR = os.getenv("MEDIA_DIR") or os.path.join(
     os.path.dirname(DB_PATH) or ".", "media"
 )
+
+# Game/activity icon map (app/game_icons.py). Fetched from Discord's public
+# detectable-apps list and cached here so the dashboard's Activity tab can show
+# real art for any game, refreshing weekly. Defaults next to the database; set
+# GAME_ICONS_REFRESH_DAYS=0 to force a refresh on every boot.
+GAME_ICONS_CACHE = os.getenv("GAME_ICONS_CACHE") or os.path.join(
+    os.path.dirname(DB_PATH) or ".", "game_icons.json"
+)
+try:
+    GAME_ICONS_REFRESH_DAYS = float(os.getenv("GAME_ICONS_REFRESH_DAYS", "7"))
+except ValueError:
+    GAME_ICONS_REFRESH_DAYS = 7.0
+# Load the cache (or bundled seed) now — cheap and network-free — so icons work
+# the moment the dashboard serves a request; the live refresh happens on_ready.
+game_icons.configure(GAME_ICONS_CACHE)
 
 # How many days of channel history to scan on startup to seed the message log,
 # so the dashboard's activity feed has data the moment the bot comes up rather
@@ -1878,6 +1894,23 @@ async def _handle_combined_nutrition(
         pass
 
 
+@tasks.loop(hours=24)
+async def game_icons_refresh() -> None:  # pragma: no cover - discord runtime
+    """Refresh the game-icon map from Discord's live list.
+
+    Runs on startup and daily thereafter; the refresh itself no-ops unless the
+    cache is older than GAME_ICONS_REFRESH_DAYS, so the large download happens
+    at most about once a week.
+    """
+    try:
+        await game_icons.refresh(
+            GAME_ICONS_CACHE, max_age_days=GAME_ICONS_REFRESH_DAYS,
+            force=GAME_ICONS_REFRESH_DAYS <= 0,
+        )
+    except Exception:
+        LOG.exception("Game-icon refresh failed")
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -1936,6 +1969,10 @@ async def on_ready() -> None:
             WEBUI_PORT,
         )
         bot.loop.create_task(_webui_sync_all_guilds())
+
+    # Keep the dashboard's game-icon map current (downloads only when stale).
+    if not game_icons_refresh.is_running():
+        game_icons_refresh.start()
 
     if REMINDER_CHANNEL_ID and not weekly_reminder.is_running():
         weekly_reminder.start()
@@ -9498,6 +9535,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         calorie_streak=_calorie_streak,
         protein_streak=_protein_streak,
         media_dir=MEDIA_DIR if ENABLE_MEDIA_DOWNLOAD else None,
+        display_tz=DISPLAY_TZ,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -10977,30 +11015,47 @@ def _discord_status_to_str(status: discord.Status) -> str:
     return raw  # "online", "idle", or "offline"
 
 
-def _get_main_activity_info(
+def _get_all_activities_info(
     member: discord.Member,
-) -> tuple[str | None, str | None]:
-    """Return ``(name, image_url)`` for the member's primary game/app activity.
+) -> list[tuple[str, str | None]]:
+    """All of the member's game/app activities as ordered ``(name, image_url)``.
 
-    Ignores Spotify and custom statuses; everything else with a name (games,
-    rich-presence apps, streams, embedded voice activities) is fair game.
-    Whitelisting specific classes is fragile — discord.py occasionally
-    delivers rich-presence payloads as subclasses we didn't list, and they
-    silently get dropped. ``image_url`` is the rich-presence large image when
-    the activity exposes one (many plain "playing X" presences don't).
+    A user can run several at once — e.g. a game alongside a launcher, or two
+    games — and we record every one so concurrent play shows up in the
+    dashboard rather than only the first. Ignores Spotify and custom statuses;
+    everything else with a name (games, rich-presence apps, streams, embedded
+    voice activities) is fair game. Whitelisting specific classes is fragile —
+    discord.py occasionally delivers rich-presence payloads as subclasses we
+    didn't list, and they silently get dropped. ``image_url`` is the
+    rich-presence large image when the activity exposes one (many plain
+    "playing X" presences don't). Names are de-duplicated, keeping the first
+    occurrence (and its image).
     """
+    out: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
     for act in member.activities:
         if isinstance(act, (discord.Spotify, discord.CustomActivity)):
             continue
         name = getattr(act, "name", None) or getattr(act, "title", None)
-        if name:
-            image: str | None = None
-            try:
-                image = getattr(act, "large_image_url", None)
-            except Exception:  # pragma: no cover - asset URL build can throw
-                image = None
-            return str(name), (str(image) if image else None)
-    return None, None
+        if not name or str(name) in seen:
+            continue
+        image: str | None = None
+        try:
+            image = getattr(act, "large_image_url", None)
+        except Exception:  # pragma: no cover - asset URL build can throw
+            image = None
+        seen.add(str(name))
+        out.append((str(name), str(image) if image else None))
+    return out
+
+
+def _get_main_activity_info(
+    member: discord.Member,
+) -> tuple[str | None, str | None]:
+    """Return ``(name, image_url)`` for the member's primary game/app activity
+    (the first of :func:`_get_all_activities_info`)."""
+    acts = _get_all_activities_info(member)
+    return acts[0] if acts else (None, None)
 
 
 def _get_main_activity(member: discord.Member) -> str | None:
@@ -11016,8 +11071,7 @@ def _seed_presence_snapshot(guild_id: int, member: discord.Member) -> None:
     bot came back online after a restart.
     """
     db.presence_log_event(guild_id, member.id, _discord_status_to_str(member.status))
-    name, image = _get_main_activity_info(member)
-    db.activity_log_event(guild_id, member.id, name, image_url=image)
+    db.activity_log_set(guild_id, member.id, _get_all_activities_info(member))
 
 
 def _seed_tracked_presence_snapshots() -> None:
@@ -11052,16 +11106,16 @@ async def on_presence_update(
         if before.status != after.status:
             status = _discord_status_to_str(after.status)
             db.presence_log_event(after.guild.id, after.id, status)
-        # Activity tracking
-        before_act = _get_main_activity(before)
-        after_act, after_img = _get_main_activity_info(after)
-        if before_act != after_act:
-            db.activity_log_event(
-                after.guild.id, after.id, after_act, image_url=after_img,
-            )
+        # Activity tracking — record the full set of concurrent games/apps so
+        # someone running, say, tModLoader and Excel at once shows both.
+        before_acts = [n for n, _img in _get_all_activities_info(before)]
+        after_info = _get_all_activities_info(after)
+        after_acts = [n for n, _img in after_info]
+        if before_acts != after_acts:
+            db.activity_log_set(after.guild.id, after.id, after_info)
             LOG.info(
                 "Activity change for %s in %s: %r -> %r (raw=%s)",
-                after.id, after.guild.id, before_act, after_act,
+                after.id, after.guild.id, before_acts, after_acts,
                 [type(a).__name__ + ":" + str(getattr(a, "name", "?"))
                  for a in after.activities],
             )
@@ -11367,12 +11421,12 @@ async def track_schedule_cmd(
     summary = summarize_presence(
         events, window_start, now, display_tz=DISPLAY_TZ,
     )
-    act_rows = db.activity_events_for(
+    act_sets = db.activity_sets_for(
         guild_id, user.id, since=window_start, until=now,
     )
-    activity_totals = summarize_activities(
-        [(r["activity"], r["at"]) for r in act_rows], window_start, now,
-    ) if act_rows else {}
+    activity_totals = summarize_activity_sets(
+        act_sets, window_start, now,
+    ) if act_sets else {}
     embed = _render_schedule_embed(user, summary, days, activity_totals or None)
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
