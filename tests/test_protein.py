@@ -67,6 +67,8 @@ def test_protein_goal_set_get_remove(db):
     # Update is upsert.
     db.protein_goal_set(1, 100, "alice", 200)
     assert db.protein_goal_get(1, 100)["daily_target_g"] == 200.0
+    # tracked_users matches goals against current guild membership.
+    db.upsert_member(1, 100, "alice", "Alice")
     assert {r["user_id"] for r in db.protein_tracked_users(1)} == {100}
     assert db.protein_goal_remove(1, 100) is True
     assert db.protein_goal_get(1, 100) is None

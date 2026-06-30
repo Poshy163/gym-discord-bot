@@ -206,12 +206,67 @@ def test_calorie_goal_remove_keeps_entries(db):
     assert db.calorie_goal_remove(1, 100) is False
 
 
-def test_calorie_tracked_users_scoped_to_guild(db):
+def test_calorie_tracked_users_scoped_to_membership(db):
+    # Tracking is global, but a guild's report only lists that guild's current
+    # members — matched against the members mirror, not the goal's stored guild.
     db.calorie_goal_set(1, 100, "alice", 2500)
     db.calorie_goal_set(1, 200, "bob", 3000)
     db.calorie_goal_set(2, 300, "carol", 1800)
-    users = db.calorie_tracked_users(1)
-    assert [r["username"] for r in users] == ["alice", "bob"]
+    db.upsert_member(1, 100, "alice", "Alice")
+    db.upsert_member(1, 200, "bob", "Bob")
+    db.upsert_member(2, 300, "carol", "Carol")
+    assert [r["username"] for r in db.calorie_tracked_users(1)] == ["alice", "bob"]
+    assert [r["username"] for r in db.calorie_tracked_users(2)] == ["carol"]
+
+
+def test_calorie_tracked_users_follows_member_across_servers(db):
+    # A user who set their goal in server 2 but is a member of server 1 still
+    # appears in server 1's report (and not where they aren't a member).
+    db.calorie_goal_set(2, 100, "alice", 2500)
+    db.upsert_member(1, 100, "alice", "Alice")
+    assert [r["user_id"] for r in db.calorie_tracked_users(1)] == [100]
+    assert db.calorie_tracked_users(2) == []
+    # Leaving the server drops them from its report; history/goal remain.
+    db.upsert_member(1, 100, "alice", "Alice", present=False)
+    assert db.calorie_tracked_users(1) == []
+    assert db.calorie_goal_get(1, 100)["daily_target_kcal"] == 2500
+
+
+def test_global_goal_consolidation_migration(db, tmp_path):
+    # Simulate an older DB with a separate goal row per server for one user,
+    # then re-open it so the startup migration consolidates to the latest.
+    db.calorie_goal_set(1, 100, "alice", 2500)
+    with db._conn() as c:  # noqa: SLF001 - exercising the migration directly
+        c.execute(
+            "INSERT INTO calorie_goals "
+            "(guild_id, user_id, username, daily_target_kcal, set_at) "
+            "VALUES (2, 100, 'alice', 1800, '2000-01-01T00:00:00+00:00')"
+        )
+        c.execute(
+            "INSERT INTO protein_goals "
+            "(guild_id, user_id, username, daily_target_g, set_at) "
+            "VALUES (2, 100, 'alice', 99, '2000-01-01T00:00:00+00:00')"
+        )
+        c.execute(
+            "INSERT INTO protein_goals "
+            "(guild_id, user_id, username, daily_target_g, set_at) "
+            "VALUES (1, 100, 'alice', 180, '2099-01-01T00:00:00+00:00')"
+        )
+    db.close()
+    reopened = Database(tmp_path / "gym.sqlite3")
+    try:
+        with reopened._conn() as c:  # noqa: SLF001
+            cal = c.execute(
+                "SELECT daily_target_kcal FROM calorie_goals WHERE user_id = 100"
+            ).fetchall()
+            pro = c.execute(
+                "SELECT daily_target_g FROM protein_goals WHERE user_id = 100"
+            ).fetchall()
+        # One row each, keeping the most-recently-set target.
+        assert [r["daily_target_kcal"] for r in cal] == [2500]
+        assert [r["daily_target_g"] for r in pro] == [180]
+    finally:
+        reopened.close()
 
 
 def test_calorie_goal_is_global_per_user(db):

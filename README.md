@@ -102,6 +102,10 @@ Calories:
   scan (deduped per message, dated to the original post), so messages sent
   while the bot was offline — or before you set a target — get imported once
   you've run `/calories setup`.
+- **Backdating:** add a day to a chat log to file it under that day —
+  `650kcal yesterday`, `200c monday`, `coffee yesterday`, `40p 3 days ago`, or
+  an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and
+  combined posts; the reply notes the day it landed on.
 - `/calories today [user]` — today's entries and total vs target.
 - `/calories week [user]` — per-day totals for the last 7 days.
 - `/calories undo` — remove your most recent entry. To remove a *specific*

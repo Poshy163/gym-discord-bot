@@ -376,6 +376,127 @@ def test_untimeout_503_when_not_wired(tmp_path):
     _run(go())
 
 
+def test_member_track_start_and_stop(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        calls = []
+
+        async def fake_track(guild_id, user_id, start, actor_name):
+            calls.append((guild_id, user_id, start, actor_name))
+            return {"ok": True, "tracked": start, "changed": True}
+
+        app = build_app(db=db, password="secret", presence_track=fake_track)
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post(
+                "/api/member/track",
+                json={"guild": "1", "user": "100", "action": "start"},
+            )
+            assert r.status == 200 and (await r.json())["tracked"] is True
+            r = await client.post(
+                "/api/member/track",
+                json={"guild": "1", "user": "100", "action": "stop"},
+            )
+            assert r.status == 200 and (await r.json())["tracked"] is False
+            assert [c[2] for c in calls] == [True, False]
+            assert calls[0][0] == 1 and calls[0][1] == 100
+            assert calls[0][3].startswith("web:")
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_track_rejects_bad_action(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+
+        async def fake_track(*a):
+            return {"ok": True}
+
+        app = build_app(db=db, password="secret", presence_track=fake_track)
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post(
+                "/api/member/track",
+                json={"guild": "1", "user": "100", "action": "pause"},
+            )
+            assert r.status == 400
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_track_503_when_not_wired(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")  # no presence_track
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post(
+                "/api/member/track", json={"guild": "1", "user": "100"},
+            )
+            assert r.status == 503
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_exposes_presence_tracking_state(tmp_path):
+    """api_member reports whether the member is tracked and whether the control
+    should appear (handler wired + feature enabled)."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.upsert_member(1, 100, "alice", "Alice")
+
+        async def fake_track(*a):
+            return {"ok": True}
+
+        app = build_app(
+            db=db, password="secret",
+            presence_track=fake_track, presence_enabled=True,
+        )
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/member?guild=1&user=100")).json()
+            assert d["presence_tracking_available"] is True
+            assert d["presence_tracked"] is False
+            db.presence_track_add(1, 100, started_by=0)
+            d = await (await client.get("/api/member?guild=1&user=100")).json()
+            assert d["presence_tracked"] is True
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_track_control_hidden_when_feature_disabled(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.upsert_member(1, 100, "alice", "Alice")
+
+        async def fake_track(*a):
+            return {"ok": True}
+
+        # Handler wired but presence_enabled defaults False → control hidden.
+        app = build_app(db=db, password="secret", presence_track=fake_track)
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/member?guild=1&user=100")).json()
+            assert d["presence_tracking_available"] is False
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_channels_endpoint_returns_injected_list(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

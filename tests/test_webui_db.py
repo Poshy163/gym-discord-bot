@@ -274,3 +274,53 @@ def test_member_overview_aggregates(db):
     assert ov["lifts"]["n"] == 2 and ov["lifts"]["equip"] == 2
     assert ov["calories"]["total"] == 800
     assert ov["bodyweight"]["weight_kg"] == 82.5
+
+
+def test_member_overview_nutrition_is_global(db):
+    # Calorie/protein totals span every server; lifts stay guild-scoped.
+    db.calorie_add(1, 100, "Alice", 500)
+    db.calorie_add(2, 100, "Alice", 300)
+    db.protein_add(1, 100, "Alice", 40)
+    db.protein_add(2, 100, "Alice", 30)
+    db.add_lifts(1, 100, "Alice", [_Lift("bench", 100)])
+    db.add_lifts(2, 100, "Alice", [_Lift("squat", 140)])
+    ov = db.web_member_overview(1, 100)
+    assert ov["calories"]["total"] == 800   # both servers
+    assert ov["protein"]["total"] == 70     # both servers
+    assert ov["lifts"]["n"] == 1            # only guild 1's lift
+
+
+def test_web_list_calories_global_per_user_but_guild_for_all(db):
+    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.upsert_member(2, 100, "alice", "Alice", present=True)
+    db.upsert_member(2, 200, "bob", "Bob", present=True)
+    db.calorie_add(1, 100, "Alice", 500)
+    db.calorie_add(2, 100, "Alice", 300)   # logged in another server
+    db.calorie_add(2, 200, "Bob", 250)
+    # Per-user: every server's entries, regardless of which guild is selected.
+    alice = db.web_list_calories(1, user_id=100)
+    assert sorted(r["kcal"] for r in alice) == [300, 500]
+    # Guild-wide: only entries from members of that guild. Alice (member of
+    # guild 1) shows her cross-server entries; Bob (not in guild 1) doesn't.
+    g1 = db.web_list_calories(1)
+    assert sorted(r["kcal"] for r in g1) == [300, 500]
+    g2 = db.web_list_calories(2)
+    assert sorted(r["kcal"] for r in g2) == [250, 300, 500]
+
+
+def test_web_list_protein_global_per_user(db):
+    db.upsert_member(1, 100, "alice", "Alice", present=True)
+    db.protein_add(1, 100, "Alice", 40)
+    db.protein_add(2, 100, "Alice", 30)
+    rows = db.web_list_protein(5, user_id=100)  # any guild id
+    assert sorted(r["grams"] for r in rows) == [30, 40]
+
+
+def test_web_delete_entry_works_across_guilds(db):
+    # An entry logged in guild 2 is deletable from guild 1's dashboard, since
+    # entries are global; the audit is recorded under the acting guild.
+    cid = db.calorie_add(2, 100, "Alice", 500)
+    db.audit_live = True
+    assert db.web_delete_calorie(1, cid, "web:op") is True
+    assert db.web_list_calories(2, user_id=100) == []
+    assert db.list_audit(1, category="data")[0]["action"] == "calorie_delete"

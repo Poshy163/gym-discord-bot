@@ -76,6 +76,9 @@ TimeoutHandler = Callable[[int, int, str], Awaitable[dict]]
 BlacklistAnnouncer = Callable[[int, int, "str | None", str], Awaitable[dict]]
 # (guild_id) -> list of {channel_id, channel_name, members:[…]} currently in VC.
 VoiceSnapshotHandler = Callable[[int], Awaitable[list[dict]]]
+# (guild_id, user_id, start, actor_name) -> result dict — start/stop recording a
+# member's presence + activity (the dashboard's "Presence tracking" control).
+PresenceTrackHandler = Callable[[int, int, bool, str], Awaitable[dict]]
 
 
 class _Sessions:
@@ -118,6 +121,8 @@ def build_app(
     remove_timeout: TimeoutHandler | None = None,
     announce_blacklist: BlacklistAnnouncer | None = None,
     voice_snapshot: VoiceSnapshotHandler | None = None,
+    presence_track: PresenceTrackHandler | None = None,
+    presence_enabled: bool = False,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -133,7 +138,10 @@ def build_app(
     just-blacklisted user with the reason; when not injected blacklisting still
     works silently (no announcement). ``voice_snapshot`` (optional) returns the
     live "who's in VC now" occupancy for the Voice tab; when not injected the
-    tab shows only the logged join/leave history.
+    tab shows only the logged join/leave history. ``presence_track`` (optional)
+    starts/stops recording a member's presence + activity from the member panel;
+    ``presence_enabled`` mirrors the bot's ENABLE_PRESENCE_TRACKING flag so the
+    dashboard only offers the control when the feature is actually on.
     """
     sessions = _Sessions()
 
@@ -279,6 +287,10 @@ def build_app(
             "audit": audit,
             "strava_linked": db.get_strava_account(uid) is not None,
             "revo_linked": db.get_revo_account(uid) is not None,
+            "presence_tracked": db.presence_is_tracked(gid, uid),
+            "presence_tracking_available": bool(
+                presence_enabled and presence_track is not None
+            ),
             "nutrition": {
                 "calorie_goal": (
                     cal_goal["daily_target_kcal"] if cal_goal else None
@@ -804,6 +816,31 @@ def build_app(
         status = 200 if result.get("ok") else 400
         return web.json_response(result, status=status)
 
+    async def api_member_track(request: web.Request) -> web.Response:
+        _require(request)
+        if presence_track is None:
+            return web.json_response(
+                {"ok": False, "error": "presence tracking unavailable"},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user required")
+        action = str(body.get("action", "start")).lower()
+        if action not in ("start", "stop"):
+            raise web.HTTPBadRequest(text="action must be start or stop")
+        result = await presence_track(
+            gid, uid, action == "start", _actor(request),
+        )
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+
     async def _edit_ctx(request: web.Request) -> tuple[int, dict]:
         try:
             body = await request.json()
@@ -865,6 +902,7 @@ def build_app(
         web.post("/api/member/role", api_member_role),
         web.get("/api/member/moderation", api_member_moderation),
         web.post("/api/member/untimeout", api_member_untimeout),
+        web.post("/api/member/track", api_member_track),
         web.get("/healthz", health),
     ])
     return app
@@ -1474,6 +1512,7 @@ async function memberView(uid){
       :'<span class="muted">No roles.</span>'}</div>
     ${m.present?roleAdder(uid,d.roles):''}
     ${m.present?`<h2 style="margin-top:1.6rem">Moderation</h2><div id="modbox" class="faint">Checking timeout…</div>`:''}
+    ${d.presence_tracking_available?`<h2 style="margin-top:1.6rem">Presence tracking</h2><div id="trackbox">${trackBox(uid,d.presence_tracked)}</div>`:''}
     <h2 style="margin-top:1.6rem">History</h2>${auditTable(d.audit)}
     <p style="margin-top:1rem" class="muted">View this member's
       <a class="link" onclick="go2('lifts','${uid}')">lifts</a>,
@@ -1499,6 +1538,21 @@ async function loadModeration(uid){
 async function removeTimeout(uid){
   const r=await post("/api/member/untimeout",{guild,user:uid});
   if(r&&r.ok){toast(r.changed===false?"Wasn't timed out":"Timeout removed ✓");memberView(uid);}
+  else{toast((r&&r.error)||"Failed");}
+}
+
+// ---- presence tracking (start/stop from the member panel) ----
+function trackBox(uid,tracked){
+  return tracked
+    ? `<span class="pill">🎮 Recording presence &amp; activity</span>
+       <button class="btn sm danger" onclick="setTrack('${uid}',false)">Stop tracking</button>`
+    : `<span class="faint">Not tracked.</span>
+       <button class="btn sm" onclick="setTrack('${uid}',true)">Start tracking</button>`;
+}
+async function setTrack(uid,start){
+  if(start&&!confirm("Start recording this member's online/offline status and game activity?"))return;
+  const r=await post("/api/member/track",{guild,user:uid,action:start?'start':'stop'});
+  if(r&&r.ok){toast(start?"Tracking started ✓":"Tracking stopped ✓");memberView(uid);}
   else{toast((r&&r.error)||"Failed");}
 }
 
@@ -1719,8 +1773,8 @@ async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}`);if(!d)return;
   const users=d.users||[];
   if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
-    <span class="faint">Presence/activity tracking is owner-controlled via <code>/track start</code>
-    and needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
+    <span class="faint">Open a member and hit <b>Start tracking</b>, or use <code>/track start</code>.
+    Needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
   // online first, then by current game, then name.
   users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
     || (b.current_game?1:0)-(a.current_game?1:0)

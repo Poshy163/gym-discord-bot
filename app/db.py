@@ -634,7 +634,31 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE message_log ADD COLUMN attachments TEXT"
                 )
+            self._consolidate_global_goals()
             self._recanonicalize_equipment()
+
+    def _consolidate_global_goals(self) -> None:
+        """Collapse calorie/protein goals to one row per user.
+
+        Tracking is per-user/global, but databases written before that change
+        could hold a separate goal row per server. Logged *entries* are already
+        read globally (by user_id), so no entry migration is needed — only the
+        goal rows (the opt-in marker + daily target) need de-duplicating. We
+        keep each user's most-recently-set row and drop the rest. Idempotent:
+        a DB that already has one row per user is left untouched.
+        """
+        for table in ("calorie_goals", "protein_goals"):
+            self._connection.execute(
+                # The inner GROUP BY with a single MAX() picks, per user, the
+                # rowid belonging to the latest set_at (a documented SQLite
+                # bare-column guarantee); everything else for that user is
+                # deleted.
+                f"DELETE FROM {table} WHERE rowid NOT IN ("
+                f"  SELECT rowid FROM ("
+                f"    SELECT rowid, MAX(set_at) FROM {table} GROUP BY user_id"
+                f"  )"
+                f")"
+            )
 
     def _recanonicalize_equipment(self) -> None:
         """Re-run the alias table over every stored equipment label.
@@ -3186,12 +3210,21 @@ class Database:
             return ok
 
     def calorie_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
-        """Everyone with a calorie goal in this guild — the weekly AI
-        summary iterates this list."""
+        """Calorie-tracking members of this guild — the weekly AI summary
+        iterates this list.
+
+        Tracking is global (one goal row per user, tagged with whichever server
+        they last set it in), so membership is matched against the **members
+        mirror** for this guild rather than the goal's stored ``guild_id``;
+        otherwise someone who set their goal in another server would silently
+        drop out of this guild's report."""
         with self._conn() as c:
             return list(c.execute(
-                "SELECT user_id, username, daily_target_kcal "
-                "FROM calorie_goals WHERE guild_id = ? ORDER BY username",
+                "SELECT g.user_id, g.username, g.daily_target_kcal "
+                "FROM calorie_goals g "
+                "JOIN members m ON m.user_id = g.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 "
+                "ORDER BY g.username",
                 (guild_id,),
             ))
 
@@ -3237,17 +3270,22 @@ class Database:
         self, guild_id: int, user_id: int,
         *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
-        """Delete the user's most recent intake entry and return it."""
+        """Delete the user's most recent intake entry and return it.
+
+        Global: undoes the latest entry across **every** server (one shared
+        diary), so `/calories undo` works regardless of where it was logged.
+        ``guild_id`` is kept for the audit record but not used to scope the
+        lookup."""
         with self._conn() as c:
             row = c.execute(
                 """
                 SELECT id, kcal, note, raw, logged_at
                 FROM calorie_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT 1
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -3369,30 +3407,37 @@ class Database:
         """All intake entries in [start_iso, end_iso), oldest first. Day
         bucketing happens in the caller against DISPLAY_TIMEZONE — the
         stored timestamps are UTC and the local day boundary isn't
-        substr-able here."""
+        substr-able here.
+
+        Tracking is global, so this returns the user's entries from **every
+        server** (one shared diary). ``guild_id`` is accepted for signature
+        compatibility but intentionally not filtered on."""
         with self._conn() as c:
             return list(c.execute(
                 """
                 SELECT id, kcal, note, raw, logged_at
                 FROM calorie_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND logged_at >= ? AND logged_at < ?
                 ORDER BY logged_at ASC, id ASC
                 """,
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             ))
 
     def calorie_logged_days(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> list[str]:
         """Distinct calendar dates (YYYY-MM-DD) with a calorie entry in the
-        window. Lets callers tell 'logged 0' from 'didn't track'."""
+        window. Lets callers tell 'logged 0' from 'didn't track'.
+
+        Global: counts a day as logged if an entry was made in **any** server.
+        ``guild_id`` is kept for signature compatibility but not filtered on."""
         with self._conn() as c:
             return [r[0] for r in c.execute(
                 "SELECT DISTINCT substr(logged_at, 1, 10) FROM calorie_entries "
-                "WHERE guild_id = ? AND user_id = ? "
+                "WHERE user_id = ? "
                 "AND logged_at >= ? AND logged_at < ?",
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             )]
 
     def calorie_total_between(
@@ -3481,10 +3526,16 @@ class Database:
             return ok
 
     def protein_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
+        """Protein-tracking members of this guild. Like its calorie twin,
+        tracking is global so membership is matched against the members mirror
+        for this guild rather than the goal's stored ``guild_id``."""
         with self._conn() as c:
             return list(c.execute(
-                "SELECT user_id, username, daily_target_g "
-                "FROM protein_goals WHERE guild_id = ? ORDER BY username",
+                "SELECT g.user_id, g.username, g.daily_target_g "
+                "FROM protein_goals g "
+                "JOIN members m ON m.user_id = g.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 "
+                "ORDER BY g.username",
                 (guild_id,),
             ))
 
@@ -3527,17 +3578,20 @@ class Database:
         self, guild_id: int, user_id: int,
         *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
-        """Delete the user's most recent protein entry and return it."""
+        """Delete the user's most recent protein entry and return it.
+
+        Global: undoes the latest entry across **every** server. ``guild_id``
+        is kept for the audit record but not used to scope the lookup."""
         with self._conn() as c:
             row = c.execute(
                 """
                 SELECT id, grams, note, raw, logged_at
                 FROM protein_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                 ORDER BY logged_at DESC, id DESC
                 LIMIT 1
                 """,
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -3552,13 +3606,16 @@ class Database:
     def protein_logged_days(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> list[str]:
-        """Distinct calendar dates (YYYY-MM-DD) with a protein entry in window."""
+        """Distinct calendar dates (YYYY-MM-DD) with a protein entry in window.
+
+        Global: counts a day as logged if an entry was made in **any** server.
+        ``guild_id`` is kept for signature compatibility but not filtered on."""
         with self._conn() as c:
             return [r[0] for r in c.execute(
                 "SELECT DISTINCT substr(logged_at, 1, 10) FROM protein_entries "
-                "WHERE guild_id = ? AND user_id = ? "
+                "WHERE user_id = ? "
                 "AND logged_at >= ? AND logged_at < ?",
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             )]
 
     def protein_total_between(
@@ -3617,17 +3674,21 @@ class Database:
     def protein_entries_between(
         self, guild_id: int, user_id: int, start_iso: str, end_iso: str,
     ) -> list[sqlite3.Row]:
-        """All protein entries in [start_iso, end_iso), oldest first."""
+        """All protein entries in [start_iso, end_iso), oldest first.
+
+        Global: returns the user's entries from **every** server (one shared
+        diary). ``guild_id`` is kept for signature compatibility but not
+        filtered on."""
         with self._conn() as c:
             return list(c.execute(
                 """
                 SELECT id, grams, note, raw, logged_at
                 FROM protein_entries
-                WHERE guild_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND logged_at >= ? AND logged_at < ?
                 ORDER BY logged_at, id
                 """,
-                (guild_id, user_id, start_iso, end_iso),
+                (user_id, start_iso, end_iso),
             ))
 
     # ---- saved foods -----------------------------------------------------
@@ -4238,27 +4299,38 @@ class Database:
         self, guild_id: int, user_id: int | None = None,
         limit: int = 100, offset: int = 0,
     ) -> list[sqlite3.Row]:
-        sql = (
-            "SELECT id, user_id, username, kcal, note, logged_at "
-            "FROM calorie_entries WHERE guild_id = ?"
-        )
-        params: list[object] = [guild_id]
+        """Calorie entries for the dashboard. Tracking is global: a specific
+        user's list spans **every** server, and the guild-wide list (no user)
+        shows entries from that guild's current members."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
-        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+            sql = (
+                "SELECT id, user_id, username, kcal, note, logged_at "
+                "FROM calorie_entries WHERE user_id = ? "
+                "ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            params: list[object] = [user_id, limit, offset]
+        else:
+            sql = (
+                "SELECT e.id, e.user_id, e.username, e.kcal, e.note, e.logged_at "
+                "FROM calorie_entries e "
+                "JOIN members m ON m.user_id = e.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 "
+                "ORDER BY e.logged_at DESC, e.id DESC LIMIT ? OFFSET ?"
+            )
+            params = [guild_id, limit, offset]
         with self._conn() as c:
             return list(c.execute(sql, params))
 
     def web_delete_calorie(
         self, guild_id: int, entry_id: int, actor_name: str,
     ) -> bool:
+        # Entries are global, so a row shown in any guild's dashboard is deletable
+        # by its id; ``guild_id`` only labels the audit entry.
         with self._conn() as c:
             row = c.execute(
                 "SELECT user_id, username, kcal FROM calorie_entries "
-                "WHERE id = ? AND guild_id = ?",
-                (entry_id, guild_id),
+                "WHERE id = ?",
+                (entry_id,),
             ).fetchone()
             if row is None:
                 return False
@@ -4275,27 +4347,38 @@ class Database:
         self, guild_id: int, user_id: int | None = None,
         limit: int = 100, offset: int = 0,
     ) -> list[sqlite3.Row]:
-        sql = (
-            "SELECT id, user_id, username, grams, note, logged_at "
-            "FROM protein_entries WHERE guild_id = ?"
-        )
-        params: list[object] = [guild_id]
+        """Protein entries for the dashboard. Global, mirroring
+        :meth:`web_list_calories`: per-user spans every server; the guild-wide
+        list shows that guild's current members' entries."""
         if user_id is not None:
-            sql += " AND user_id = ?"
-            params.append(user_id)
-        sql += " ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+            sql = (
+                "SELECT id, user_id, username, grams, note, logged_at "
+                "FROM protein_entries WHERE user_id = ? "
+                "ORDER BY logged_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            params: list[object] = [user_id, limit, offset]
+        else:
+            sql = (
+                "SELECT e.id, e.user_id, e.username, e.grams, e.note, e.logged_at "
+                "FROM protein_entries e "
+                "JOIN members m ON m.user_id = e.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 "
+                "ORDER BY e.logged_at DESC, e.id DESC LIMIT ? OFFSET ?"
+            )
+            params = [guild_id, limit, offset]
         with self._conn() as c:
             return list(c.execute(sql, params))
 
     def web_delete_protein(
         self, guild_id: int, entry_id: int, actor_name: str,
     ) -> bool:
+        # Entries are global — deletable by id from any guild's dashboard;
+        # ``guild_id`` only labels the audit entry.
         with self._conn() as c:
             row = c.execute(
                 "SELECT user_id, username, grams FROM protein_entries "
-                "WHERE id = ? AND guild_id = ?",
-                (entry_id, guild_id),
+                "WHERE id = ?",
+                (entry_id,),
             ).fetchone()
             if row is None:
                 return False
@@ -4312,7 +4395,11 @@ class Database:
         self, guild_id: int, user_id: int,
     ) -> dict:
         """Compact per-member snapshot for the dashboard member page: lift
-        counters, latest bodyweight, and today/total nutrition counts."""
+        counters, latest bodyweight, and total nutrition counts.
+
+        Nutrition is global (calorie/protein tracking spans every server), so
+        the kcal/protein totals are summed by user across all guilds; lifts and
+        bodyweight stay guild-scoped."""
         with self._conn() as c:
             lifts = c.execute(
                 """
@@ -4330,13 +4417,13 @@ class Database:
             ).fetchone()
             cal = c.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(kcal),0) AS total "
-                "FROM calorie_entries WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "FROM calorie_entries WHERE user_id = ?",
+                (user_id,),
             ).fetchone()
             pro = c.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(grams),0) AS total "
-                "FROM protein_entries WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "FROM protein_entries WHERE user_id = ?",
+                (user_id,),
             ).fetchone()
             return {
                 "lifts": dict(lifts) if lifts else {},

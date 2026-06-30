@@ -5,7 +5,10 @@ We avoid importing discord runtime state by only touching pure functions.
 
 from __future__ import annotations
 
+import asyncio
 import os
+from datetime import date, datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import discord
 
@@ -15,7 +18,9 @@ os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 from app.bot import (  # noqa: E402
+    _backdate_label,
     _build_progress_payload,
+    _day_window_for,
     _e1rm_progression,
     _get_main_activity,
     _parse_recap_json,
@@ -25,11 +30,15 @@ from app.bot import (  # noqa: E402
     _rejected_lifts_note,
     _render_revo_calendar,
     _safe_label,
+    _split_date_hint,
+    _target_in_channel,
+    _today_window,
     _true_weight_kg,
     _true_weight_suffix,
     _zero_quip,
     _ZERO_CALORIE_QUIPS,
     _ZERO_PROTEIN_QUIPS,
+    DISPLAY_TZ,
     db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
@@ -323,3 +332,113 @@ def test_parse_recap_json_variants():
     assert v == "totally not json" and t is None
     # Empty input.
     assert _parse_recap_json("") == (None, None)
+
+
+# --- _target_in_channel: per-channel privacy guard for "look up someone" -----
+
+def _fake_interaction(*, user_id=111, guild_id=1, channel=None):
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.guild_id = guild_id
+    interaction.channel = channel
+    return interaction
+
+
+def _member_who_can_see(can_see: bool):
+    # MagicMock(spec=discord.Member) passes isinstance(x, discord.Member), so the
+    # helper treats it as a real Member and reads channel.permissions_for(member).
+    member = MagicMock(spec=discord.Member)
+    member.id = 222
+    return member
+
+
+def _channel_granting(view: bool):
+    channel = MagicMock()
+    perms = MagicMock()
+    perms.view_channel = view
+    channel.permissions_for.return_value = perms
+    return channel
+
+
+def test_target_in_channel_allows_self_lookup():
+    # Looking yourself up never needs a channel check.
+    interaction = _fake_interaction(user_id=111, channel=_channel_granting(False))
+    me = MagicMock(spec=discord.Member)
+    me.id = 111
+    assert asyncio.run(_target_in_channel(interaction, me)) is True
+
+
+def test_target_in_channel_allows_when_no_channel_context():
+    # DM / unknown channel: nothing to enforce, defer to the share-a-server guard.
+    interaction = _fake_interaction(guild_id=None, channel=None)
+    other = _member_who_can_see(False)
+    assert asyncio.run(_target_in_channel(interaction, other)) is True
+
+
+def test_target_in_channel_allows_member_who_can_view():
+    interaction = _fake_interaction(channel=_channel_granting(True))
+    other = _member_who_can_see(True)
+    assert asyncio.run(_target_in_channel(interaction, other)) is True
+
+
+def test_target_in_channel_blocks_member_who_cannot_view():
+    interaction = _fake_interaction(channel=_channel_granting(False))
+    other = _member_who_can_see(False)
+    assert asyncio.run(_target_in_channel(interaction, other)) is False
+
+
+# --- backdating nutrition logs: _split_date_hint / windows / labels ----------
+
+def test_split_date_hint_strips_trailing_yesterday():
+    now = datetime(2026, 6, 30, 9, 0, tzinfo=DISPLAY_TZ)  # Tuesday
+    dt, text = _split_date_hint("500c yesterday", now)
+    assert text == "500c"
+    assert dt is not None
+    assert dt.astimezone(DISPLAY_TZ).date() == date(2026, 6, 29)
+
+
+def test_split_date_hint_no_hint_returns_unchanged():
+    now = datetime(2026, 6, 30, 9, 0, tzinfo=DISPLAY_TZ)
+    assert _split_date_hint("coffee", now) == (None, "coffee")
+    assert _split_date_hint("500c", now) == (None, "500c")
+
+
+def test_split_date_hint_days_ago_and_weekday():
+    now = datetime(2026, 6, 30, 9, 0, tzinfo=DISPLAY_TZ)  # Tuesday
+    dt, text = _split_date_hint("40g protein 3 days ago", now)
+    assert text == "40g protein"
+    assert dt.astimezone(DISPLAY_TZ).date() == date(2026, 6, 27)
+    dt2, text2 = _split_date_hint("500c monday", now)
+    assert text2 == "500c"
+    assert dt2.astimezone(DISPLAY_TZ).date() == date(2026, 6, 29)  # this Monday
+
+
+def test_split_date_hint_keeps_weekday_in_food_name():
+    # "yesterday" wins over the weekday word, so a food called "sunday roast"
+    # survives intact while still being backdated.
+    now = datetime(2026, 6, 30, 9, 0, tzinfo=DISPLAY_TZ)
+    dt, text = _split_date_hint("sunday roast yesterday", now)
+    assert text == "sunday roast"
+    assert dt.astimezone(DISPLAY_TZ).date() == date(2026, 6, 29)
+
+
+def test_day_window_for_none_matches_today():
+    assert _day_window_for(None) == _today_window()
+
+
+def test_day_window_for_brackets_the_day():
+    dt = datetime(2026, 6, 29, 15, 0, tzinfo=timezone.utc)
+    start, end = _day_window_for(dt)
+    assert start <= dt.isoformat() < end
+    span = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    assert span == timedelta(days=1)
+
+
+def test_backdate_label_today_and_none_are_empty():
+    assert _backdate_label(None) == ""
+    assert _backdate_label(datetime.now(timezone.utc)) == ""
+
+
+def test_backdate_label_for_old_day():
+    old = datetime.now(timezone.utc) - timedelta(days=5)
+    assert "logged for" in _backdate_label(old)

@@ -133,6 +133,15 @@ DEV_GUILD: discord.Object | None = (
     discord.Object(id=int(_gid)) if _gid.isdigit() else None
 )
 
+# Where slash commands get published:
+#   "global" (default) — registered application-wide so EVERY server the bot is
+#                        in gets them. First publish can take up to ~1h to
+#                        propagate through Discord; later updates are near-instant.
+#   "guild"            — registered only to GUILD_ID for instant updates while
+#                        developing. Other servers see no commands in this mode.
+# Most deployments want "global"; "guild" is a dev convenience.
+COMMAND_SCOPE = os.getenv("COMMAND_SCOPE", "global").strip().lower()
+
 # A parsed message must yield at least this many lifts before we auto-store it.
 # Keeps casual chatter out of the DB.
 MIN_LIFTS_FOR_AUTO = int(os.getenv("MIN_LIFTS_FOR_AUTO", "2"))
@@ -513,6 +522,73 @@ def _resolve_date_hint(
     return local_dt.astimezone(timezone.utc)
 
 
+# Resolution order mirrors _resolve_date_hint so we strip exactly the token it
+# acted on (and nothing else — important so a weekday/"today" word that's part
+# of a food name elsewhere in the message survives).
+_DATE_HINT_PATTERNS = (
+    _DATE_HINT_YESTERDAY,
+    _DATE_HINT_TODAY,
+    _DATE_HINT_DAYS_AGO,
+    _DATE_HINT_ISO,
+    _DATE_HINT_WEEKDAY,
+)
+
+
+def _split_date_hint(
+    text: str, now_local: datetime,
+) -> tuple[datetime | None, str]:
+    """Resolve a backdating hint and strip just that phrase from the text.
+
+    Returns ``(utc_dt_or_None, text_without_that_hint)``. Lets the strict
+    "amount only" nutrition parsers still match a backdated post like
+    ``500c yesterday`` -> ``500c``. Only the single matched hint is removed, so
+    ``sunday roast yesterday`` resolves to yesterday and leaves ``sunday roast``
+    intact. No hint -> the text is returned unchanged.
+    """
+    if not text:
+        return None, text
+    for pat in _DATE_HINT_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        dt = _resolve_date_hint(m.group(0), now_local)
+        if dt is None:
+            continue
+        cleaned = text[:m.start()] + " " + text[m.end():]
+        return dt, " ".join(cleaned.split())
+    return None, text
+
+
+def _day_window_for(dt_utc: datetime | None) -> tuple[str, str]:
+    """UTC ISO ``(start, end)`` bounds of the local day containing ``dt_utc``.
+
+    Defaults to today's window when ``dt_utc`` is None, so a backdated entry's
+    running total is shown against the right day rather than today's."""
+    if dt_utc is None:
+        return _today_window()
+    local_day = dt_utc.astimezone(DISPLAY_TZ).date()
+    start_local = datetime.combine(local_day, dtime.min, tzinfo=DISPLAY_TZ)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _backdate_label(logged_at: datetime | None) -> str:
+    """A short ' · logged for …' suffix when ``logged_at`` is a past local day,
+    so a backdated entry's reply makes the date obvious. Empty for today."""
+    if logged_at is None:
+        return ""
+    local_day = logged_at.astimezone(DISPLAY_TZ).date()
+    today = datetime.now(DISPLAY_TZ).date()
+    if local_day == today:
+        return ""
+    if local_day == today - timedelta(days=1):
+        return " · logged for yesterday"
+    return f" · logged for {local_day.strftime('%a %d %b')}"
+
+
 def _display_name(user: object) -> str:
     return str(
         getattr(user, "display_name", None)
@@ -889,6 +965,53 @@ async def _deny_invisible_target(interaction: discord.Interaction, target) -> bo
     return True
 
 
+async def _target_in_channel(interaction: discord.Interaction, target) -> bool:
+    """True if ``target`` can see the channel the command was used in.
+
+    Per-channel privacy guard for "look up someone else" lookups: you can only
+    pull another member's data from a channel they themselves can read. You can
+    always look up yourself. In a DM (no channel) there's nothing to enforce, so
+    we defer to the share-a-server guard and allow.
+    """
+    if target.id == interaction.user.id:
+        return True
+    channel = interaction.channel
+    if channel is None or interaction.guild_id is None:
+        return True
+    # Need a Member (not a bare User) to evaluate channel permissions.
+    member = target if isinstance(target, discord.Member) else None
+    if member is None:
+        guild = _ctx_guild(interaction)
+        member = guild.get_member(target.id) if guild is not None else None
+    if member is None:
+        return False
+    try:
+        return channel.permissions_for(member).view_channel
+    except (AttributeError, TypeError):
+        # Channel type without per-member perms (shouldn't happen for the
+        # text channels these commands run in) — don't block on it.
+        return True
+
+
+async def _deny_channel_outsider(interaction: discord.Interaction, target) -> bool:
+    """Send the standard refusal when ``target`` can't see the current channel.
+
+    Returns True (and replies ephemerally) when the lookup must be blocked, so
+    callers can ``if await _deny_channel_outsider(...): return``.
+    """
+    if await _target_in_channel(interaction, target):
+        return False
+    msg = (
+        "That member can't see this channel, so I won't show their info here — "
+        "ask from a channel they're in."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+    return True
+
+
 def _should_auto_store(lifts: list[Lift]) -> bool:
     return should_auto_store_lifts(lifts, MIN_LIFTS_FOR_AUTO)
 
@@ -1131,25 +1254,30 @@ async def _handle_bodyweight_message(
 async def _reply_calorie_logged(
     message: discord.Message, target: object, goal: sqlite3.Row,
     added_kcal: float, label: str | None, *, entry_id: int = 0,
+    logged_at: datetime | None = None,
 ) -> None:
-    """React ✅ and reply with what was added + today's running total.
+    """React ✅ and reply with what was added + that day's running total.
 
     Shared by both chat calorie paths so a `200 calories` post and a saved-food
     shortcut give the same `/calories add`-style feedback. When ``entry_id`` is
     given, the reply is tracked + gets a ❌ affordance so reacting removes that
-    specific entry."""
+    specific entry. ``logged_at`` (set when the post was backdated, e.g.
+    ``200c yesterday``) anchors the running total to that day and notes it."""
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
-    total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
+    total, _n = db.calorie_total_between(
+        guild_id, target_id, *_day_window_for(logged_at),
+    )
     label_part = f" — {label}" if label else ""
     suffix = _target_suffix(message.author, target)
     try:
         reply = await message.reply(
-            f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}\n"
+            f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
+            f"{_backdate_label(logged_at)}\n"
             + _calorie_status_line(total, float(goal["daily_target_kcal"])),
             mention_author=False,
         )
@@ -1194,12 +1322,14 @@ def _zero_quip(kind: str) -> str:
 async def _handle_calorie_message(
     message: discord.Message, target: object,
     kcal: float, unit: str, note: str | None,
+    *, logged_at: datetime | None = None,
 ) -> None:
     """Persist a chat-message calorie entry (`650kcal`, `2700kj maccas`).
 
     Mirrors `/calories add`: the target must have run `/calories setup`
     first, and the per-entry typo cap applies. Replies with a ✅ reaction and
-    today's running total; `/calories undo` reverses it.
+    the running total; `/calories undo` reverses it. ``logged_at`` backdates the
+    entry (e.g. `650kcal yesterday`) — None files it under the message time.
     """
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
@@ -1236,7 +1366,7 @@ async def _handle_calorie_message(
         entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=message.content.strip()[:80],
-            message_id=message.id,
+            logged_at=logged_at, message_id=message.id,
         )
     except Exception:
         LOG.exception("Failed to store calorie entry for user %s", target_id)
@@ -1245,7 +1375,10 @@ async def _handle_calorie_message(
     LOG.info(
         "Stored %.0f kcal for %s in #%s", kcal, target, message.channel,
     )
-    await _reply_calorie_logged(message, target, goal, kcal, note, entry_id=entry_id)
+    await _reply_calorie_logged(
+        message, target, goal, kcal, note,
+        entry_id=entry_id, logged_at=logged_at,
+    )
 
 
 def _match_calorie_food(
@@ -1272,12 +1405,14 @@ def _match_calorie_food(
 async def _handle_calorie_food_message(
     message: discord.Message, target: object,
     food_row: sqlite3.Row, servings: int,
+    *, logged_at: datetime | None = None,
 ) -> None:
     """Log a saved-food chat shortcut (`coffee`, `2 protein shake`).
 
     Always logs the food's calories. If the food was saved with a protein value
     and the user is protein-tracking, the protein is logged too and a combined
-    reply (🥗) is posted so a ❌ removes both entries at once."""
+    reply (🥗) is posted so a ❌ removes both entries at once. ``logged_at``
+    backdates both entries (e.g. `coffee yesterday`)."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     kcal = float(food_row["kcal"]) * servings
@@ -1299,7 +1434,7 @@ async def _handle_calorie_food_message(
     try:
         entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
-            note=note, raw=raw, message_id=message.id,
+            note=note, raw=raw, logged_at=logged_at, message_id=message.id,
         )
     except Exception:
         LOG.exception("Failed to store food entry for user %s", target_id)
@@ -1315,7 +1450,7 @@ async def _handle_calorie_food_message(
         try:
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
-                note=note, raw=raw, message_id=message.id,
+                note=note, raw=raw, logged_at=logged_at, message_id=message.id,
             )
             logged_protein = True
         except Exception:
@@ -1330,14 +1465,16 @@ async def _handle_calorie_food_message(
 
     if not logged_protein:
         await _reply_calorie_logged(
-            message, target, goal, kcal, note, entry_id=entry_id,
+            message, target, goal, kcal, note,
+            entry_id=entry_id, logged_at=logged_at,
         )
         return
 
     # Combined reply (🥗) — mirrors _handle_combined_nutrition so the shared ❌
     # undo path removes both the calorie and protein entries via the source id.
-    cal_total, _ = db.calorie_total_between(guild_id, target_id, *_today_window())
-    pro_total, _ = db.protein_total_between(guild_id, target_id, *_today_window())
+    window = _day_window_for(logged_at)
+    cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
+    pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
     suffix = _target_suffix(message.author, target)
     try:
         await message.add_reaction("✅")
@@ -1346,7 +1483,8 @@ async def _handle_calorie_food_message(
     try:
         reply = await message.reply(
             f"🥗 Logged **{calories.format_kcal(kcal)}** + "
-            f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}\n"
+            f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}"
+            f"{_backdate_label(logged_at)}\n"
             + _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
             + "\n"
             + _protein_status_line(pro_total, float(pro_goal["daily_target_g"])),
@@ -1377,8 +1515,12 @@ def _protein_status_line(total: float, ceiling: float) -> str:
 
 async def _handle_protein_message(
     message: discord.Message, target: object, grams: float,
+    *, logged_at: datetime | None = None,
 ) -> None:
-    """Persist a chat-message protein entry (`40p`, `40g protein`)."""
+    """Persist a chat-message protein entry (`40p`, `40g protein`).
+
+    ``logged_at`` backdates the entry (e.g. `40p yesterday`); None files it
+    under the message time."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     goal = db.protein_goal_get(guild_id, target_id)
@@ -1412,30 +1554,38 @@ async def _handle_protein_message(
     try:
         db.protein_add(
             guild_id, target_id, _display_name(target), grams,
-            raw=message.content.strip()[:80], message_id=message.id,
+            raw=message.content.strip()[:80],
+            logged_at=logged_at, message_id=message.id,
         )
     except Exception:
         LOG.exception("Failed to store protein entry for user %s", target_id)
         return
     LOG.info("Stored %.0fg protein for %s in #%s", grams, target, message.channel)
-    await _reply_protein_logged(message, target, goal, grams)
+    await _reply_protein_logged(message, target, goal, grams, logged_at=logged_at)
 
 
 async def _reply_protein_logged(
     message: discord.Message, target: object, goal: sqlite3.Row, grams: float,
+    *, logged_at: datetime | None = None,
 ) -> None:
-    """React ✅ and reply with what was added + today's running total vs max."""
+    """React ✅ and reply with what was added + that day's running total vs max.
+
+    ``logged_at`` (a backdated post) anchors the total to that day and notes
+    it."""
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
-    total, _n = db.protein_total_between(guild_id, target_id, *_today_window())
+    total, _n = db.protein_total_between(
+        guild_id, target_id, *_day_window_for(logged_at),
+    )
     suffix = _target_suffix(message.author, target)
     try:
         reply = await message.reply(
-            f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}\n"
+            f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}"
+            f"{_backdate_label(logged_at)}\n"
             + _protein_status_line(total, float(goal["daily_target_g"])),
             mention_author=False,
         )
@@ -1451,10 +1601,11 @@ async def _reply_protein_logged(
 
 async def _handle_combined_nutrition(
     message: discord.Message, target: object, kcal: float, grams: float,
+    *, logged_at: datetime | None = None,
 ) -> None:
     """Log a message that carries BOTH a calorie and a protein amount
     (`500c and 40p`) — stores each entry the user is tracking and posts one
-    combined reply."""
+    combined reply. ``logged_at`` backdates both (e.g. `500c and 40p yesterday`)."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     cal_goal = db.calorie_goal_get(guild_id, target_id)
@@ -1476,14 +1627,15 @@ async def _handle_combined_nutrition(
     status_lines: list[str] = []
     skipped: list[str] = []
 
+    window = _day_window_for(logged_at)
     if cal_goal is not None:
         if 0 < kcal <= _MAX_ENTRY_KCAL:
             db.calorie_add(
                 guild_id, target_id, _display_name(target), kcal,
-                raw=raw, message_id=message.id,
+                raw=raw, logged_at=logged_at, message_id=message.id,
             )
             total, _n = db.calorie_total_between(
-                guild_id, target_id, *_today_window(),
+                guild_id, target_id, *window,
             )
             logged.append(f"**{calories.format_kcal(kcal)}**")
             status_lines.append(
@@ -1498,10 +1650,10 @@ async def _handle_combined_nutrition(
         if 0 < grams <= _MAX_PROTEIN_ENTRY_G:
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
-                raw=raw, message_id=message.id,
+                raw=raw, logged_at=logged_at, message_id=message.id,
             )
             total, _n = db.protein_total_between(
-                guild_id, target_id, *_today_window(),
+                guild_id, target_id, *window,
             )
             logged.append(f"**{protein_mod.format_grams(grams)}** protein")
             status_lines.append(
@@ -1535,7 +1687,7 @@ async def _handle_combined_nutrition(
         # Leading 🥗 marks this as a combined reply; the undo handler removes
         # every nutrition entry tied to the source message.
         reply = await message.reply(
-            f"🥗 Logged {' + '.join(logged)}{suffix}\n"
+            f"🥗 Logged {' + '.join(logged)}{suffix}{_backdate_label(logged_at)}\n"
             + "\n".join(status_lines) + tail,
             mention_author=False,
         )
@@ -1560,12 +1712,28 @@ async def on_ready() -> None:
             "in the Discord Developer Portal."
         )
     try:
-        if DEV_GUILD is not None:
+        if COMMAND_SCOPE == "guild" and DEV_GUILD is not None:
+            # Dev mode: instant, but only this one guild gets the commands.
             bot.tree.copy_global_to(guild=DEV_GUILD)
             synced = await bot.tree.sync(guild=DEV_GUILD)
+            LOG.info(
+                "Synced %d slash commands to guild %s only "
+                "(COMMAND_SCOPE=guild — other servers see nothing)",
+                len(synced), _gid,
+            )
         else:
+            # Global: every server the bot is in gets the commands. If a guild
+            # was previously used for instant sync, clear that guild-scoped copy
+            # first so its commands don't show up twice next to the global ones.
+            if DEV_GUILD is not None:
+                bot.tree.clear_commands(guild=DEV_GUILD)
+                await bot.tree.sync(guild=DEV_GUILD)
             synced = await bot.tree.sync()
-        LOG.info("Synced %d slash commands", len(synced))
+            LOG.info(
+                "Synced %d global slash commands "
+                "(can take up to ~1h to appear in every server)",
+                len(synced),
+            )
     except Exception:  # pragma: no cover - discord runtime only
         LOG.exception("Failed to sync commands")
 
@@ -2301,7 +2469,10 @@ def _backfill_calorie_entry(msg: discord.Message, target: object, content: str) 
     calories, store it (deduped by message id, dated to the message). Returns
     True if a new entry was inserted. Used only by the history backfill — the
     live path is :func:`_handle_calorie_message`."""
-    hit = calories.parse_chat_message(content)
+    hint_dt, parse_content = _split_date_hint(
+        content, msg.created_at.astimezone(DISPLAY_TZ),
+    )
+    hit = calories.parse_chat_message(parse_content)
     if hit is None:
         return False
     kcal, _unit, note = hit
@@ -2315,7 +2486,7 @@ def _backfill_calorie_entry(msg: discord.Message, target: object, content: str) 
         inserted = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=msg.content.strip()[:80],
-            logged_at=msg.created_at.astimezone(timezone.utc),
+            logged_at=hint_dt or msg.created_at.astimezone(timezone.utc),
             message_id=msg.id,
         )
     except Exception:
@@ -2611,38 +2782,59 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
+    # Backdating for nutrition logs: a trailing "yesterday" / "monday" /
+    # "3 days ago" / ISO date files the entry under that day. We strip just that
+    # phrase so the strict amount-only parsers below still match ("500c
+    # yesterday" -> "500c"); the original `content` is left untouched for the
+    # lift path, which does its own date resolution.
+    nut_dt, nut_content = _split_date_hint(
+        content, message.created_at.astimezone(DISPLAY_TZ),
+    )
+
     # Quick calorie logging path: `650kcal`, `200 cal toastie`, `2700kj`,
     # or `@user 650kcal` to log for someone else. The unit is mandatory
     # (kcal/cal/kj) so plain lift numbers never match this branch.
-    cal_hit = calories.parse_chat_message(content)
+    cal_hit = calories.parse_chat_message(nut_content)
     if cal_hit is not None:
-        await _handle_calorie_message(message, target, *cal_hit)
+        await _handle_calorie_message(message, target, *cal_hit, logged_at=nut_dt)
         await bot.process_commands(message)
         return
 
     # Saved-food shortcut: a message that's exactly one of the target's saved
     # foods ("coffee", "2 protein shake") logs that food's calories. Gated on
     # the user actually tracking + the name being defined, so normal chatter
-    # falls through to the lift parser.
+    # falls through to the lift parser. Try the full text first so a food named
+    # with a weekday/"today" word isn't mistaken for a date hint; only then the
+    # hint-stripped version, which backdates it.
     food_hit = _match_calorie_food(message, target, content)
+    food_dt = None
+    if food_hit is None and nut_dt is not None:
+        food_hit = _match_calorie_food(message, target, nut_content)
+        food_dt = nut_dt
     if food_hit is not None:
-        await _handle_calorie_food_message(message, target, *food_hit)
+        await _handle_calorie_food_message(
+            message, target, *food_hit, logged_at=food_dt,
+        )
         await bot.process_commands(message)
         return
 
     # Protein chat shortcut: `40p`, `40g protein`, `protein 40`. Requires an
     # explicit protein marker so a bare number/weight never matches.
-    protein_grams = protein_mod.parse_protein_chat_message(content)
+    protein_grams = protein_mod.parse_protein_chat_message(nut_content)
     if protein_grams is not None:
-        await _handle_protein_message(message, target, protein_grams)
+        await _handle_protein_message(
+            message, target, protein_grams, logged_at=nut_dt,
+        )
         await bot.process_commands(message)
         return
 
     # Combined log: a message carrying BOTH a calorie and a protein amount,
     # e.g. `500c and 40p`. Only fires when both tokens are present.
-    combined = nutrition.parse_combined(content)
+    combined = nutrition.parse_combined(nut_content)
     if combined is not None:
-        await _handle_combined_nutrition(message, target, *combined)
+        await _handle_combined_nutrition(
+            message, target, *combined, logged_at=nut_dt,
+        )
         await bot.process_commands(message)
         return
 
@@ -4692,6 +4884,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "(`650`, `650c`, `2700kj`, or a saved food like `coffee`)\n"
             "Or just type `650kcal` / `200c` / `2700kj` on its own in chat — "
             "I'll react ✅ and reply with your running total\n"
+            "Add `yesterday` / `monday` / `3 days ago` to backdate, e.g. "
+            "`650kcal yesterday`\n"
             "`/calories food_set <name> <amount> [protein]` — save a food "
             "shortcut (optionally with protein), then log it by typing "
             "`coffee` or `2 coffee` in chat\n"
@@ -8927,6 +9121,8 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         remove_timeout=_webui_remove_timeout,
         announce_blacklist=_webui_announce_blacklist,
         voice_snapshot=_webui_voice_snapshot,
+        presence_track=_webui_presence_track,
+        presence_enabled=ENABLE_PRESENCE_TRACKING,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -9428,6 +9624,60 @@ async def _webui_remove_timeout(
         detail=f"timeout removed (by {actor_name})",
     )
     return {"ok": True, "changed": True}
+
+
+async def _webui_presence_track(
+    guild_id: int, user_id: int, start: bool, actor_name: str,
+) -> dict:  # pragma: no cover
+    """Start or stop presence/activity tracking for a member from the dashboard.
+
+    Mirrors the owner-only ``/track start`` and ``/track stop`` slash commands:
+    refuses bots, seeds an initial snapshot on start so the activity view has
+    something to show immediately, and audits the change. Requires
+    ``ENABLE_PRESENCE_TRACKING`` (the dashboard hides the control otherwise, but
+    we re-check here in case it's toggled off after a page load)."""
+    if not ENABLE_PRESENCE_TRACKING:
+        return {
+            "ok": False,
+            "error": "Presence tracking is disabled — set "
+                     "ENABLE_PRESENCE_TRACKING=true and enable the Presence "
+                     "intent, then restart the bot.",
+        }
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "error": "Server not found or bot not in it."}
+    member = await _webui_resolve_member(guild, user_id)
+    if member is None:
+        return {"ok": False, "error": "That user isn't a member of this server."}
+    if member.bot:
+        return {"ok": False, "error": "I won't track other bots."}
+
+    if start:
+        inserted = db.presence_track_add(guild_id, user_id, started_by=0)
+        # Seed status + current activity so the activity view isn't blank until
+        # the next gateway transition.
+        try:
+            _seed_presence_snapshot(guild_id, member)
+        except Exception:
+            LOG.exception("Failed to seed initial presence snapshot (dashboard)")
+        if inserted:
+            db.add_audit(
+                guild_id, "member", "presence_track_start",
+                actor_name=actor_name,
+                subject_id=user_id, subject_name=_member_display(member),
+                detail=f"presence tracking started (by {actor_name})",
+            )
+        return {"ok": True, "tracked": True, "changed": inserted}
+
+    removed = db.presence_track_remove(guild_id, user_id)
+    if removed:
+        db.add_audit(
+            guild_id, "member", "presence_track_stop",
+            actor_name=actor_name,
+            subject_id=user_id, subject_name=_member_display(member),
+            detail=f"presence tracking stopped (by {actor_name})",
+        )
+    return {"ok": True, "tracked": False, "changed": removed}
 
 
 @bot.event
@@ -11589,6 +11839,8 @@ async def calories_today_cmd(
     target_user = user or interaction.user
     if await _deny_invisible_target(interaction, target_user):
         return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
@@ -11639,6 +11891,8 @@ async def calories_week_cmd(
 ) -> None:
     target_user = user or interaction.user
     if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
         return
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
@@ -11993,6 +12247,8 @@ async def protein_today_cmd(
     target_user = user or interaction.user
     if await _deny_invisible_target(interaction, target_user):
         return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
     guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
     if goal is None:
@@ -12039,6 +12295,8 @@ async def protein_week_cmd(
 ) -> None:
     target_user = user or interaction.user
     if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
         return
     guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
