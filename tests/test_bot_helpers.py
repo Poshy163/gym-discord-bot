@@ -462,3 +462,50 @@ def test_guild_has_gym_channel_scopes_allow_list_per_guild(monkeypatch):
     assert bot._guild_has_gym_channel(None) is False
     monkeypatch.setattr(bot, "GYM_CHANNEL_IDS", set())
     assert bot._guild_has_gym_channel(g_listed) is False
+
+
+# --- logging streaks ---------------------------------------------------------
+
+def test_logging_streak_pure():
+    from app.bot import _logging_streak
+    today = date(2026, 6, 30)
+    # Three consecutive days ending today.
+    assert _logging_streak({date(2026, 6, 30), date(2026, 6, 29), date(2026, 6, 28)}, today) == 3
+    # Anchored at yesterday (nothing logged today yet) — still alive.
+    assert _logging_streak({date(2026, 6, 29), date(2026, 6, 28)}, today) == 2
+    # A gap before today/yesterday means no current streak.
+    assert _logging_streak({date(2026, 6, 27)}, today) == 0
+    assert _logging_streak(set(), today) == 0
+
+
+def test_calorie_and_protein_streak_count_local_days():
+    from app.bot import _calorie_streak, _protein_streak, DISPLAY_TZ as TZ
+    uid = 515151
+    today = datetime.now(TZ).date()
+    for off in (0, 1, 2):
+        d = today - timedelta(days=off)
+        noon_utc = datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ).astimezone(timezone.utc)
+        _bot_db.calorie_add(0, uid, "x", 100, logged_at=noon_utc)
+        _bot_db.protein_add(0, uid, "x", 30, logged_at=noon_utc)
+    assert _calorie_streak(uid) == 3
+    assert _protein_streak(uid) == 3
+    # A user who logged only 3 days ago has no current streak.
+    uid2 = 515152
+    d = today - timedelta(days=3)
+    noon_utc = datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ).astimezone(timezone.utc)
+    _bot_db.calorie_add(0, uid2, "x", 100, logged_at=noon_utc)
+    assert _calorie_streak(uid2) == 0
+
+
+def test_protein_weekly_blocks_flags_over_max():
+    from app.bot import _protein_weekly_blocks
+    g, uid = 880001, 880100
+    _bot_db.upsert_member(g, uid, "alice", "Alice")
+    _bot_db.protein_goal_set(g, uid, "Alice", 180)
+    now = datetime.now(timezone.utc)
+    _bot_db.protein_add(g, uid, "Alice", 220, logged_at=now)  # over the 180 max
+    start = (now - timedelta(days=3)).isoformat()
+    end = (now + timedelta(days=1)).isoformat()
+    blocks = _protein_weekly_blocks(g, start, end)
+    assert any("Alice" in b for b in blocks)
+    assert any("over" in b for b in blocks)

@@ -589,6 +589,105 @@ def _backdate_label(logged_at: datetime | None) -> str:
     return f" · logged for {local_day.strftime('%a %d %b')}"
 
 
+def _slash_logged_at(day: str | None) -> tuple[datetime | None, bool]:
+    """Resolve a slash-command ``day`` argument to a UTC datetime.
+
+    Returns ``(logged_at, ok)``. No day given -> ``(None, True)`` (today).
+    A recognised hint ("yesterday", "monday", "3 days ago", "2026-06-28") ->
+    ``(dt, True)``. Anything unparseable -> ``(None, False)`` so the caller can
+    reject it instead of silently logging for today.
+    """
+    if day is None or not day.strip():
+        return None, True
+    dt = _resolve_date_hint(day, datetime.now(DISPLAY_TZ))
+    return dt, dt is not None
+
+
+_BAD_DAY_MSG = (
+    "Couldn't read that day — try `yesterday`, `monday`, `3 days ago`, or a "
+    "date like `2026-06-28`."
+)
+
+
+# How far back we scan when computing a logging streak. A run longer than this
+# is rare and still renders (capped at the window); keeps the query cheap.
+_STREAK_WINDOW_DAYS = 60
+
+
+def _logging_streak(days: set[date], today: date) -> int:
+    """Consecutive local days with an entry, ending today *or* yesterday.
+
+    Anchoring at either keeps the streak "alive" the morning after — it only
+    resets once a whole day passes with nothing logged. Pure + testable.
+    """
+    if today in days:
+        cursor = today
+    elif (today - timedelta(days=1)) in days:
+        cursor = today - timedelta(days=1)
+    else:
+        return 0
+    n = 0
+    while cursor in days:
+        n += 1
+        cursor -= timedelta(days=1)
+    return n
+
+
+def _entry_local_days(entries: "list[sqlite3.Row]") -> set[date]:
+    """Set of DISPLAY_TZ calendar dates an entry list touches.
+
+    Buckets by *local* day (not the UTC date prefix) so streaks line up with the
+    user's own calendar — important in +HH:MM zones where a morning meal is the
+    previous UTC day."""
+    out: set[date] = set()
+    for r in entries:
+        try:
+            dt = datetime.fromisoformat(r["logged_at"])
+        except (ValueError, TypeError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        out.add(dt.astimezone(DISPLAY_TZ).date())
+    return out
+
+
+def _streak_window_iso() -> tuple[date, str, str]:
+    """``(today_local, start_iso, end_iso)`` covering the streak look-back."""
+    today = datetime.now(DISPLAY_TZ).date()
+    start = datetime.combine(
+        today - timedelta(days=_STREAK_WINDOW_DAYS), dtime.min, tzinfo=DISPLAY_TZ,
+    )
+    end = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=DISPLAY_TZ)
+    return (
+        today,
+        start.astimezone(timezone.utc).isoformat(),
+        end.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _calorie_streak(user_id: int) -> int:
+    """Current consecutive-day calorie-logging streak for ``user_id`` (global)."""
+    today, start_iso, end_iso = _streak_window_iso()
+    days = _entry_local_days(
+        db.calorie_entries_between(0, user_id, start_iso, end_iso)
+    )
+    return _logging_streak(days, today)
+
+
+def _protein_streak(user_id: int) -> int:
+    """Current consecutive-day protein-logging streak for ``user_id`` (global)."""
+    today, start_iso, end_iso = _streak_window_iso()
+    days = _entry_local_days(
+        db.protein_entries_between(0, user_id, start_iso, end_iso)
+    )
+    return _logging_streak(days, today)
+
+
+def _streak_suffix(streak: int) -> str:
+    """' · 🔥 N day streak' for a 2+ day streak, else empty (no day-one noise)."""
+    return f" · 🔥 {streak} day streak" if streak >= 2 else ""
+
+
 def _display_name(user: object) -> str:
     return str(
         getattr(user, "display_name", None)
@@ -838,6 +937,25 @@ def _effective_guild_for_dm(user_id: int) -> int | None:
     if len(shared) == 1:
         return shared[0]
     return None
+
+
+def _dm_storage_guild(user_id: int) -> int | None:
+    """A shared guild to attribute a DM-logged *global* entry to when the user
+    hasn't pinned one with ``/server``.
+
+    Calories/protein/foods/bodyweight are global, so the stored ``guild_id`` is
+    only a label (it decides which server's report/dashboard surfaces the row).
+    We prefer the guild that already holds their nutrition goal so it lands with
+    their other data, else the lowest shared guild id. None when they share no
+    server with the bot.
+    """
+    shared = _shared_guild_ids(user_id)
+    if not shared:
+        return None
+    home = db.nutrition_home_guild(user_id)
+    if home is not None and home in shared:
+        return home
+    return shared[0]
 
 
 def _guild_has_gym_channel(guild: "discord.Guild | None") -> bool:
@@ -1185,10 +1303,16 @@ def _new_prs_for_lifts(
 def _msg_guild_id(message: discord.Message) -> int:
     """The server a chat message logs to: its own guild, or — for a DM — the
     sender's effective server (their ``/server`` default, or the single server
-    we share). 0 when neither resolves."""
+    we share). Falls back to a deterministic shared server for global nutrition/
+    bodyweight logging when the DM is otherwise ambiguous; 0 when nothing
+    resolves."""
     if message.guild is not None:
         return message.guild.id
-    return _effective_guild_for_dm(message.author.id) or 0
+    return (
+        _effective_guild_for_dm(message.author.id)
+        or _dm_storage_guild(message.author.id)
+        or 0
+    )
 
 
 async def _store_lifts(
@@ -1292,7 +1416,8 @@ async def _reply_calorie_logged(
         reply = await message.reply(
             f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
             f"{_backdate_label(logged_at)}\n"
-            + _calorie_status_line(total, float(goal["daily_target_kcal"])),
+            + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+            + _streak_suffix(_calorie_streak(target_id)),
             mention_author=False,
         )
     except discord.HTTPException:
@@ -1500,6 +1625,7 @@ async def _handle_calorie_food_message(
             f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}"
             f"{_backdate_label(logged_at)}\n"
             + _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+            + _streak_suffix(_calorie_streak(target_id))
             + "\n"
             + _protein_status_line(pro_total, float(pro_goal["daily_target_g"])),
             mention_author=False,
@@ -1600,7 +1726,8 @@ async def _reply_protein_logged(
         reply = await message.reply(
             f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}"
             f"{_backdate_label(logged_at)}\n"
-            + _protein_status_line(total, float(goal["daily_target_g"])),
+            + _protein_status_line(total, float(goal["daily_target_g"]))
+            + _streak_suffix(_protein_streak(target_id)),
             mention_author=False,
         )
     except discord.HTTPException:
@@ -1697,12 +1824,17 @@ async def _handle_combined_nutrition(
     tail = (
         f"\n*(skipped {', '.join(skipped)})*" if skipped else ""
     )
+    # Whichever tracker has a live streak (calories first).
+    streak = (
+        _streak_suffix(_calorie_streak(target_id))
+        or _streak_suffix(_protein_streak(target_id))
+    )
     try:
         # Leading 🥗 marks this as a combined reply; the undo handler removes
         # every nutrition entry tied to the source message.
         reply = await message.reply(
             f"🥗 Logged {' + '.join(logged)}{suffix}{_backdate_label(logged_at)}\n"
-            + "\n".join(status_lines) + tail,
+            + "\n".join(status_lines) + streak + tail,
             mention_author=False,
         )
     except discord.HTTPException:
@@ -2372,10 +2504,38 @@ def _parse_recap_json(raw: str) -> tuple[str | None, str | None]:
     return (verdict[:500] if verdict else None), (tip[:200] if tip else None)
 
 
+def _protein_weekly_blocks(
+    guild_id: int, start_iso: str, end_iso: str,
+) -> list[str]:
+    """One stats line per protein-tracking member for the weekly report.
+
+    Plain stats (no AI): days logged, average vs the daily max, and how often
+    they went over — the protein tracker is about staying *under* a ceiling."""
+    blocks: list[str] = []
+    for row in db.protein_tracked_users(guild_id):
+        user_id = int(row["user_id"])
+        name = db.get_user_nickname(user_id) or row["username"]
+        who = f"**{name}** <@{user_id}>"
+        target = float(row["daily_target_g"])
+        days = _protein_week_days(guild_id, user_id, start_iso, end_iso)
+        if not days:
+            blocks.append(f"{who} — no protein logged this week.")
+            continue
+        avg = sum(days.values()) / len(days)
+        over = sum(1 for v in days.values() if v > target)
+        tail = f" · ⚠️ over {over}/{len(days)} days" if over else ""
+        blocks.append(
+            f"{who} — {len(days)}/7 days · avg "
+            f"{protein_mod.format_grams(avg)}/day vs max "
+            f"{protein_mod.format_grams(target)}{tail}"
+        )
+    return blocks
+
+
 async def _post_weekly_report(
     channel: discord.abc.Messageable, guild_id: int,
 ) -> None:
-    """Send the gym recap, then the calorie check-in embed if anyone's
+    """Send the gym recap, then calorie + protein check-in embeds if anyone's
     tracking. Shared by the scheduled task and /weekly_report."""
     label, start_iso, end_iso = _week_window()
     text = _weekly_gym_text(guild_id, label, start_iso, end_iso)
@@ -2392,18 +2552,27 @@ async def _post_weekly_report(
             embed=strava_embed, allowed_mentions=discord.AllowedMentions.none(),
         )
     cal_blocks = await _calorie_ai_summaries(guild_id, start_iso, end_iso)
-    if not cal_blocks:
-        return
-    embed = discord.Embed(
-        title=f"🍎 Weekly calorie check-in — {label}",
-        description="\n\n".join(cal_blocks)[:4000],
-        colour=EMBED_COLOUR,
-    )
-    if gemini_client.available():
-        embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
-    await channel.send(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-    )
+    if cal_blocks:
+        embed = discord.Embed(
+            title=f"🍎 Weekly calorie check-in — {label}",
+            description="\n\n".join(cal_blocks)[:4000],
+            colour=EMBED_COLOUR,
+        )
+        if gemini_client.available():
+            embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
+        await channel.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
+    pro_blocks = _protein_weekly_blocks(guild_id, start_iso, end_iso)
+    if pro_blocks:
+        embed = discord.Embed(
+            title=f"🥩 Weekly protein check-in — {label}",
+            description="\n\n".join(pro_blocks)[:4000],
+            colour=EMBED_COLOUR,
+        )
+        await channel.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 @tasks.loop(time=_weekly_report_time())
@@ -2464,18 +2633,27 @@ async def weekly_report_cmd(interaction: discord.Interaction) -> None:
     cal_blocks = await _calorie_ai_summaries(
         guild_id, start_iso, end_iso,
     )
-    if not cal_blocks:
-        return
-    embed = discord.Embed(
-        title=f"🍎 Weekly calorie check-in — {label}",
-        description="\n\n".join(cal_blocks)[:4000],
-        colour=EMBED_COLOUR,
-    )
-    if gemini_client.available():
-        embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
-    await interaction.channel.send(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-    )
+    if cal_blocks:
+        embed = discord.Embed(
+            title=f"🍎 Weekly calorie check-in — {label}",
+            description="\n\n".join(cal_blocks)[:4000],
+            colour=EMBED_COLOUR,
+        )
+        if gemini_client.available():
+            embed.set_footer(text=f"AI summaries · {gemini_client.model_name()}")
+        await interaction.channel.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
+    pro_blocks = _protein_weekly_blocks(guild_id, start_iso, end_iso)
+    if pro_blocks:
+        embed = discord.Embed(
+            title=f"🥩 Weekly protein check-in — {label}",
+            description="\n\n".join(pro_blocks)[:4000],
+            colour=EMBED_COLOUR,
+        )
+        await interaction.channel.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 def _backfill_calorie_entry(msg: discord.Message, target: object, content: str) -> bool:
@@ -2724,15 +2902,21 @@ async def on_message(message: discord.Message) -> None:
     gid = message.guild.id if message.guild else _effective_guild_for_dm(
         message.author.id
     )
+    # Ambiguous DM (in 2+ servers, no /server default): calories/protein/foods/
+    # bodyweight are all global, so we can still log those — attribute them to a
+    # deterministic shared server. Only the lift path (per-server) still asks for
+    # /server, guarded below.
+    dm_ambiguous = in_dm and gid is None
+    if dm_ambiguous:
+        gid = _dm_storage_guild(message.author.id)
     if gid is None:
-        # A DM we can't pin to a server. Nudge only when it looks like a real
-        # logging attempt, so casual DMs don't get a wall of text.
+        # DM with no shared server at all — nothing we can attribute it to.
+        # Nudge only when it looks like a real logging attempt.
         if in_dm and _looks_like_log_attempt(message.content):
             try:
                 await message.reply(
-                    "I couldn't tell which server to log that in — we either "
-                    "share no server, or you're in several. Set one with "
-                    "`/server`, then try again.",
+                    "I couldn't log that — we don't share a server. Add me to "
+                    "your server (or join one I'm in), then try again.",
                     mention_author=False,
                 )
             except discord.HTTPException:
@@ -2861,6 +3045,21 @@ async def on_message(message: discord.Message) -> None:
 
     lifts = parse_message(content, custom_aliases=guild_aliases)
     lifts, rejected_lifts = _split_reasonable_lifts(lifts)
+    # We got past every (global) nutrition path without a match. Lifts are
+    # per-server, so in an ambiguous DM we can't tell which server to credit —
+    # ask the user to pick one rather than guess. Nutrition already worked above.
+    if dm_ambiguous and lifts and _should_auto_store(lifts):
+        try:
+            await message.reply(
+                "I can log calories, protein and bodyweight from a DM anywhere, "
+                "but **lifts** are per-server — set which one with `/server`, "
+                "then re-post.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        await bot.process_commands(message)
+        return
     # Backdated logging: phrases like "yesterday", "3 days ago", "monday",
     # or an ISO date in the message override the message's own timestamp
     # so a workout posted the morning after still files under the prior day.
@@ -4912,10 +5111,12 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`coffee` or `2 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
-            "`/calories undo` — remove your last entry, or react ❌ on the "
-            "bot's reply to remove that specific one\n"
+            "`/calories edit <amount>` — fix your last entry · "
+            "`/calories undo` — remove it (or react ❌ on the bot's reply)\n"
+            "`/calories leaderboard` — who's on the longest 🔥 logging streak\n"
             "`/calories stop` — stop tracking (history kept)\n"
-            "Tracked members get an AI summary in the Sunday "
+            "Tracking is global — your goal, foods & entries follow you across "
+            "servers + DMs. Tracked members get an AI summary in the Sunday "
             "`/weekly_report`"
         ),
         inline=False,
@@ -4929,7 +5130,8 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "Or just type `40p` / `40g protein` in chat\n"
             "Log both at once: `500c and 40p`\n"
             "`/protein today [user]` · `/protein week [user]`\n"
-            "`/protein undo` — remove your last entry\n"
+            "`/protein edit <grams>` — fix your last entry · "
+            "`/protein undo` — remove it\n"
             "`/protein stop` — stop tracking (history kept)"
         ),
         inline=False,
@@ -9144,6 +9346,8 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         voice_snapshot=_webui_voice_snapshot,
         presence_track=_webui_presence_track,
         presence_enabled=ENABLE_PRESENCE_TRACKING,
+        calorie_streak=_calorie_streak,
+        protein_streak=_protein_streak,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -11785,11 +11989,13 @@ async def calories_setup_cmd(
 @app_commands.describe(
     amount='Energy ("650", "650c", "2700kj") or a saved food ("coffee", "2 coffee").',
     note="What it was (optional, shows in /calories today).",
+    day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
 async def calories_add_cmd(
     interaction: discord.Interaction,
     amount: str,
     note: str | None = None,
+    day: str | None = None,
 ) -> None:
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
@@ -11797,6 +12003,10 @@ async def calories_add_cmd(
         await interaction.response.send_message(
             _CALORIES_NOT_SET_MSG, ephemeral=True,
         )
+        return
+    logged_at, day_ok = _slash_logged_at(day)
+    if not day_ok:
+        await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
         return
 
     # Energy amount first ("650", "2700kj"); fall back to a saved-food name.
@@ -11835,16 +12045,18 @@ async def calories_add_cmd(
         return
     db.calorie_add(
         guild_id, interaction.user.id, _display_name(interaction.user),
-        kcal, note=note, raw=amount.strip(),
+        kcal, note=note, raw=amount.strip(), logged_at=logged_at,
     )
     total, _n = db.calorie_total_between(
-        guild_id, interaction.user.id, *_today_window(),
+        guild_id, interaction.user.id, *_day_window_for(logged_at),
     )
     # Skip the note suffix when it just repeats the food name we already show.
     note_part = f" — {note}" if note and note != logged_label else ""
     await interaction.response.send_message(
-        f"🍽️ Logged **{logged_label}**{converted}{note_part}\n"
+        f"🍽️ Logged **{logged_label}**{converted}{note_part}"
+        f"{_backdate_label(logged_at)}\n"
         + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        + _streak_suffix(_calorie_streak(interaction.user.id))
     )
 
 
@@ -11949,6 +12161,9 @@ async def calories_week_cmd(
             f"\nAvg on logged days: **{calories.format_kcal(avg)}** vs "
             f"target {calories.format_kcal(target_kcal)}"
         )
+    streak = _calorie_streak(target_user.id)
+    if streak >= 2:
+        lines.append(f"🔥 **{streak} day** logging streak")
     embed = discord.Embed(
         title=f"🍎 Calories this week — {target_user.display_name}",
         description="\n".join(lines),
@@ -11986,6 +12201,103 @@ async def calories_undo_cmd(interaction: discord.Interaction) -> None:
             _calorie_status_line(total, float(goal["daily_target_kcal"]))
         )
     await interaction.response.send_message("\n".join(lines))
+
+
+@calories_group.command(
+    name="edit",
+    description="Fix the amount of your most recent calorie entry.",
+)
+@app_commands.describe(
+    amount='Corrected energy ("650", "650c", "2700kj").',
+    note="Optional new note (leave blank to keep the old one).",
+)
+async def calories_edit_cmd(
+    interaction: discord.Interaction, amount: str, note: str | None = None,
+) -> None:
+    guild_id = _ctx_guild_id(interaction)
+    goal = db.calorie_goal_get(guild_id, interaction.user.id)
+    if goal is None:
+        await interaction.response.send_message(
+            _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    parsed = calories.parse_energy(amount)
+    if parsed is None or parsed[0] <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that — try `650`, `650c`, or `2700kj`.",
+            ephemeral=True,
+        )
+        return
+    kcal, unit = parsed
+    if kcal > _MAX_ENTRY_KCAL:
+        await interaction.response.send_message(
+            f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — looks like a typo.",
+            ephemeral=True,
+        )
+        return
+    old = db.calorie_update_last(
+        guild_id, interaction.user.id, kcal, note=note, raw=amount.strip(),
+        username=_display_name(interaction.user),
+    )
+    if old is None:
+        await interaction.response.send_message(
+            "No calorie entries to edit yet.", ephemeral=True,
+        )
+        return
+    converted = f" = {calories.format_kcal(kcal)}" if unit == "kj" else ""
+    total, _n = db.calorie_total_between(
+        guild_id, interaction.user.id, *_today_window(),
+    )
+    await interaction.response.send_message(
+        f"✏️ Updated last entry "
+        f"**{calories.format_kcal(float(old['kcal']))}** → "
+        f"**{calories.format_kcal(kcal)}**{converted}\n"
+        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+    )
+
+
+@calories_group.command(
+    name="leaderboard",
+    description="Who's on the longest calorie-logging streak.",
+)
+async def calories_leaderboard_cmd(interaction: discord.Interaction) -> None:
+    guild_id = _ctx_guild_id(interaction)
+    rows = db.calorie_tracked_users(guild_id)
+    if not rows:
+        await interaction.response.send_message(
+            "Nobody's tracking calories in this server yet.", ephemeral=True,
+        )
+        return
+    ranked = sorted(
+        (
+            (_calorie_streak(int(r["user_id"])),
+             db.get_user_nickname(int(r["user_id"])) or r["username"])
+            for r in rows
+        ),
+        key=lambda t: (-t[0], t[1].lower()),
+    )
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (streak, name) in enumerate(ranked):
+        if streak <= 0:
+            continue
+        prefix = medals[i] if i < len(medals) else f"`{i + 1}.`"
+        lines.append(
+            f"{prefix} **{_safe_label(name)}** — 🔥 {streak} day"
+            f"{'s' if streak != 1 else ''}"
+        )
+    desc = (
+        "\n".join(lines) if lines
+        else "No active streaks yet — log something today to start one! 🔥"
+    )
+    embed = discord.Embed(
+        title="🔥 Calorie logging streaks",
+        description=desc,
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @calories_group.command(
@@ -12220,9 +12532,11 @@ async def protein_setup_cmd(
 @app_commands.describe(
     grams='Grams of protein, e.g. "40".',
     note="What it was (optional, shows in /protein today).",
+    day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
 async def protein_add_cmd(
     interaction: discord.Interaction, grams: str, note: str | None = None,
+    day: str | None = None,
 ) -> None:
     guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, interaction.user.id)
@@ -12230,6 +12544,10 @@ async def protein_add_cmd(
         await interaction.response.send_message(
             _PROTEIN_NOT_SET_MSG, ephemeral=True,
         )
+        return
+    logged_at, day_ok = _slash_logged_at(day)
+    if not day_ok:
+        await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
         return
     amount = protein_mod.parse_protein_amount(grams)
     if amount is None or amount <= 0:
@@ -12246,15 +12564,17 @@ async def protein_add_cmd(
         return
     db.protein_add(
         guild_id, interaction.user.id, _display_name(interaction.user),
-        amount, note=note, raw=grams.strip(),
+        amount, note=note, raw=grams.strip(), logged_at=logged_at,
     )
     total, _n = db.protein_total_between(
-        guild_id, interaction.user.id, *_today_window(),
+        guild_id, interaction.user.id, *_day_window_for(logged_at),
     )
     note_part = f" — {note}" if note else ""
     await interaction.response.send_message(
-        f"🥩 Logged **{protein_mod.format_grams(amount)}** protein{note_part}\n"
+        f"🥩 Logged **{protein_mod.format_grams(amount)}** protein{note_part}"
+        f"{_backdate_label(logged_at)}\n"
         + _protein_status_line(total, float(goal["daily_target_g"]))
+        + _streak_suffix(_protein_streak(interaction.user.id))
     )
 
 
@@ -12354,6 +12674,9 @@ async def protein_week_cmd(
             f"\nAvg on logged days: **{protein_mod.format_grams(avg)}** vs "
             f"max {protein_mod.format_grams(target_g)}"
         )
+    streak = _protein_streak(target_user.id)
+    if streak >= 2:
+        lines.append(f"🔥 **{streak} day** logging streak")
     embed = discord.Embed(
         title=f"🥩 Protein this week — {target_user.display_name}",
         description="\n".join(lines),
@@ -12389,6 +12712,56 @@ async def protein_undo_cmd(interaction: discord.Interaction) -> None:
         )
         lines.append(_protein_status_line(total, float(goal["daily_target_g"])))
     await interaction.response.send_message("\n".join(lines))
+
+
+@protein_group.command(
+    name="edit", description="Fix the amount of your most recent protein entry.",
+)
+@app_commands.describe(
+    grams='Corrected grams of protein, e.g. "40".',
+    note="Optional new note (leave blank to keep the old one).",
+)
+async def protein_edit_cmd(
+    interaction: discord.Interaction, grams: str, note: str | None = None,
+) -> None:
+    guild_id = _ctx_guild_id(interaction)
+    goal = db.protein_goal_get(guild_id, interaction.user.id)
+    if goal is None:
+        await interaction.response.send_message(
+            _PROTEIN_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    amount = protein_mod.parse_protein_amount(grams)
+    if amount is None or amount <= 0:
+        await interaction.response.send_message(
+            "Couldn't read that — give a number of grams, e.g. `40`.",
+            ephemeral=True,
+        )
+        return
+    if amount > _MAX_PROTEIN_ENTRY_G:
+        await interaction.response.send_message(
+            f"That's over {_MAX_PROTEIN_ENTRY_G}g in one entry — looks like a typo.",
+            ephemeral=True,
+        )
+        return
+    old = db.protein_update_last(
+        guild_id, interaction.user.id, amount, note=note, raw=grams.strip(),
+        username=_display_name(interaction.user),
+    )
+    if old is None:
+        await interaction.response.send_message(
+            "No protein entries to edit yet.", ephemeral=True,
+        )
+        return
+    total, _n = db.protein_total_between(
+        guild_id, interaction.user.id, *_today_window(),
+    )
+    await interaction.response.send_message(
+        f"✏️ Updated last entry "
+        f"**{protein_mod.format_grams(float(old['grams']))}** → "
+        f"**{protein_mod.format_grams(amount)}** protein\n"
+        + _protein_status_line(total, float(goal["daily_target_g"]))
+    )
 
 
 @protein_group.command(

@@ -476,6 +476,43 @@ def test_member_exposes_presence_tracking_state(tmp_path):
     _run(go())
 
 
+def test_member_exposes_nutrition_streaks(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.upsert_member(1, 100, "alice", "Alice")
+        app = build_app(
+            db=db, password="secret",
+            calorie_streak=lambda uid: 5, protein_streak=lambda uid: 3,
+        )
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/member?guild=1&user=100")).json()
+            assert d["calorie_streak"] == 5
+            assert d["protein_streak"] == 3
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_streaks_none_when_not_wired(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.upsert_member(1, 100, "alice", "Alice")
+        app = build_app(db=db, password="secret")  # no streak handlers
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/member?guild=1&user=100")).json()
+            assert d["calorie_streak"] is None
+            assert d["protein_streak"] is None
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_member_track_control_hidden_when_feature_disabled(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

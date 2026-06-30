@@ -105,16 +105,27 @@ Calories:
 - **Backdating:** add a day to a chat log to file it under that day —
   `650kcal yesterday`, `200c monday`, `coffee yesterday`, `40p 3 days ago`, or
   an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and
-  combined posts; the reply notes the day it landed on.
+  combined posts; the reply notes the day it landed on. The slash commands take
+  it too: `/calories add 650 day:yesterday`, `/protein add 40 day:monday`.
 - `/calories today [user]` — today's entries and total vs target.
-- `/calories week [user]` — per-day totals for the last 7 days.
+- `/calories week [user]` — per-day totals for the last 7 days (with your 🔥
+  logging streak).
+- `/calories leaderboard` — ranks the server's trackers by current logging
+  streak.
+- `/calories edit <amount> [note]` — fix the amount of your most recent entry.
 - `/calories undo` — remove your most recent entry. To remove a *specific*
   entry instead, react ❌ on the bot's `🍽️ +N cal` reply for it (the logger,
   the target, or an admin can do this).
 - **Edit to fix:** editing the original chat message updates the stored entry —
   e.g. correcting `1730c` to `1730kj` recomputes the calories; deleting the
   amount removes it.
+- **Streaks:** log on consecutive days and the bot shows a 🔥 streak on replies
+  and in `/calories week`; it stays alive until a whole day passes unlogged.
 - `/calories stop` — stop tracking (history is kept; `setup` re-enables).
+
+Calorie tracking is **global per user** — your daily goal, saved foods and
+logged entries follow you across every server the bot is in, and in DMs. (Same
+for protein and bodyweight.)
 
 Saved foods (personal name → calorie shortcuts):
 
@@ -150,7 +161,9 @@ A lightweight, separate tracker for keeping protein **under** a daily ceiling
   bot reacts ✅ and replies with your running total vs your max (with a ⚠️ once
   you're over). An explicit `p`/`protein` marker is required, so a bare number
   or a `40kg` lift is never mistaken for protein.
-- `/protein today [user]` · `/protein week [user]` — totals vs your max.
+- `/protein today [user]` · `/protein week [user]` — totals vs your max (with
+  your 🔥 logging streak).
+- `/protein edit <grams> [note]` — fix the amount of your most recent entry.
 - `/protein undo` — remove your most recent entry, or react ❌ on the bot's
   reply to remove that specific one (the logger, the target, or an admin).
 - `/protein stop` — stop tracking (history kept; `setup` re-enables).
@@ -260,8 +273,10 @@ Defaults are **08:00** in `DISPLAY_TIMEZONE`. Tune with `DAILY_UPDATE_HOUR` and
 Every Sunday evening the bot posts a 7-day recap: total lifts, PRs, most
 active members, popular lifts — plus a **🍎 weekly calorie check-in** with a
 short Gemini-written summary for each member tracking via `/calories`
-(adherence to target, consistency, one encouraging note). Without
-`GEMINI_API_KEY` the calorie section falls back to plain stats lines.
+(adherence to target, consistency, one encouraging note) and a **🥩 weekly
+protein check-in** (days logged, average vs max, and how often they went over).
+Without `GEMINI_API_KEY` the calorie section falls back to plain stats lines;
+the protein section is always plain stats.
 
 The channel comes from `WEEKLY_REPORT_CHANNEL_ID`, falling back to
 `DAILY_UPDATE_CHANNEL_ID` then `REMINDER_CHANNEL_ID`. Defaults are **Sunday

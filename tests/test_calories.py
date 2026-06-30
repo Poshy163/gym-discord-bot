@@ -181,6 +181,28 @@ def db(tmp_path):
     d.close()
 
 
+def test_calorie_update_last_edits_most_recent(db):
+    db.calorie_add(1, 100, "Alice", 500)
+    db.calorie_add(1, 100, "Alice", 300)  # most recent
+    old = db.calorie_update_last(1, 100, 250, username="Alice")
+    assert old["kcal"] == 300
+    rows = db.calorie_entries_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert sorted(r["kcal"] for r in rows) == [250, 500]
+    # Nothing to edit for a user with no entries.
+    assert db.calorie_update_last(1, 999, 100) is None
+
+
+def test_nutrition_home_guild_prefers_goal_guild(db):
+    assert db.nutrition_home_guild(100) is None
+    db.calorie_goal_set(2, 100, "Alice", 2000)
+    assert db.nutrition_home_guild(100) == 2
+    # Protein-only user resolves via the protein goal.
+    db.protein_goal_set(3, 200, "Bob", 180)
+    assert db.nutrition_home_guild(200) == 3
+
+
 def test_calorie_goal_set_get_update(db):
     db.calorie_goal_set(1, 100, "alice", 2500)
     goal = db.calorie_goal_get(1, 100)

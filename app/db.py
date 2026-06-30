@@ -2597,13 +2597,17 @@ class Database:
     def get_latest_bodyweight(
         self, guild_id: int, user_id: int,
     ) -> sqlite3.Row | None:
-        """Return the most recent bodyweight row for this user, or None."""
+        """Return the most recent bodyweight row for this user, or None.
+
+        Bodyweight is a personal metric and tracked **globally** — a weigh-in
+        logged in any server (or DM) is the user's latest everywhere.
+        ``guild_id`` is kept for signature compatibility but not filtered on."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT weight_kg, recorded_at FROM bodyweights "
-                "WHERE guild_id = ? AND user_id = ? "
+                "WHERE user_id = ? "
                 "ORDER BY recorded_at DESC, id DESC LIMIT 1",
-                (guild_id, user_id),
+                (user_id,),
             ).fetchone()
             return row
 
@@ -2613,14 +2617,15 @@ class Database:
         """Return this user's bodyweight measurements oldest-first.
 
         Used by ``/bodyweight_history`` and ``/bodyweight_graph`` so the
-        timeline plots left-to-right without an extra reverse step.
+        timeline plots left-to-right without an extra reverse step. Global:
+        weigh-ins from every server are one timeline (``guild_id`` unused).
         """
         with self._conn() as c:
             return c.execute(
                 "SELECT weight_kg, recorded_at FROM bodyweights "
-                "WHERE guild_id = ? AND user_id = ? "
+                "WHERE user_id = ? "
                 "ORDER BY recorded_at ASC, id ASC LIMIT ?",
-                (guild_id, user_id, int(limit)),
+                (user_id, int(limit)),
             ).fetchall()
 
     def latest_bodyweights_bulk(
@@ -2630,7 +2635,9 @@ class Database:
 
         Used by `/leaderboard` to compute everyone's true weight without
         issuing one query per row. Users without any bodyweight entry are
-        omitted from the result.
+        omitted. Global, matching :meth:`get_latest_bodyweight`: each user's
+        latest weigh-in regardless of which server it was logged in
+        (``guild_id`` kept for signature compatibility, not filtered on).
         """
         if not user_ids:
             return {}
@@ -2653,11 +2660,11 @@ class Database:
                                ORDER BY recorded_at DESC, id DESC
                            ) AS rn
                     FROM bodyweights
-                    WHERE guild_id = ? AND user_id IN ({placeholders})
+                    WHERE user_id IN ({placeholders})
                 )
                 SELECT user_id, weight_kg FROM ranked WHERE rn = 1
                 """,
-                [guild_id, *unique],
+                [*unique],
             ).fetchall()
         return {int(r["user_id"]): float(r["weight_kg"]) for r in rows}
 
@@ -3297,6 +3304,36 @@ class Database:
             )
             return row
 
+    def calorie_update_last(
+        self, guild_id: int, user_id: int, kcal: float,
+        *, note: str | None = None, raw: str | None = None,
+        username: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Overwrite the user's most recent calorie entry's amount (global).
+
+        Returns the *old* row (id, kcal, note) so the caller can show the change,
+        or None when there's nothing to edit. A new ``note`` replaces the old;
+        ``None`` keeps it."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, kcal, note FROM calorie_entries WHERE user_id = ? "
+                "ORDER BY logged_at DESC, id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute(
+                "UPDATE calorie_entries SET kcal = ?, "
+                "note = COALESCE(?, note), raw = COALESCE(?, raw) WHERE id = ?",
+                (float(kcal), note, raw, row["id"]),
+            )
+            self._audit_data(
+                c, guild_id, "calorie_edit", subject_id=user_id,
+                actor_id=user_id, actor_name=username,
+                detail=f"edited {float(row['kcal']):.0f} → {float(kcal):.0f} kcal",
+            )
+            return row
+
     def track_calorie_reply(
         self,
         reply_message_id: int,
@@ -3600,6 +3637,33 @@ class Database:
                 c, guild_id, "protein_undo", subject_id=user_id,
                 actor_id=actor_id, actor_name=actor_name,
                 detail=f"undid {float(row['grams']):.0f} g protein",
+            )
+            return row
+
+    def protein_update_last(
+        self, guild_id: int, user_id: int, grams: float,
+        *, note: str | None = None, raw: str | None = None,
+        username: str | None = None,
+    ) -> sqlite3.Row | None:
+        """Overwrite the user's most recent protein entry's amount (global).
+        Returns the *old* row or None when there's nothing to edit."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, grams, note FROM protein_entries WHERE user_id = ? "
+                "ORDER BY logged_at DESC, id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute(
+                "UPDATE protein_entries SET grams = ?, "
+                "note = COALESCE(?, note), raw = COALESCE(?, raw) WHERE id = ?",
+                (float(grams), note, raw, row["id"]),
+            )
+            self._audit_data(
+                c, guild_id, "protein_edit", subject_id=user_id,
+                actor_id=user_id, actor_name=username,
+                detail=f"edited {float(row['grams']):.0f} → {float(grams):.0f} g",
             )
             return row
 
@@ -4130,6 +4194,24 @@ class Database:
             ).fetchall()
         return [int(r["guild_id"]) for r in rows]
 
+    def nutrition_home_guild(self, user_id: int) -> int | None:
+        """The guild a user's (global) calorie/protein goal row is filed under.
+
+        Tracking is global, but the goal row still carries the guild it was last
+        set in. DM logging uses this to attribute a global entry to the same
+        server as the user's other data when they haven't pinned one with
+        ``/server``. Returns None if they aren't tracking anything."""
+        with self._conn() as c:
+            for table in ("calorie_goals", "protein_goals"):
+                row = c.execute(
+                    f"SELECT guild_id FROM {table} WHERE user_id = ? "
+                    "ORDER BY set_at DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if row is not None:
+                    return int(row["guild_id"])
+        return None
+
     def dm_guild_get(self, user_id: int) -> int | None:
         """The user's stored default guild for DM commands, if any."""
         with self._conn() as c:
@@ -4397,9 +4479,8 @@ class Database:
         """Compact per-member snapshot for the dashboard member page: lift
         counters, latest bodyweight, and total nutrition counts.
 
-        Nutrition is global (calorie/protein tracking spans every server), so
-        the kcal/protein totals are summed by user across all guilds; lifts and
-        bodyweight stay guild-scoped."""
+        Nutrition and bodyweight are global (they span every server), so those
+        totals/latest are by user across all guilds; lifts stay guild-scoped."""
         with self._conn() as c:
             lifts = c.execute(
                 """
@@ -4411,9 +4492,9 @@ class Database:
             ).fetchone()
             bw = c.execute(
                 "SELECT weight_kg, recorded_at FROM bodyweights "
-                "WHERE guild_id = ? AND user_id = ? "
-                "ORDER BY recorded_at DESC LIMIT 1",
-                (guild_id, user_id),
+                "WHERE user_id = ? "
+                "ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                (user_id,),
             ).fetchone()
             cal = c.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(kcal),0) AS total "

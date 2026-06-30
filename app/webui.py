@@ -79,6 +79,9 @@ VoiceSnapshotHandler = Callable[[int], Awaitable[list[dict]]]
 # (guild_id, user_id, start, actor_name) -> result dict — start/stop recording a
 # member's presence + activity (the dashboard's "Presence tracking" control).
 PresenceTrackHandler = Callable[[int, int, bool, str], Awaitable[dict]]
+# (user_id) -> current consecutive-day logging streak. Injected so the dashboard
+# reuses the bot's timezone-correct streak logic; None hides the streak chips.
+StreakHandler = Callable[[int], int]
 
 
 class _Sessions:
@@ -123,6 +126,8 @@ def build_app(
     voice_snapshot: VoiceSnapshotHandler | None = None,
     presence_track: PresenceTrackHandler | None = None,
     presence_enabled: bool = False,
+    calorie_streak: StreakHandler | None = None,
+    protein_streak: StreakHandler | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -291,6 +296,8 @@ def build_app(
             "presence_tracking_available": bool(
                 presence_enabled and presence_track is not None
             ),
+            "calorie_streak": calorie_streak(uid) if calorie_streak else None,
+            "protein_streak": protein_streak(uid) if protein_streak else None,
             "nutrition": {
                 "calorie_goal": (
                     cal_goal["daily_target_kcal"] if cal_goal else None
@@ -1481,6 +1488,8 @@ async function memberView(uid){
       <div class="muted">${esc(m.username||"")}</div>
       <div class="chips">${d.strava_linked?'<span class="pill">🟧 Strava</span>':''}
         ${d.revo_linked?'<span class="pill">🟢 Revo</span>':''}
+        ${d.calorie_streak>=2?`<span class="pill">🔥 ${d.calorie_streak}d calories</span>`:''}
+        ${d.protein_streak>=2?`<span class="pill">🔥 ${d.protein_streak}d protein</span>`:''}
         ${m.present?'':'<span class="pill faint">left server</span>'}</div></div></div>
     <div class="cards">${stat(L.n||0,"Lifts")}${stat(L.equip||0,"Exercises")}
       ${stat(o.bodyweight?o.bodyweight.weight_kg+" kg":"—","Bodyweight")}

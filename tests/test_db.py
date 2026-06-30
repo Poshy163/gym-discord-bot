@@ -417,11 +417,19 @@ def test_bodyweight_missing_user_returns_none(db):
     assert db.get_latest_bodyweight(1, 999) is None
 
 
-def test_bodyweight_scoped_per_guild(db):
-    db.set_bodyweight(1, 100, 90.0)
-    db.set_bodyweight(2, 100, 110.0)
-    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 90.0
+def test_bodyweight_is_global_per_user(db):
+    # Bodyweight is a personal metric tracked globally: the latest weigh-in in
+    # any server is the user's latest everywhere.
+    t0 = datetime(2025, 1, 1, 7, 0, tzinfo=timezone.utc)
+    t1 = datetime(2025, 1, 2, 7, 0, tzinfo=timezone.utc)
+    db.set_bodyweight(1, 100, 90.0, recorded_at=t0)
+    db.set_bodyweight(2, 100, 110.0, recorded_at=t1)  # later, different server
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 110.0
     assert db.get_latest_bodyweight(2, 100)["weight_kg"] == 110.0
+    assert db.get_latest_bodyweight(999, 100)["weight_kg"] == 110.0
+    # A different user is unaffected.
+    db.set_bodyweight(1, 200, 80.0)
+    assert db.get_latest_bodyweight(5, 200)["weight_kg"] == 80.0
 
 
 def test_bodyweight_bulk_returns_only_known(db):
@@ -450,19 +458,19 @@ def test_bodyweight_bulk_picks_latest_with_id_tiebreaker(db):
     assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 92.0
 
 
-def test_bodyweight_history_returns_oldest_first_and_scoped(db):
+def test_bodyweight_history_returns_oldest_first_and_global(db):
     """`/bodyweight_history` and `/bodyweight_graph` rely on chronological
-    order plus strict guild + user scoping."""
+    order; history is global per-user (every server is one timeline)."""
     t0 = datetime(2025, 1, 1, 7, 0, tzinfo=timezone.utc)
     t1 = datetime(2025, 1, 8, 7, 0, tzinfo=timezone.utc)
     t2 = datetime(2025, 1, 15, 7, 0, tzinfo=timezone.utc)
     db.set_bodyweight(1, 100, 95.0, recorded_at=t1)
     db.set_bodyweight(1, 100, 94.0, recorded_at=t0)  # inserted out of order
-    db.set_bodyweight(1, 100, 96.0, recorded_at=t2)
-    # Noise in other guild / user — must not bleed in.
-    db.set_bodyweight(2, 100, 200.0, recorded_at=t1)
+    db.set_bodyweight(2, 100, 96.0, recorded_at=t2)  # different server, latest
+    # Another user must not bleed in.
     db.set_bodyweight(1, 999, 50.0, recorded_at=t1)
 
+    # All of this user's weigh-ins, across servers, oldest-first.
     rows = db.bodyweight_history(1, 100)
     assert [float(r["weight_kg"]) for r in rows] == [94.0, 95.0, 96.0]
 

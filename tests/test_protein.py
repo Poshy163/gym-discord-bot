@@ -58,6 +58,18 @@ def db(tmp_path):
     d.close()
 
 
+def test_protein_update_last_edits_most_recent(db):
+    db.protein_add(1, 100, "Alice", 40)
+    db.protein_add(1, 100, "Alice", 25)  # most recent
+    old = db.protein_update_last(1, 100, 55, username="Alice")
+    assert old["grams"] == 25
+    rows = db.protein_entries_between(
+        1, 100, "2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00",
+    )
+    assert sorted(r["grams"] for r in rows) == [40, 55]
+    assert db.protein_update_last(1, 999, 30) is None
+
+
 def test_protein_goal_set_get_remove(db):
     assert db.protein_goal_get(1, 100) is None
     db.protein_goal_set(1, 100, "alice", 180)
