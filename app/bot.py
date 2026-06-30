@@ -840,6 +840,20 @@ def _effective_guild_for_dm(user_id: int) -> int | None:
     return None
 
 
+def _guild_has_gym_channel(guild: "discord.Guild | None") -> bool:
+    """True if any configured ``GYM_CHANNEL_IDS`` channel lives in ``guild``.
+
+    The allow-list is global (just channel IDs), so we scope it per-guild with
+    this: a guild that contains at least one listed channel is restricted to
+    those channels, while a guild with none is scanned in full. That keeps a
+    busy server focused on its gym channel yet lets the bot work out-of-the-box
+    in every other server it joins — without naming a channel in each one.
+    """
+    if not GYM_CHANNEL_IDS or guild is None:
+        return False
+    return any(guild.get_channel(cid) is not None for cid in GYM_CHANNEL_IDS)
+
+
 async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
     """Resolve a guild for DM interactions before any command runs.
 
@@ -2736,8 +2750,15 @@ async def on_message(message: discord.Message) -> None:
             return
     except Exception:
         LOG.exception("Blacklist check failed in on_message")
-    # The gym-channel gate only applies in servers; DMs always go through.
-    if not in_dm and GYM_CHANNEL_IDS and message.channel.id not in GYM_CHANNEL_IDS:
+    # The gym-channel allow-list only restricts guilds that actually contain a
+    # listed channel — a server configured with specific channels stays focused
+    # there, while every OTHER server the bot is in scans all channels (so chat
+    # logging / saved-food shortcuts just work everywhere). DMs always go through.
+    if (
+        not in_dm and GYM_CHANNEL_IDS
+        and message.channel.id not in GYM_CHANNEL_IDS
+        and _guild_has_gym_channel(message.guild)
+    ):
         await bot.process_commands(message)
         return
 

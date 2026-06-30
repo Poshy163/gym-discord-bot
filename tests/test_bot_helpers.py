@@ -442,3 +442,23 @@ def test_backdate_label_today_and_none_are_empty():
 def test_backdate_label_for_old_day():
     old = datetime.now(timezone.utc) - timedelta(days=5)
     assert "logged for" in _backdate_label(old)
+
+
+# --- per-guild gym-channel gate ---------------------------------------------
+
+def test_guild_has_gym_channel_scopes_allow_list_per_guild(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "GYM_CHANNEL_IDS", {111, 222})
+    # A guild that contains a listed channel is "restricted" (gate applies).
+    g_listed = MagicMock()
+    g_listed.get_channel = lambda cid: object() if cid == 111 else None
+    assert bot._guild_has_gym_channel(g_listed) is True
+    # A guild with none of the listed channels is scanned in full.
+    g_other = MagicMock()
+    g_other.get_channel = lambda cid: None
+    assert bot._guild_has_gym_channel(g_other) is False
+    # No guild, and an empty allow-list, are both False.
+    assert bot._guild_has_gym_channel(None) is False
+    monkeypatch.setattr(bot, "GYM_CHANNEL_IDS", set())
+    assert bot._guild_has_gym_channel(g_listed) is False
