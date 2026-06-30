@@ -239,6 +239,37 @@ def test_message_log_attachments_stored_and_backfilled(db):
     assert rows["hi"] == gif
 
 
+def test_message_log_update_content_overwrites_media(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    img = '[{"url": "/media/1/5.png", "kind": "image", "stored": true}]'
+    gif = '[{"url": "/media/1/6.mp4", "kind": "video", "stored": true}]'
+    db.message_log_add(1, 100, "before", message_id=9, channel_id=7,
+                       attachments=img, at=base)
+    # An edit replaces both text and media (unlike the add-time backfill) and
+    # stamps edited_at.
+    assert db.message_log_update_content(1, 9, "after", gif) is True
+    row = db.message_channel_log(1, 7)[0]
+    assert row["content"] == "after"
+    assert row["attachments"] == gif
+    assert row["edited_at"] is not None
+    # No row for an unknown message id.
+    assert db.message_log_update_content(1, 999, "x", None) is False
+
+
+def test_message_log_mark_deleted_keeps_content(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.message_log_add(1, 100, "bye", message_id=11, channel_id=7, at=base)
+    assert db.message_log_mark_deleted(1, 11) is True
+    row = db.message_channel_log(1, 7)[0]
+    # Content is preserved; only the deletion marker is set.
+    assert row["content"] == "bye"
+    assert row["deleted_at"] is not None
+    # Idempotent — re-flagging an already-deleted row is a no-op.
+    assert db.message_log_mark_deleted(1, 11) is False
+    # Unknown message id is a no-op too.
+    assert db.message_log_mark_deleted(1, 12345) is False
+
+
 def test_message_log_latest_at_tracks_newest(db):
     assert db.message_log_latest_at(1) is None
     base = datetime(2026, 6, 1, tzinfo=timezone.utc)

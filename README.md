@@ -358,6 +358,12 @@ for browsing and editing everything the bot tracks without touching Discord:
   still enforces role hierarchy (it can't assign a role above its own top role,
   or moderate someone who outranks it).
 - **Roles** — each role with its colour and live member list.
+- **Messages** — a per-channel chat log of **everything** members post: full
+  text, and a **permanent local copy of every attachment** (images, videos, GIFs
+  and any other uploaded file) so they survive Discord's expiring CDN links and
+  message deletion. Edited messages show their latest text (tagged *edited*) and
+  deleted ones are flagged 🗑️ rather than vanishing. Controlled by
+  `ENABLE_MESSAGE_LOGGING` / `ENABLE_MEDIA_DOWNLOAD` (see `.env.example`).
 - **Leaderboard** — pick an exercise and see the ranked best lifts (with
   medals + avatars).
 - **Audit log** — a unified, filterable, paged trail of role changes (including
@@ -368,6 +374,11 @@ for browsing and editing everything the bot tracks without touching Discord:
   delete and (for lifts) edit. Every change is written to the audit log.
 
 Profile pictures appear throughout, and the whole thing is a modern dark UI.
+
+**Auto un-timeout** (`AUTO_UNTIMEOUT=true`, on by default): the bot immediately
+clears any timeout placed on a member, recording each removal in the audit log.
+It needs **Moderate Members** and a role above the target (Discord enforces both),
+and never acts on the guild owner or anyone it doesn't outrank.
 
 It is **off until you set `WEBUI_PASSWORD`**. Enabling it also turns on the
 privileged **Server Members** intent, which you must additionally toggle on for

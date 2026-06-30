@@ -268,6 +268,33 @@ ENABLE_MESSAGE_LOGGING = os.getenv(
     "ENABLE_MESSAGE_LOGGING", "true"
 ).lower() in ("1", "true", "yes", "y", "on")
 
+# Auto un-timeout: whenever a member is timed out (their "communication disabled
+# until" is set to a future time), the bot immediately clears it again. Needs the
+# Moderate Members permission and a role above the target — Discord enforces both,
+# and the bot can never act on members it doesn't outrank or on the guild owner.
+# Requires the members intent (forced on below). Default ON; set to a false-y
+# value to disable. Every removal is recorded in the dashboard audit log.
+AUTO_UNTIMEOUT = os.getenv(
+    "AUTO_UNTIMEOUT", "true"
+).lower() in ("1", "true", "yes", "y", "on")
+
+# Where downloaded message media (images, videos, any uploaded file) is stored so
+# it survives Discord's expiring CDN links and message deletion. Defaults to a
+# "media" folder next to the SQLite database. Set MEDIA_DIR to override, or
+# ENABLE_MEDIA_DOWNLOAD=false to keep logging only the (expiring) remote URLs.
+ENABLE_MEDIA_DOWNLOAD = os.getenv(
+    "ENABLE_MEDIA_DOWNLOAD", "true"
+).lower() in ("1", "true", "yes", "y", "on")
+# Attachments larger than this are left as a remote URL rather than downloaded,
+# so a single huge upload can't blow up local disk. 0 means "no cap".
+try:
+    MEDIA_MAX_MB = float(os.getenv("MEDIA_MAX_MB", "50"))
+except ValueError:
+    MEDIA_MAX_MB = 50.0
+MEDIA_DIR = os.getenv("MEDIA_DIR") or os.path.join(
+    os.path.dirname(DB_PATH) or ".", "media"
+)
+
 # How many days of channel history to scan on startup to seed the message log,
 # so the dashboard's activity feed has data the moment the bot comes up rather
 # than only from messages seen live. 0 disables the seed. Re-runs are cheap:
@@ -311,6 +338,12 @@ if ENABLE_PRESENCE_TRACKING:
 if WEBUI_ENABLED:
     # Required to enumerate members/roles and receive on_member_* events.
     intents.members = True
+if AUTO_UNTIMEOUT:
+    # on_member_update only fires (so we can catch a new timeout) with the
+    # members intent. Enable the non-privileged moderation events too so the
+    # bot also receives them where available.
+    intents.members = True
+    intents.moderation = True
 bot = commands.Bot(command_prefix="!gym ", intents=intents)
 
 # Make every slash command usable in DMs and as a user-installed app, not just
@@ -2793,7 +2826,7 @@ async def _backfill_message_logs() -> None:  # pragma: no cover - discord runtim
                 async for msg in channel.history(
                     limit=None, after=after, oldest_first=True,
                 ):
-                    media = _message_media(msg)
+                    media = await _message_media(msg)
                     if not msg.content and not media:
                         continue
                     if db.message_log_add(
@@ -2834,31 +2867,88 @@ def _looks_like_log_attempt(text: str) -> bool:
     return bool(lifts and _should_auto_store(lifts))
 
 
-def _message_media(message: discord.Message) -> str | None:
-    """Collect image/video/GIF media from a message's attachments and embeds,
-    as a JSON list of ``{"url", "kind"}`` (kind: ``image`` or ``video``), or None
-    when there's none. Powers the photos/GIFs shown in the dashboard Messages tab
-    — Tenor/Giphy GIFs come through as ``gifv`` embeds (an mp4 that loops).
+def _attachment_kind(att: discord.Attachment) -> str:
+    """Classify an attachment as ``image`` / ``video`` / ``file`` from its
+    content-type, falling back to the filename extension."""
+    ct = (att.content_type or "").lower()
+    name = (att.filename or "").lower()
+    if ct.startswith("image/") or name.endswith(
+        (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic")
+    ):
+        return "image"
+    if ct.startswith("video/") or name.endswith(
+        (".mp4", ".webm", ".mov", ".mkv", ".avi")
+    ):
+        return "video"
+    return "file"
+
+
+async def _store_attachment(att: discord.Attachment, guild_id: int) -> str | None:
+    """Download one attachment into ``MEDIA_DIR`` and return its dashboard-served
+    relative path (``<guild_id>/<id><ext>``), or None if it couldn't be saved.
+
+    Idempotent: a file already on disk (from a previous live-log or backfill
+    pass) is reused rather than re-downloaded. Oversized attachments and any
+    download failure return None so the caller keeps the (expiring) remote URL.
+    """
+    if MEDIA_MAX_MB > 0 and att.size and att.size > MEDIA_MAX_MB * 1024 * 1024:
+        return None
+    ext = os.path.splitext(att.filename or "")[1].lower()
+    # Keep only a safe alphanumeric extension; drop anything weird.
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,12}", ext or ""):
+        ext = ""
+    rel = f"{guild_id}/{att.id}{ext}"
+    dest = os.path.join(MEDIA_DIR, str(guild_id), f"{att.id}{ext}")
+    try:
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return rel  # already stored
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        await att.save(dest, use_cached=False)
+        return rel
+    except (discord.HTTPException, OSError) as exc:
+        LOG.warning("Couldn't store attachment %s: %s", att.id, exc)
+        # Clean up a half-written file so a retry can succeed.
+        try:
+            if os.path.exists(dest) and os.path.getsize(dest) == 0:
+                os.remove(dest)
+        except OSError:
+            pass
+        return None
+
+
+async def _message_media(message: discord.Message) -> str | None:
+    """Collect every attachment (images, videos, GIFs and any other uploaded
+    file) plus embedded image/GIF media from a message, as a JSON list of
+    ``{"url", "kind", "name", "stored"}`` items, or None when there's none.
+
+    Uploaded attachments are downloaded into ``MEDIA_DIR`` and referenced by a
+    local ``/media/...`` path (``stored: true``) so they outlive Discord's
+    expiring CDN links and survive the message being deleted. Embed media
+    (Tenor/Giphy GIFs, link-preview images) stays as the original remote URL
+    (``stored: false``) — it's hosted elsewhere and doesn't expire with Discord.
+    Powers the photos/GIFs/files shown in the dashboard Messages tab.
     """
     items: list[dict] = []
     seen: set[str] = set()
 
-    def _add(url: str | None, kind: str) -> None:
+    def _add(url: str | None, kind: str, *, name: str | None = None,
+             stored: bool = False) -> None:
         if url and url not in seen:
             seen.add(url)
-            items.append({"url": url, "kind": kind})
+            item = {"url": url, "kind": kind, "stored": stored}
+            if name:
+                item["name"] = name
+            items.append(item)
 
     for att in message.attachments:
-        ct = (att.content_type or "").lower()
-        name = (att.filename or "").lower()
-        if ct.startswith("image/") or name.endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp")
-        ):
-            _add(att.url, "image")
-        elif ct.startswith("video/") or name.endswith(
-            (".mp4", ".webm", ".mov")
-        ):
-            _add(att.url, "video")
+        kind = _attachment_kind(att)
+        rel = await _store_attachment(att, message.guild.id) if (
+            ENABLE_MEDIA_DOWNLOAD and message.guild is not None
+        ) else None
+        if rel is not None:
+            _add(f"/media/{rel}", kind, name=att.filename, stored=True)
+        else:
+            _add(att.url, kind, name=att.filename, stored=False)
     for emb in message.embeds:
         etype = (getattr(emb, "type", "") or "").lower()
         vid = getattr(getattr(emb, "video", None), "url", None)
@@ -2870,6 +2960,13 @@ def _message_media(message: discord.Message) -> str | None:
             _add(vid, "video") if vid else _add(thumb, "image")
         elif etype == "image":
             _add(img or thumb or getattr(emb, "url", None), "image")
+    # Stickers render as images (PNG/APNG/GIF). Lottie stickers are vector JSON
+    # the dashboard can't display, so they're skipped here (the message is still
+    # logged via the on_message sticker check).
+    for sticker in getattr(message, "stickers", []) or []:
+        fmt = getattr(getattr(sticker, "format", None), "name", "") or ""
+        if fmt.lower() != "lottie":
+            _add(getattr(sticker, "url", None), "image", name=sticker.name)
     return json.dumps(items) if items else None
 
 
@@ -2881,8 +2978,8 @@ async def on_message(message: discord.Message) -> None:
     # bot/guild and gym-channel gates. Failures here must never break handling.
     if ENABLE_MESSAGE_LOGGING and message.guild is not None:
         try:
-            media = _message_media(message)
-            if message.content or media:
+            media = await _message_media(message)
+            if message.content or media or message.stickers:
                 db.message_log_add(
                     message.guild.id, message.author.id, message.content,
                     channel_id=message.channel.id,
@@ -3317,12 +3414,31 @@ async def on_message_edit(
     before: discord.Message, after: discord.Message,
 ) -> None:
     """Re-parse edited gym posts so corrections flow into the DB."""
+    # Keep the message log faithful to the current message: reflect edited text
+    # and any media added/swapped by the edit. Runs for every author (bots too)
+    # and channel, before the gym-post gates below, mirroring on_message's logger.
+    if ENABLE_MESSAGE_LOGGING and after.guild is not None:
+        try:
+            media = await _message_media(after)
+            # Ensure a row exists (edits can predate logging), then overwrite it.
+            db.message_log_add(
+                after.guild.id, after.author.id, after.content,
+                channel_id=after.channel.id,
+                channel_name=getattr(after.channel, "name", None),
+                message_id=after.id, at=after.created_at, attachments=media,
+            )
+            db.message_log_update_content(
+                after.guild.id, after.id, after.content, media,
+                edited_at=after.edited_at,
+            )
+        except Exception:
+            LOG.exception("Failed to log message edit for activity feed")
     if after.author.bot or not after.guild:
         return
     if GYM_CHANNEL_IDS and after.channel.id not in GYM_CHANNEL_IDS:
         return
     if before.content == after.content:
-        return  # ignore embed/attachment-only edits
+        return  # ignore embed/attachment-only edits for the lift re-parse
 
     guild_id = after.guild.id
     # Blacklisted members can't add anything to the bot — including by *editing*
@@ -3596,6 +3712,38 @@ async def _handle_nutrition_reaction_undo(
             await original.remove_reaction("✅", bot.user)  # type: ignore[arg-type]
         except discord.HTTPException:
             pass
+
+
+@bot.event
+async def on_raw_message_delete(
+    payload: discord.RawMessageDeleteEvent,
+) -> None:  # pragma: no cover - discord runtime
+    """Flag a deleted message in the log instead of dropping it.
+
+    Uses the *raw* event so it fires even for messages that aren't in the
+    gateway cache (e.g. older posts). The content and any downloaded media are
+    kept — we only stamp ``deleted_at`` so the dashboard can show it was removed.
+    """
+    if not ENABLE_MESSAGE_LOGGING or payload.guild_id is None:
+        return
+    try:
+        db.message_log_mark_deleted(payload.guild_id, payload.message_id)
+    except Exception:
+        LOG.exception("Failed to flag deleted message in log")
+
+
+@bot.event
+async def on_raw_bulk_message_delete(
+    payload: discord.RawBulkMessageDeleteEvent,
+) -> None:  # pragma: no cover - discord runtime
+    """Flag a bulk deletion (channel purge / moderation sweep) in the log."""
+    if not ENABLE_MESSAGE_LOGGING or payload.guild_id is None:
+        return
+    for mid in payload.message_ids:
+        try:
+            db.message_log_mark_deleted(payload.guild_id, mid)
+        except Exception:
+            LOG.exception("Failed to flag bulk-deleted message in log")
 
 
 @bot.event
@@ -9348,6 +9496,7 @@ async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
         presence_enabled=ENABLE_PRESENCE_TRACKING,
         calorie_streak=_calorie_streak,
         protein_streak=_protein_streak,
+        media_dir=MEDIA_DIR if ENABLE_MEDIA_DOWNLOAD else None,
     )
     try:
         _webui_runner = await webui.start_server(
@@ -9949,10 +10098,66 @@ def _can_read_audit_log(guild: "discord.Guild") -> bool:
     return bool(me and guild.me.guild_permissions.view_audit_log)
 
 
+async def _maybe_auto_untimeout(
+    before: "discord.Member", after: "discord.Member",
+) -> None:  # pragma: no cover - discord runtime
+    """If ``after`` just became (or had extended) an active timeout, clear it.
+
+    Fires on the not-timed-out → timed-out transition (and on a re-applied /
+    extended timeout, since the ``until`` value changes). Our own clearing makes
+    the next update timed-out → none, which this skips. Best-effort: a missing
+    permission or a target we don't outrank is recorded, not raised.
+    """
+    if not AUTO_UNTIMEOUT:
+        return
+    before_until = before.timed_out_until
+    after_until = after.timed_out_until
+    now = datetime.now(timezone.utc)
+    # Only act when there's an active timeout whose value just changed — this
+    # ignores our own removal (after_until becomes None) and timeouts that have
+    # already expired.
+    if after_until is None or after_until <= now or after_until == before_until:
+        return
+    guild = after.guild
+    name = _member_display(after)
+    if not _bot_can_moderate(guild, after):
+        db.add_audit(
+            guild.id, "member", "timeout_auto_skip",
+            subject_id=after.id, subject_name=name,
+            detail="timeout detected but I can't moderate this member "
+                   "(need Moderate Members + a higher role)",
+        )
+        return
+    try:
+        await after.timeout(None, reason="Auto un-timeout")
+    except discord.Forbidden:
+        db.add_audit(
+            guild.id, "member", "timeout_auto_skip",
+            subject_id=after.id, subject_name=name,
+            detail="couldn't auto-remove timeout — Discord refused (permissions)",
+        )
+        return
+    except discord.HTTPException as exc:
+        LOG.warning("Auto un-timeout failed for %s: %s", after.id, exc)
+        return
+    LOG.info("Auto-removed timeout on %s in guild %s", after.id, guild.id)
+    db.add_audit(
+        guild.id, "member", "timeout_auto_removed",
+        subject_id=after.id, subject_name=name,
+        detail="timeout auto-removed (auto un-timeout)",
+    )
+
+
 @bot.event
 async def on_member_update(
     before: "discord.Member", after: "discord.Member",
 ) -> None:  # pragma: no cover - discord runtime
+    # Auto un-timeout runs independently of the dashboard mirror, so do it first
+    # and don't let the WEBUI gate below skip it.
+    try:
+        await _maybe_auto_untimeout(before, after)
+    except Exception:
+        LOG.exception("Auto un-timeout handler failed")
     if not WEBUI_ENABLED:
         return
     gid = after.guild.id

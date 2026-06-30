@@ -204,7 +204,9 @@ CREATE TABLE IF NOT EXISTS message_log (
     message_id   INTEGER,
     content      TEXT,
     attachments  TEXT,
-    at           TEXT    NOT NULL
+    at           TEXT    NOT NULL,
+    edited_at    TEXT,
+    deleted_at   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_log_user
@@ -633,6 +635,17 @@ class Database:
             if msg_cols and "attachments" not in msg_cols:
                 self._connection.execute(
                     "ALTER TABLE message_log ADD COLUMN attachments TEXT"
+                )
+            # Soft-delete marker: set when a logged message is deleted in Discord
+            # so the dashboard can flag it without losing the content/media.
+            if msg_cols and "deleted_at" not in msg_cols:
+                self._connection.execute(
+                    "ALTER TABLE message_log ADD COLUMN deleted_at TEXT"
+                )
+            # Records the most recent edit so an edited message shows as such.
+            if msg_cols and "edited_at" not in msg_cols:
+                self._connection.execute(
+                    "ALTER TABLE message_log ADD COLUMN edited_at TEXT"
                 )
             self._consolidate_global_goals()
             self._recanonicalize_equipment()
@@ -3016,6 +3029,39 @@ class Database:
                 )
             return False
 
+    def message_log_update_content(
+        self, guild_id: int, message_id: int,
+        content: str | None, attachments: str | None,
+        edited_at: datetime | None = None,
+    ) -> bool:
+        """Overwrite a logged message's content + attachments after an edit and
+        stamp ``edited_at``. Unlike :meth:`message_log_add`'s backfill, this
+        replaces the stored media (an edit can add or swap images). Returns True
+        if a row was updated."""
+        ts = _normalize_iso(edited_at)
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE message_log SET content = ?, attachments = ?, "
+                "edited_at = ? WHERE guild_id = ? AND message_id = ?",
+                (content, attachments, ts, guild_id, message_id),
+            )
+            return cur.rowcount > 0
+
+    def message_log_mark_deleted(
+        self, guild_id: int, message_id: int, when: datetime | None = None,
+    ) -> bool:
+        """Flag a logged message as deleted (keeping its content/media) so the
+        dashboard can show a "(deleted)" marker. No-op if it was never logged or
+        is already flagged. Returns True if a row was newly flagged."""
+        ts = _normalize_iso(when)
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE message_log SET deleted_at = ? "
+                "WHERE guild_id = ? AND message_id = ? AND deleted_at IS NULL",
+                (ts, guild_id, message_id),
+            )
+            return cur.rowcount > 0
+
     def message_count_since(
         self, guild_id: int, user_id: int, since: datetime | None = None,
     ) -> int:
@@ -3115,6 +3161,7 @@ class Database:
             rows = c.execute(
                 """
                 SELECT ml.user_id, ml.content, ml.attachments, ml.at,
+                       ml.edited_at, ml.deleted_at,
                        mem.display_name AS display_name, mem.avatar AS avatar
                 FROM message_log ml
                 LEFT JOIN members mem

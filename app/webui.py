@@ -41,6 +41,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,7 @@ def build_app(
     presence_enabled: bool = False,
     calorie_streak: StreakHandler | None = None,
     protein_streak: StreakHandler | None = None,
+    media_dir: str | None = None,
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -555,6 +557,8 @@ def build_app(
                 "content": r["content"],
                 "media": _media(r["attachments"]),
                 "at": r["at"],
+                "edited": bool(r["edited_at"]),
+                "deleted": bool(r["deleted_at"]),
             }
             for r in rows
         ]
@@ -871,6 +875,27 @@ def build_app(
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def media(request: web.Request) -> web.StreamResponse:
+        """Serve a downloaded message attachment from ``media_dir``.
+
+        Authenticated (logged-in operators only) and confined to ``media_dir``
+        — the requested path is resolved and rejected if it escapes the root, so
+        a crafted ``../`` can't read arbitrary files. Long-cached because each
+        file is content-addressed by its immutable Discord attachment id."""
+        _require(request)
+        if not media_dir:
+            raise web.HTTPNotFound(text="media storage disabled")
+        rel = request.match_info.get("path", "")
+        base = os.path.abspath(media_dir)
+        full = os.path.abspath(os.path.join(base, rel))
+        if full != base and not full.startswith(base + os.sep):
+            raise web.HTTPForbidden(text="bad path")
+        if not os.path.isfile(full):
+            raise web.HTTPNotFound(text="not found")
+        return web.FileResponse(
+            full, headers={"Cache-Control": "private, max-age=31536000"},
+        )
+
     app = web.Application()
     app.add_routes([
         web.get("/login", login_get),
@@ -910,6 +935,7 @@ def build_app(
         web.get("/api/member/moderation", api_member_moderation),
         web.post("/api/member/untimeout", api_member_untimeout),
         web.post("/api/member/track", api_member_track),
+        web.get("/media/{path:.*}", media),
         web.get("/healthz", health),
     ])
     return app
@@ -1300,6 +1326,13 @@ padding:.06rem .3rem;margin:0 -.3rem;border-radius:4px;color:#dbe1e8}
 .dc-att{max-width:260px;max-height:260px;border-radius:8px;background:#0d1117;
 border:1px solid var(--line);object-fit:cover;cursor:pointer}
 video.dc-att{cursor:default}
+.dc-file{display:inline-flex;align-items:center;gap:.3rem;padding:.4rem .6rem;
+border-radius:8px;background:#0d1117;border:1px solid var(--line);
+color:#c9d1ff;text-decoration:none;font-size:.85rem}
+.dc-file:hover{background:#161b22}
+.dc-line.dc-del{opacity:.6}
+.dc-tag{font-size:.72rem;color:var(--muted)}
+.dc-delm{display:inline-block;margin:.15rem 0;color:#f0883e}
 .btn.sm{padding:.25rem .55rem;font-size:.8rem}
 .bl-list{display:flex;flex-direction:column;gap:.5rem;max-height:240px;overflow-y:auto;margin-bottom:.8rem}
 .bl-row{display:flex;align-items:center;justify-content:space-between;gap:.7rem;
@@ -1344,6 +1377,7 @@ const ACTION_LABEL={
   join:"📥 joined",leave:"📤 left",nick_change:"🏷️ nickname",username_change:"🏷️ username",
   kick:"👢 kicked",ban:"🔨 banned",unban:"♻️ unbanned",invite_create:"✉️ invite sent",
   timeout_remove:"⏳ timeout removed",
+  timeout_auto_removed:"⏳ timeout auto-removed",timeout_auto_skip:"⚠️ timeout (couldn't auto-remove)",
   message_blacklist_add:"🚫 msg blacklisted",message_blacklist_remove:"♻️ msg unblacklisted",
   lift_add:"🏋️ lift logged",lift_undo:"↩️ lift undone",lift_delete:"🗑️ lift deleted",lift_edit:"✏️ lift edited",
   calorie_add:"🔥 calories logged",calorie_undo:"↩️ calories undone",calorie_delete:"🗑️ calories deleted",calorie_edit:"✏️ calories edited",
@@ -1854,9 +1888,12 @@ function msgGroups(msgs){
 }
 function mediaHtml(media){
   if(!media||!media.length)return"";
-  return `<div class="dc-media">${media.map(m=>m.kind==="video"
+  return `<div class="dc-media">${media.map(m=>
+    m.kind==="video"
     ? `<video class="dc-att" src="${esc(m.url)}" autoplay loop muted playsinline></video>`
-    : `<img class="dc-att" src="${esc(m.url)}" loading="lazy" alt="" onclick="window.open('${esc(m.url)}','_blank')">`
+    : m.kind==="image"
+    ? `<img class="dc-att" src="${esc(m.url)}" loading="lazy" alt="" onclick="window.open('${esc(m.url)}','_blank')">`
+    : `<a class="dc-file" href="${esc(m.url)}" target="_blank" rel="noopener">📎 ${esc(m.name||"file")}</a>`
   ).join("")}</div>`;
 }
 function renderChat(msgs){
@@ -1866,7 +1903,7 @@ function renderChat(msgs){
     <div class="dc-gb"><div class="dc-gh"><a class="dc-au link" onclick="memberView('${g.user_id}')">${esc(g.name||g.user_id)}</a>
       <span class="dc-ts">${fmtTs(g.at)}</span>
       <button class="dc-bl" title="Blacklist this user from message logging" onclick="blacklistUser('${g.user_id}')">🚫</button></div>
-    ${g.items.map(it=>`${it.content?`<div class="dc-msg">${renderContent(it.content)}</div>`:""}${mediaHtml(it.media)}`).join("")}</div></div>`).join("");
+    ${g.items.map(it=>`<div class="dc-line${it.deleted?' dc-del':''}">${it.content?`<div class="dc-msg">${renderContent(it.content)}${it.edited?' <span class="dc-tag">(edited)</span>':''}</div>`:""}${mediaHtml(it.media)}${it.deleted?'<span class="dc-tag dc-delm">🗑️ deleted</span>':''}</div>`).join("")}</div></div>`).join("");
 }
 // Open the blacklist dialog pre-filled with a user picked straight from a chat
 // message — no need to hunt down their numeric ID.

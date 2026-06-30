@@ -552,3 +552,51 @@ def test_channels_endpoint_returns_injected_list(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+def test_media_route_serves_stored_files_with_auth(tmp_path):
+    """Downloaded attachments are served from the media dir to logged-in
+    operators only, confined to the media root (no path traversal)."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        media = tmp_path / "media"
+        (media / "1").mkdir(parents=True)
+        (media / "1" / "42.png").write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+        # A secret well outside the media root we must never serve.
+        (tmp_path / "secret.txt").write_text("top secret")
+
+        app = build_app(db=db, password="secret", media_dir=str(media))
+        client = await _client(app)
+        try:
+            # Unauthenticated requests are rejected.
+            assert (await client.get("/media/1/42.png")).status == 401
+            await _login(client)
+            ok = await client.get("/media/1/42.png")
+            assert ok.status == 200
+            assert (await ok.read()) == b"\x89PNG\r\n\x1a\nDATA"
+            # Missing file -> 404.
+            assert (await client.get("/media/1/nope.png")).status == 404
+            # Path traversal is blocked (403 or 404, never the secret bytes).
+            trav = await client.get("/media/../secret.txt")
+            assert trav.status in (403, 404)
+            assert "top secret" not in (await trav.text())
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_media_route_404_when_storage_disabled(tmp_path):
+    """With no media_dir injected (download disabled), the route 404s rather
+    than erroring."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")  # media_dir=None
+        client = await _client(app)
+        try:
+            await _login(client)
+            assert (await client.get("/media/1/42.png")).status == 404
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
