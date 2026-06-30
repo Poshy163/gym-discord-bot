@@ -2871,11 +2871,13 @@ class Database:
 
     @staticmethod
     def _activity_set(row: sqlite3.Row) -> list[dict]:
-        """Decode a row's concurrent-activity snapshot into ``[{"n","i"}]``.
+        """Decode a row's concurrent-activity snapshot into ``[{"n","i","a"}]``.
 
-        Falls back to the legacy single ``activity``/``image_url`` columns for
-        rows written before the ``activities`` JSON column existed, so old and
-        new data aggregate the same way."""
+        ``a`` is the Discord application id (or None) used to resolve an icon
+        for apps that ship no image. Falls back to the legacy single
+        ``activity``/``image_url`` columns for rows written before the
+        ``activities`` JSON column existed, so old and new data behave the
+        same."""
         keys = row.keys()
         raw = row["activities"] if "activities" in keys else None
         if raw:
@@ -2885,31 +2887,41 @@ class Database:
                 items = None
             if isinstance(items, list):
                 return [
-                    {"n": str(it["n"]), "i": it.get("i")}
+                    {"n": str(it["n"]), "i": it.get("i"), "a": it.get("a")}
                     for it in items
                     if isinstance(it, dict) and it.get("n")
                 ]
         name = row["activity"]
         if name:
             img = row["image_url"] if "image_url" in keys else None
-            return [{"n": name, "i": img}]
+            return [{"n": name, "i": img, "a": None}]
         return []
+
+    @staticmethod
+    def _split_activity(item) -> tuple[str, str | None, int | None]:
+        """Normalise a logged activity into ``(name, image_url, app_id)``,
+        tolerating plain ``(name, image)`` pairs from the legacy wrapper."""
+        name = item[0]
+        image = item[1] if len(item) > 1 else None
+        app_id = item[2] if len(item) > 2 else None
+        return str(name), image, app_id
 
     def activity_log_set(
         self, guild_id: int, user_id: int,
-        activities: list[tuple[str, str | None]],
+        activities: list[tuple],
         at: datetime | None = None,
     ) -> bool:
         """Append a snapshot of *all* games/apps a user is running at once.
 
-        ``activities`` is an ordered list of ``(name, image_url)`` for every
-        concurrent activity (empty = stopped everything). De-duplicates against
-        the previous snapshot on the ordered list of names — so a late-arriving
-        image for an unchanged set doesn't spam a new row. The legacy
-        ``activity``/``image_url`` columns mirror the primary (first) entry.
-        Returns True if a row was inserted."""
+        ``activities`` is an ordered list of ``(name, image_url[, app_id])`` for
+        every concurrent activity (empty = stopped everything). De-duplicates
+        against the previous snapshot on the ordered list of names — so a
+        late-arriving image for an unchanged set doesn't spam a new row. The
+        legacy ``activity``/``image_url`` columns mirror the primary (first)
+        entry. Returns True if a row was inserted."""
         ts = _normalize_iso(at)
-        names = [str(n) for n, _img in activities if n]
+        parsed = [self._split_activity(a) for a in activities if a and a[0]]
+        names = [name for name, _img, _aid in parsed]
         with self._conn() as c:
             last = c.execute(
                 "SELECT activity, image_url, activities FROM activity_events "
@@ -2924,12 +2936,11 @@ class Database:
                 if last_names == names:
                     return False
             primary = names[0] if names else None
-            primary_img = activities[0][1] if names else None
-            payload = (
-                json.dumps([{"n": str(n), "i": img} for n, img in activities
-                            if n])
-                if names else None
-            )
+            primary_img = parsed[0][1] if names else None
+            payload = json.dumps([
+                {"n": name, "i": img, **({"a": aid} if aid else {})}
+                for name, img, aid in parsed
+            ]) if names else None
             c.execute(
                 "INSERT INTO activity_events "
                 "(guild_id, user_id, activity, image_url, activities, at) "
@@ -3005,6 +3016,26 @@ class Database:
                 for d in self._activity_set(r):
                     if d["i"]:
                         out[d["n"]] = d["i"]
+            return out
+
+    def activity_appid_map(
+        self, guild_id: int, user_id: int,
+    ) -> dict[str, int]:
+        """Best-known Discord application id per activity name (most recent
+        wins). Lets the dashboard resolve an icon for apps that ship no image
+        but expose an application id."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT activity, image_url, activities FROM activity_events "
+                "WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY at ASC, id ASC",
+                (guild_id, user_id),
+            )
+            out: dict[str, int] = {}
+            for r in rows:
+                for d in self._activity_set(r):
+                    if d.get("a"):
+                        out[d["n"]] = int(d["a"])
             return out
 
     def activity_events_for(
@@ -3211,6 +3242,19 @@ class Database:
                 "ORDER BY at DESC, id DESC LIMIT ?",
                 params,
             ).fetchall()
+
+    def message_daily_counts(
+        self, guild_id: int, since: datetime,
+    ) -> dict[str, int]:
+        """Logged-message counts per calendar day (UTC) at/after ``since``,
+        as ``{YYYY-MM-DD: count}``. Powers the Overview activity sparkline."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT substr(at, 1, 10) AS d, COUNT(*) AS n FROM message_log "
+                "WHERE guild_id = ? AND at >= ? GROUP BY d ORDER BY d",
+                (guild_id, _normalize_iso(since)),
+            ).fetchall()
+            return {r["d"]: int(r["n"]) for r in rows}
 
     def message_log_latest_at(self, guild_id: int) -> str | None:
         """ISO timestamp of the most recent logged message in ``guild_id``, or

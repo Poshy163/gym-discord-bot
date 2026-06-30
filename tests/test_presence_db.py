@@ -393,8 +393,8 @@ def test_activity_current_set_decodes_snapshot(db):
     db.activity_log_set(1, 100, [("Rust", "http://img/rust.png"), ("Discord", None)], at=t0)
     acts, at = db.activity_current_set(1, 100)
     assert acts == [
-        {"n": "Rust", "i": "http://img/rust.png"},
-        {"n": "Discord", "i": None},
+        {"n": "Rust", "i": "http://img/rust.png", "a": None},
+        {"n": "Discord", "i": None, "a": None},
     ]
     assert at == t0.isoformat()
     # Stopping everything yields an empty set, not None.
@@ -424,3 +424,18 @@ def test_activity_log_event_still_drives_set_storage(db):
     t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
     assert db.activity_log_event(1, 100, "Halo", at=t0) is True
     assert db.activity_sets_for(1, 100) == [(["Halo"], t0.isoformat())]
+
+
+def test_activity_app_id_is_stored_and_mapped(db):
+    t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    # CurseForge ships no image but carries an application id (3-tuple form).
+    db.activity_log_set(
+        1, 100,
+        [("CurseForge", None, 1124349969906815007), ("Rust", None, None)],
+        at=t0,
+    )
+    acts, _ = db.activity_current_set(1, 100)
+    assert acts[0] == {"n": "CurseForge", "i": None, "a": 1124349969906815007}
+    assert acts[1] == {"n": "Rust", "i": None, "a": None}
+    # The app-id map exposes it by name for the dashboard's icon resolver.
+    assert db.activity_appid_map(1, 100) == {"CurseForge": 1124349969906815007}

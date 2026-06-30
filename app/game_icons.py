@@ -5,8 +5,12 @@ recognises — each entry carries the icon hash needed to build a stable CDN URL
 (``https://cdn.discordapp.com/app-icons/{id}/{hash}.png``). We pull that list at
 runtime, build a name→icon map from it, and cache it to disk so *any* game a
 tracked member plays resolves to real art — not just a hand-maintained subset.
-Both the list and the images are hosted by Discord, so there's nothing to
-self-host.
+
+Apps that aren't in the games list (CurseForge, Crunchyroll, …) often still have
+a registered Discord application, so when one shows up with an ``application_id``
+we resolve its icon on demand from the per-application RPC endpoint
+(``/applications/{id}/rpc``) and cache that by id too. Both the list and the
+images are hosted by Discord, so there's nothing to self-host.
 
 Lifecycle:
 
@@ -34,6 +38,10 @@ LOG = logging.getLogger("gymbot.game_icons")
 
 # Discord's public "detectable games" list — the authoritative online source.
 DETECTABLE_URL = "https://discord.com/api/v10/applications/detectable"
+# Per-application metadata (name + icon hash) for *any* registered app, not just
+# games — how we resolve icons for apps like CurseForge/Crunchyroll that aren't
+# in the detectable list but carry an application id in their presence.
+RPC_URL = "https://discord.com/api/v10/applications/{app_id}/rpc"
 _CDN = "https://cdn.discordapp.com/app-icons/{app_id}/{icon}.png"
 
 # Bundled offline fallback (generated from the same list) so common games still
@@ -44,6 +52,13 @@ _SEED_FILE = Path(__file__).with_name("game_icons_seed.json")
 # non-alphanumeric characters stripped so lookups survive punctuation/spacing/
 # casing drift ("PUBG: BATTLEGROUNDS", "Baldur's Gate 3", "ROBLOX").
 _ICONS: dict[str, str] = {}
+# Per-application-id icon cache, resolved lazily from the RPC endpoint. Values
+# are a URL, or "" to mark an id we've checked that has no icon (so we don't
+# re-fetch it every request).
+_APP_ICONS: dict[str, str] = {}
+# Where to persist the app-icon cache (set by ``configure``). The name map has
+# its own cache; this one is tiny and updated independently as apps appear.
+_APP_CACHE_PATH: Path | None = None
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 # "Rust with Medal" / "Minecraft with Medal" — Medal's capture overlay renames
 # the activity; strip the suffix so it resolves to the underlying game. The
@@ -155,14 +170,97 @@ def _cache_age_days(cache_path: str | os.PathLike) -> float | None:
         return None
 
 
+def _app_cache_path(cache_path: str | os.PathLike) -> Path:
+    """Sibling file holding the small per-app-id icon cache."""
+    return Path(cache_path).with_name("game_icons_apps.json")
+
+
 def configure(cache_path: str | os.PathLike | None) -> None:
-    """Populate the in-memory map at startup: the on-disk cache if present,
+    """Populate the in-memory maps at startup: the on-disk caches if present,
     otherwise the bundled seed. Cheap and network-free — call before serving."""
+    global _APP_CACHE_PATH
+    if cache_path is not None:
+        _APP_CACHE_PATH = _app_cache_path(cache_path)
+        try:
+            with _APP_CACHE_PATH.open(encoding="utf-8") as fh:
+                cached = json.load(fh)
+            if isinstance(cached, dict):
+                _APP_ICONS.update({str(k): str(v) for k, v in cached.items()})
+        except (OSError, ValueError):
+            pass
     if cache_path and load_cache(cache_path):
-        LOG.info("Game icons: loaded %d entries from cache", len(_ICONS))
+        LOG.info(
+            "Game icons: loaded %d entries from cache (%d app icons)",
+            len(_ICONS), len(_APP_ICONS),
+        )
         return
     _apply({})  # seed only
     LOG.info("Game icons: using bundled seed (%d entries)", len(_ICONS))
+
+
+def app_icon(app_id: int | str | None) -> str | None:
+    """Return a cached icon URL for a Discord application id, or None.
+
+    Synchronous and cache-only — call :func:`resolve_app_icons` first to
+    populate the cache. A cached empty string (an id known to have no icon)
+    also returns None."""
+    if not app_id:
+        return None
+    return _APP_ICONS.get(str(app_id)) or None
+
+
+async def _fetch_app_icon(app_id: str, session) -> str | None:
+    """Resolve one application id to an icon URL via the RPC endpoint."""
+    import aiohttp
+
+    try:
+        async with session.get(
+            RPC_URL.format(app_id=app_id),
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception:
+        return None
+    icon = data.get("icon") if isinstance(data, dict) else None
+    return _CDN.format(app_id=app_id, icon=icon) if icon else None
+
+
+async def resolve_app_icons(app_ids, session=None) -> None:
+    """Ensure ``app_ids`` are in the app-icon cache, fetching any misses.
+
+    Looks each unknown id up via Discord's per-application RPC endpoint
+    (covering non-game apps), records the URL — or ``""`` when the app has no
+    icon, so we don't re-fetch it — and persists the cache. Failures are
+    swallowed; the dashboard just shows a coloured tile for unresolved ids."""
+    import asyncio
+
+    pending = [str(a) for a in app_ids if a and str(a) not in _APP_ICONS]
+    if not pending:
+        return
+    import aiohttp
+
+    own = session is None
+    session = session or aiohttp.ClientSession()
+    try:
+        results = await asyncio.gather(
+            *(_fetch_app_icon(a, session) for a in pending)
+        )
+    finally:
+        if own:
+            await session.close()
+    for app_id, url in zip(pending, results):
+        _APP_ICONS[app_id] = url or ""  # "" = checked, no icon
+    if _APP_CACHE_PATH is not None:
+        try:
+            _APP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _APP_CACHE_PATH.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(_APP_ICONS, fh)
+            tmp.replace(_APP_CACHE_PATH)
+        except OSError as exc:  # pragma: no cover - disk error
+            LOG.warning("Game icons: could not write app-icon cache: %s", exc)
 
 
 async def fetch_detectable(session=None) -> list[dict]:

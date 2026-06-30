@@ -107,3 +107,34 @@ def test_refresh_keeps_map_when_fetch_fails(tmp_path, monkeypatch):
     assert n >= 1
     assert icon_for("tModLoader")
     assert not cache.exists()
+
+
+# --- per-application icon resolution (non-game apps) ----------------------
+
+def test_resolve_app_icons_caches_and_marks_misses(monkeypatch):
+    game_icons._APP_ICONS.clear()
+    monkeypatch.setattr(game_icons, "_APP_CACHE_PATH", None)  # no disk in tests
+
+    calls = []
+
+    async def fake_fetch(app_id, session):
+        calls.append(app_id)
+        # "111" has an icon, "222" has none.
+        return "https://cdn/app/111.png" if app_id == "111" else None
+
+    monkeypatch.setattr(game_icons, "_fetch_app_icon", fake_fetch)
+    asyncio.run(game_icons.resolve_app_icons([111, 222]))
+
+    assert game_icons.app_icon(111) == "https://cdn/app/111.png"
+    assert game_icons.app_icon(222) is None  # known-no-icon → None, not refetch
+    assert game_icons.app_icon(None) is None
+
+    # A second resolve doesn't re-hit the endpoint for already-known ids.
+    asyncio.run(game_icons.resolve_app_icons([111, 222]))
+    assert calls == ["111", "222"]
+
+
+def test_app_icon_is_cache_only_before_resolve(monkeypatch):
+    game_icons._APP_ICONS.clear()
+    # Nothing resolved yet → no icon (the dashboard draws a coloured tile).
+    assert game_icons.app_icon(999) is None

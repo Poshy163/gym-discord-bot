@@ -414,3 +414,98 @@ def nightly_sleep_sessions(
             "duration_hours": round(duration_h, 2),
         })
     return sessions
+
+
+def _circular_mean_hours(hours: list[float]) -> float | None:
+    """Mean of clock hours treating them as points on a 24h circle.
+
+    A plain average mishandles times that straddle midnight (01:00 and 23:00
+    average to noon, not midnight); the circular mean returns ~00:00 instead.
+    """
+    import math
+
+    if not hours:
+        return None
+    sin = sum(math.sin(2 * math.pi * h / 24.0) for h in hours)
+    cos = sum(math.cos(2 * math.pi * h / 24.0) for h in hours)
+    if abs(sin) < 1e-9 and abs(cos) < 1e-9:  # pragma: no cover - antipodal
+        return None
+    ang = math.atan2(sin, cos)
+    return (ang / (2 * math.pi) * 24.0) % 24.0
+
+
+def _hhmm(hours: float | None) -> str | None:
+    if hours is None:
+        return None
+    h = int(hours) % 24
+    m = int(round((hours - int(hours)) * 60)) % 60
+    return f"{h:02d}:{m:02d}"
+
+
+def sleep_stats(sessions: list[dict], *, target_hours: float = 8.0) -> dict:
+    """Summarise nightly sleep sessions (from :func:`nightly_sleep_sessions`).
+
+    Returns averages and consistency measures the dashboard charts: mean/spread
+    of nightly duration, typical bedtime/wake (circular means, so straddling
+    midnight is handled), weekday-vs-weekend averages, cumulative sleep debt
+    against ``target_hours``, and a per-night series for a sparkline. Empty
+    input yields zero/None fields rather than raising.
+    """
+    import math
+    from datetime import datetime as _dt
+
+    durations = [float(s["duration_hours"]) for s in sessions]
+    nights = len(durations)
+    if not nights:
+        return {
+            "nights": 0, "avg_hours": None, "min_hours": None,
+            "max_hours": None, "std_hours": None, "bedtime": None,
+            "wake": None, "weekday_avg": None, "weekend_avg": None,
+            "debt_hours": 0.0, "target_hours": target_hours, "series": [],
+        }
+
+    avg = sum(durations) / nights
+    var = sum((d - avg) ** 2 for d in durations) / nights
+    std = math.sqrt(var)
+
+    def _local_hour(stamp: str) -> float | None:
+        # stamp is "YYYY-MM-DD HH:MM" in the display timezone.
+        try:
+            t = _dt.strptime(stamp, "%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return None
+        return t.hour + t.minute / 60.0
+
+    bed = _circular_mean_hours(
+        [h for s in sessions if (h := _local_hour(s["start_local"])) is not None]
+    )
+    wake = _circular_mean_hours(
+        [h for s in sessions if (h := _local_hour(s["end_local"])) is not None]
+    )
+
+    weekday, weekend = [], []
+    for s in sessions:
+        try:
+            wd = _dt.strptime(s["date"], "%Y-%m-%d").weekday()
+        except (ValueError, TypeError):
+            continue
+        (weekend if wd >= 5 else weekday).append(float(s["duration_hours"]))
+
+    return {
+        "nights": nights,
+        "avg_hours": round(avg, 2),
+        "min_hours": round(min(durations), 2),
+        "max_hours": round(max(durations), 2),
+        "std_hours": round(std, 2),
+        "bedtime": _hhmm(bed),
+        "wake": _hhmm(wake),
+        "weekday_avg": round(sum(weekday) / len(weekday), 2) if weekday else None,
+        "weekend_avg": round(sum(weekend) / len(weekend), 2) if weekend else None,
+        # Positive = slept less than target overall; negative = surplus.
+        "debt_hours": round(target_hours * nights - sum(durations), 1),
+        "target_hours": target_hours,
+        "series": [
+            {"date": s["date"], "hours": float(s["duration_hours"])}
+            for s in sessions
+        ],
+    }

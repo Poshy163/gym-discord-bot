@@ -244,6 +244,63 @@ def build_app(
         ]
         return web.json_response({"guilds": out})
 
+    def _overview_live(gid: int) -> dict:
+        """Live snapshot for the Overview header: who's online/playing now, the
+        day's top games, average recent sleep, and a 7-day message sparkline.
+        Loops only the (small) tracked-user set plus one grouped message query."""
+        now = datetime.now(timezone.utc)
+        day_since = now - timedelta(hours=24)
+        week_since = now - timedelta(days=7)
+        online = playing = tracked = 0
+        game_today: dict[str, float] = {}
+        sleep_avgs: list[float] = []
+        for row in db.presence_track_list(gid):
+            tracked += 1
+            uid = int(row["user_id"])
+            pres = db.presence_current(gid, uid)
+            if pres and presence.is_online(pres["status"]):
+                online += 1
+            cur = db.activity_current_set(gid, uid)
+            if cur and cur[0]:
+                playing += 1
+            for nm, secs in presence.summarize_activity_sets(
+                db.activity_sets_for(gid, uid, since=day_since), day_since, now,
+            ).items():
+                game_today[nm] = game_today.get(nm, 0.0) + secs
+            events = [
+                (r["status"], r["at"])
+                for r in db.presence_events_for(
+                    gid, uid, since=week_since, until=now,
+                )
+            ]
+            st = presence.sleep_stats(presence.nightly_sleep_sessions(
+                events, week_since, now, display_tz=display_tz,
+            ))
+            if st["avg_hours"] is not None:
+                sleep_avgs.append(st["avg_hours"])
+        top_today = [
+            {"name": nm, "seconds": round(secs),
+             "image": game_icons.icon_for(nm)}
+            for nm, secs in sorted(
+                game_today.items(), key=lambda kv: kv[1], reverse=True,
+            )[:5]
+        ]
+        # 7-day message sparkline (oldest→newest, zero-filled).
+        counts = db.message_daily_counts(gid, week_since)
+        msg_series = []
+        for i in range(7, -1, -1):
+            day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+            msg_series.append({"date": day, "count": counts.get(day, 0)})
+        return {
+            "online": online, "playing": playing, "tracked": tracked,
+            "top_today": top_today,
+            "avg_sleep": (
+                round(sum(sleep_avgs) / len(sleep_avgs), 1)
+                if sleep_avgs else None
+            ),
+            "messages_7d": msg_series,
+        }
+
     async def api_overview(request: web.Request) -> web.Response:
         _require(request)
         gid = _guild_id(request)
@@ -257,6 +314,7 @@ def build_app(
             "known_members": len(members),
             "role_count": len(roles),
             "recent_audit": recent,
+            "live": _overview_live(gid),
         })
 
     async def api_members(request: web.Request) -> web.Response:
@@ -470,9 +528,11 @@ def build_app(
         ]})
 
     def _act_icon(name: str, stored: str | None) -> str | None:
-        """Resolve an activity's art: its own rich-presence image (or one
-        captured for it in an earlier session) first, then the curated
-        game-icon fallback, then None (the UI draws a coloured tile)."""
+        """Resolve an activity's art from data we already have: its own
+        rich-presence image (or one captured in an earlier session) first, then
+        the curated/dynamic game-icon map. Returns None when only an app-id
+        lookup could help — :func:`game_icons.app_icon` fills those in after a
+        batched resolve."""
         return stored or game_icons.icon_for(name)
 
     async def api_activity(request: web.Request) -> web.Response:
@@ -482,21 +542,40 @@ def build_app(
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
         users = []
+        missing_app_ids: set[int] = set()
+        # Server-wide totals for the "most played" leaderboard:
+        # name -> {seconds, players, stored image, app id}.
+        server: dict[str, dict] = {}
+
+        def _game(name, stored, app_id, **extra):
+            # Carry the app id alongside so a single batched RPC resolve can
+            # backfill icons for apps that ship no image (CurseForge, …).
+            image = _act_icon(name, stored)
+            if image is None and app_id:
+                missing_app_ids.add(int(app_id))
+            return {"name": name, "image": image, "_app": app_id, **extra}
+
         for row in db.presence_track_list(gid):
             uid = int(row["user_id"])
             member = db.get_member(gid, uid)
+            display = member["display_name"] if member else str(uid)
             pres = db.presence_current(gid, uid)
             cur = db.activity_current_set(gid, uid)
             imgmap = db.activity_image_map(gid, uid)
+            appidmap = db.activity_appid_map(gid, uid)
             totals = presence.summarize_activity_sets(
                 db.activity_sets_for(gid, uid, since=since), since, now,
             )
+            for nm, secs in totals.items():
+                e = server.setdefault(
+                    nm, {"seconds": 0.0, "players": [], "img": None, "app": None}
+                )
+                e["seconds"] += secs
+                e["players"].append(display)
+                e["img"] = e["img"] or imgmap.get(nm)
+                e["app"] = e["app"] or appidmap.get(nm)
             top = [
-                {
-                    "name": nm,
-                    "seconds": round(secs),
-                    "image": _act_icon(nm, imgmap.get(nm)),
-                }
+                _game(nm, imgmap.get(nm), appidmap.get(nm), seconds=round(secs))
                 for nm, secs in list(totals.items())[:6]
             ]
             # Everything the user is running right now (a game plus a launcher,
@@ -505,25 +584,49 @@ def build_app(
             if cur is not None:
                 acts, at = cur
                 current_games = [
-                    {
-                        "name": d["n"],
-                        "image": _act_icon(d["n"], d["i"] or imgmap.get(d["n"])),
-                        "since": at,
-                    }
+                    _game(d["n"], d["i"] or imgmap.get(d["n"]),
+                          d.get("a") or appidmap.get(d["n"]), since=at)
                     for d in acts
                 ]
             users.append({
                 "user_id": str(uid),
-                "display_name": (
-                    member["display_name"] if member else str(uid)
-                ),
+                "display_name": display,
                 "avatar": member["avatar"] if member else None,
                 "status": pres["status"] if pres else None,
                 "status_at": pres["at"] if pres else None,
                 "current_games": current_games,
                 "top_games": top,
             })
-        return web.json_response({"users": users, "window_days": days})
+
+        leaders = sorted(
+            server.items(), key=lambda kv: kv[1]["seconds"], reverse=True,
+        )[:8]
+        for _nm, e in leaders:  # make sure leaderboard icons resolve too
+            if e["app"] and not (e["img"] or game_icons.icon_for(_nm)):
+                missing_app_ids.add(int(e["app"]))
+
+        # One batched RPC resolve for every app that still lacks art, then fill
+        # the icons in and drop the internal app-id field from the payload.
+        if missing_app_ids:
+            await game_icons.resolve_app_icons(missing_app_ids)
+        for u in users:
+            for g in (*u["current_games"], *u["top_games"]):
+                app_id = g.pop("_app", None)
+                if g["image"] is None and app_id:
+                    g["image"] = game_icons.app_icon(app_id)
+        leaderboard = [
+            {
+                "name": nm,
+                "seconds": round(e["seconds"]),
+                "players": e["players"],
+                "image": e["img"] or game_icons.icon_for(nm)
+                or game_icons.app_icon(e["app"]),
+            }
+            for nm, e in leaders
+        ]
+        return web.json_response(
+            {"users": users, "window_days": days, "leaderboard": leaderboard}
+        )
 
     async def api_sleep(request: web.Request) -> web.Response:
         _require(request)
@@ -543,8 +646,7 @@ def build_app(
             sessions = presence.nightly_sleep_sessions(
                 events, since, now, display_tz=display_tz,
             )
-            durations = [s["duration_hours"] for s in sessions]
-            avg = round(sum(durations) / len(durations), 2) if durations else None
+            stats = presence.sleep_stats(sessions)
             users.append({
                 "user_id": str(uid),
                 "display_name": (
@@ -553,8 +655,9 @@ def build_app(
                 "avatar": member["avatar"] if member else None,
                 "status": pres["status"] if pres else None,
                 "sessions": sessions,
-                "nights": len(sessions),
-                "avg_hours": avg,
+                "nights": stats["nights"],
+                "avg_hours": stats["avg_hours"],
+                "stats": stats,
             })
         return web.json_response({"users": users, "window_days": days})
 
@@ -1237,6 +1340,19 @@ background:var(--accent);opacity:.85}
 .stat .n{font-size:1.85rem;font-weight:750;line-height:1.1;letter-spacing:-.5px}
 .stat .l{color:var(--muted);font-size:.74rem;text-transform:uppercase;
 letter-spacing:.06em;margin-top:.25rem}
+/* overview live tiles */
+.ov-live{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+gap:1rem;margin:-.4rem 0 1.6rem}
+.ov-tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.7rem .9rem}
+.ov-wide{grid-column:1/-1}
+.ov-k{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:.35rem}
+.ov-v{font-size:1.15rem;font-weight:650}
+.ov-spark{display:flex;align-items:flex-end;gap:3px;height:30px}
+.ovbar{flex:1;min-width:3px;background:linear-gradient(180deg,#6366f1,#22d3ee);border-radius:2px 2px 0 0}
+.ov-games{display:flex;flex-wrap:wrap;gap:.4rem}
+.ov-game{display:inline-flex;align-items:center;gap:.35rem;background:#ffffff08;
+border:1px solid var(--line);border-radius:999px;padding:.2rem .55rem;font-size:.82rem}
+.ov-game .ovgi{width:18px;height:18px;border-radius:5px;flex:none}
 
 /* table card */
 .tcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
@@ -1365,8 +1481,8 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .gi{width:30px;height:30px;border-radius:7px;flex:none}
 .tg .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.88rem}
 .tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
-.tg .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
-.tg .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
+.tg .barwrap,.lead-nm .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
+.tg .barfill,.lead-nm .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
 .offline-card{opacity:.6}
 .nowlist{display:flex;flex-direction:column;gap:.4rem}
 /* day-window segmented control (Activity + Sleep tabs) */
@@ -1387,6 +1503,27 @@ background:linear-gradient(90deg,#6366f1,#8b5cf6)}
 .slpt{font-size:.72rem}
 .slph{flex:none;width:62px;text-align:right;font-size:.82rem;font-weight:600;
 font-variant-numeric:tabular-nums}
+.schips{display:flex;flex-wrap:wrap;gap:.35rem}
+.schip{background:#ffffff08;border:1px solid var(--line);border-radius:7px;
+padding:.18rem .45rem;font-size:.74rem;color:var(--muted)}
+.schip b{color:#e6edf3;font-variant-numeric:tabular-nums}
+.sspark{display:flex;align-items:flex-end;gap:2px;height:34px;margin:.2rem 0 .1rem}
+.sbar{flex:1;min-width:2px;border-radius:2px 2px 0 0;background:#6366f1}
+.sbar.low{background:#ed4245}.sbar.mid{background:#faa61a}.sbar.ok{background:#3ba55d}
+/* live indicator + server game leaderboard */
+.live-dot{width:8px;height:8px;border-radius:50%;background:#3ba55d;flex:none;
+box-shadow:0 0 0 0 #3ba55d99;animation:livePulse 2s infinite}
+@keyframes livePulse{0%{box-shadow:0 0 0 0 #3ba55d77}70%{box-shadow:0 0 0 6px #3ba55d00}100%{box-shadow:0 0 0 0 #3ba55d00}}
+.lead-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+padding:.9rem 1.1rem;margin-bottom:1.1rem}
+.lead-h{font-weight:600;margin-bottom:.7rem;font-size:.92rem}
+.lead-list{display:flex;flex-direction:column;gap:.5rem}
+.lead-row{display:flex;align-items:center;gap:.6rem}
+.lead-rank{flex:none;width:18px;text-align:center;color:var(--muted);font-size:.82rem;font-variant-numeric:tabular-nums}
+.lead-row .gi{width:26px;height:26px;border-radius:6px;flex:none}
+.lead-nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.88rem}
+.lead-who{flex:1.2;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.78rem}
+.lead-row .pt{flex:none;font-size:.8rem;color:var(--muted);font-variant-numeric:tabular-nums}
 /* messages — Discord-style channel browser */
 .dc{display:flex;height:calc(100vh - 200px);min-height:420px;border:1px solid var(--line);
 border-radius:14px;overflow:hidden;background:var(--panel)}
@@ -1491,11 +1628,23 @@ const ACTION_LABEL={
   bodyweight_log:"⚖️ bodyweight"};
 function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
 let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[],ALL_ROLES=[];
+// Current search term, persisted across live re-renders so typing isn't lost.
+let SEARCH="";
 
-function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" oninput="filterTable(this.value)">`;}
-function filterTable(term){term=(term||"").toLowerCase();
+function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" value="${esc(SEARCH)}" oninput="filterTable(this.value)">`;}
+// Filters both data tables and card grids: table rows by text, cards by their
+// explicit data-search key (so we match the player/game name, not icon alt-text).
+function filterTable(term){SEARCH=term=(term||"").toLowerCase();
   document.querySelectorAll("#view tbody tr").forEach(tr=>{
-    tr.style.display=tr.textContent.toLowerCase().includes(term)?"":"none";});}
+    tr.style.display=tr.textContent.toLowerCase().includes(term)?"":"none";});
+  document.querySelectorAll("#view [data-search]").forEach(el=>{
+    el.style.display=el.dataset.search.includes(term)?"":"none";});}
+
+// Live auto-refresh: the Activity and Voice tabs re-poll on a timer and patch
+// just their grid so the view stays current without a manual refresh.
+let LIVE=null;
+function clearLive(){if(LIVE){clearInterval(LIVE);LIVE=null;}}
+function setLive(fn){clearLive();LIVE=setInterval(fn,15000);}
 function pct(v,g){return Math.max(0,Math.min(100,g?v/g*100:0));}
 function bar(label,val,goal,unit,warnOver){
   val=val||0;
@@ -1548,7 +1697,7 @@ function spinner(){return '<div class="center"><div class="spin"></div></div>';}
 
 function renderNav(){document.getElementById("nav").innerHTML=
   TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" onclick="go('${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
-function go(t){tab=t;dataUserFilter=null;renderNav();render();}
+function go(t){tab=t;dataUserFilter=null;SEARCH="";renderNav();render();}
 async function onGuild(){guild=document.getElementById("guild").value;await loadAvatars();await loadRoles();render();}
 
 async function loadAvatars(){AV={};try{const d=await api(`/api/members?guild=${guild}`);
@@ -1570,6 +1719,7 @@ async function resync(){if(!guild)return;toast("Syncing…");
 
 async function render(){
   const v=document.getElementById("view");
+  clearLive();  // stop any prior tab's auto-refresh before drawing the new one
   if(!guild){v.innerHTML='<div class="empty">Pick a guild.</div>';return;}
   v.innerHTML=spinner();
   try{
@@ -1589,10 +1739,26 @@ function stat(n,l){return `<div class="stat"><div class="n">${esc(n)}</div><div 
 
 async function renderOverview(v){
   const d=await api(`/api/overview?guild=${guild}`);if(!d)return;const t=d.totals||{};
+  const L=d.live||{};
+  // Compact daily message sparkline (last 7d).
+  const msgs=L.messages_7d||[];const mmax=Math.max(1,...msgs.map(x=>x.count));
+  const msgSpark=msgs.length?`<div class="ov-spark" title="messages/day, last 7d">${msgs.map(x=>
+    `<span class="ovbar" style="height:${Math.max(8,Math.round(x.count/mmax*100))}%" title="${esc(x.date)}: ${x.count}"></span>`).join("")}</div>`:"";
+  const topToday=(L.top_today||[]).length?`<div class="ov-games">${L.top_today.map(g=>`<span class="ov-game">
+      ${gameTile(g.name,g.image,18,"ovgi")}${esc(g.name)}</span>`).join("")}</div>`
+    :'<span class="faint">nobody playing today</span>';
   v.innerHTML=`<div class="cards">
     ${stat(d.member_count,"Members")}${stat(d.role_count,"Roles")}
     ${stat(t.total_lifts||0,"Lifts")}${stat(t.lifters||0,"Lifters")}
     ${stat(t.unique_equip||0,"Exercises")}</div>
+    <div class="ov-live">
+      <div class="ov-tile"><div class="ov-k">Tracked now</div>
+        <div class="ov-v">${L.online||0} online <span class="faint">· ${L.playing||0} playing · ${L.tracked||0} tracked</span></div></div>
+      <div class="ov-tile"><div class="ov-k">Avg sleep <span class="faint">7d</span></div>
+        <div class="ov-v">${L.avg_sleep!=null?fmtHours(L.avg_sleep):"—"}</div></div>
+      <div class="ov-tile"><div class="ov-k">Messages <span class="faint">7d</span></div>${msgSpark}</div>
+      <div class="ov-tile ov-wide"><div class="ov-k">Top games today</div>${topToday}</div>
+    </div>
     <h2>Recent activity</h2>${auditTable(d.recent_audit)}`;
 }
 
@@ -1938,19 +2104,51 @@ function daySeg(){return `<span class="dayseg">`+
 
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;
-  const users=d.users||[];
-  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
+  if(!(d.users||[]).length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
     <span class="faint">Open a member and hit <b>Start tracking</b>, or use <code>/track start</code>.
     Needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">🎮 Activity
+      <span class="faint" id="actCount"></span></h2>
+      <span class="live-dot" title="Live — refreshes automatically"></span>
+      <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players or games…")}</div>
+    <div id="actLeader">${actLeaderHTML(d.leaderboard)}</div>
+    <div class="act-grid" id="actGrid">${actCardsHTML(d.users)}</div>`;
+  setActCount(d);
+  setLive(liveActivity);
+}
+// Re-poll and patch just the grid/leaderboard so the search box keeps focus.
+async function liveActivity(){
+  if(tab!=="activity"){clearLive();return;}
+  let d;try{d=await api(`/api/activity?guild=${guild}&days=${WIN_DAYS}`);}catch(e){return;}
+  if(!d||tab!=="activity")return;
+  const grid=document.getElementById("actGrid");if(!grid)return;
+  grid.innerHTML=actCardsHTML(d.users);
+  const lead=document.getElementById("actLeader");if(lead)lead.innerHTML=actLeaderHTML(d.leaderboard);
+  setActCount(d);
+  filterTable(SEARCH);  // reapply the active search to the freshly drawn cards
+}
+function setActCount(d){const el=document.getElementById("actCount");if(!el)return;
+  const online=(d.users||[]).filter(u=>["online","idle","dnd"].includes(u.status)).length;
+  el.textContent=`· ${online}/${(d.users||[]).length} online · last ${d.window_days}d`;}
+function actCardsHTML(users){
   // online first, then by whether currently playing, then name.
-  users.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
+  users=users.slice().sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
     || ((b.current_games||[]).length?1:0)-((a.current_games||[]).length?1:0)
     || a.display_name.localeCompare(b.display_name));
-  const online=users.filter(u=>["online","idle","dnd"].includes(u.status)).length;
-  v.innerHTML=`<div class="filters"><h2 style="margin:0">🎮 Activity
-      <span class="faint">· ${online}/${users.length} online · last ${d.window_days}d</span></h2>
-      <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players…")}</div>
-    <div class="act-grid">${users.map(actCard).join("")}</div>`;
+  return users.map(actCard).join("");
+}
+// Search key: player name plus every game shown, so a game name filters too.
+function actSearchKey(u){return [u.display_name,...(u.current_games||[]).map(g=>g.name),
+  ...(u.top_games||[]).map(g=>g.name)].join(" ").toLowerCase();}
+function actLeaderHTML(rows){
+  if(!rows||!rows.length)return"";
+  const max=Math.max(1,...rows.map(r=>r.seconds));
+  return `<div class="lead-card"><div class="lead-h">🏆 Most played · server · last ${WIN_DAYS}d</div>
+    <div class="lead-list">${rows.map((r,i)=>`<div class="lead-row">
+      <span class="lead-rank">${i+1}</span>${gameTile(r.name,r.image,26,"gi")}
+      <div class="lead-nm">${esc(r.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(r.seconds/max*100)}%"></div></div></div>
+      <div class="lead-who faint">${(r.players||[]).map(esc).join(", ")}</div>
+      <div class="pt">${fmtPlaytime(r.seconds)}</div></div>`).join("")}</div></div>`;
 }
 function actCard(u){
   const offline=!["online","idle","dnd"].includes(u.status);
@@ -1967,7 +2165,7 @@ function actCard(u){
       <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
       <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
     : '<div class="faint" style="font-size:.84rem">No games tracked in this window.</div>';
-  return `<div class="act-card${offline?' offline-card':''}">
+  return `<div class="act-card${offline?' offline-card':''}" data-search="${esc(actSearchKey(u))}">
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
         <span class="dot ${statusClass(u.status)}"></span></span>
@@ -2007,8 +2205,36 @@ async function renderSleep(v){
       <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players…")}</div>
     <div class="act-grid">${users.map(sleepCard).join("")}</div>`;
 }
+// A row of summary chips (average, consistency, typical bed/wake, weekday vs
+// weekend, sleep debt vs target) above the per-night list.
+function sleepStatsHTML(st){
+  if(!st||!st.nights)return"";
+  const chip=(l,v,t)=>`<span class="schip"${t?` title="${esc(t)}"`:""}><b>${v}</b> ${l}</span>`;
+  const debt=st.debt_hours||0;
+  const debtStr=(debt>0?"−":"+")+fmtHours(Math.abs(debt));
+  return `<div class="schips">
+    ${chip("avg",fmtHours(st.avg_hours))}
+    ${st.std_hours!=null?chip("±",fmtHours(st.std_hours),"consistency (std-dev of nightly hours)"):""}
+    ${st.bedtime?chip("bed",st.bedtime,"typical bedtime"):""}
+    ${st.wake?chip("wake",st.wake,"typical wake-up"):""}
+    ${st.weekday_avg!=null?chip("wk",fmtHours(st.weekday_avg),"weekday average"):""}
+    ${st.weekend_avg!=null?chip("we",fmtHours(st.weekend_avg),"weekend average"):""}
+    ${chip("vs "+fmtHours(st.target_hours),debtStr,"sleep debt vs target ("+(debt>0?"under":"over")+")")}
+  </div>`;
+}
+// Per-night mini bar chart, coloured by how much sleep that night got.
+function sleepSpark(series,target){
+  if(!series||!series.length)return"";
+  const max=Math.max(target||8,...series.map(p=>p.hours));
+  return `<div class="sspark">${series.map(p=>{
+    const h=Math.max(6,Math.round(p.hours/max*100));
+    const cls=p.hours<6?"low":(p.hours<7.5?"mid":"ok");
+    return `<span class="sbar ${cls}" style="height:${h}%" title="${esc(p.date)}: ${fmtHours(p.hours)}"></span>`;
+  }).join("")}</div>`;
+}
 function sleepCard(u){
   const offline=!["online","idle","dnd"].includes(u.status);
+  const st=u.stats||{};
   const sessions=(u.sessions||[]).slice().reverse(); // newest first
   const rows=sessions.length?`<div class="slplist">${sessions.slice(0,10).map(s=>`<div class="slprow">
       ${sleepBar(s)}
@@ -2016,13 +2242,15 @@ function sleepCard(u){
       <div class="slpt faint">${esc(s.start_local.slice(11))}–${esc(s.end_local.slice(11))}</div></div>
       <div class="slph">${fmtHours(s.duration_hours)}</div></div>`).join("")}</div>`
     : '<div class="faint" style="font-size:.84rem">No sleep sessions detected in this window.</div>';
-  return `<div class="act-card${offline?' offline-card':''}">
+  return `<div class="act-card${offline?' offline-card':''}" data-search="${esc((u.display_name||'').toLowerCase())}">
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
         <span class="dot ${statusClass(u.status)}"></span></span>
       <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
       <div class="act-sub">${u.nights} night${u.nights===1?"":"s"} · avg ${fmtHours(u.avg_hours)}</div></div>
     </div>
+    ${sleepStatsHTML(st)}
+    ${sleepSpark(st.series,st.target_hours)}
     ${rows}
   </div>`;
 }
@@ -2152,11 +2380,29 @@ async function removeBlacklist(uid){
 const VC_EV={join:["📥","joined"],leave:["📤","left"],move:["🔀","moved to"]};
 async function renderVoice(v){
   const d=await api(`/api/voice?guild=${guild}`);if(!d)return;
+  v.innerHTML=`<div class="filters"><h2 style="margin:0">🔊 Voice
+      <span class="faint" id="vcCount"></span></h2>
+      <span class="live-dot" title="Live — refreshes automatically"></span>
+      <span class="sp" style="flex:1"></span>${searchBar("Search members…")}</div>
+    <div id="vcBody">${voiceBodyHTML(d)}</div>`;
+  setVcCount(d);
+  setLive(liveVoice);
+}
+async function liveVoice(){
+  if(tab!=="voice"){clearLive();return;}
+  let d;try{d=await api(`/api/voice?guild=${guild}`);}catch(e){return;}
+  if(!d||tab!=="voice")return;
+  const body=document.getElementById("vcBody");if(!body)return;
+  body.innerHTML=voiceBodyHTML(d);setVcCount(d);filterTable(SEARCH);
+}
+function setVcCount(d){const el=document.getElementById("vcCount");if(!el)return;
+  const inVc=(d.occupancy||[]).reduce((n,c)=>n+(c.members||[]).length,0);
+  el.textContent=`· ${inVc} in voice now`;}
+function voiceBodyHTML(d){
   const occ=d.occupancy||[], events=d.events||[];
-  const inVc=occ.reduce((n,c)=>n+(c.members||[]).length,0);
   const occHtml=occ.length?occ.map(c=>`<div class="vc-chan">
       <div class="vc-chan-h">🔊 ${esc(c.channel_name)} <span class="faint">· ${(c.members||[]).length}</span></div>
-      <div class="vc-members">${(c.members||[]).map(m=>`<div class="vc-mem">
+      <div class="vc-members">${(c.members||[]).map(m=>`<div class="vc-mem" data-search="${esc((m.display_name||'').toLowerCase())}">
         ${avFor(m.user_id,m.display_name,26)}
         <a class="link" onclick="memberView('${m.user_id}')">${esc(m.display_name)}</a>
         ${m.streaming?'<span class="vc-ic" title="Streaming">🔴</span>':""}
@@ -2164,16 +2410,12 @@ async function renderVoice(v){
       </div>`).join("")}</div></div>`).join("")
     : '<div class="faint">Nobody is in a voice channel right now.</div>';
   const logHtml=events.length?events.map(e=>{const m=VC_EV[e.event]||["•",e.event];
-    return `<div class="vc-ev">${avFor(e.user_id,e.display_name,24)}
+    return `<div class="vc-ev" data-search="${esc((e.display_name||'').toLowerCase())}">${avFor(e.user_id,e.display_name,24)}
       <span class="vc-ev-who"><a class="link" onclick="memberView('${e.user_id}')">${esc(e.display_name)}</a></span>
       <span class="vc-ev-act">${m[0]} ${m[1]}${e.channel?` <span class="vc-ch">🔊 ${esc(e.channel)}</span>`:""}</span>
       <span class="vc-ev-ts">${fmtTs(e.at)}</span></div>`;}).join("")
     : '<div class="faint">No voice activity logged yet.</div>';
-  v.innerHTML=`<div class="filters"><h2 style="margin:0">🔊 Voice
-      <span class="faint">· ${inVc} in voice now</span></h2>
-      <span class="sp" style="flex:1"></span>
-      <button class="btn" onclick="render()" title="Refresh">↻ Refresh</button></div>
-    <div class="vc-grid">${occHtml}</div>
+  return `<div class="vc-grid">${occHtml}</div>
     <h3 style="margin:1.4rem 0 .6rem">Recent voice activity</h3>
     <div class="vc-log">${logHtml}</div>`;
 }

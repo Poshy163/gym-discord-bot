@@ -8,10 +8,19 @@ from app.presence import (
     format_duration,
     is_online,
     nightly_sleep_sessions,
+    sleep_stats,
     summarize_activities,
     summarize_activity_sets,
     summarize_presence,
 )
+
+
+def _sess(date, start_local, end_local, hours):
+    return {
+        "date": date, "start": "", "end": "",
+        "start_local": start_local, "end_local": end_local,
+        "duration_hours": hours,
+    }
 
 
 UTC = timezone.utc
@@ -214,3 +223,54 @@ def test_summarize_activities_adapter_matches_single_track():
 def test_summarize_activity_sets_empty_window():
     start = datetime(2026, 5, 1, tzinfo=UTC)
     assert summarize_activity_sets([(["X"], _iso(start))], start, start) == {}
+
+
+# --- sleep_stats ----------------------------------------------------------
+
+def test_sleep_stats_empty():
+    s = sleep_stats([])
+    assert s["nights"] == 0
+    assert s["avg_hours"] is None
+    assert s["debt_hours"] == 0.0
+    assert s["series"] == []
+
+
+def test_sleep_stats_core_numbers():
+    sessions = [
+        _sess("2026-06-01", "2026-05-31 23:00", "2026-06-01 06:00", 7.0),
+        _sess("2026-06-02", "2026-06-02 01:00", "2026-06-02 10:00", 9.0),
+    ]
+    s = sleep_stats(sessions, target_hours=8.0)
+    assert s["nights"] == 2
+    assert s["avg_hours"] == 8.0
+    assert s["min_hours"] == 7.0 and s["max_hours"] == 9.0
+    assert s["std_hours"] == 1.0           # consistency
+    assert s["debt_hours"] == 0.0          # 8*2 - 16
+    assert [p["hours"] for p in s["series"]] == [7.0, 9.0]
+
+
+def test_sleep_stats_bedtime_is_circular():
+    # Bedtimes 23:00 and 01:00 average to ~midnight, not noon.
+    sessions = [
+        _sess("2026-06-01", "2026-05-31 23:00", "2026-06-01 07:00", 8.0),
+        _sess("2026-06-02", "2026-06-02 01:00", "2026-06-02 09:00", 8.0),
+    ]
+    s = sleep_stats(sessions)
+    assert s["bedtime"] == "00:00"
+
+
+def test_sleep_stats_debt_when_under_target():
+    sessions = [_sess("2026-06-01", "2026-06-01 02:00", "2026-06-01 08:00", 6.0)]
+    s = sleep_stats(sessions, target_hours=8.0)
+    assert s["debt_hours"] == 2.0  # slept 2h under target
+
+
+def test_sleep_stats_weekday_vs_weekend():
+    # 2026-06-06 is a Saturday, 2026-06-08 a Monday.
+    sessions = [
+        _sess("2026-06-06", "2026-06-06 02:00", "2026-06-06 12:00", 10.0),
+        _sess("2026-06-08", "2026-06-08 00:00", "2026-06-08 07:00", 7.0),
+    ]
+    s = sleep_stats(sessions)
+    assert s["weekend_avg"] == 10.0
+    assert s["weekday_avg"] == 7.0

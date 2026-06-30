@@ -268,6 +268,108 @@ def test_activity_overlaps_and_resolves_icons(tmp_path):
     _run(go())
 
 
+def test_activity_resolves_app_icon_for_non_game_app(tmp_path, monkeypatch):
+    """An app with no rich-presence image and no entry in the games map still
+    gets an icon resolved via its Discord application id (RPC endpoint)."""
+    from app import game_icons
+
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        # CurseForge: no image, not in the games list, but carries an app id.
+        db.activity_log_set(1, 100, [("CurseForge", None, 999001)],
+                            at=now - timedelta(hours=1))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/activity?guild=1")).json()
+            g = d["users"][0]["current_games"][0]
+            assert g["name"] == "CurseForge"
+            assert g["image"] == "https://cdn/app/999001.png"
+            assert "_app" not in g  # internal field is stripped from the payload
+        finally:
+            await client.close()
+            db.close()
+
+    game_icons._APP_ICONS.clear()
+    monkeypatch.setattr(game_icons, "_APP_CACHE_PATH", None)
+
+    async def fake_fetch(app_id, session):
+        return f"https://cdn/app/{app_id}.png"
+
+    monkeypatch.setattr(game_icons, "_fetch_app_icon", fake_fetch)
+    _run(go())
+
+
+def test_activity_includes_server_leaderboard(tmp_path):
+    """The Activity payload carries a server-wide 'most played' leaderboard
+    aggregating every tracked user, with the players on each game."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.upsert_member(1, 200, "bob", "Bob")
+        db.presence_track_add(1, 100, started_by=0)
+        db.presence_track_add(1, 200, started_by=0)
+        # Both play Rust; only Alice plays tModLoader → Rust ranks first.
+        db.activity_log_set(1, 100, [("Rust", None)], at=now - timedelta(hours=3))
+        db.activity_log_set(1, 100, [("tModLoader", None)], at=now - timedelta(hours=2))
+        db.activity_log_set(1, 200, [("Rust", None)], at=now - timedelta(hours=3))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/activity?guild=1&days=7")).json()
+            lb = {r["name"]: r for r in d["leaderboard"]}
+            assert "Rust" in lb and "tModLoader" in lb
+            assert lb["Rust"]["seconds"] >= lb["tModLoader"]["seconds"]
+            assert set(lb["Rust"]["players"]) == {"Alice", "Bob"}
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_overview_live_block(tmp_path):
+    """The Overview payload includes a 'live' block: who's online/playing now,
+    the day's top games, average sleep, and a 7-day message series."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        db.presence_log_event(1, 100, "online", at=now - timedelta(hours=2))
+        db.activity_log_set(1, 100, [("Rust", None)], at=now - timedelta(hours=1))
+        db.message_log_add(1, 100, "hi", message_id=1, at=now - timedelta(hours=1))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/overview?guild=1")).json()
+            live = d["live"]
+            assert live["tracked"] == 1 and live["online"] == 1
+            assert live["playing"] == 1
+            assert live["top_today"][0]["name"] == "Rust"
+            assert len(live["messages_7d"]) == 8  # today + 7 days back
+            assert sum(p["count"] for p in live["messages_7d"]) >= 1
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_sleep_tab_reports_nightly_sessions(tmp_path):
     """The Sleep tab derives nightly sessions from presence and summarises them
     (count + average) per tracked user."""
@@ -297,6 +399,10 @@ def test_sleep_tab_reports_nightly_sessions(tmp_path):
             assert u["nights"] == 1
             assert u["avg_hours"] == 8.0
             assert u["sessions"][0]["duration_hours"] == 8.0
+            # Insights block is present and summarises the single night.
+            assert u["stats"]["nights"] == 1
+            assert u["stats"]["avg_hours"] == 8.0
+            assert len(u["stats"]["series"]) == 1
         finally:
             await client.close()
             db.close()

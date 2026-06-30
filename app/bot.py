@@ -11017,8 +11017,8 @@ def _discord_status_to_str(status: discord.Status) -> str:
 
 def _get_all_activities_info(
     member: discord.Member,
-) -> list[tuple[str, str | None]]:
-    """All of the member's game/app activities as ordered ``(name, image_url)``.
+) -> list[tuple[str, str | None, int | None]]:
+    """The member's game/app activities as ordered ``(name, image_url, app_id)``.
 
     A user can run several at once — e.g. a game alongside a launcher, or two
     games — and we record every one so concurrent play shows up in the
@@ -11028,10 +11028,12 @@ def _get_all_activities_info(
     discord.py occasionally delivers rich-presence payloads as subclasses we
     didn't list, and they silently get dropped. ``image_url`` is the
     rich-presence large image when the activity exposes one (many plain
-    "playing X" presences don't). Names are de-duplicated, keeping the first
-    occurrence (and its image).
+    "playing X" presences don't); ``app_id`` is the Discord application id when
+    present, letting the dashboard fetch an icon for apps that ship no image and
+    aren't in the games list (CurseForge, Crunchyroll, …). Names are
+    de-duplicated, keeping the first occurrence (and its image/app id).
     """
-    out: list[tuple[str, str | None]] = []
+    out: list[tuple[str, str | None, int | None]] = []
     seen: set[str] = set()
     for act in member.activities:
         if isinstance(act, (discord.Spotify, discord.CustomActivity)):
@@ -11044,8 +11046,13 @@ def _get_all_activities_info(
             image = getattr(act, "large_image_url", None)
         except Exception:  # pragma: no cover - asset URL build can throw
             image = None
+        app_id = getattr(act, "application_id", None)
         seen.add(str(name))
-        out.append((str(name), str(image) if image else None))
+        out.append((
+            str(name),
+            str(image) if image else None,
+            int(app_id) if app_id else None,
+        ))
     return out
 
 
@@ -11055,7 +11062,7 @@ def _get_main_activity_info(
     """Return ``(name, image_url)`` for the member's primary game/app activity
     (the first of :func:`_get_all_activities_info`)."""
     acts = _get_all_activities_info(member)
-    return acts[0] if acts else (None, None)
+    return (acts[0][0], acts[0][1]) if acts else (None, None)
 
 
 def _get_main_activity(member: discord.Member) -> str | None:
@@ -11108,9 +11115,9 @@ async def on_presence_update(
             db.presence_log_event(after.guild.id, after.id, status)
         # Activity tracking — record the full set of concurrent games/apps so
         # someone running, say, tModLoader and Excel at once shows both.
-        before_acts = [n for n, _img in _get_all_activities_info(before)]
+        before_acts = [t[0] for t in _get_all_activities_info(before)]
         after_info = _get_all_activities_info(after)
-        after_acts = [n for n, _img in after_info]
+        after_acts = [t[0] for t in after_info]
         if before_acts != after_acts:
             db.activity_log_set(after.guild.id, after.id, after_info)
             LOG.info(
