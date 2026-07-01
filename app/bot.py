@@ -5401,6 +5401,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             value=(
                 "`/hevy_help` — how it works + how to link\n"
                 "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
+                "`/hevy_recent` — show the most recent workout\n"
                 "`/hevy_status` — check if you're linked\n"
                 "`/hevy_unlink` — remove your stored API key"
             ),
@@ -10720,6 +10721,7 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
         name="Commands",
         value=(
             "`/hevy_link` — link your account\n"
+            "`/hevy_recent` — show your most recent workout\n"
             "`/hevy_status` — check link + last sync time\n"
             "`/hevy_unlink` — remove your key and stop syncing\n"
             "`/hevy_help` — this message"
@@ -10899,6 +10901,78 @@ async def hevy_poll() -> None:
 @hevy_poll.before_loop
 async def _hevy_poll_before() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
+
+
+@bot.tree.command(
+    name="hevy_recent",
+    description="Show the most recent Hevy workout (yours, or another member's).",
+)
+@app_commands.describe(member="Whose latest workout to show. Defaults to you.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_recent_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if not _hevy_enabled():
+        await interaction.response.send_message(
+            "Hevy integration isn't available right now.", ephemeral=True,
+        )
+        return
+    target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
+    row = db.hevy_get(target.id)
+    if row is None:
+        msg = (
+            "You haven't linked Hevy yet — see `/hevy_help`."
+            if target.id == interaction.user.id
+            else f"{target.mention} hasn't linked a Hevy account."
+        )
+        await interaction.response.send_message(
+            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    def _fetch() -> "dict | None | str":
+        try:
+            api_key = hevy_client.decrypt_key(row["api_key_enc"])
+            workouts = hevy_client.fetch_workouts(api_key, page=1, page_size=1)
+            return workouts[0] if workouts else None
+        except hevy_client.HevyAuthError:
+            return "auth"
+        except hevy_client.HevyError as exc:
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _fetch)
+    if isinstance(result, str):
+        if result == "auth":
+            msg = (
+                "❌ Hevy rejected your API key — re-link with `/hevy_link`."
+                if target.id == interaction.user.id
+                else f"{target.display_name}'s Hevy key was rejected (they may "
+                "need to re-link)."
+            )
+        else:
+            LOG.info("Hevy recent fetch failed for %s: %s", target.id, result)
+            msg = "Couldn't reach Hevy just now — try again shortly."
+        await interaction.followup.send(
+            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    if result is None:
+        await interaction.followup.send(
+            f"No Hevy workouts found for {target.display_name}.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    summary = hevy_client.summarize_workout(result)
+    embed = _hevy_workout_embed(_display_name(target), summary)
+    await interaction.followup.send(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(
