@@ -117,6 +117,43 @@ class _Sessions:
             self._store.pop(token, None)
 
 
+# Login brute-force guard: after this many wrong passwords from one IP within
+# the window, that IP is locked out for the cooldown. Counts reset on success.
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCKOUT_SECONDS = 15 * 60
+
+
+class _LoginThrottle:
+    """Per-IP failed-login counter with a temporary lockout.
+
+    In-process and best-effort (a determined attacker behind rotating IPs isn't
+    stopped), but it turns the single shared password from "unlimited online
+    guessing" into "5 tries per IP per 15 min", which is the point."""
+
+    def __init__(self) -> None:
+        self._fails: dict[str, list[float]] = {}
+        self._locked_until: dict[str, float] = {}
+
+    def locked_for(self, ip: str) -> int:
+        """Seconds remaining on this IP's lockout, or 0 if not locked."""
+        until = self._locked_until.get(ip, 0.0)
+        remaining = until - time.time()
+        return int(remaining) if remaining > 0 else 0
+
+    def record_failure(self, ip: str) -> None:
+        now = time.time()
+        recent = [t for t in self._fails.get(ip, []) if now - t < LOGIN_LOCKOUT_SECONDS]
+        recent.append(now)
+        self._fails[ip] = recent
+        if len(recent) >= LOGIN_MAX_FAILS:
+            self._locked_until[ip] = now + LOGIN_LOCKOUT_SECONDS
+            self._fails[ip] = []
+
+    def record_success(self, ip: str) -> None:
+        self._fails.pop(ip, None)
+        self._locked_until.pop(ip, None)
+
+
 def build_app(
     *,
     db,
@@ -161,6 +198,7 @@ def build_app(
     the operator's local sense of time.
     """
     sessions = _Sessions()
+    login_throttle = _LoginThrottle()
 
     def _today() -> tuple[str, str]:
         if today_window is not None:
@@ -180,13 +218,14 @@ def build_app(
         if not _authed(request):
             raise web.HTTPUnauthorized(text="login required")
 
+    def _client_ip(request: web.Request) -> str:
+        peer = request.headers.get("X-Forwarded-For") or (request.remote or "?")
+        return peer.split(",")[0].strip()
+
     def _actor(request: web.Request) -> str:
         # No per-user identity; attribute edits to the requesting IP so the
         # audit trail at least distinguishes operators on a shared deployment.
-        peer = request.headers.get("X-Forwarded-For") or (
-            request.remote or "?"
-        )
-        return f"web:{peer.split(',')[0].strip()}"
+        return f"web:{_client_ip(request)}"
 
     def _guild_id(request: web.Request) -> int:
         try:
@@ -202,10 +241,24 @@ def build_app(
         return web.Response(text=LOGIN_HTML, content_type="text/html")
 
     async def login_post(request: web.Request) -> web.Response:
+        ip = _client_ip(request)
+        locked = login_throttle.locked_for(ip)
+        if locked:
+            mins = max(1, locked // 60)
+            LOG.warning("Dashboard login blocked (locked out) from %s", ip)
+            body = LOGIN_HTML.replace(
+                "<!--ERR-->",
+                f'<p class="err">Too many attempts. Try again in ~{mins} min.</p>',
+            )
+            return web.Response(
+                text=body, content_type="text/html", status=429,
+                headers={"Retry-After": str(locked)},
+            )
         data = await request.post()
         supplied = str(data.get("password", ""))
         # Constant-time compare so the form can't be used as a timing oracle.
         if password and hmac.compare_digest(supplied, password):
+            login_throttle.record_success(ip)
             token = sessions.create()
             resp = web.HTTPFound("/")
             resp.set_cookie(
@@ -214,6 +267,8 @@ def build_app(
             )
             LOG.info("Dashboard login from %s", _actor(request))
             return resp
+        login_throttle.record_failure(ip)
+        LOG.warning("Failed dashboard login from %s", ip)
         body = LOGIN_HTML.replace(
             "<!--ERR-->", '<p class="err">Wrong password.</p>'
         )
@@ -1077,7 +1132,17 @@ def build_app(
             full, headers={"Cache-Control": "private, max-age=31536000"},
         )
 
-    app = web.Application()
+    @web.middleware
+    async def _security_headers(request: web.Request, handler):
+        resp = await handler(request)
+        # Defensive headers: block clickjacking + MIME sniffing, trim referrer
+        # leakage. The dashboard is same-origin and uses no external embeds.
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "same-origin")
+        return resp
+
+    app = web.Application(middlewares=[_security_headers])
     app.add_routes([
         web.get("/login", login_get),
         web.post("/login", login_post),

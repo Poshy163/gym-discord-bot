@@ -32,6 +32,42 @@ async def _client(app):
     return client
 
 
+def test_login_locks_out_after_repeated_failures(tmp_path):
+    """Five wrong passwords from one IP lock it out — even a subsequent correct
+    password is refused with 429 until the cooldown."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            for _ in range(5):
+                r = await client.post("/login", data={"password": "nope"})
+                assert r.status == 401
+            # Locked now: the *correct* password is still refused.
+            r = await client.post("/login", data={"password": "secret"})
+            assert r.status == 429
+            assert r.headers.get("Retry-After")
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_responses_carry_security_headers(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            r = await client.get("/login")
+            assert r.headers.get("X-Frame-Options") == "DENY"
+            assert r.headers.get("X-Content-Type-Options") == "nosniff"
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_invite_requires_auth(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

@@ -138,12 +138,9 @@ for canon, aliases in _ALIAS_GROUPS.items():
         _ALIAS_TO_CANON[_normalize_token(a)] = canon
 
 
-def canonicalize(name: str) -> str:
-    """Return the canonical equipment name for an input label.
-
-    If the label is unknown, a cleaned-up version of the input is returned
-    so it is still stored consistently.
-    """
+def _lookup(name: str) -> str:
+    """Core alias resolution: normalized-key lookup with plural/apostrophe
+    fallbacks. Returns the canonical name, or the cleaned input if unknown."""
     key = _normalize_token(name)
     if not key:
         return ""
@@ -156,6 +153,31 @@ def canonicalize(name: str) -> str:
     if key.endswith(" s") and key[:-2] in _ALIAS_TO_CANON:
         return _ALIAS_TO_CANON[key[:-2]]
     return key
+
+
+def canonicalize(name: str) -> str:
+    """Return the canonical equipment name for an input label.
+
+    If the label is unknown, a cleaned-up version of the input is returned so
+    it is still stored consistently.
+
+    Hevy formats exercises as ``Bench Press (Barbell)`` / ``Lat Pulldown
+    (Cable)``; that equipment-in-parens suffix shouldn't fork a new "machine"
+    from the base lift. So when the full label doesn't match a known machine we
+    retry with the parenthetical stripped. We try the *full* label first,
+    though, because some parentheticals are meaningful (``Pull Ups (Assisted)``
+    resolves to the chin-assist machine, not plain pull-ups).
+    """
+    result = _lookup(name)
+    if result and result in _ALIAS_GROUPS:
+        return result  # matched a known machine (keeps meaningful qualifiers)
+    stripped = re.sub(r"\([^)]*\)", " ", name or "")
+    if stripped != (name or ""):
+        retried = _lookup(stripped)
+        # Prefer the stripped form: it either now matches a machine, or is at
+        # least a cleaner standalone label without the "(Cable)" noise.
+        return retried or result
+    return result
 
 
 def aliases_for(canonical: str) -> list[str]:

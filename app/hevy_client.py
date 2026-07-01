@@ -163,6 +163,27 @@ def fetch_workouts(api_key: str, page: int = 1, page_size: int = 10) -> list[dic
     return []
 
 
+def fetch_recent_workouts(api_key: str, limit: int = 50) -> list[dict]:
+    """Most recent up to ``limit`` workouts, paging the API (newest-first).
+
+    Hevy caps ``pageSize`` at 10 for ``/workouts``, so this walks pages until it
+    has ``limit`` workouts or runs out. Used for the backfill on first link."""
+    page_size = 10
+    out: list[dict] = []
+    page = 1
+    while len(out) < limit:
+        batch = fetch_workouts(api_key, page=page, page_size=page_size)
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < page_size:
+            break  # last page
+        page += 1
+        if page > 50:  # hard safety cap (500 workouts) against a bad loop
+            break
+    return out[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Pure mappers (no network — unit-tested)
 # ---------------------------------------------------------------------------

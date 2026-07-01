@@ -11,6 +11,7 @@ import asyncio
 import csv
 import io
 import importlib
+import hashlib
 import json
 import logging
 import os
@@ -1911,6 +1912,84 @@ async def game_icons_refresh() -> None:  # pragma: no cover - discord runtime
         LOG.exception("Game-icon refresh failed")
 
 
+_CMD_SIG_KEY = "command_sync_sig"
+
+
+def _command_tree_signature() -> str:
+    """Stable fingerprint of the current slash-command surface + scope.
+
+    Lets us skip Discord's (daily-rate-limited) command sync when nothing has
+    changed since the last successful sync — the fix for re-syncing on every
+    ``on_ready`` (which re-fires on each gateway reconnect)."""
+    def sig(c: object) -> dict:
+        d = {
+            "n": c.name,
+            "d": getattr(c, "description", "") or "",
+            "ctx": str(getattr(c, "allowed_contexts", None)),
+            "ins": str(getattr(c, "allowed_installs", None)),
+        }
+        if isinstance(c, app_commands.Group):
+            d["s"] = [sig(s) for s in sorted(c.commands, key=lambda x: x.name)]
+        else:
+            d["p"] = [
+                {
+                    "n": p.name, "d": p.description or "",
+                    "t": str(p.type), "r": p.required,
+                    "c": [str(ch.value) for ch in (p.choices or [])],
+                }
+                for p in getattr(c, "parameters", [])
+            ]
+        return d
+
+    cmds = sorted(bot.tree.get_commands(), key=lambda c: c.name)
+    blob = json.dumps(
+        {"scope": COMMAND_SCOPE, "guild": _gid, "cmds": [sig(c) for c in cmds]},
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+async def _sync_commands(*, force: bool = False) -> dict:
+    """Sync the slash-command tree, skipping the network call when the command
+    surface is unchanged since the last successful sync.
+
+    ``force`` overrides the skip (used by ``/sync``). Returns
+    ``{"action": "skipped"|"guild"|"global", "count": int}``. The hash is only
+    stored on a successful sync, so a failed sync is retried on the next
+    ``on_ready``/reconnect rather than being silently marked done.
+    """
+    signature = _command_tree_signature()
+    if not force and db.meta_get(_CMD_SIG_KEY) == signature:
+        LOG.info("Slash commands unchanged since last sync — skipping.")
+        return {"action": "skipped", "count": 0}
+    if COMMAND_SCOPE == "guild" and DEV_GUILD is not None:
+        # Dev mode: instant, but only this one guild gets the commands.
+        bot.tree.copy_global_to(guild=DEV_GUILD)
+        synced = await bot.tree.sync(guild=DEV_GUILD)
+        action = "guild"
+        LOG.info(
+            "Synced %d slash commands to guild %s only "
+            "(COMMAND_SCOPE=guild — other servers see nothing)",
+            len(synced), _gid,
+        )
+    else:
+        # Global: every server the bot is in gets the commands. If a guild was
+        # previously used for instant sync, clear that guild-scoped copy first
+        # so its commands don't show up twice next to the global ones.
+        if DEV_GUILD is not None:
+            bot.tree.clear_commands(guild=DEV_GUILD)
+            await bot.tree.sync(guild=DEV_GUILD)
+        synced = await bot.tree.sync()
+        action = "global"
+        LOG.info(
+            "Synced %d global slash commands "
+            "(can take up to ~1h to appear in every server)",
+            len(synced),
+        )
+    db.meta_set(_CMD_SIG_KEY, signature)
+    return {"action": action, "count": len(synced)}
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -1924,28 +2003,7 @@ async def on_ready() -> None:
             "in the Discord Developer Portal."
         )
     try:
-        if COMMAND_SCOPE == "guild" and DEV_GUILD is not None:
-            # Dev mode: instant, but only this one guild gets the commands.
-            bot.tree.copy_global_to(guild=DEV_GUILD)
-            synced = await bot.tree.sync(guild=DEV_GUILD)
-            LOG.info(
-                "Synced %d slash commands to guild %s only "
-                "(COMMAND_SCOPE=guild — other servers see nothing)",
-                len(synced), _gid,
-            )
-        else:
-            # Global: every server the bot is in gets the commands. If a guild
-            # was previously used for instant sync, clear that guild-scoped copy
-            # first so its commands don't show up twice next to the global ones.
-            if DEV_GUILD is not None:
-                bot.tree.clear_commands(guild=DEV_GUILD)
-                await bot.tree.sync(guild=DEV_GUILD)
-            synced = await bot.tree.sync()
-            LOG.info(
-                "Synced %d global slash commands "
-                "(can take up to ~1h to appear in every server)",
-                len(synced),
-            )
+        await _sync_commands()
     except Exception:  # pragma: no cover - discord runtime only
         LOG.exception("Failed to sync commands")
 
@@ -2029,6 +2087,12 @@ async def on_ready() -> None:
             HEVY_POLL_MINUTES,
             f" → feed <#{HEVY_FEED_CHANNEL_ID}>" if HEVY_FEED_CHANNEL_ID else "",
         )
+        if HEVY_FEED_CHANNEL_ID is None:
+            LOG.warning(
+                "HEVY_FEED_CHANNEL_ID is unset — Hevy workouts will import as "
+                "lifts but won't be posted to any channel. Set it to enable the "
+                "workout feed."
+            )
 
 
 _WEEKDAY_NAMES = [
@@ -4304,6 +4368,38 @@ async def machine_cmd(
     await interaction.response.send_message("\n".join(lines))
 
 
+@bot.tree.command(
+    name="sync",
+    description="(Owner) Force a re-sync of the bot's slash commands with Discord.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def sync_cmd(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            "This command is owner-only.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        result = await _sync_commands(force=True)
+    except Exception as exc:  # pragma: no cover - discord runtime
+        LOG.exception("Manual /sync failed")
+        await interaction.followup.send(
+            f"❌ Sync failed: `{exc}`", ephemeral=True,
+        )
+        return
+    if result["action"] == "guild":
+        where = f"to this guild only (COMMAND_SCOPE=guild) — visible immediately"
+    else:
+        where = "globally — can take up to ~1h to appear in every server"
+    await interaction.followup.send(
+        f"✅ Synced **{result['count']}** commands {where}. "
+        "If they don't show, hard-refresh Discord (Ctrl+R).",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="version", description="Show the bot's version info.")
 async def version_cmd(interaction: discord.Interaction) -> None:
     if REMINDER_CHANNEL_ID:
@@ -5402,6 +5498,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
                 "`/hevy_help` — how it works + how to link\n"
                 "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
                 "`/hevy_recent` — show the most recent workout\n"
+                "`/hevy_sync` — re-sync your last 50 workouts\n"
                 "`/hevy_status` — check if you're linked\n"
                 "`/hevy_unlink` — remove your stored API key"
             ),
@@ -10662,6 +10759,55 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(
+    name="hevy_sync",
+    description="Re-sync your last 50 Hevy workouts (imports any the bot missed).",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
+    if not _hevy_enabled():
+        await interaction.response.send_message(
+            "Hevy integration isn't available right now.", ephemeral=True,
+        )
+        return
+    row = db.hevy_get(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You haven't linked Hevy yet — see `/hevy_help`.", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    result = await _hevy_sync_account(row, force_backfill=True)
+    if result.get("error") == "auth":
+        await interaction.followup.send(
+            "❌ Hevy rejected your API key — re-link with `/hevy_link`.",
+            ephemeral=True,
+        )
+        return
+    if result.get("error"):
+        await interaction.followup.send(
+            "Couldn't reach Hevy just now — try again shortly.", ephemeral=True,
+        )
+        return
+    if result["new"] == 0:
+        await interaction.followup.send(
+            "✅ Already up to date — no new workouts to import.", ephemeral=True,
+        )
+        return
+    feed = (
+        f" A summary was posted to <#{HEVY_FEED_CHANNEL_ID}>."
+        if HEVY_FEED_CHANNEL_ID else ""
+    )
+    prs = f", {result['prs']} new PR{'s' if result['prs'] != 1 else ''}" if result["prs"] else ""
+    await interaction.followup.send(
+        f"✅ Imported **{result['new']}** workout"
+        f"{'s' if result['new'] != 1 else ''} — {result['lifts']} lifts, "
+        f"{result['volume_kg']:,} kg volume{prs}.{feed}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="hevy_help",
     description="How the Hevy integration works and how to link your account.",
 )
@@ -10722,6 +10868,7 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "`/hevy_link` — link your account\n"
             "`/hevy_recent` — show your most recent workout\n"
+            "`/hevy_sync` — re-sync your last 50 workouts\n"
             "`/hevy_status` — check link + last sync time\n"
             "`/hevy_unlink` — remove your key and stop syncing\n"
             "`/hevy_help` — this message"
@@ -10764,9 +10911,33 @@ def _hevy_exercise_line(ex: dict) -> str:
     return f"**{_safe_label(ex.get('title') or 'Exercise')}** · " + " · ".join(bits)
 
 
-def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
+def _collapse_prs(
+    prs: list[tuple[Lift, float | None]],
+) -> dict[str, tuple[float, float | None]]:
+    """Collapse ``_new_prs_for_lifts`` output to the best new PR per equipment:
+    ``{equipment: (weight_kg, previous_best_or_None)}``."""
+    best: dict[str, tuple[float, float | None]] = {}
+    for lift, prev in prs:
+        cur = best.get(lift.equipment)
+        if cur is None or lift.weight_kg > cur[0]:
+            best[lift.equipment] = (lift.weight_kg, prev)
+    return best
+
+
+def _hevy_pr_lines(prs_by_equip: dict[str, tuple[float, float | None]]) -> list[str]:
+    lines = []
+    for equip, (weight, prev) in prs_by_equip.items():
+        was = f" (was {prev:g}kg)" if prev else " — first time!"
+        lines.append(f"**{_safe_label(equip)}** {weight:g}kg{was}")
+    return lines
+
+
+def _hevy_workout_embed(
+    member_name: str, summary: dict,
+    prs_by_equip: dict[str, tuple[float, float | None]] | None = None,
+) -> discord.Embed:
     """Build the feed embed for a completed Hevy workout — the full stat line,
-    a per-exercise breakdown, and the heaviest set of the session."""
+    a per-exercise breakdown, any new personal bests, and the heaviest set."""
     warm = summary.get("warmup_set_count") or 0
     sets_str = f"**{summary.get('working_set_count', summary['set_count'])}** sets"
     if warm:
@@ -10798,6 +10969,12 @@ def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
             name="Exercises", value="\n".join(lines)[:1024], inline=False,
         )
 
+    if prs_by_equip:
+        pr_lines = _hevy_pr_lines(prs_by_equip)
+        embed.add_field(
+            name="🎉 New PR!" if len(pr_lines) == 1 else "🎉 New PRs!",
+            value="\n".join(pr_lines)[:1024], inline=False,
+        )
     top = summary.get("top")
     if top:
         reps = f" × {top['reps']}" if top.get("reps") else ""
@@ -10813,29 +10990,113 @@ def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
     return embed
 
 
-async def _hevy_sync_account(row) -> None:
-    """Import a linked member's new Hevy workouts as lifts and post feed embeds."""
+def _hevy_backfill_embed(member_name: str, stats: dict) -> discord.Embed:
+    """One-shot summary embed for a backfill/manual sync (instead of spamming a
+    separate embed per historical workout)."""
+    desc = [
+        f"**{stats['workouts']}** workouts",
+        f"**{stats['lifts']}** lifts",
+        f"**{stats['volume_kg']:,} kg** total volume",
+    ]
+    embed = discord.Embed(
+        title="📥 Hevy history synced",
+        colour=HEVY_COLOUR,
+        description=" · ".join(desc),
+    )
+    embed.set_author(name=f"🏋️ {member_name}'s workouts imported")
+    if stats.get("pr_count"):
+        embed.add_field(
+            name="🎉 Personal bests",
+            value=f"{stats['pr_count']} new PR"
+            f"{'s' if stats['pr_count'] != 1 else ''} set across these workouts",
+            inline=False,
+        )
+    first, last = stats.get("first"), stats.get("last")
+    if first and last:
+        f_dt, l_dt = _parse_hevy_time(first), _parse_hevy_time(last)
+        if f_dt and l_dt:
+            rng = (
+                f"<t:{int(f_dt.timestamp())}:D> → <t:{int(l_dt.timestamp())}:D>"
+            )
+            embed.add_field(name="Date range", value=rng, inline=False)
+    embed.set_footer(text="via Hevy")
+    return embed
+
+
+def _hevy_import_workout(
+    user_id: int, guild_id: int, username: str, workout: dict,
+) -> dict | None:
+    """Import one Hevy workout's lifts (deduped), detecting any new PRs first.
+
+    Returns ``{"summary", "lifts", "prs", "when"}`` for a freshly-imported
+    workout, or None if it has no id or was already imported. PRs are computed
+    against the DB **before** the insert so the comparison excludes this
+    workout's own sets."""
+    wid = str(workout.get("id") or "")
+    if not wid or db.hevy_workout_imported(user_id, wid):
+        return None
+    if not db.hevy_mark_workout(user_id, wid):
+        return None  # raced with another poll
+    lifts = hevy_client.workout_to_lifts(workout)
+    prs = _collapse_prs(_new_prs_for_lifts(guild_id, user_id, lifts)) if lifts else {}
+    when = _parse_hevy_time(workout.get("start_time"))
+    if lifts:
+        try:
+            db.add_lifts(
+                guild_id=guild_id, user_id=user_id, username=username,
+                lifts=lifts, logged_at=when,
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Hevy: failed to import workout %s", wid)
+    return {
+        "summary": hevy_client.summarize_workout(workout),
+        "lifts": lifts, "prs": prs, "when": when,
+    }
+
+
+async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
+    """Import a linked member's new Hevy workouts as lifts and post to the feed.
+
+    On the first sync (or a forced backfill) it pulls up to 50 recent workouts,
+    imports their history with the original dates, and posts a **single** summary
+    announcement rather than one embed per workout. On routine polls it imports
+    just the new workouts and posts a full-stats embed (with PR callouts) for
+    each. Returns a small stats dict for callers that want to report the result
+    (e.g. the manual ``/hevy sync`` command)."""
+    result = {"new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False}
     user_id = int(row["user_id"])
     guild_id = int(row["guild_id"])
     try:
         api_key = hevy_client.decrypt_key(row["api_key_enc"])
     except hevy_client.HevyError:
         LOG.warning("Hevy: unreadable API key for user %s — skipping", user_id)
-        return
+        return result
+
+    first_sync = row["last_synced_at"] is None
+    # Accounts linked before the 50-workout backfill existed have a NULL
+    # backfilled_at — catch them up automatically on their next poll.
+    never_backfilled = (
+        "backfilled_at" not in row.keys() or row["backfilled_at"] is None
+    )
+    backfill = first_sync or force_backfill or never_backfilled
+    result["backfill"] = backfill
 
     def _fetch() -> list[dict]:
+        if backfill:
+            return hevy_client.fetch_recent_workouts(api_key, limit=50)
         return hevy_client.fetch_workouts(api_key, page=1, page_size=10)
 
     try:
         workouts = await bot.loop.run_in_executor(None, _fetch)
     except hevy_client.HevyAuthError:
         LOG.warning("Hevy: API key for user %s was rejected (revoked?)", user_id)
-        return
+        result["error"] = "auth"
+        return result
     except hevy_client.HevyError as exc:
         LOG.info("Hevy: fetch failed for user %s: %s", user_id, exc)
-        return
+        result["error"] = "fetch"
+        return result
 
-    first_sync = row["last_synced_at"] is None
     member = None
     guild = bot.get_guild(guild_id)
     if guild is not None:
@@ -10845,33 +11106,53 @@ async def _hevy_sync_account(row) -> None:
         bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
     )
 
-    # Hevy returns newest-first; import oldest-first so logs read chronologically.
+    # Hevy returns newest-first; import oldest-first so logs read chronologically
+    # and PRs accrue in the right order.
+    imported: list[dict] = []
     for workout in reversed(workouts):
-        wid = str(workout.get("id") or "")
-        if not wid or db.hevy_workout_imported(user_id, wid):
-            continue
-        if not db.hevy_mark_workout(user_id, wid):
-            continue  # raced with another poll
-        lifts = hevy_client.workout_to_lifts(workout)
-        when = _parse_hevy_time(workout.get("start_time"))
-        if lifts:
+        r = _hevy_import_workout(user_id, guild_id, username, workout)
+        if r is not None:
+            imported.append(r)
+
+    result["new"] = len(imported)
+    result["lifts"] = sum(len(r["lifts"]) for r in imported)
+    result["volume_kg"] = sum(r["summary"]["volume_kg"] for r in imported)
+    result["prs"] = sum(len(r["prs"]) for r in imported)
+
+    if feed_channel is not None and imported:
+        if backfill:
+            # One summary instead of up to 50 individual embeds.
+            starts = [r["summary"].get("start_time") for r in imported]
+            starts = [s for s in starts if s]
+            stats = {
+                "workouts": result["new"], "lifts": result["lifts"],
+                "volume_kg": result["volume_kg"], "pr_count": result["prs"],
+                "first": min(starts) if starts else None,
+                "last": max(starts) if starts else None,
+            }
             try:
-                db.add_lifts(
-                    guild_id=guild_id, user_id=user_id, username=username,
-                    lifts=lifts, logged_at=when,
+                await feed_channel.send(
+                    embed=_hevy_backfill_embed(username, stats),
                 )
-            except Exception:  # pragma: no cover - defensive
-                LOG.exception("Hevy: failed to import workout %s", wid)
-        # The very first sync after linking is silent for the feed (no backfill
-        # spam); lifts still import so history is captured.
-        if feed_channel is not None and not first_sync and lifts:
-            try:
-                summary = hevy_client.summarize_workout(workout)
-                await feed_channel.send(embed=_hevy_workout_embed(username, summary))
             except discord.HTTPException:  # pragma: no cover - best effort
-                LOG.info("Hevy: failed to post feed embed for %s", wid)
+                LOG.info("Hevy: failed to post backfill summary for %s", user_id)
+        else:
+            for r in imported:
+                if not r["lifts"]:
+                    continue
+                try:
+                    await feed_channel.send(
+                        embed=_hevy_workout_embed(
+                            username, r["summary"], r["prs"],
+                        ),
+                    )
+                except discord.HTTPException:  # pragma: no cover - best effort
+                    LOG.info("Hevy: failed to post feed embed for %s", user_id)
 
     db.hevy_mark_synced(user_id)
+    if backfill:
+        db.hevy_mark_backfilled(user_id)
+    return result
 
 
 def _parse_hevy_time(value: object) -> datetime | None:

@@ -85,6 +85,33 @@ def test_summarize_workout_full_stats():
     assert plank["best_weight_kg"] is None and plank["volume_kg"] == 0
 
 
+def test_fetch_recent_workouts_pages_until_short_page(monkeypatch):
+    # Two full pages then a short one signals the end.
+    pages = {
+        1: [{"id": str(i)} for i in range(10)],
+        2: [{"id": str(i)} for i in range(10, 20)],
+        3: [{"id": str(i)} for i in range(20, 23)],
+    }
+    monkeypatch.setattr(
+        hevy_client, "fetch_workouts",
+        lambda api_key, page=1, page_size=10: pages.get(page, []),
+    )
+    got = hevy_client.fetch_recent_workouts("key", limit=50)
+    assert [w["id"] for w in got] == [str(i) for i in range(23)]
+
+
+def test_fetch_recent_workouts_trims_to_limit(monkeypatch):
+    # Always-full pages: must stop at the requested limit.
+    monkeypatch.setattr(
+        hevy_client, "fetch_workouts",
+        lambda api_key, page=1, page_size=10: [
+            {"id": str((page - 1) * 10 + i)} for i in range(10)
+        ],
+    )
+    got = hevy_client.fetch_recent_workouts("key", limit=25)
+    assert len(got) == 25 and got[-1]["id"] == "24"
+
+
 def test_summarize_workout_defaults_for_empty():
     s = hevy_client.summarize_workout({})
     assert s["title"] == "Workout"
@@ -151,3 +178,11 @@ def test_hevy_mark_synced(db):
     assert db.hevy_get(1)["last_synced_at"] is None
     db.hevy_mark_synced(1)
     assert db.hevy_get(1)["last_synced_at"] is not None
+
+
+def test_hevy_backfill_marker(db):
+    # New accounts start un-backfilled so the poll catches up their history once.
+    db.hevy_link(1, 42, "enc")
+    assert db.hevy_get(1)["backfilled_at"] is None
+    db.hevy_mark_backfilled(1)
+    assert db.hevy_get(1)["backfilled_at"] is not None

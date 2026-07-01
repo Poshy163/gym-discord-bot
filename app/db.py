@@ -378,7 +378,8 @@ CREATE TABLE IF NOT EXISTS hevy_account (
     api_key_enc    TEXT    NOT NULL,
     hevy_username  TEXT,
     last_synced_at TEXT,
-    linked_at      TEXT    NOT NULL
+    linked_at      TEXT    NOT NULL,
+    backfilled_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hevy_imported (
@@ -401,6 +402,14 @@ CREATE TABLE IF NOT EXISTS guild_meta (
     name         TEXT    NOT NULL,
     member_count INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT    NOT NULL
+);
+
+-- Tiny global key/value store for bot-internal bookkeeping that isn't
+-- per-guild (e.g. the hash of the last successfully-synced slash-command set,
+-- so we don't re-sync — and risk Discord's rate limit — when nothing changed).
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
 -- One row per role the bot can see, refreshed on startup and from the
@@ -651,6 +660,18 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE activity_events ADD COLUMN activities TEXT"
                 )
+            # One-time 50-workout backfill marker. Accounts linked before the
+            # backfill existed have this NULL, so the next poll catches them up.
+            hevy_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(hevy_account)"
+                )
+            }
+            if hevy_cols and "backfilled_at" not in hevy_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_account ADD COLUMN backfilled_at TEXT"
+                )
             msg_cols = {
                 row["name"]
                 for row in self._connection.execute(
@@ -671,6 +692,30 @@ class Database:
             if msg_cols and "edited_at" not in msg_cols:
                 self._connection.execute(
                     "ALTER TABLE message_log ADD COLUMN edited_at TEXT"
+                )
+            # One-time: older Hevy imports forked a separate machine per
+            # equipment qualifier ("Bench Press (Barbell)" -> "bench press
+            # barbell"). Now that canonicalize() strips the parenthetical,
+            # re-derive those rows' equipment from the original Hevy title kept
+            # in ``raw`` so the history merges with the matching machine. Keyed
+            # off ``raw`` (which still has the parens) — a plain re-canonicalize
+            # can't recover it because the stored value already lost them.
+            if self._connection.execute(
+                "SELECT 1 FROM app_meta WHERE key = 'hevy_equip_recanon_v1'"
+            ).fetchone() is None:
+                from .aliases import canonicalize as _canon
+                for r in self._connection.execute(
+                    "SELECT id, raw FROM lifts WHERE raw LIKE 'hevy:%'"
+                ).fetchall():
+                    eq = _canon(r["raw"][5:])
+                    if eq:
+                        self._connection.execute(
+                            "UPDATE lifts SET equipment = ? WHERE id = ?",
+                            (eq, r["id"]),
+                        )
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO app_meta (key, value) "
+                    "VALUES ('hevy_equip_recanon_v1', 'done')"
                 )
             self._consolidate_global_goals()
             self._recanonicalize_equipment()
@@ -2504,6 +2549,17 @@ class Database:
                 (_normalize_iso(at), user_id),
             )
 
+    def hevy_mark_backfilled(
+        self, user_id: int, at: datetime | None = None,
+    ) -> None:
+        """Record that this account has had its one-time 50-workout history
+        backfill, so routine polls stop re-fetching the full history."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET backfilled_at = ? WHERE user_id = ?",
+                (_normalize_iso(at), user_id),
+            )
+
     def hevy_workout_imported(self, user_id: int, workout_id: str) -> bool:
         """True if ``workout_id`` has already been imported for this user."""
         with self._conn() as c:
@@ -4275,6 +4331,25 @@ class Database:
         with self._conn() as c:
             row = c.execute(sql, params).fetchone()
             return int(row[0]) if row else 0
+
+    # ---- global key/value bookkeeping -----------------------------------
+
+    def meta_get(self, key: str) -> str | None:
+        """Read a value from the global ``app_meta`` kv store, or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM app_meta WHERE key = ?", (key,),
+            ).fetchone()
+            return row["value"] if row else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        """Upsert a value into the global ``app_meta`` kv store."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     # ---- role / member mirror -------------------------------------------
 
