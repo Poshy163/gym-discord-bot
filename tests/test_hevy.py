@@ -14,6 +14,7 @@ WORKOUT = {
     "id": "abc-123",
     "title": "Push Day",
     "start_time": "2026-06-01T08:00:00Z",
+    "end_time": "2026-06-01T09:15:00Z",
     "exercises": [
         {
             "title": "Bench Press (Barbell)",
@@ -64,11 +65,33 @@ def test_summarize_workout_totals_and_top_set():
     assert s["top"] == {"title": "Bench Press (Barbell)", "weight_kg": 100.0, "reps": 5}
 
 
+def test_summarize_workout_full_stats():
+    s = hevy_client.summarize_workout(WORKOUT)
+    # Working vs warmup split (one bench set is a warmup).
+    assert s["working_set_count"] == 3
+    assert s["warmup_set_count"] == 1
+    # Reps across all sets: 10 + 5 + 5 (+0 for the plank).
+    assert s["total_reps"] == 20
+    # 08:00 → 09:15 = 75 minutes.
+    assert s["duration_seconds"] == 75 * 60
+    # Per-exercise breakdown, in order.
+    assert [e["title"] for e in s["exercises"]] == [
+        "Bench Press (Barbell)", "Plank",
+    ]
+    bench = s["exercises"][0]
+    assert bench["sets"] == 3 and bench["best_weight_kg"] == 100.0
+    assert bench["best_reps"] == 5 and bench["volume_kg"] == 1600
+    plank = s["exercises"][1]
+    assert plank["best_weight_kg"] is None and plank["volume_kg"] == 0
+
+
 def test_summarize_workout_defaults_for_empty():
     s = hevy_client.summarize_workout({})
     assert s["title"] == "Workout"
     assert s["exercise_count"] == 0 and s["set_count"] == 0
     assert s["volume_kg"] == 0 and s["top"] is None
+    assert s["working_set_count"] == 0 and s["total_reps"] == 0
+    assert s["duration_seconds"] is None and s["exercises"] == []
 
 
 def test_api_key_encryption_roundtrip(monkeypatch):

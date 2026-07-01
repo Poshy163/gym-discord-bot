@@ -5399,6 +5399,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         embed.add_field(
             name="🏋️ Hevy",
             value=(
+                "`/hevy_help` — how it works + how to link\n"
                 "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
                 "`/hevy_status` — check if you're linked\n"
                 "`/hevy_unlink` — remove your stored API key"
@@ -10659,26 +10660,153 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
-    """Build the feed embed for a completed Hevy workout."""
+@bot.tree.command(
+    name="hevy_help",
+    description="How the Hevy integration works and how to link your account.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_help_cmd(interaction: discord.Interaction) -> None:
+    feed = (
+        f" and posts a summary to <#{HEVY_FEED_CHANNEL_ID}>"
+        if HEVY_FEED_CHANNEL_ID else ""
+    )
     embed = discord.Embed(
-        title=summary["title"],
+        title="🏋️ Hevy integration",
         colour=HEVY_COLOUR,
         description=(
-            f"**{summary['exercise_count']}** exercises · "
-            f"**{summary['set_count']}** sets · "
-            f"**{summary['volume_kg']:,} kg** volume"
+            "Link your [Hevy](https://www.hevy.com/) account and I'll pull in "
+            f"each workout you finish — logging every weighted set as a lift{feed}."
         ),
     )
+    embed.add_field(
+        name="1 · Get your API key",
+        value=(
+            "In the Hevy app: **Settings → API → Generate API Key** "
+            "(requires **Hevy Pro**), then copy it."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="2 · Link it",
+        value=(
+            "Run `/hevy_link api_key:<your key>` — do this in a **DM** with me to "
+            "keep the key private. It's stored **encrypted**; the plaintext is "
+            "never saved or shown back."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="How syncing works",
+        value=(
+            "Hevy has no instant push, so I **check for new workouts about every "
+            f"{HEVY_POLL_MINUTES} min** — expect up to that long after you finish "
+            "before it appears. Each workout imports once; the **first** sync "
+            "after linking pulls your history **silently** (no feed spam)."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="What you get",
+        value=(
+            "• Every weighted working set becomes a **lift** (feeds PRs, "
+            "leaderboards and your stats)\n"
+            "• A per-workout summary: exercises, sets, reps, volume, duration, "
+            "a per-exercise breakdown and your top set"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`/hevy_link` — link your account\n"
+            "`/hevy_status` — check link + last sync time\n"
+            "`/hevy_unlink` — remove your key and stop syncing\n"
+            "`/hevy_help` — this message"
+        ),
+        inline=False,
+    )
+    if not _hevy_enabled():
+        embed.add_field(
+            name="⚠️ Currently unavailable",
+            value=(
+                "The host hasn't finished setting up Hevy (missing dependencies "
+                "or encryption key), so linking is disabled for now."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Hevy Pro required · your key is encrypted at rest")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _hevy_duration_str(seconds: int | None) -> str | None:
+    """Render a workout's elapsed time as ``1h 23m`` / ``45m`` / ``30s``."""
+    if not seconds or seconds <= 0:
+        return None
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m" if m else f"{s}s"
+
+
+def _hevy_exercise_line(ex: dict) -> str:
+    """One breakdown line: name + set count + top set (or reps for bodyweight)."""
+    sets = ex.get("sets") or 0
+    bits = [f"{sets} set{'s' if sets != 1 else ''}"]
+    if ex.get("best_weight_kg"):
+        reps = f"×{ex['best_reps']}" if ex.get("best_reps") else ""
+        bits.append(f"top {ex['best_weight_kg']:g}kg{reps}")
+    elif ex.get("reps"):
+        bits.append(f"{ex['reps']} reps")
+    return f"**{_safe_label(ex.get('title') or 'Exercise')}** · " + " · ".join(bits)
+
+
+def _hevy_workout_embed(member_name: str, summary: dict) -> discord.Embed:
+    """Build the feed embed for a completed Hevy workout — the full stat line,
+    a per-exercise breakdown, and the heaviest set of the session."""
+    warm = summary.get("warmup_set_count") or 0
+    sets_str = f"**{summary.get('working_set_count', summary['set_count'])}** sets"
+    if warm:
+        sets_str += f" (+{warm} warmup)"
+    desc = [
+        f"**{summary['exercise_count']}** exercises",
+        sets_str,
+        f"**{summary.get('total_reps', 0):,}** reps",
+        f"**{summary['volume_kg']:,} kg** volume",
+    ]
+    dur = _hevy_duration_str(summary.get("duration_seconds"))
+    if dur:
+        desc.append(f"⏱️ **{dur}**")
+    embed = discord.Embed(
+        title=summary["title"], colour=HEVY_COLOUR, description=" · ".join(desc),
+    )
     embed.set_author(name=f"🏋️ {member_name} finished a Hevy workout")
+
+    # Per-exercise breakdown, capped so the field stays within Discord's 1024
+    # char limit (and doesn't dominate the feed for a 20-exercise session).
+    exercises = summary.get("exercises") or []
+    lines: list[str] = []
+    for ex in exercises[:12]:
+        lines.append(_hevy_exercise_line(ex))
+    if len(exercises) > 12:
+        lines.append(f"…and {len(exercises) - 12} more")
+    if lines:
+        embed.add_field(
+            name="Exercises", value="\n".join(lines)[:1024], inline=False,
+        )
+
     top = summary.get("top")
     if top:
         reps = f" × {top['reps']}" if top.get("reps") else ""
         embed.add_field(
-            name="Top set",
-            value=f"{top['title']} — {top['weight_kg']:g}kg{reps}",
+            name="🏆 Top set",
+            value=f"{_safe_label(top['title'])} — {top['weight_kg']:g}kg{reps}",
             inline=False,
         )
+    when = _parse_hevy_time(summary.get("start_time"))
+    if when is not None:
+        embed.timestamp = when
     embed.set_footer(text="via Hevy")
     return embed
 

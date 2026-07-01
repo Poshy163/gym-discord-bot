@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from typing import Any
 
 from .aliases import canonicalize
@@ -211,34 +212,82 @@ def workout_to_lifts(workout: dict) -> list[Lift]:
     return out
 
 
-def summarize_workout(workout: dict) -> dict:
-    """Compact summary for the Discord feed embed.
+def _iso_dt(value: Any) -> datetime | None:
+    """Parse a Hevy ISO-8601 timestamp to a datetime, or None (pure helper)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
 
-    Returns title, exercise/set counts, total volume (kg = Σ weight×reps) and the
-    single heaviest set, plus the workout id and start time.
+
+def summarize_workout(workout: dict) -> dict:
+    """Full summary for the Discord feed embed.
+
+    Aggregates the whole workout: exercise/set counts (working vs warmup), total
+    reps, total volume (kg = Σ weight×reps), elapsed duration, the single
+    heaviest set, and a per-exercise breakdown (sets + top set + volume). All
+    fields are derived purely from the workout dict (no network) so this stays
+    unit-testable. ``set_count`` counts every logged set; ``working_set_count``
+    excludes warmups.
     """
     exercises = workout.get("exercises") or []
-    set_count = 0
+    set_count = working_sets = warmup_sets = total_reps = 0
     volume = 0.0
     top: tuple[str, float, int] | None = None
+    ex_summaries: list[dict] = []
     for ex in exercises:
         title = (ex.get("title") or "").strip()
-        for s in ex.get("sets") or []:
+        ex_sets = ex.get("sets") or []
+        ex_volume = 0.0
+        ex_reps = 0
+        ex_top: tuple[float, int] | None = None
+        for s in ex_sets:
             weight = _as_float(s.get("weight_kg")) or 0.0
             reps = _as_int(s.get("reps")) or 0
             set_count += 1
+            if (s.get("type") or "normal") == "warmup":
+                warmup_sets += 1
+            else:
+                working_sets += 1
+            total_reps += reps
+            ex_reps += reps
             volume += weight * reps
+            ex_volume += weight * reps
             if weight > 0 and (top is None or weight > top[1]):
                 top = (title, weight, reps)
+            if weight > 0 and (ex_top is None or weight > ex_top[0]):
+                ex_top = (weight, reps)
+        ex_summaries.append({
+            "title": title or "Exercise",
+            "sets": len(ex_sets),
+            "reps": ex_reps,
+            "best_weight_kg": ex_top[0] if ex_top else None,
+            "best_reps": ex_top[1] if ex_top else None,
+            "volume_kg": round(ex_volume),
+        })
+    start = _iso_dt(workout.get("start_time") or workout.get("created_at"))
+    end = _iso_dt(workout.get("end_time"))
+    duration_seconds = (
+        int((end - start).total_seconds())
+        if start and end and end > start else None
+    )
     return {
         "id": str(workout.get("id") or ""),
         "title": (workout.get("title") or "Workout").strip() or "Workout",
         "exercise_count": len(exercises),
         "set_count": set_count,
+        "working_set_count": working_sets,
+        "warmup_set_count": warmup_sets,
+        "total_reps": total_reps,
         "volume_kg": round(volume),
+        "duration_seconds": duration_seconds,
         "top": (
             {"title": top[0], "weight_kg": top[1], "reps": top[2]}
             if top else None
         ),
+        "exercises": ex_summaries,
         "start_time": workout.get("start_time") or workout.get("created_at"),
+        "end_time": workout.get("end_time"),
     }
