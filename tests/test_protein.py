@@ -20,6 +20,9 @@ def test_parse_protein_amount():
     assert protein.parse_protein_amount("12.5") == 12.5
     assert protein.parse_protein_amount("abc") is None
     assert protein.parse_protein_amount("") is None
+    # Multiplier prefix: 70g of a 43 g/100g food.
+    assert protein.parse_protein_amount("0.7x43") == pytest.approx(30.1)
+    assert protein.parse_protein_amount("0.7 x 43g") == pytest.approx(30.1)
 
 
 def test_parse_protein_chat_message_accepts_marked_amounts():
@@ -30,6 +33,18 @@ def test_parse_protein_chat_message_accepts_marked_amounts():
     assert protein.parse_protein_chat_message("protein 40") == 40.0
     assert protein.parse_protein_chat_message("protein 40g") == 40.0
     assert protein.parse_protein_chat_message("40p!") == 40.0
+
+
+def test_parse_protein_chat_message_multiplier():
+    # Per-100g label maths: 70g of a 43 g/100g food.
+    assert protein.parse_protein_chat_message("0.7x43p") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("0.7 x 43 p") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("0.7*43g protein") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("2x20p") == 40.0
+    assert protein.parse_protein_chat_message("protein 0.7x43") == pytest.approx(30.1)
+    # Still needs the protein marker — a multiplied bare number is not a log.
+    assert protein.parse_protein_chat_message("0.7x43") is None
+    assert protein.parse_protein_chat_message("0.7x43g") is None
 
 
 def test_parse_protein_chat_message_rejects_ambiguous():

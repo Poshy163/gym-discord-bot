@@ -14,15 +14,22 @@ import re
 
 from . import calories
 
+# Both tokens accept the same optional multiplier prefix as the single-token
+# parsers, for per-100g label maths (`0.7x1640kj and 0.7x43p`). The protein
+# pattern needs a distinct group name per alternative (m1/m2) because a group
+# name can't repeat within one regex.
 # Un-anchored (findable) calorie + protein tokens.
 _CAL = re.compile(
+    r"(?:(?P<mult>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
     r"(?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
     r"(?P<unit>kcal|cals?|calories?|kj|kilojoules?|c)\b",
     re.IGNORECASE,
 )
 _PRO = re.compile(
-    r"(?:(?P<g1>\d+(?:\.\d+)?)\s*g?\s*(?:protein|prot|p)\b"
-    r"|protein\s*(?P<g2>\d+(?:\.\d+)?)\s*g?\b)",
+    r"(?:(?:(?P<m1>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
+    r"(?P<g1>\d+(?:\.\d+)?)\s*g?\s*(?:protein|prot|p)\b"
+    r"|protein\s*(?:(?P<m2>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
+    r"(?P<g2>\d+(?:\.\d+)?)\s*g?\b)",
     re.IGNORECASE,
 )
 # Words/symbols allowed to sit between (and around) the two tokens.
@@ -59,7 +66,12 @@ def parse_combined(text: str) -> tuple[float, float] | None:
         return None  # leftover words → it's a sentence, not a log
 
     num = float(cal_m.group("num").replace(",", ""))
+    if cal_m.group("mult"):
+        num *= float(cal_m.group("mult"))
     unit = cal_m.group("unit").lower().rstrip("s")
     kcal = calories.kj_to_kcal(num) if unit in _KJ_UNITS else num
     grams = float(pro_m.group("g1") or pro_m.group("g2"))
+    pro_mult = pro_m.group("m1") or pro_m.group("m2")
+    if pro_mult:
+        grams *= float(pro_mult)
     return kcal, grams

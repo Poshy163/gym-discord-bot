@@ -20,13 +20,19 @@ def kcal_to_kj(kcal: float) -> float:
     return kcal * KJ_PER_KCAL
 
 
+# Optional multiplier prefix for label maths: food labels list energy per
+# 100 g, so eating 70 g of a "1640 kJ per 100 g" food is `0.7x1640kj`. The
+# multiplier scales the amount (0.7 × 1640 = 1148 kJ). Accepts x / * / ×.
+_MULT = r"(?:(?P<mult>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
+
 # Accepts "850", "850c", "850 cal", "850kcal", "850 calories", "3,550kJ",
-# "3550 kj", "2 100 kilojoules". Bare numbers default to kcal — that's what
-# people mean when they say "I had 600".
+# "3550 kj", "2 100 kilojoules", "0.7x1640kj". Bare numbers default to kcal —
+# that's what people mean when they say "I had 600".
 _ENERGY_RE = re.compile(
-    r"""
+    rf"""
     ^\s*
-    (?P<num>\d{1,3}(?:[ ,]\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)
+    {_MULT}
+    (?P<num>\d{{1,3}}(?:[ ,]\d{{3}})*(?:\.\d+)?|\d+(?:\.\d+)?)
     \s*
     (?P<unit>kj|kilojoules?|kcal|cals?|calories?|c)?
     \s*$
@@ -41,14 +47,18 @@ def parse_energy(text: str) -> tuple[float, str] | None:
     """Parse a free-form energy amount into ``(kcal, unit_entered)``.
 
     ``unit_entered`` is ``"kj"`` or ``"kcal"`` (what the user typed, so the
-    reply can echo the conversion). Returns None when the text isn't an
-    energy amount. Negative amounts aren't representable by the grammar —
-    corrections go through the undo path instead.
+    reply can echo the conversion). A multiplier prefix scales the amount:
+    ``0.7x1640kj`` is 0.7 × 1640 kJ — handy when the label only lists per-100g
+    values. Returns None when the text isn't an energy amount. Negative
+    amounts aren't representable by the grammar — corrections go through the
+    undo path instead.
     """
     m = _ENERGY_RE.match(text or "")
     if m is None:
         return None
     num = float(m.group("num").replace(",", "").replace(" ", ""))
+    if m.group("mult"):
+        num *= float(m.group("mult"))
     unit_raw = (m.group("unit") or "").lower()
     unit = unit_raw.rstrip("s")
     if unit in _KJ_UNITS:
@@ -62,11 +72,13 @@ def parse_energy(text: str) -> tuple[float, str] | None:
 # sentences like "1500cal is crazy work" so casual chatter is never logged;
 # descriptions go through "/calories add ... note" instead. A bare number
 # never matches (it would collide with lift posts). The "[ \t.]*" separator
-# lets "200c", "200 c" and "200.c" all work.
+# lets "200c", "200 c" and "200.c" all work. A multiplier prefix scales the
+# amount for per-100g label maths: "0.7x1640kj" logs 0.7 × 1640 kJ.
 _CHAT_ENERGY_RE = re.compile(
-    r"""
+    rf"""
     ^\s*
-    (?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)
+    {_MULT}
+    (?P<num>\d{{1,3}}(?:,\d{{3}})*(?:\.\d+)?|\d+(?:\.\d+)?)
     [ \t.]*
     (?P<unit>kcal|cals?|calories?|kj|kilojoules?|c)
     [\s.!?]*$
@@ -88,6 +100,8 @@ def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
     if m is None:
         return None
     num = float(m.group("num").replace(",", ""))
+    if m.group("mult"):
+        num *= float(m.group("mult"))
     unit_raw = m.group("unit").lower()
     unit = "kj" if unit_raw.rstrip("s") in _KJ_UNITS else "kcal"
     kcal = kj_to_kcal(num) if unit == "kj" else num

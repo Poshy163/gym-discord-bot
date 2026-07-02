@@ -68,10 +68,32 @@ def test_parse_energy_kj_forms(text, kj):
 
 
 @pytest.mark.parametrize("text", [
-    "", "lunch", "-300", "650 kg", "kj", "650x", "six hundred",
+    "", "lunch", "-300", "650 kg", "kj", "650x", "six hundred", "0.7x",
+    "0.7x kj",
 ])
 def test_parse_energy_rejects_garbage(text):
     assert parse_energy(text) is None
+
+
+# ---- multiplier prefix (per-100g label maths) -------------------------------
+
+@pytest.mark.parametrize("text,expected_kcal,expected_unit", [
+    # 70g of a 1640 kJ/100g food.
+    ("0.7x1640kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.7 x 1640 kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.7*1640kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.7×1640kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.6x430c", 258.0, "kcal"),
+    (".5x400 cal", 200.0, "kcal"),
+    ("2x600c", 1200.0, "kcal"),
+    ("0.5x2000", 1000.0, "kcal"),  # bare number still defaults to kcal
+])
+def test_parse_energy_multiplier(text, expected_kcal, expected_unit):
+    result = parse_energy(text)
+    assert result is not None
+    kcal, unit = result
+    assert kcal == pytest.approx(expected_kcal)
+    assert unit == expected_unit
 
 
 # ---- parse_chat_message ----------------------------------------------------
@@ -91,6 +113,11 @@ def test_parse_energy_rejects_garbage(text):
     ("200c", 200.0, "kcal"),
     ("500.c", 500.0, "kcal"),
     ("650c", 650.0, "kcal"),
+    # Multiplier prefix: 70g of a 1640 kJ/100g food, 60g of a 430 cal/100g one.
+    ("0.7x1640kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.7 x 1640 kj", 0.7 * 1640.0 / 4.184, "kj"),
+    ("0.6x430c", 258.0, "kcal"),
+    ("2x600c", 1200.0, "kcal"),
 ])
 def test_parse_chat_message_accepts(text, kcal, unit):
     result = parse_chat_message(text)
@@ -116,6 +143,8 @@ def test_parse_chat_message_accepts(text, kcal, unit):
     "200 cal toastie",
     "2,700 kJ maccas run",
     "650 cal - big mac meal",
+    "0.7x1640",        # multiplier on a bare number — still no unit, no log
+    "0.7x1640kj lunch",  # multiplier amounts inside a sentence are ignored too
     "",
 ])
 def test_parse_chat_message_rejects(text):
