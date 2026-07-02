@@ -8,6 +8,7 @@ from app.training_math import (
     DEFAULT_BAR_KG,
     daily_streak,
     plate_breakdown,
+    project_bodyweight_eta,
     project_goal_eta,
     weekly_streak,
 )
@@ -158,3 +159,76 @@ def test_project_goal_eta_no_progress():
     assert rate == 0.0
     assert eta is None
     assert "progress" in reason
+
+
+# -- project_bodyweight_eta ---------------------------------------------------
+
+def _bw_history(
+    start: datetime, days: int, start_kg: float, kg_per_day: float,
+    every: int = 3,
+) -> list[tuple[datetime, float]]:
+    return [
+        (start + timedelta(days=d), start_kg + kg_per_day * d)
+        for d in range(0, days + 1, every)
+    ]
+
+
+def test_project_bodyweight_eta_cutting():
+    # Losing 0.05 kg/day = 0.35 kg/week from 84 kg; 2 kg to go → ~5.7 weeks.
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    history = _bw_history(start, 30, 85.5, -0.05)
+    today = start + timedelta(days=30)
+    rate, eta, reason = project_bodyweight_eta(history, 82.0, today)
+    assert reason == ""
+    assert rate == pytest.approx(-0.35, rel=1e-6)
+    expected_weeks = (82.0 - 84.0) / -0.35
+    assert eta == (today + timedelta(weeks=expected_weeks)).date()
+
+
+def test_project_bodyweight_eta_bulking():
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    history = _bw_history(start, 30, 70.0, 0.04)
+    today = start + timedelta(days=30)
+    rate, eta, reason = project_bodyweight_eta(history, 75.0, today)
+    assert reason == ""
+    assert rate == pytest.approx(0.28, rel=1e-6)
+    assert eta is not None and eta > today.date()
+
+
+def test_project_bodyweight_eta_wrong_direction():
+    # Trending UP while the goal is BELOW current weight → no ETA.
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    history = _bw_history(start, 30, 80.0, 0.05)
+    today = start + timedelta(days=30)
+    rate, eta, reason = project_bodyweight_eta(history, 75.0, today)
+    assert rate is not None and rate > 0
+    assert eta is None
+    assert "down" in reason
+
+
+def test_project_bodyweight_eta_already_there():
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    history = [(start, 80.0), (start + timedelta(days=14), 80.02)]
+    rate, eta, reason = project_bodyweight_eta(
+        history, 80.0, start + timedelta(days=14),
+    )
+    assert eta is None
+    assert "already" in reason
+
+
+def test_project_bodyweight_eta_needs_history():
+    today = datetime(2026, 4, 1, tzinfo=UTC)
+    assert project_bodyweight_eta([], 80.0, today)[1] is None
+    one = [(today, 85.0)]
+    rate, eta, reason = project_bodyweight_eta(one, 80.0, today)
+    assert eta is None and "two" in reason
+
+
+def test_project_bodyweight_eta_caps_far_future():
+    # Barely moving: 5 kg to go at 0.007 kg/week is decades away → refuse.
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    history = _bw_history(start, 30, 85.0, -0.001)
+    today = start + timedelta(days=30)
+    rate, eta, reason = project_bodyweight_eta(history, 80.0, today)
+    assert eta is None
+    assert "two years" in reason

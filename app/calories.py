@@ -150,6 +150,37 @@ def parse_food_phrase(text: str) -> tuple[int, str] | None:
     return max(1, min(servings, 50)), name
 
 
+# Meals: a named bundle of saved foods ("breakfast" = coffee + oats + shake)
+# logged in one go. Items are entered as a comma/plus-separated list where
+# each piece uses the same serving syntax as a food shortcut ("2x oats").
+_MEAL_MAX_ITEMS = 12
+
+
+def parse_meal_items(text: str) -> list[tuple[int, str]] | None:
+    """Split a meal definition into ``[(servings, normalized_name), ...]``.
+
+    Accepts "coffee, 2x oats, protein shake" or "coffee + oats". Names are
+    normalized but NOT validated — callers must check each against the user's
+    saved foods. Returns None for empty input or over 12 items. Duplicate
+    names merge by summing servings so "coffee, coffee" is ``[(2, "coffee")]``.
+    """
+    if not text or "\n" in text:
+        return None
+    merged: dict[str, int] = {}
+    for piece in re.split(r"[,+]", text):
+        piece = piece.strip()
+        if not piece:
+            continue
+        parsed = parse_food_phrase(piece)
+        if parsed is None:
+            return None
+        servings, name = parsed
+        merged[name] = min(merged.get(name, 0) + servings, 50)
+    if not merged or len(merged) > _MEAL_MAX_ITEMS:
+        return None
+    return [(count, name) for name, count in merged.items()]
+
+
 def format_kcal(kcal: float) -> str:
     """Render a kcal amount the way the bot displays it (whole numbers)."""
     return f"{round(kcal):,} cal"

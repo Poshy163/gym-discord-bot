@@ -12,6 +12,7 @@ Configuration comes from the environment:
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
@@ -99,6 +100,7 @@ def generate(
     max_output_tokens: int | None = None,
     thinking_budget: int | None = None,
     response_mime_type: str | None = None,
+    images: list[tuple[str, bytes]] | None = None,
 ) -> str:
     """Send ``prompt`` to Gemini and return the model's text reply.
 
@@ -107,7 +109,9 @@ def generate(
     let callers shape the response per feature. ``thinking_budget`` opts a
     request into deeper reasoning (flash defaults to 0 = off for latency); set a
     small budget for genuinely analytical tasks. ``response_mime_type`` can be
-    ``"application/json"`` to ask for structured output. Transient failures
+    ``"application/json"`` to ask for structured output. ``images`` attaches
+    inline image parts as ``(mime_type, raw_bytes)`` tuples ahead of the text
+    prompt — used for vision tasks like reading nutrition labels. Transient failures
     (HTTP 429/500/503/504 or transport errors) are retried up to ``retries``
     times (waiting ``GEMINI_RETRY_DELAY`` seconds if set, else an escalating
     backoff). If the primary model is still overloaded after that and
@@ -138,6 +142,7 @@ def generate(
                 temperature=temperature, max_output_tokens=max_output_tokens,
                 thinking_budget=thinking_budget,
                 response_mime_type=response_mime_type,
+                images=images,
             )
         except GeminiError as exc:
             last_exc = exc
@@ -165,6 +170,7 @@ def _call_model(
     max_output_tokens: int | None,
     thinking_budget: int | None,
     response_mime_type: str | None,
+    images: list[tuple[str, bytes]] | None = None,
 ) -> str:
     """Call one model with the retry loop; returns text or raises GeminiError."""
     url = f"{API_ROOT}/models/{mdl}:generateContent"
@@ -184,8 +190,20 @@ def _call_model(
         }
     elif thinking_budget is not None:
         gen_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+    # Image parts go first so the text prompt reads as a question *about* the
+    # attached image(s) — the ordering Google's own docs use for vision.
+    parts: list[dict] = [
+        {
+            "inline_data": {
+                "mime_type": mime,
+                "data": base64.b64encode(blob).decode("ascii"),
+            }
+        }
+        for mime, blob in (images or [])
+    ]
+    parts.append({"text": prompt})
     body: dict = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": gen_config,
     }
     if system:

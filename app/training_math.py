@@ -179,3 +179,53 @@ def project_goal_eta(
     weeks_needed = (target_kg - latest_kg) / rate
     eta = (today + timedelta(weeks=weeks_needed)).date()
     return rate, eta, ""
+
+
+def project_bodyweight_eta(
+    history: list[tuple[datetime, float]], target_kg: float, today: datetime,
+) -> tuple[float | None, date | None, str]:
+    """Estimate when a user's bodyweight will reach ``target_kg``.
+
+    Unlike :func:`project_goal_eta` (lifts only go up), a bodyweight goal can
+    sit above OR below the current weight — cutting and bulking both project.
+    Uses a least-squares slope over the weigh-ins rather than endpoints
+    because daily bodyweight is noisy (water, food in transit).
+
+    Returns ``(kg_per_week, eta_date, reason)`` with the same contract as
+    :func:`project_goal_eta`: rate/eta None plus a short human reason when a
+    projection isn't possible, empty reason on success. The rate is signed
+    (negative = losing).
+    """
+    if not history:
+        return None, None, "no weigh-ins yet — log one with `/bodyweight`"
+    history = sorted(history, key=lambda r: r[0])
+    latest_ts, latest_kg = history[-1]
+    if abs(latest_kg - target_kg) < 0.05:
+        return None, None, "already at target"
+    if len(history) < 2 or latest_ts <= history[0][0]:
+        return None, None, "need at least two dated weigh-ins to project"
+
+    # Least-squares slope in kg/day (same shape as tdee._linreg_slope_per_day,
+    # duplicated to keep both modules dependency-free and independently pure).
+    t0 = history[0][0]
+    xs = [(ts - t0).total_seconds() / 86400.0 for ts, _ in history]
+    ys = [kg for _, kg in history]
+    n = len(history)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom == 0:
+        return None, None, "need at least two dated weigh-ins to project"
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    rate = slope * 7.0
+
+    needed = target_kg - latest_kg   # signed: negative when cutting
+    if rate == 0 or (needed > 0) != (rate > 0):
+        direction = "down" if needed < 0 else "up"
+        return rate, None, f"weight isn't trending {direction} yet — can't project"
+    weeks_needed = needed / rate
+    # A projection years out is noise, not a plan.
+    if weeks_needed > 104:
+        return rate, None, "at the current rate that's over two years away"
+    eta = (today + timedelta(weeks=weeks_needed)).date()
+    return rate, eta, ""

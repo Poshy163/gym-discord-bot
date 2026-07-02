@@ -63,7 +63,9 @@ from .presence import (
     summarize_presence,
 )
 from . import __version__
+from . import ai_food
 from . import calories
+from . import food_lookup
 from . import game_icons
 from . import gemini_client
 from . import hevy_client
@@ -72,6 +74,7 @@ from . import protein as protein_mod
 from . import revo_client
 from . import strava_client
 from . import strava_web
+from . import tdee as tdee_lib
 from . import webui
 
 # Set of all alias phrases (canonical + aliases) the built-in table already
@@ -245,6 +248,19 @@ WEEKLY_REPORT_CHANNEL_ID: int | None = (
 WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "6"))
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
 WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
+
+# Nightly SQLite backups: a consistent snapshot of the whole database written
+# via SQLite's online backup API, named gym-YYYYMMDD.sqlite3. Defaults to a
+# "backups" folder next to the DB (inside the gym-data volume under Docker).
+# BACKUP_KEEP is how many snapshots to retain (oldest pruned); 0 disables the
+# feature entirely. Runs daily at BACKUP_HOUR:BACKUP_MINUTE local time —
+# default 03:30, when nobody is logging.
+BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(
+    os.path.dirname(DB_PATH) or ".", "backups"
+)
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "14"))
+BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))
+BACKUP_MINUTE = int(os.getenv("BACKUP_MINUTE", "30"))
 
 # Bot "accent" colour for embeds.
 EMBED_COLOUR = discord.Colour.from_str("#f26522")
@@ -1688,6 +1704,274 @@ async def _handle_calorie_food_message(
         pass
 
 
+def _match_calorie_meal(
+    message: discord.Message, target: object, content: str,
+) -> tuple[str, list[tuple[int, sqlite3.Row]], list[str]] | None:
+    """If ``content`` is exactly one of ``target``'s saved meals, return
+    ``(display, [(servings, food_row), ...], missing_names)``. Requires the
+    user to be calorie-tracking. Foods deleted since the meal was saved end
+    up in ``missing_names`` so the reply can flag them."""
+    # Same cheap pre-filter as parse_food_phrase: meal names are short single
+    # lines, so don't run DB lookups against paragraphs of chat.
+    if not content or "\n" in content or len(content) > 64:
+        return None
+    guild_id = _msg_guild_id(message)
+    target_id = int(getattr(target, "id"))
+    if db.calorie_goal_get(guild_id, target_id) is None:
+        return None
+    name = calories.normalize_food(content)
+    if not name:
+        return None
+    meal = db.calorie_meal_get(target_id, name)
+    if meal is None:
+        return None
+    display, items = meal
+    resolved: list[tuple[int, sqlite3.Row]] = []
+    missing: list[str] = []
+    for servings, food_name in items:
+        row = db.calorie_food_get(guild_id, target_id, food_name)
+        if row is None:
+            missing.append(food_name)
+        else:
+            resolved.append((servings, row))
+    if not resolved:
+        return None
+    return display, resolved, missing
+
+
+def _meal_totals(
+    items: list[tuple[int, sqlite3.Row]],
+) -> tuple[float, float]:
+    """Sum ``(kcal, protein_g)`` across resolved meal items."""
+    kcal = sum(float(row["kcal"]) * n for n, row in items)
+    grams = sum(
+        float(row["protein_g"]) * n
+        for n, row in items
+        if row["protein_g"] is not None
+    )
+    return kcal, grams
+
+
+async def _handle_calorie_meal_message(
+    message: discord.Message, target: object,
+    display: str, items: list[tuple[int, sqlite3.Row]], missing: list[str],
+    *, logged_at: datetime | None = None,
+) -> None:
+    """Log a saved-meal chat shortcut ("breakfast") as ONE calorie entry (plus
+    one protein entry when tracked), so a single ❌ removes the whole meal.
+    Mirrors :func:`_handle_calorie_food_message`."""
+    guild_id = _msg_guild_id(message)
+    target_id = int(getattr(target, "id"))
+    goal = db.calorie_goal_get(guild_id, target_id)
+    if goal is None:  # pragma: no cover - _match_calorie_meal already checked
+        return
+    kcal, grams = _meal_totals(items)
+    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+        try:
+            await message.reply(
+                f"**{display}** adds up to {calories.format_kcal(kcal)} — "
+                "outside what I'll log in one entry. Check its foods with "
+                "`/calories meal_list`.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    note = f"{display} (meal)"
+    raw = message.content.strip()[:80]
+    try:
+        db.calorie_add(
+            guild_id, target_id, _display_name(target), kcal,
+            note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+        )
+    except Exception:
+        LOG.exception("Failed to store meal entry for user %s", target_id)
+        return
+
+    pro_goal = db.protein_goal_get(guild_id, target_id)
+    logged_protein = False
+    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
+        try:
+            db.protein_add(
+                guild_id, target_id, _display_name(target), grams,
+                note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+            )
+            logged_protein = True
+        except Exception:
+            LOG.exception("Failed to store meal protein for user %s", target_id)
+
+    LOG.info(
+        "Stored meal '%s' (%.0f kcal%s) for %s in #%s",
+        display, kcal, f", {grams:.0f}g protein" if logged_protein else "",
+        target, message.channel,
+    )
+    window = _day_window_for(logged_at)
+    cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
+    suffix = _target_suffix(message.author, target)
+    parts = [f"**{calories.format_kcal(kcal)}**"]
+    if logged_protein:
+        parts.append(f"**{protein_mod.format_grams(grams)}** protein")
+    lines = [
+        f"🥗 Logged {' + '.join(parts)} — {note}{suffix}"
+        f"{_backdate_label(logged_at)}",
+        _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+        + _streak_suffix(_calorie_streak(target_id)),
+    ]
+    if logged_protein:
+        pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
+        lines.append(
+            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+        )
+    if missing:
+        lines.append(
+            f"*(skipped deleted food(s): {', '.join(missing)} — re-save the "
+            "meal with `/calories meal_set`)*"
+        )
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    try:
+        reply = await message.reply("\n".join(lines), mention_author=False)
+    except discord.HTTPException:
+        return
+    try:
+        await reply.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+
+
+# Caps for AI-estimated entries. Estimates are logged like any other entry but
+# marked in the note; a stricter per-entry cap than typed amounts keeps a
+# hallucinated number from wrecking a day's stats.
+_MAX_AI_ESTIMATE_KCAL = 5_000
+
+
+async def _ai_estimate_meal(description: str) -> ai_food.MealEstimate | str:
+    """Run the Gemini meal-estimate prompt off-thread. Returns the estimate or
+    a short user-facing error string."""
+    try:
+        raw = await asyncio.to_thread(
+            gemini_client.generate,
+            f"Estimate this: {description}",
+            system=ai_food.ESTIMATE_SYSTEM,
+            temperature=0.2,           # estimation, not creativity
+            max_output_tokens=200,
+            response_mime_type="application/json",
+        )
+    except gemini_client.GeminiError as exc:
+        return gemini_client.friendly_message(exc)
+    return ai_food.parse_estimate(raw)
+
+
+async def _handle_estimate_message(
+    message: discord.Message, target: object, description: str,
+    *, logged_at: datetime | None = None,
+) -> bool:
+    """Chat AI estimate: `~large big mac meal` → Gemini guesses kcal/protein
+    and logs them. Returns True when the message was consumed (logged or a
+    reply was sent), False to fall through to the other parsers (user not
+    tracking, or AI not configured)."""
+    guild_id = _msg_guild_id(message)
+    target_id = int(getattr(target, "id"))
+    goal = db.calorie_goal_get(guild_id, target_id)
+    if goal is None or not gemini_client.available():
+        return False
+    # Best-effort typing indicator while the AI thinks — never let a missing
+    # permission on it kill the actual estimate.
+    try:
+        await message.channel.typing()
+    except discord.HTTPException:
+        pass
+    result = await _ai_estimate_meal(description)
+    if isinstance(result, str):
+        try:
+            await message.reply(
+                f"🤖 Couldn't estimate that: {result}", mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return True
+    await _log_ai_estimate(message, target, goal, result, logged_at=logged_at)
+    return True
+
+
+async def _log_ai_estimate(
+    message: discord.Message, target: object, goal: sqlite3.Row,
+    est: ai_food.MealEstimate, *, logged_at: datetime | None = None,
+) -> None:
+    """Store an AI meal estimate (calories + protein when tracked) and post
+    the combined reply with the ❌-undo affordance. Chat (`~`) path only —
+    `/calories estimate` has its own interaction-based reply."""
+    guild_id = _msg_guild_id(message)
+    target_id = int(getattr(target, "id"))
+    if not (0 < est.kcal <= _MAX_AI_ESTIMATE_KCAL):
+        try:
+            await message.reply(
+                f"🤖 The AI guessed {calories.format_kcal(est.kcal)} — outside "
+                "what I'll auto-log. Log it manually if it's real.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    label = est.name or "AI estimate"
+    note = f"{label} (AI estimate)"
+    raw = message.content.strip()[:80]
+    try:
+        db.calorie_add(
+            guild_id, target_id, _display_name(target), est.kcal,
+            note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+        )
+    except Exception:
+        LOG.exception("Failed to store AI estimate for user %s", target_id)
+        return
+    pro_goal = db.protein_goal_get(guild_id, target_id)
+    grams = est.protein_g or 0.0
+    logged_protein = False
+    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
+        try:
+            db.protein_add(
+                guild_id, target_id, _display_name(target), grams,
+                note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+            )
+            logged_protein = True
+        except Exception:
+            LOG.exception("Failed to store AI protein for user %s", target_id)
+
+    window = _day_window_for(logged_at)
+    cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
+    suffix = _target_suffix(message.author, target)
+    conf = f" · confidence: {est.confidence}" if est.confidence else ""
+    parts = [f"**{calories.format_kcal(est.kcal)}**"]
+    if logged_protein:
+        parts.append(f"**{protein_mod.format_grams(grams)}** protein")
+    lines = [
+        f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}{suffix}"
+        f"{_backdate_label(logged_at)}",
+        _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+        + _streak_suffix(_calorie_streak(target_id)),
+    ]
+    if logged_protein:
+        pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
+        lines.append(
+            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+        )
+    lines.append("*AI estimate — ❌ to remove, `/calories edit` to correct.*")
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    try:
+        reply = await message.reply("\n".join(lines), mention_author=False)
+    except discord.HTTPException:
+        return
+    try:
+        await reply.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+
+
 def _protein_status_line(total: float, ceiling: float) -> str:
     """Status line for protein vs the daily ceiling. Emphasises going *over*,
     since the tracker exists to avoid overeating protein."""
@@ -2049,6 +2333,17 @@ async def on_ready() -> None:
             DISPLAY_TZ, BODYWEIGHT_REMINDER_CHANNEL_ID,
         )
 
+    if not streak_saver_loop.is_running():
+        streak_saver_loop.start()
+        LOG.info("Streak-saver reminder loop started (15 min cadence)")
+
+    if BACKUP_KEEP > 0 and not db_backup.is_running():
+        db_backup.start()
+        LOG.info(
+            "Nightly DB backup scheduled for %02d:%02d (%s) -> %s (keep %d)",
+            BACKUP_HOUR, BACKUP_MINUTE, _tz_name, BACKUP_DIR, BACKUP_KEEP,
+        )
+
     if DAILY_UPDATE_CHANNEL_ID and not daily_update.is_running():
         daily_update.start()
         LOG.info(
@@ -2232,6 +2527,112 @@ async def bodyweight_reminder() -> None:
 
 @bodyweight_reminder.before_loop
 async def _before_bodyweight_reminder() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=15)
+async def streak_saver_loop() -> None:
+    """DM opted-in users who haven't logged calories by their chosen time.
+
+    Runs every 15 minutes and fires for a user once their local reminder time
+    has passed, at most once per day (``last_sent`` gate). Users who already
+    logged today are marked sent without a DM so the check doesn't repeat all
+    evening. Opt-in via `/calories remind`.
+    """
+    now_local = datetime.now(DISPLAY_TZ)
+    today = now_local.date().isoformat()
+    for row in db.calorie_reminder_list():
+        # Isolate each user: one bad row / closed DM must never take the
+        # whole loop down (tasks.loop stops on an unhandled exception).
+        try:
+            await _streak_saver_check_user(row, now_local, today)
+        except Exception:
+            LOG.exception(
+                "Streak-saver check failed for user %s", row["user_id"],
+            )
+
+
+async def _streak_saver_check_user(
+    row: sqlite3.Row, now_local: datetime, today: str,
+) -> None:
+    """Evaluate one opted-in user and DM them if their nudge is due."""
+    user_id = int(row["user_id"])
+    if row["last_sent"] == today:
+        return
+    due = dtime(hour=int(row["hour"]), minute=int(row["minute"]))
+    if now_local.time() < due:
+        return
+    # Stopped tracking since opting in → quietly skip (prefs kept so
+    # tracking again revives the reminder without another /calories remind).
+    if db.calorie_goal_get(0, user_id) is None:
+        db.calorie_reminder_mark_sent(user_id, today)
+        return
+    _total, n = db.calorie_total_between(0, user_id, *_today_window())
+    if n > 0:
+        db.calorie_reminder_mark_sent(user_id, today)
+        return
+    # Mark before sending: one attempt per day even when the DM bounces
+    # (closed DMs would otherwise retry every 15 minutes all night).
+    db.calorie_reminder_mark_sent(user_id, today)
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            return
+    streak = _calorie_streak(user_id)
+    streak_part = (
+        f"your **{streak}-day** logging streak ends at midnight"
+        if streak >= 2 else "today's diary is still empty"
+    )
+    try:
+        await user.send(
+            f"🔔 Nothing logged yet today — {streak_part}. "
+            "Reply here with e.g. `650c`, a saved food name, or "
+            "`~describe your dinner` and I'll log it. "
+            "(`/calories remind off:true` stops these.)"
+        )
+        LOG.info("Streak-saver DM sent to %s", user_id)
+    except discord.HTTPException:
+        LOG.info("Streak-saver DM to %s failed (DMs closed?)", user_id)
+
+
+@streak_saver_loop.before_loop
+async def _before_streak_saver() -> None:  # pragma: no cover - discord runtime
+    await bot.wait_until_ready()
+
+
+def _backup_time() -> dtime:
+    return _scheduled_time(BACKUP_HOUR, BACKUP_MINUTE)
+
+
+@tasks.loop(time=_backup_time())
+async def db_backup() -> None:
+    """Nightly consistent snapshot of the SQLite DB into BACKUP_DIR.
+
+    Uses the online backup API (safe against the live connection) and prunes
+    to the newest BACKUP_KEEP files. One snapshot per calendar day — re-runs
+    on the same day just overwrite that day's file.
+    """
+    stamp = datetime.now(DISPLAY_TZ).strftime("%Y%m%d")
+    dest = Path(BACKUP_DIR) / f"gym-{stamp}.sqlite3"
+    try:
+        await asyncio.to_thread(db.backup_to, dest)
+    except Exception:
+        LOG.exception("Nightly DB backup failed")
+        return
+    LOG.info("DB backup written: %s", dest)
+    try:
+        snaps = sorted(Path(BACKUP_DIR).glob("gym-*.sqlite3"))
+        for old in snaps[: max(0, len(snaps) - BACKUP_KEEP)]:
+            old.unlink()
+            LOG.info("Pruned old DB backup: %s", old)
+    except OSError:
+        LOG.exception("Backup rotation failed")
+
+
+@db_backup.before_loop
+async def _before_db_backup() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
 
 
@@ -3194,6 +3595,24 @@ async def on_message(message: discord.Message) -> None:
         content, message.created_at.astimezone(DISPLAY_TZ),
     )
 
+    # AI meal estimate: `~large big mac meal` asks Gemini to guess calories
+    # and protein, then logs them. The `~` prefix is an explicit opt-in per
+    # message (a double `~~` is Discord strikethrough, not an estimate), and
+    # the handler falls through silently when the user isn't calorie-tracking
+    # or AI isn't configured.
+    if (
+        nut_content.startswith("~")
+        and not nut_content.startswith("~~")
+        and len(nut_content.lstrip("~ ")) >= 3
+    ):
+        handled = await _handle_estimate_message(
+            message, target, nut_content.lstrip("~ ").strip(),
+            logged_at=nut_dt,
+        )
+        if handled:
+            await bot.process_commands(message)
+            return
+
     # Quick calorie logging path: `650kcal`, `200 cal toastie`, `2700kj`,
     # or `@user 650kcal` to log for someone else. The unit is mandatory
     # (kcal/cal/kj) so plain lift numbers never match this branch.
@@ -3217,6 +3636,20 @@ async def on_message(message: discord.Message) -> None:
     if food_hit is not None:
         await _handle_calorie_food_message(
             message, target, *food_hit, logged_at=food_dt,
+        )
+        await bot.process_commands(message)
+        return
+
+    # Saved-meal shortcut: same idea as foods, but for named bundles
+    # ("breakfast" = coffee + oats + shake) logged as one entry.
+    meal_hit = _match_calorie_meal(message, target, content)
+    meal_dt = None
+    if meal_hit is None and nut_dt is not None:
+        meal_hit = _match_calorie_meal(message, target, nut_content)
+        meal_dt = nut_dt
+    if meal_hit is not None:
+        await _handle_calorie_meal_message(
+            message, target, *meal_hit, logged_at=meal_dt,
         )
         await bot.process_commands(message)
         return
@@ -5376,35 +5809,54 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.add_field(
+    # Second embed: nutrition + integrations. Split so neither embed can
+    # brush Discord's 6 000-char per-embed total as features accumulate.
+    embed2 = discord.Embed(colour=EMBED_COLOUR)
+    embed2.add_field(
         name="🍎 Calories",
         value=(
             "`/calories setup <target>` — set a daily target "
             "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
             "`/calories add <amount> [note]` — log intake "
-            "(`650`, `650c`, `2700kj`, or a saved food like `coffee`)\n"
+            "(`650`, `650c`, `2700kj`, or a saved food)\n"
             "Or just type `650kcal` / `200c` / `2700kj` on its own in chat — "
-            "I'll react ✅ and reply with your running total\n"
-            "Label maths: `0.7x1640kj` logs 0.7 × 1640 kJ — for when the "
-            "label only lists per-100g values and you ate 70g\n"
-            "Add `yesterday` / `monday` / `3 days ago` to backdate, e.g. "
-            "`650kcal yesterday`\n"
-            "`/calories food_set <name> <amount> [protein]` — save a food "
-            "shortcut (optionally with protein), then log it by typing "
-            "`coffee` or `2 coffee` in chat\n"
-            "`/calories food_list` · `/calories food_remove <name>`\n"
+            "I'll react ✅ with your running total\n"
+            "Label maths: `0.7x1640kj` = 0.7 × 1640 kJ (per-100g label, ate "
+            "70g) — same idea for protein: `0.7x43p`\n"
+            "Backdate with `yesterday` / `monday` / `3 days ago`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories edit <amount>` — fix your last entry · "
-            "`/calories undo` — remove it (or react ❌ on the bot's reply)\n"
-            "`/calories leaderboard` — who's on the longest 🔥 logging streak\n"
+            "`/calories undo` — remove it (or react ❌ on my reply)\n"
+            "`/calories leaderboard` — longest 🔥 logging streak\n"
+            "`/calories remind [time]` — evening DM if you haven't logged\n"
+            "`/calories export [user]` — CSVs of calories/protein/bodyweight\n"
             "`/calories stop` — stop tracking (history kept)\n"
-            "Tracking is global — your goal, foods & entries follow you across "
-            "servers + DMs. Tracked members get an AI summary in the Sunday "
-            "`/weekly_report`"
+            "Tracking is global (all servers + DMs); tracked members get an "
+            "AI summary in the Sunday `/weekly_report`"
         ),
         inline=False,
     )
-    embed.add_field(
+    embed2.add_field(
+        name="🧠 Smart food logging",
+        value=(
+            "`/calories food_set <name> <amount> [protein]` — save a food "
+            "shortcut, then log it by typing `coffee` or `2 coffee` in chat\n"
+            "`/calories food_list` · `/calories food_remove <name>`\n"
+            "`/calories meal_set <name> <foods>` — bundle saved foods "
+            "(`breakfast` = `coffee, 2x oats`); log it with one word\n"
+            "`/calories meal_list` · `/calories meal_remove <name>`\n"
+            "`/calories food_lookup <query> [save]` — per-100g values from "
+            "Open Food Facts (name or barcode)\n"
+            "`/calories estimate <description>` — AI-guess calories + protein "
+            "for a described meal, or type `~large big mac meal` in chat\n"
+            "`/calories label <image> [grams]` — read a nutrition-panel "
+            "photo; give grams to log it directly\n"
+            "`/calories tdee [user] [days]` — estimate your real maintenance "
+            "calories from your own logs + weigh-ins"
+        ),
+        inline=False,
+    )
+    embed2.add_field(
         name="🥩 Protein",
         value=(
             "Optional daily-max tracker — flags when you go *over*.\n"
@@ -5430,6 +5882,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "sets someone else's)\n"
             "`/bodyweight_history [user] [limit]` — list past weigh-ins\n"
             "`/bodyweight_graph [user]` — plot a PNG chart of weigh-ins\n"
+            "`/bodyweight_goal [target_kg]` — set a weight goal + projected ETA\n"
             "`/undo` — remove your most recent entry\n"
             "React ❌ on my reply to undo that specific post "
             "(logger or target lifter only)\n"
@@ -5466,7 +5919,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.add_field(
+    embed2.add_field(
         name="🏋️ Revo Fitness",
         value=(
             "`/busy [club]` — live club occupancy\n"
@@ -5484,7 +5937,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         inline=False,
     )
     if not STRAVA_DISABLED:
-        embed.add_field(
+        embed2.add_field(
             name="🏃 Strava",
             value=(
                 "`/strava_link` — link your Strava (workouts auto-post to the feed)\n"
@@ -5495,7 +5948,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             inline=False,
         )
     if _hevy_enabled():
-        embed.add_field(
+        embed2.add_field(
             name="🏋️ Hevy",
             value=(
                 "`/hevy_help` — how it works + how to link\n"
@@ -5507,8 +5960,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             ),
             inline=False,
         )
-    embed.set_footer(text="Weights parsed as kg. Plates assumed 20kg each.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed2.set_footer(text="Weights parsed as kg. Plates assumed 20kg each.")
+    await interaction.response.send_message(
+        embeds=[embed, embed2], ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -7072,6 +7527,107 @@ async def bodyweight_graph_cmd(
         f"⚖️ **{target.display_name} — bodyweight** "
         f"({ys[0]:g}kg → {ys[-1]:g}kg, {sign}{delta:g}kg)",
         file=file,
+    )
+
+
+# Sanity bounds for a bodyweight target — same range the weigh-in parser
+# accepts, so a goal can never sit outside what can actually be logged.
+_BW_GOAL_MIN_KG = 30.0
+_BW_GOAL_MAX_KG = 300.0
+
+# Only weigh-ins this recent feed the trend used for the goal ETA. Older
+# history describes a different phase (bulk vs cut) and would skew the slope.
+_BW_TREND_WINDOW_DAYS = 90
+
+
+def _bodyweight_goal_status(user_id: int, display_name: str) -> str:
+    """Status + ETA text for a user's bodyweight goal (assumes goal exists)."""
+    from .training_math import project_bodyweight_eta
+    goal = db.bodyweight_goal_get(user_id)
+    target_kg = float(goal["target_kg"])
+    latest = db.get_latest_bodyweight(0, user_id)
+    if latest is None:
+        return (
+            f"🎯 Goal: **{target_kg:g} kg** — no weigh-ins yet, so no "
+            "projection. Log one with `/bodyweight` or `bw 82.4` in chat."
+        )
+    latest_kg = float(latest["weight_kg"])
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_BW_TREND_WINDOW_DAYS)
+    history: list[tuple[datetime, float]] = []
+    for row in db.bodyweight_history(0, user_id):
+        dt = datetime.fromisoformat(row["recorded_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt >= cutoff:
+            history.append((dt, float(row["weight_kg"])))
+    rate, eta, reason = project_bodyweight_eta(
+        history, target_kg, datetime.now(DISPLAY_TZ),
+    )
+    to_go = target_kg - latest_kg
+    head = (
+        f"🎯 **{display_name}** — bodyweight goal **{target_kg:g} kg** "
+        f"(currently {latest_kg:g} kg, {to_go:+.1f} kg to go)"
+    )
+    if eta is not None and rate is not None:
+        weeks = max(0.0, (eta - datetime.now(DISPLAY_TZ).date()).days / 7.0)
+        return (
+            f"{head}\nTrend over the last {_BW_TREND_WINDOW_DAYS} days: "
+            f"**{rate:+.2f} kg/week** → on track for about "
+            f"**{eta.strftime('%d %b %Y')}** (~{weeks:.0f} weeks)."
+        )
+    if rate is not None and reason:
+        return f"{head}\nTrend: {rate:+.2f} kg/week — {reason}."
+    return f"{head}\n{reason.capitalize()}." if reason else head
+
+
+@bot.tree.command(
+    name="bodyweight_goal",
+    description="Set a bodyweight target and see your projected ETA from the trend.",
+)
+@app_commands.describe(
+    target_kg="Your goal bodyweight in kg (leave blank to view progress).",
+    remove="Clear your bodyweight goal.",
+)
+async def bodyweight_goal_cmd(
+    interaction: discord.Interaction,
+    target_kg: float | None = None,
+    remove: bool = False,
+) -> None:
+    user_id = interaction.user.id
+    if remove:
+        cleared = db.bodyweight_goal_remove(user_id)
+        await interaction.response.send_message(
+            "🗑️ Bodyweight goal cleared." if cleared
+            else "You didn't have a bodyweight goal set.",
+            ephemeral=True,
+        )
+        return
+    if target_kg is None:
+        if db.bodyweight_goal_get(user_id) is None:
+            await interaction.response.send_message(
+                "No bodyweight goal set — run `/bodyweight_goal "
+                "target_kg:<kg>` to set one.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            _bodyweight_goal_status(user_id, _display_name(interaction.user)),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    if not (_BW_GOAL_MIN_KG <= target_kg <= _BW_GOAL_MAX_KG):
+        await interaction.response.send_message(
+            f"That target needs to be {_BW_GOAL_MIN_KG:g}–"
+            f"{_BW_GOAL_MAX_KG:g} kg.",
+            ephemeral=True,
+        )
+        return
+    db.bodyweight_goal_set(user_id, _display_name(interaction.user), target_kg)
+    await interaction.response.send_message(
+        _bodyweight_goal_status(user_id, _display_name(interaction.user))
+        + "\nCheck back with `/bodyweight_goal` any time — the ETA re-reads "
+        "your latest weigh-ins.",
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -13256,6 +13812,670 @@ async def calories_food_remove_cmd(
         "See `/calories food_list`."
     )
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+@calories_group.command(
+    name="tdee",
+    description="Estimate your maintenance calories from your own logs + weigh-ins.",
+)
+@app_commands.describe(
+    user="The member to analyse (defaults to you).",
+    days="Window to analyse, 14–90 days (default 28).",
+)
+async def calories_tdee_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    days: app_commands.Range[int, 14, 90] = 28,
+) -> None:
+    target_user = user or interaction.user
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
+    goal = db.calorie_goal_get(guild_id, target_user.id)
+    if goal is None:
+        msg = (
+            _CALORIES_NOT_SET_MSG if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking calories."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    now_local = datetime.now(DISPLAY_TZ)
+    start_local = datetime.combine(
+        now_local.date() - timedelta(days=days), dtime.min, tzinfo=DISPLAY_TZ,
+    )
+    start_iso = start_local.astimezone(timezone.utc).isoformat()
+    end_iso = now_local.astimezone(timezone.utc).isoformat()
+
+    weights: list[tuple[datetime, float]] = []
+    for row in db.bodyweight_history(guild_id, target_user.id):
+        dt = datetime.fromisoformat(row["recorded_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt >= start_local.astimezone(timezone.utc):
+            weights.append((dt, float(row["weight_kg"])))
+    day_totals = {
+        date.fromisoformat(k): v
+        for k, v in _calorie_week_days(
+            guild_id, target_user.id, start_iso, end_iso,
+        ).items()
+    }
+
+    est, reason = tdee_lib.estimate_tdee(weights, day_totals)
+    if est is None:
+        await interaction.response.send_message(
+            f"Can't estimate maintenance yet: {reason}.", ephemeral=True,
+        )
+        return
+
+    target_kcal = float(goal["daily_target_kcal"])
+    gap = target_kcal - est.tdee_kcal   # negative = target sits in a deficit
+    projected_kg_wk = gap * 7.0 / tdee_lib.KCAL_PER_KG
+    direction = "below" if gap < 0 else "above"
+    trend = (
+        f"{est.kg_per_week:+.2f} kg/week "
+        f"({est.start_kg:.1f} → {est.end_kg:.1f} kg)"
+    )
+    lines = [
+        f"Based on the last **{est.days_spanned} days**: {est.weighins} "
+        f"weigh-ins, calories logged on {est.logged_days}/"
+        f"{est.days_spanned + 1} days ({est.coverage:.0%}).",
+        f"Average intake: **{calories.format_kcal(est.avg_intake_kcal)}**/day "
+        f"({calories.kcal_to_kj(est.avg_intake_kcal):,.0f} kJ)",
+        f"Weight trend: **{trend}**",
+        "",
+        f"**Estimated maintenance ≈ {calories.format_kcal(est.tdee_kcal)}/day** "
+        f"({calories.kcal_to_kj(est.tdee_kcal):,.0f} kJ)",
+        f"Your target ({calories.format_kcal(target_kcal)}) sits "
+        f"≈ **{calories.format_kcal(abs(gap))} {direction}** maintenance → "
+        f"≈ **{projected_kg_wk:+.2f} kg/week** if you keep hitting it.",
+    ]
+    if est.coverage < 0.8:
+        lines.append(
+            "\n⚠️ Unlogged days in the window make this rougher than it "
+            "could be — log every day for a tighter estimate."
+        )
+    lines.append(
+        "\n*Rule-of-thumb maths (7 700 cal ≈ 1 kg) on your own data — "
+        "water weight and unlogged snacks both move it.*"
+    )
+    embed = discord.Embed(
+        title=f"📐 Maintenance estimate — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@calories_group.command(
+    name="export",
+    description="Download your nutrition history (calories, protein, bodyweight) as CSV.",
+)
+@app_commands.describe(user="Only export this member's data (defaults to you).")
+async def calories_export_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
+    all_time = ("0000-01-01T00:00:00+00:00", "9999-01-01T00:00:00+00:00")
+
+    files: list[discord.File] = []
+    counts: list[str] = []
+
+    cal_rows = db.calorie_entries_between(guild_id, target_user.id, *all_time)
+    if cal_rows:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["logged_at", "kcal", "note", "raw"])
+        for r in cal_rows:
+            w.writerow([r["logged_at"], r["kcal"], r["note"] or "", r["raw"] or ""])
+        files.append(discord.File(
+            io.BytesIO(buf.getvalue().encode("utf-8")), filename="calories.csv",
+        ))
+        counts.append(f"{len(cal_rows)} calorie entries")
+
+    pro_rows = db.protein_entries_between(guild_id, target_user.id, *all_time)
+    if pro_rows:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["logged_at", "grams", "note", "raw"])
+        for r in pro_rows:
+            w.writerow([r["logged_at"], r["grams"], r["note"] or "", r["raw"] or ""])
+        files.append(discord.File(
+            io.BytesIO(buf.getvalue().encode("utf-8")), filename="protein.csv",
+        ))
+        counts.append(f"{len(pro_rows)} protein entries")
+
+    bw_rows = db.bodyweight_history(guild_id, target_user.id)
+    if bw_rows:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["recorded_at", "weight_kg"])
+        for r in bw_rows:
+            w.writerow([r["recorded_at"], r["weight_kg"]])
+        files.append(discord.File(
+            io.BytesIO(buf.getvalue().encode("utf-8")), filename="bodyweight.csv",
+        ))
+        counts.append(f"{len(bw_rows)} weigh-ins")
+
+    if not files:
+        await interaction.response.send_message(
+            f"No nutrition data to export for {target_user.display_name}.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"Exported {', '.join(counts)} for **{target_user.display_name}**.",
+        files=files,
+        ephemeral=True,
+    )
+
+
+@calories_group.command(
+    name="food_lookup",
+    description="Look up a packaged food's per-100g values (Open Food Facts).",
+)
+@app_commands.describe(
+    query="Product name or barcode, e.g. 'vegemite' or '9300650658516'.",
+    save="Optionally save the top result as a food shortcut under this name "
+         "(values are per 100 g).",
+)
+async def calories_food_lookup_cmd(
+    interaction: discord.Interaction, query: str, save: str | None = None,
+) -> None:
+    if not food_lookup.available():
+        await interaction.response.send_message(
+            "Food lookup isn't available on this bot (missing HTTP "
+            "dependency).", ephemeral=True,
+        )
+        return
+    await interaction.response.defer(thinking=True)
+    try:
+        results = await asyncio.to_thread(food_lookup.lookup, query.strip())
+    except food_lookup.FoodLookupError as exc:
+        await interaction.followup.send(f"Lookup failed: {exc}")
+        return
+    if not results:
+        await interaction.followup.send(
+            f"No usable match for **{query.strip()}** on Open Food Facts — "
+            "try a simpler name or the barcode."
+        )
+        return
+
+    top = results[0]
+    title = top.name if top.brand is None else f"{top.name} ({top.brand})"
+    kj = top.kj_per_100g
+    kcal = top.kcal_per_100g
+    if kcal is None and kj is not None:
+        kcal = calories.kj_to_kcal(kj)
+    if kj is None and kcal is not None:
+        kj = calories.kcal_to_kj(kcal)
+    lines = [f"**{title}** — per 100 g:"]
+    if kj is not None:
+        lines.append(f"• Energy: **{kj:,.0f} kJ** ({kcal:,.0f} cal)")
+    if top.protein_per_100g is not None:
+        lines.append(f"• Protein: **{top.protein_per_100g:g} g**")
+    if top.serving_g:
+        lines.append(f"• Stated serving: {top.serving_g:g} g")
+    if kj is not None:
+        example = [f"`0.6x{kj:.0f}kj`"]
+        if top.protein_per_100g is not None:
+            example.append(f"`0.6x{top.protein_per_100g:g}p`")
+        lines.append(
+            f"\nAte 60 g? Log it as {' and '.join(example)} — scale the "
+            "0.6 to your grams ÷ 100."
+        )
+    if len(results) > 1:
+        alts = ", ".join(
+            r.name if r.brand is None else f"{r.name} ({r.brand})"
+            for r in results[1:4]
+        )
+        lines.append(f"\nOther matches: {alts}")
+
+    if save is not None and save.strip():
+        norm = calories.normalize_food(save)
+        if norm and kcal is not None and 0 < kcal <= _MAX_ENTRY_KCAL:
+            db.calorie_food_set(
+                _ctx_guild_id(interaction), interaction.user.id, norm,
+                save.strip(), kcal, top.protein_per_100g,
+            )
+            lines.append(
+                f"\n🍴 Saved **{save.strip()}** = "
+                f"{calories.format_kcal(kcal)} per serving — note the serving "
+                "is **100 g**, so `2 " + norm + "` in chat logs 200 g."
+            )
+        else:
+            lines.append(
+                "\n(Couldn't save it — no usable calorie value on the record.)"
+            )
+    lines.append("\n*Data: Open Food Facts (crowdsourced — sanity-check it).*")
+    await interaction.followup.send(
+        "\n".join(lines), allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@calories_group.command(
+    name="estimate",
+    description="AI-estimate calories + protein for a described meal and log it.",
+)
+@app_commands.describe(
+    description="What you ate, e.g. 'large Big Mac meal' or '2 slices pepperoni pizza'.",
+    day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
+)
+async def calories_estimate_cmd(
+    interaction: discord.Interaction, description: str, day: str | None = None,
+) -> None:
+    guild_id = _ctx_guild_id(interaction)
+    goal = db.calorie_goal_get(guild_id, interaction.user.id)
+    if goal is None:
+        await interaction.response.send_message(
+            _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    if not gemini_client.available():
+        await interaction.response.send_message(
+            "🤖 AI features aren't configured on this bot.", ephemeral=True,
+        )
+        return
+    logged_at, day_ok = _slash_logged_at(day)
+    if not day_ok:
+        await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    result = await _ai_estimate_meal(description.strip())
+    if isinstance(result, str):
+        await interaction.followup.send(f"🤖 Couldn't estimate that: {result}")
+        return
+    if not (0 < result.kcal <= _MAX_AI_ESTIMATE_KCAL):
+        await interaction.followup.send(
+            f"🤖 The AI guessed {calories.format_kcal(result.kcal)} — outside "
+            "what I'll auto-log. Log it manually if it's real."
+        )
+        return
+    label = result.name or description.strip()[:60]
+    note = f"{label} (AI estimate)"
+    db.calorie_add(
+        guild_id, interaction.user.id, _display_name(interaction.user),
+        result.kcal, note=note, raw=description.strip()[:80],
+        logged_at=logged_at,
+    )
+    pro_goal = db.protein_goal_get(guild_id, interaction.user.id)
+    grams = result.protein_g or 0.0
+    logged_protein = False
+    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
+        db.protein_add(
+            guild_id, interaction.user.id, _display_name(interaction.user),
+            grams, note=note, raw=description.strip()[:80], logged_at=logged_at,
+        )
+        logged_protein = True
+    window = _day_window_for(logged_at)
+    total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
+    conf = f" · confidence: {result.confidence}" if result.confidence else ""
+    parts = [f"**{calories.format_kcal(result.kcal)}**"]
+    if logged_protein:
+        parts.append(f"**{protein_mod.format_grams(grams)}** protein")
+    lines = [
+        f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}"
+        f"{_backdate_label(logged_at)}",
+        _calorie_status_line(total, float(goal["daily_target_kcal"])),
+    ]
+    if logged_protein:
+        pro_total, _ = db.protein_total_between(
+            guild_id, interaction.user.id, *window,
+        )
+        lines.append(
+            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+        )
+    lines.append(
+        "*AI estimate — `/calories undo` to remove, `/calories edit` to correct.*"
+    )
+    await interaction.followup.send("\n".join(lines))
+
+
+# Attachment guardrails for /calories label. Discord caps most uploads well
+# under this anyway; the cap protects the Gemini request from huge camera raws.
+_LABEL_MAX_BYTES = 10 * 1024 * 1024
+_LABEL_MIME_OK = ("image/png", "image/jpeg", "image/webp", "image/heic")
+
+
+@calories_group.command(
+    name="label",
+    description="Read a nutrition-panel photo; give grams eaten to log it.",
+)
+@app_commands.describe(
+    image="A photo of the nutrition information panel.",
+    grams="How many grams you ate — leave blank to just read the label.",
+    day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
+)
+async def calories_label_cmd(
+    interaction: discord.Interaction,
+    image: discord.Attachment,
+    grams: app_commands.Range[float, 1, 2000] | None = None,
+    day: str | None = None,
+) -> None:
+    if not gemini_client.available():
+        await interaction.response.send_message(
+            "🤖 AI features aren't configured on this bot.", ephemeral=True,
+        )
+        return
+    guild_id = _ctx_guild_id(interaction)
+    goal = db.calorie_goal_get(guild_id, interaction.user.id)
+    if grams is not None and goal is None:
+        await interaction.response.send_message(
+            _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    logged_at, day_ok = _slash_logged_at(day)
+    if not day_ok:
+        await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
+        return
+    mime = (image.content_type or "").split(";")[0].strip().lower()
+    if mime not in _LABEL_MIME_OK:
+        await interaction.response.send_message(
+            "That doesn't look like a photo — attach a PNG/JPEG/WebP image "
+            "of the nutrition panel.", ephemeral=True,
+        )
+        return
+    if image.size > _LABEL_MAX_BYTES:
+        await interaction.response.send_message(
+            "That image is over 10 MB — crop it to just the panel and retry.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    try:
+        blob = await image.read()
+    except discord.HTTPException:
+        await interaction.followup.send("Couldn't download that attachment.")
+        return
+    try:
+        raw = await asyncio.to_thread(
+            gemini_client.generate,
+            "Read the nutrition information panel in this photo.",
+            system=ai_food.LABEL_SYSTEM,
+            temperature=0.1,           # transcription, not creativity
+            max_output_tokens=300,
+            response_mime_type="application/json",
+            images=[(mime, blob)],
+        )
+    except gemini_client.GeminiError as exc:
+        await interaction.followup.send(gemini_client.friendly_message(exc))
+        return
+    info = ai_food.parse_label(raw)
+    if isinstance(info, str):
+        await interaction.followup.send(f"🤖 {info} — try a straighter photo.")
+        return
+
+    kj100 = info.kj_per_100g
+    kcal100 = info.kcal_per_100g
+    if kcal100 is None and kj100 is not None:
+        kcal100 = calories.kj_to_kcal(kj100)
+    if kj100 is None and kcal100 is not None:
+        kj100 = calories.kcal_to_kj(kcal100)
+    name = info.name or "that label"
+    lines = [f"🏷️ **{name}** — per 100 g:"]
+    if kj100 is not None:
+        lines.append(f"• Energy: **{kj100:,.0f} kJ** ({kcal100:,.0f} cal)")
+    if info.protein_per_100g is not None:
+        lines.append(f"• Protein: **{info.protein_per_100g:g} g**")
+    if info.serving_g:
+        lines.append(f"• Stated serving: {info.serving_g:g} g")
+
+    if grams is None or kcal100 is None:
+        if kj100 is not None:
+            lines.append(
+                f"\nTo log it: re-run with `grams:`, or use the chat maths — "
+                f"e.g. `0.6x{kj100:.0f}kj` for 60 g (your grams ÷ 100)."
+            )
+        lines.append("\n*Read by AI — double-check against the label.*")
+        await interaction.followup.send("\n".join(lines))
+        return
+
+    scale = float(grams) / 100.0
+    kcal = kcal100 * scale
+    if not (0 < kcal <= _MAX_ENTRY_KCAL):
+        await interaction.followup.send(
+            "\n".join(lines)
+            + f"\n\nThat works out to {calories.format_kcal(kcal)} — outside "
+            "what I'll log in one entry, so nothing was stored."
+        )
+        return
+    note = f"{name} ({grams:g} g, label)" if info.name else f"label ({grams:g} g)"
+    db.calorie_add(
+        guild_id, interaction.user.id, _display_name(interaction.user), kcal,
+        note=note, raw=f"label {grams:g}g", logged_at=logged_at,
+    )
+    pro_goal = db.protein_goal_get(guild_id, interaction.user.id)
+    pro_grams = (
+        info.protein_per_100g * scale
+        if info.protein_per_100g is not None else 0.0
+    )
+    logged_protein = False
+    if pro_goal is not None and 0 < pro_grams <= _MAX_PROTEIN_ENTRY_G:
+        db.protein_add(
+            guild_id, interaction.user.id, _display_name(interaction.user),
+            pro_grams, note=note, raw=f"label {grams:g}g", logged_at=logged_at,
+        )
+        logged_protein = True
+    window = _day_window_for(logged_at)
+    total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
+    parts = [f"**{calories.format_kcal(kcal)}**"]
+    if logged_protein:
+        parts.append(f"**{protein_mod.format_grams(pro_grams)}** protein")
+    lines.append(
+        f"\n🍽️ Logged {' + '.join(parts)} for **{grams:g} g**"
+        f"{_backdate_label(logged_at)}"
+    )
+    lines.append(_calorie_status_line(total, float(goal["daily_target_kcal"])))
+    if logged_protein:
+        pro_total, _ = db.protein_total_between(
+            guild_id, interaction.user.id, *window,
+        )
+        lines.append(
+            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+        )
+    lines.append(
+        "*Read by AI — `/calories undo` if it misread the label.*"
+    )
+    await interaction.followup.send("\n".join(lines))
+
+
+@calories_group.command(
+    name="meal_set",
+    description="Bundle saved foods into a meal you can log with one word.",
+)
+@app_commands.describe(
+    name="Meal name, e.g. breakfast.",
+    foods='Comma-separated saved foods, e.g. "coffee, 2x oats, protein shake".',
+)
+async def calories_meal_set_cmd(
+    interaction: discord.Interaction, name: str, foods: str,
+) -> None:
+    norm = calories.normalize_food(name)
+    if not norm:
+        await interaction.response.send_message(
+            "Give the meal a name, e.g. `/calories meal_set breakfast "
+            "coffee, oats`.", ephemeral=True,
+        )
+        return
+    guild_id = _ctx_guild_id(interaction)
+    if db.calorie_food_get(guild_id, interaction.user.id, norm) is not None:
+        await interaction.response.send_message(
+            f"You already have a saved *food* called **{name.strip()}** — "
+            "pick a different meal name so chat logging stays unambiguous.",
+            ephemeral=True,
+        )
+        return
+    items = calories.parse_meal_items(foods)
+    if items is None:
+        await interaction.response.send_message(
+            "Couldn't read that list — use comma-separated saved foods like "
+            "`coffee, 2x oats, protein shake` (max 12).", ephemeral=True,
+        )
+        return
+    resolved: list[tuple[int, sqlite3.Row]] = []
+    unknown: list[str] = []
+    for servings, food_name in items:
+        row = db.calorie_food_get(guild_id, interaction.user.id, food_name)
+        if row is None:
+            unknown.append(food_name)
+        else:
+            resolved.append((servings, row))
+    if unknown:
+        await interaction.response.send_message(
+            f"Not saved food(s): **{', '.join(unknown)}** — define them with "
+            "`/calories food_set` first (see `/calories food_list`).",
+            ephemeral=True,
+        )
+        return
+    db.calorie_meal_set(interaction.user.id, norm, name.strip(), items)
+    kcal, grams = _meal_totals(resolved)
+    macro = calories.format_kcal(kcal)
+    if grams > 0:
+        macro += f" + {protein_mod.format_grams(grams)} protein"
+    pieces = ", ".join(
+        (f"{n}× " if n > 1 else "") + row["display"] for n, row in resolved
+    )
+    await interaction.response.send_message(
+        f"🥗 Saved meal **{name.strip()}** = {pieces} ({macro} right now — "
+        f"it re-reads the foods each time you log it).\n"
+        f"Log it by typing `{norm}` in chat."
+    )
+
+
+@calories_group.command(
+    name="meal_list", description="List your saved meals.",
+)
+async def calories_meal_list_cmd(interaction: discord.Interaction) -> None:
+    rows = db.calorie_meal_list(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(
+            "You haven't saved any meals yet. Bundle saved foods with "
+            "`/calories meal_set <name> <foods>`.", ephemeral=True,
+        )
+        return
+    guild_id = _ctx_guild_id(interaction)
+    lines = []
+    for r in rows:
+        meal = db.calorie_meal_get(interaction.user.id, r["name"])
+        if meal is None:
+            continue
+        _display, items = meal
+        resolved = []
+        missing = 0
+        for servings, food_name in items:
+            food = db.calorie_food_get(guild_id, interaction.user.id, food_name)
+            if food is None:
+                missing += 1
+            else:
+                resolved.append((servings, food))
+        kcal, grams = _meal_totals(resolved)
+        macro = calories.format_kcal(kcal)
+        if grams > 0:
+            macro += f" · {protein_mod.format_grams(grams)} protein"
+        pieces = ", ".join(
+            (f"{n}× " if n > 1 else "") + food["display"]
+            for n, food in resolved
+        )
+        line = f"• **{r['display']}** — {pieces} ({macro})"
+        if missing:
+            line += f" ⚠️ {missing} deleted food(s)"
+        lines.append(line)
+    embed = discord.Embed(
+        title="🥗 Your saved meals",
+        description="\n".join(lines)[:4000],
+        colour=EMBED_COLOUR,
+    )
+    embed.set_footer(text="Log one by typing its name in chat, e.g. breakfast")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@calories_group.command(
+    name="meal_remove", description="Delete one of your saved meals.",
+)
+@app_commands.describe(name="The saved meal to remove.")
+async def calories_meal_remove_cmd(
+    interaction: discord.Interaction, name: str,
+) -> None:
+    norm = calories.normalize_food(name)
+    removed = db.calorie_meal_remove(interaction.user.id, norm)
+    msg = (
+        f"🗑️ Removed meal **{name.strip()}**." if removed
+        else f"No saved meal called **{name.strip()}**. "
+        "See `/calories meal_list`."
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+def _parse_hhmm(text: str) -> tuple[int, int] | None:
+    """Parse a reminder time: '20:30', '8pm', '8:30pm', '20'. None if bad."""
+    m = re.match(
+        r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", text, re.IGNORECASE,
+    )
+    if m is None:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    ampm = (m.group(3) or "").lower()
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+@calories_group.command(
+    name="remind",
+    description="Evening DM if you haven't logged calories that day (streak saver).",
+)
+@app_commands.describe(
+    time='When to nudge you, e.g. "20:30" or "8pm" (default 20:00, bot-local time).',
+    off="Turn the reminder off.",
+)
+async def calories_remind_cmd(
+    interaction: discord.Interaction,
+    time: str | None = None,
+    off: bool = False,
+) -> None:
+    if off:
+        removed = db.calorie_reminder_remove(interaction.user.id)
+        await interaction.response.send_message(
+            "🔕 Streak-saver reminder off." if removed
+            else "You didn't have a reminder set.",
+            ephemeral=True,
+        )
+        return
+    guild_id = _ctx_guild_id(interaction)
+    if db.calorie_goal_get(guild_id, interaction.user.id) is None:
+        await interaction.response.send_message(
+            _CALORIES_NOT_SET_MSG, ephemeral=True,
+        )
+        return
+    hhmm = _parse_hhmm(time) if time is not None else (20, 0)
+    if hhmm is None:
+        await interaction.response.send_message(
+            "Couldn't read that time — try `20:30` or `8pm`.", ephemeral=True,
+        )
+        return
+    hour, minute = hhmm
+    db.calorie_reminder_set(interaction.user.id, hour, minute)
+    await interaction.response.send_message(
+        f"🔔 Streak saver on — if you haven't logged anything by "
+        f"**{hour:02d}:{minute:02d}** ({_tz_name}) I'll DM you a nudge. "
+        "Make sure DMs from this server are open. `/calories remind off:true` "
+        "turns it off.",
+        ephemeral=True,
+    )
 
 
 bot.tree.add_command(calories_group)

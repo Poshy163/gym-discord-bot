@@ -605,3 +605,72 @@ def test_calorie_logged_days_distinct(db):
     assert sorted(days) == ["2026-06-01", "2026-06-03"]
     # Out-of-window entries don't count.
     assert db.calorie_logged_days(1, 100, "2026-06-02", "2026-06-03") == []
+
+
+# ---- parse_meal_items -------------------------------------------------------
+
+def test_parse_meal_items_basic():
+    from app.calories import parse_meal_items
+    assert parse_meal_items("coffee, 2x oats, protein shake") == [
+        (1, "coffee"), (2, "oats"), (1, "protein shake"),
+    ]
+    assert parse_meal_items("coffee + oats") == [(1, "coffee"), (1, "oats")]
+    assert parse_meal_items("Coffee") == [(1, "coffee")]
+
+
+def test_parse_meal_items_merges_duplicates():
+    from app.calories import parse_meal_items
+    assert parse_meal_items("coffee, coffee") == [(2, "coffee")]
+    assert parse_meal_items("2 coffee, coffee x3") == [(5, "coffee")]
+
+
+def test_parse_meal_items_rejects_bad_input():
+    from app.calories import parse_meal_items
+    assert parse_meal_items("") is None
+    assert parse_meal_items("a, b\nc") is None
+    assert parse_meal_items(", ,") is None
+    # Over the 12-item cap.
+    too_many = ", ".join(f"food{i}" for i in range(13))
+    assert parse_meal_items(too_many) is None
+
+
+# ---- saved meals + reminder prefs (DB) --------------------------------------
+
+def test_calorie_meal_set_get_roundtrip(db):
+    db.calorie_meal_set(100, "breakfast", "Breakfast", [(1, "coffee"), (2, "oats")])
+    got = db.calorie_meal_get(100, "breakfast")
+    assert got is not None
+    display, items = got
+    assert display == "Breakfast"
+    assert items == [(1, "coffee"), (2, "oats")]
+    # Upsert replaces items.
+    db.calorie_meal_set(100, "breakfast", "breakfast", [(1, "coffee")])
+    assert db.calorie_meal_get(100, "breakfast") == ("breakfast", [(1, "coffee")])
+    # Scoped per user.
+    assert db.calorie_meal_get(999, "breakfast") is None
+
+
+def test_calorie_meal_list_and_remove(db):
+    db.calorie_meal_set(100, "breakfast", "Breakfast", [(1, "coffee")])
+    db.calorie_meal_set(100, "arvo snack", "Arvo Snack", [(1, "shake")])
+    names = [r["name"] for r in db.calorie_meal_list(100)]
+    assert names == ["arvo snack", "breakfast"]  # alphabetical by display
+    assert db.calorie_meal_remove(100, "breakfast") is True
+    assert db.calorie_meal_remove(100, "breakfast") is False
+    assert [r["name"] for r in db.calorie_meal_list(100)] == ["arvo snack"]
+
+
+def test_calorie_reminder_prefs_roundtrip(db):
+    assert db.calorie_reminder_get(100) is None
+    db.calorie_reminder_set(100, 20, 30)
+    row = db.calorie_reminder_get(100)
+    assert (row["hour"], row["minute"], row["last_sent"]) == (20, 30, None)
+    db.calorie_reminder_mark_sent(100, "2026-07-02")
+    assert db.calorie_reminder_get(100)["last_sent"] == "2026-07-02"
+    # Re-setting the time re-arms (clears last_sent).
+    db.calorie_reminder_set(100, 21, 0)
+    assert db.calorie_reminder_get(100)["last_sent"] is None
+    assert len(db.calorie_reminder_list()) == 1
+    assert db.calorie_reminder_remove(100) is True
+    assert db.calorie_reminder_remove(100) is False
+    assert db.calorie_reminder_list() == []

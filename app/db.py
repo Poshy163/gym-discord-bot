@@ -293,6 +293,40 @@ CREATE TABLE IF NOT EXISTS calorie_foods (
     PRIMARY KEY (guild_id, user_id, name)
 );
 
+-- Saved meals: a named bundle of saved foods ("breakfast" = coffee + oats)
+-- logged in one go. ``items`` is a JSON array of [servings, food_name] pairs
+-- resolved against calorie_foods at log time, so editing a food updates every
+-- meal that includes it. Per-user and global (shared across servers + DMs),
+-- matching saved foods.
+CREATE TABLE IF NOT EXISTS calorie_meals (
+    user_id INTEGER NOT NULL,
+    name    TEXT    NOT NULL,
+    display TEXT    NOT NULL,
+    items   TEXT    NOT NULL,
+    set_at  TEXT    NOT NULL,
+    PRIMARY KEY (user_id, name)
+);
+
+-- Streak-saver reminders: opt-in evening DM when nothing has been logged that
+-- day. ``hour``/``minute`` are in DISPLAY_TIMEZONE; ``last_sent`` is the local
+-- YYYY-MM-DD the last nudge went out (one per day max). Global per user.
+CREATE TABLE IF NOT EXISTS calorie_reminder_prefs (
+    user_id    INTEGER PRIMARY KEY,
+    hour       INTEGER NOT NULL DEFAULT 20,
+    minute     INTEGER NOT NULL DEFAULT 0,
+    last_sent  TEXT,
+    updated_at TEXT    NOT NULL
+);
+
+-- Personal bodyweight target (kg). Global per user like bodyweights — cutting
+-- and bulking goals both make sense, so no direction is implied.
+CREATE TABLE IF NOT EXISTS bodyweight_goals (
+    user_id   INTEGER PRIMARY KEY,
+    username  TEXT    NOT NULL,
+    target_kg REAL    NOT NULL,
+    set_at    TEXT    NOT NULL
+);
+
 -- Optional protein tracker (grams). ``protein_goals`` holds each user's daily
 -- *ceiling* (the feature is about not overeating protein), and a row here is
 -- what marks a user as protein-tracking. ``protein_entries`` is one row per
@@ -855,6 +889,26 @@ class Database:
                 self._connection.close()
             except sqlite3.Error:
                 pass
+
+    def backup_to(self, dest_path: str | Path) -> None:
+        """Write a consistent snapshot of the database to ``dest_path``.
+
+        Uses SQLite's online backup API, which is safe against the live WAL
+        connection (readers/writers keep flowing; the copy is transactionally
+        consistent). Writes to a ``.tmp`` sibling first and renames into place
+        so a crash mid-copy never leaves a truncated file that looks like a
+        valid backup.
+        """
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        with self._lock:
+            target = sqlite3.connect(str(tmp))
+            try:
+                self._connection.backup(target)
+            finally:
+                target.close()
+        tmp.replace(dest)
 
     @contextmanager
     def _conn(self):
@@ -4192,6 +4246,154 @@ class Database:
         for r in rows:
             seen.setdefault(r["name"], r)
         return sorted(seen.values(), key=lambda r: (r["display"] or "").lower())
+
+    # ---- saved meals (bundles of saved foods) ------------------------------
+
+    def calorie_meal_set(
+        self, user_id: int, name: str, display: str,
+        items: list[tuple[int, str]],
+    ) -> None:
+        """Create or update a saved meal. ``name`` must already be normalized;
+        ``items`` is [(servings, normalized_food_name), ...] — validated by
+        the caller against the user's saved foods. Global per user."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO calorie_meals (user_id, name, display, items, set_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (user_id, name) DO UPDATE SET "
+                "display = excluded.display, items = excluded.items, "
+                "set_at = excluded.set_at",
+                (
+                    user_id, name, display,
+                    json.dumps([[int(n), s] for n, s in items]),
+                    _normalize_iso(None),
+                ),
+            )
+
+    def calorie_meal_get(
+        self, user_id: int, name: str,
+    ) -> tuple[str, list[tuple[int, str]]] | None:
+        """Return ``(display, items)`` for a saved meal, or None. Items whose
+        JSON doesn't decode cleanly are dropped rather than crashing the
+        caller (the row can only get that way via manual DB edits)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT display, items FROM calorie_meals "
+                "WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["items"])
+            items = [
+                (int(pair[0]), str(pair[1]))
+                for pair in raw
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ]
+        except (ValueError, TypeError):
+            return None
+        return (row["display"], items) if items else None
+
+    def calorie_meal_remove(self, user_id: int, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_meals WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def calorie_meal_list(self, user_id: int) -> list[sqlite3.Row]:
+        """All of a user's saved meals, alphabetical by display name."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT name, display, items FROM calorie_meals "
+                "WHERE user_id = ? ORDER BY LOWER(display)",
+                (user_id,),
+            ).fetchall()
+
+    # ---- streak-saver reminder prefs ---------------------------------------
+
+    def calorie_reminder_set(
+        self, user_id: int, hour: int, minute: int = 0,
+    ) -> None:
+        """Opt a user into the evening streak-saver DM at hour:minute local
+        (DISPLAY_TIMEZONE). Re-setting updates the time and re-arms today."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO calorie_reminder_prefs "
+                "(user_id, hour, minute, last_sent, updated_at) "
+                "VALUES (?, ?, ?, NULL, ?) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "hour = excluded.hour, minute = excluded.minute, "
+                "last_sent = NULL, updated_at = excluded.updated_at",
+                (user_id, int(hour), int(minute), _normalize_iso(None)),
+            )
+
+    def calorie_reminder_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT user_id, hour, minute, last_sent "
+                "FROM calorie_reminder_prefs WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+    def calorie_reminder_remove(self, user_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_reminder_prefs WHERE user_id = ?",
+                (user_id,),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def calorie_reminder_list(self) -> list[sqlite3.Row]:
+        """Everyone opted into the streak-saver, for the reminder loop."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT user_id, hour, minute, last_sent "
+                "FROM calorie_reminder_prefs",
+            ).fetchall()
+
+    def calorie_reminder_mark_sent(self, user_id: int, day: str) -> None:
+        """Record that today's nudge went out (``day`` is local YYYY-MM-DD)."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE calorie_reminder_prefs SET last_sent = ? "
+                "WHERE user_id = ?",
+                (day, user_id),
+            )
+
+    # ---- bodyweight goals ---------------------------------------------------
+
+    def bodyweight_goal_set(
+        self, user_id: int, username: str, target_kg: float,
+    ) -> None:
+        """Set (or move) a user's bodyweight target. Global like bodyweights."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO bodyweight_goals (user_id, username, target_kg, set_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "username = excluded.username, target_kg = excluded.target_kg, "
+                "set_at = excluded.set_at",
+                (user_id, username, float(target_kg), _normalize_iso(None)),
+            )
+
+    def bodyweight_goal_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT user_id, username, target_kg, set_at "
+                "FROM bodyweight_goals WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+    def bodyweight_goal_remove(self, user_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM bodyweight_goals WHERE user_id = ?",
+                (user_id,),
+            )
+            return (cur.rowcount or 0) > 0
 
     # ====================================================================
     # Web dashboard: audit log, member/role mirror, and editing helpers.

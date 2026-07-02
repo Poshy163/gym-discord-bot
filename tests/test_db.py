@@ -543,3 +543,50 @@ def test_bodyweight_history_returns_oldest_first_and_global(db):
 
     # Empty for users with no entries.
     assert db.bodyweight_history(1, 12345) == []
+
+
+# ---------------------------------------------------------------------------
+# Bodyweight goals
+# ---------------------------------------------------------------------------
+
+
+def test_bodyweight_goal_roundtrip(db):
+    assert db.bodyweight_goal_get(100) is None
+    db.bodyweight_goal_set(100, "alice", 82.5)
+    row = db.bodyweight_goal_get(100)
+    assert float(row["target_kg"]) == 82.5
+    assert row["username"] == "alice"
+    # Upsert moves the target.
+    db.bodyweight_goal_set(100, "alice", 80.0)
+    assert float(db.bodyweight_goal_get(100)["target_kg"]) == 80.0
+    # Per-user, not shared.
+    assert db.bodyweight_goal_get(999) is None
+    assert db.bodyweight_goal_remove(100) is True
+    assert db.bodyweight_goal_remove(100) is False
+    assert db.bodyweight_goal_get(100) is None
+
+
+# ---------------------------------------------------------------------------
+# Online backup
+# ---------------------------------------------------------------------------
+
+
+def test_backup_to_produces_consistent_copy(db, tmp_path):
+    db.set_bodyweight(1, 100, 84.0)
+    db.calorie_goal_set(1, 100, "alice", 2500)
+    dest = tmp_path / "backups" / "gym-20260702.sqlite3"
+    db.backup_to(dest)          # parent dir is created automatically
+    assert dest.exists()
+    assert not dest.with_suffix(dest.suffix + ".tmp").exists()
+
+    # The snapshot opens as a standalone DB with the data present.
+    copy = Database(dest)
+    try:
+        assert copy.get_latest_bodyweight(1, 100) is not None
+        assert copy.calorie_goal_get(1, 100) is not None
+    finally:
+        copy.close()
+
+    # Re-running overwrites the same file without error (same-day re-backup).
+    db.backup_to(dest)
+    assert dest.exists()

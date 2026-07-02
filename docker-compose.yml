@@ -18,6 +18,10 @@ services:
       - "8081:8081"
     volumes:
       - gym-data:/data
+    # Nightly SQLite snapshots (BACKUP_* env vars) land in /data/backups inside
+    # this volume — surviving container rebuilds. For real disaster recovery,
+    # bind-mount that path to the host or sync it off-box, e.g.:
+    #   - ./backups:/data/backups
     # The bot has no HTTP surface, so health is "can we still open the SQLite
     # store?". Cheap and detects volume / disk issues early.
     healthcheck:
