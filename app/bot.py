@@ -22,13 +22,9 @@ import sqlite3
 import tempfile
 import threading
 from calendar import monthrange
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - py<3.9 fallback
-    ZoneInfo = None  # type: ignore[assignment]
 
 import discord
 from discord import app_commands
@@ -43,7 +39,7 @@ from .aliases import (
     normalize_token,
 )
 
-from .db import Database
+from .db import KEEP, Database
 from .graphing import daily_best_points, running_best_values
 from .message_targeting import strip_leading_user_mention
 from .overview import lift_overview
@@ -72,6 +68,7 @@ from . import hevy_client
 from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
+from . import targets as targets_mod
 from . import strava_client
 from . import strava_web
 from . import tdee as tdee_lib
@@ -183,16 +180,11 @@ ADMIN_USER_IDS: set[int] = {
 
 # Timezone used when rendering dates in user-facing messages. Defaults to
 # Australia/Adelaide (the author's crew). Falls back to UTC if zoneinfo isn't
-# available or the name is invalid.
-_tz_name = os.getenv("DISPLAY_TIMEZONE", "Australia/Adelaide").strip() or "UTC"
-if ZoneInfo is not None:
-    try:
-        DISPLAY_TZ = ZoneInfo(_tz_name)
-    except Exception:  # pragma: no cover - bad tz name
-        LOG.warning("Unknown DISPLAY_TIMEZONE=%r, falling back to UTC", _tz_name)
-        DISPLAY_TZ = timezone.utc
-else:  # pragma: no cover
-    DISPLAY_TZ = timezone.utc
+# available or the name is invalid. Owned by app.targets, which needs it to know
+# when a local Saturday starts; re-exported because most of the bot (and the
+# reminder/backup schedulers) reach for these names.
+DISPLAY_TZ = targets_mod.DISPLAY_TZ
+_tz_name = targets_mod.TZ_NAME
 
 # Weekly reminder: posts a "drop your current bests" nudge on a schedule.
 # REMINDER_CHANNEL_ID is required to enable it. Day/hour default to
@@ -639,6 +631,69 @@ def _day_window_for(dt_utc: datetime | None) -> tuple[str, str]:
         start_local.astimezone(timezone.utc).isoformat(),
         end_local.astimezone(timezone.utc).isoformat(),
     )
+
+
+def _band_targets(
+    user_id: int,
+) -> tuple[targets_mod.Resolved, targets_mod.Resolved]:
+    """``(weekday, weekend)`` targets as the rules currently stand.
+
+    Resolved against the next day of each kind rather than today, so the preview
+    reflects rules that only start applying later (an edit made today, or a
+    scheduled change) instead of the ones today happens to sit under.
+    """
+    rows = db.nutrition_target_rows(user_id)
+    today = targets_mod.local_today()
+    days = [today + timedelta(days=n) for n in range(7)]
+    weekday = next(d for d in days if not targets_mod.is_weekend(d))
+    weekend = next(d for d in days if targets_mod.is_weekend(d))
+    return targets_mod.resolve(rows, weekday), targets_mod.resolve(rows, weekend)
+
+
+def _band_breakdown_lines(
+    day_totals: dict[str, float],
+    day_targets: dict[date, targets_mod.Resolved],
+    fmt, macro: str, noun: str = "target",
+) -> list[str]:
+    """Weekday-vs-weekend averages for a week grid.
+
+    Empty unless the user actually runs a split — for one all-week target the
+    two rows would just restate the overall average twice.
+    """
+    if not any(r.macro(macro).split for r in day_targets.values()):
+        return []
+    intake = {
+        day: day_totals[day.isoformat()]
+        for day in day_targets if day.isoformat() in day_totals
+    }
+    stats = targets_mod.band_stats(intake, day_targets, macro)
+    lines = []
+    for band in ("weekday", "weekend"):
+        s = stats.get(band)
+        if s is None:
+            continue
+        vs = f" vs {fmt(s.avg_target)}" if s.avg_target is not None else ""
+        adherence = (
+            f" · {s.adherence:.0%} of {noun}" if s.adherence is not None else ""
+        )
+        lines.append(
+            f"`{band.title():8}` {s.days}d · avg {fmt(s.avg_intake)}"
+            f"{vs}{adherence}"
+        )
+    return lines
+
+
+def _targets_on(
+    user_id: int, logged_at: datetime | None = None,
+) -> targets_mod.Resolved:
+    """The user's calorie/protein targets for the local day ``logged_at`` falls
+    on — today when it's None.
+
+    Always resolve against the day an entry belongs to, never today: logging
+    ``200c yesterday`` on a Monday has to score that entry against Sunday's
+    weekend target, not Monday's.
+    """
+    return db.nutrition_targets_on(user_id, targets_mod.local_day_of(logged_at))
 
 
 def _backdate_label(logged_at: datetime | None) -> str:
@@ -1482,7 +1537,7 @@ async def _reply_calorie_logged(
         reply = await message.reply(
             f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
             f"{_backdate_label(logged_at)}\n"
-            + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+            + _calorie_status_for(target_id, total, logged_at)
             + _streak_suffix(_calorie_streak(target_id)),
             mention_author=False,
         )
@@ -1680,6 +1735,10 @@ async def _handle_calorie_food_message(
     window = _day_window_for(logged_at)
     cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
     pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
+    day_targets = _reply_targets(target_id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=True, protein=logged_protein,
+    )
     suffix = _target_suffix(message.author, target)
     try:
         await message.add_reaction("✅")
@@ -1690,10 +1749,12 @@ async def _handle_calorie_food_message(
             f"🥗 Logged **{calories.format_kcal(kcal)}** + "
             f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}"
             f"{_backdate_label(logged_at)}\n"
-            + _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+            + _calorie_status_line(cal_total, day_targets.kcal.value or 0.0)
             + _streak_suffix(_calorie_streak(target_id))
             + "\n"
-            + _protein_status_line(pro_total, float(pro_goal["daily_target_g"])),
+            + _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            ),
             mention_author=False,
         )
     except discord.HTTPException:
@@ -1807,6 +1868,10 @@ async def _handle_calorie_meal_message(
     )
     window = _day_window_for(logged_at)
     cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
+    day_targets = _reply_targets(target_id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=True, protein=logged_protein,
+    )
     suffix = _target_suffix(message.author, target)
     parts = [f"**{calories.format_kcal(kcal)}**"]
     if logged_protein:
@@ -1814,13 +1879,18 @@ async def _handle_calorie_meal_message(
     lines = [
         f"🥗 Logged {' + '.join(parts)} — {note}{suffix}"
         f"{_backdate_label(logged_at)}",
-        _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+        _calorie_status_line(
+            cal_total, day_targets.kcal.value or 0.0,
+            None if logged_protein else day_label,
+        )
         + _streak_suffix(_calorie_streak(target_id)),
     ]
     if logged_protein:
         pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
         lines.append(
-            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+            _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            )
         )
     if missing:
         lines.append(
@@ -1941,6 +2011,10 @@ async def _log_ai_estimate(
 
     window = _day_window_for(logged_at)
     cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
+    day_targets = _reply_targets(target_id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=True, protein=logged_protein,
+    )
     suffix = _target_suffix(message.author, target)
     conf = f" · confidence: {est.confidence}" if est.confidence else ""
     parts = [f"**{calories.format_kcal(est.kcal)}**"]
@@ -1949,13 +2023,18 @@ async def _log_ai_estimate(
     lines = [
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}{suffix}"
         f"{_backdate_label(logged_at)}",
-        _calorie_status_line(cal_total, float(goal["daily_target_kcal"]))
+        _calorie_status_line(
+            cal_total, day_targets.kcal.value or 0.0,
+            None if logged_protein else day_label,
+        )
         + _streak_suffix(_calorie_streak(target_id)),
     ]
     if logged_protein:
         pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
         lines.append(
-            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+            _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            )
         )
     lines.append("*AI estimate — ❌ to remove, `/calories edit` to correct.*")
     try:
@@ -1972,7 +2051,9 @@ async def _log_ai_estimate(
         pass
 
 
-def _protein_status_line(total: float, ceiling: float) -> str:
+def _protein_status_line(
+    total: float, ceiling: float, label: str | None = None,
+) -> str:
     """Status line for protein vs the daily ceiling. Emphasises going *over*,
     since the tracker exists to avoid overeating protein."""
     bar = calories.progress_bar(total, ceiling)
@@ -1984,6 +2065,7 @@ def _protein_status_line(total: float, ceiling: float) -> str:
     return (
         f"`{bar}` {protein_mod.format_grams(total)} / "
         f"{protein_mod.format_grams(ceiling)} · {tail}"
+        + _target_label_suffix(label)
     )
 
 
@@ -2060,7 +2142,7 @@ async def _reply_protein_logged(
         reply = await message.reply(
             f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}"
             f"{_backdate_label(logged_at)}\n"
-            + _protein_status_line(total, float(goal["daily_target_g"]))
+            + _protein_status_for(target_id, total, logged_at)
             + _streak_suffix(_protein_streak(target_id)),
             mention_author=False,
         )
@@ -2103,6 +2185,8 @@ async def _handle_combined_nutrition(
     skipped: list[str] = []
 
     window = _day_window_for(logged_at)
+    day_targets = _reply_targets(target_id, logged_at)
+    showed_calories = showed_protein = False
     if cal_goal is not None:
         if 0 < kcal <= _MAX_ENTRY_KCAL:
             db.calorie_add(
@@ -2114,8 +2198,9 @@ async def _handle_combined_nutrition(
             )
             logged.append(f"**{calories.format_kcal(kcal)}**")
             status_lines.append(
-                _calorie_status_line(total, float(cal_goal["daily_target_kcal"]))
+                _calorie_status_line(total, day_targets.kcal.value or 0.0)
             )
+            showed_calories = True
         else:
             skipped.append("calories (looks like a typo)")
     elif kcal > 0:
@@ -2132,12 +2217,21 @@ async def _handle_combined_nutrition(
             )
             logged.append(f"**{protein_mod.format_grams(grams)}** protein")
             status_lines.append(
-                _protein_status_line(total, float(pro_goal["daily_target_g"]))
+                _protein_status_line(total, day_targets.protein.value or 0.0)
             )
+            showed_protein = True
         else:
             skipped.append("protein (looks like a typo)")
     elif grams > 0:
         skipped.append("protein (run `/protein setup`)")
+
+    # One "Using Weekend Targets" note for the whole reply, not one per macro —
+    # and only about the macros this reply actually showed.
+    label = _reply_label(
+        day_targets, calories=showed_calories, protein=showed_protein,
+    )
+    if status_lines and label:
+        status_lines[-1] += _target_label_suffix(label)
 
     if not logged:
         note = ", ".join(skipped) if skipped else "nothing"
@@ -2870,12 +2964,24 @@ _CALORIE_SUMMARY_SYSTEM = (
     "You are an upbeat, knowledgeable nutrition coach writing a short, personal "
     "weekly recap for ONE member of a Discord gym community.\n\n"
     "You receive JSON describing their week:\n"
-    "- daily_target_kcal: their goal per day\n"
-    "- per_day: each logged day with its weekday, intake (kcal) and vs_target "
-    "(intake minus target; negative = under, positive = over)\n"
+    "- daily_target_kcal: their average goal per day across the week\n"
+    "- split_targets: null if one target applies every day. Otherwise an object "
+    "with weekday_target_kcal and weekend_target_kcal — they deliberately eat "
+    "differently on Sat/Sun, so judge each day against its OWN target and never "
+    "call a bigger weekend day a slip-up when it's within the weekend target\n"
+    "- per_day: each logged day with its weekday, intake (kcal), the target "
+    "(kcal) in force that day, and vs_target (intake minus that day's target; "
+    "negative = under, positive = over). target_kcal and vs_target are null on "
+    "a day they weren't tracking a target — say nothing about hitting or "
+    "missing a target on those days\n"
     "- days_logged: how many of the 7 days they recorded anything\n"
     "- week_avg_kcal / week_total_kcal: averages and totals across logged days\n"
-    "- days_over_target / days_under_target\n"
+    "- days_over_target / days_under_target: judged per day against that day's "
+    "own target\n"
+    "- adherence: mean of (intake / that day's target) across logged days; 1.0 "
+    "is landing exactly on target\n"
+    "- weekday_avg_kcal / weekend_avg_kcal: averages within each band (null if "
+    "they logged nothing in that band)\n"
     "- highest_day / lowest_day: their biggest and smallest days\n"
     "- previous_week_avg_kcal: last week's average for trend comparison "
     "(null if they didn't log last week)\n\n"
@@ -2906,10 +3012,16 @@ def _weekday_full(iso_date: str) -> str:
 
 
 def _build_calorie_ai_payload(
-    name: str, target: float, days: dict[str, float],
+    name: str, target_rows: Sequence[Mapping], days: dict[str, float],
     prev_days: dict[str, float],
 ) -> str:
-    """Assemble the rich JSON describing one member's week for Gemini."""
+    """Assemble the rich JSON describing one member's week for Gemini.
+
+    Every day is scored against the target that was in force *that* day, so a
+    2,200-calorie Saturday on a weekend target reads as on-plan rather than as a
+    700-calorie blowout. ``target_rows`` is the user's raw rule set, resolved per
+    day here.
+    """
     sorted_days = sorted(days.items())
     values = list(days.values())
     avg = sum(values) / len(values)
@@ -2918,27 +3030,66 @@ def _build_calorie_ai_payload(
     prev_avg = (
         round(sum(prev_days.values()) / len(prev_days)) if prev_days else None
     )
+
+    intake = {date.fromisoformat(d): v for d, v in sorted_days}
+    resolved = targets_mod.resolve_days(target_rows, intake)
+    # A day can have no target at all — they weren't tracking then. It stays
+    # null rather than becoming a zero the model would read as "1,450 over".
+    day_target = {d: r.kcal.value for d, r in resolved.items()}
+    targeted = {d: t for d, t in day_target.items() if t}
+    over = sum(1 for d, t in targeted.items() if intake[d] > t)
+    under = sum(1 for d, t in targeted.items() if intake[d] < t)
+    stats = targets_mod.band_stats(intake, resolved, targets_mod.MACRO_KCAL)
+    ratios = [intake[d] / t for d, t in targeted.items()]
+
+    split = None
+    if any(r.kcal.split for r in resolved.values()):
+        weekday = stats.get("weekday")
+        weekend = stats.get("weekend")
+        split = {
+            "weekday_target_kcal": (
+                round(weekday.avg_target) if weekday and weekday.avg_target
+                else None
+            ),
+            "weekend_target_kcal": (
+                round(weekend.avg_target) if weekend and weekend.avg_target
+                else None
+            ),
+        }
+
+    def _per_day(iso: str, kcal: float) -> dict:
+        target = day_target.get(date.fromisoformat(iso))
+        return {
+            "weekday": _weekday_full(iso),
+            "date": iso,
+            "kcal": round(kcal),
+            "target_kcal": round(target) if target else None,
+            "vs_target": round(kcal - target) if target else None,
+        }
+
     return json.dumps({
         "name": name,
-        "daily_target_kcal": round(target),
+        "daily_target_kcal": (
+            round(sum(targeted.values()) / len(targeted)) if targeted else None
+        ),
+        "split_targets": split,
         "days_logged": len(days),
         "days_in_week": 7,
         "week_avg_kcal": round(avg),
         "week_total_kcal": round(sum(values)),
-        "days_over_target": sum(1 for v in values if v > target),
-        "days_under_target": sum(1 for v in values if v < target),
+        "days_over_target": over,
+        "days_under_target": under,
+        "adherence": round(sum(ratios) / len(ratios), 3) if ratios else None,
+        "weekday_avg_kcal": (
+            round(stats["weekday"].avg_intake) if "weekday" in stats else None
+        ),
+        "weekend_avg_kcal": (
+            round(stats["weekend"].avg_intake) if "weekend" in stats else None
+        ),
         "highest_day": {"weekday": _weekday_full(hi_date), "kcal": round(hi_kcal)},
         "lowest_day": {"weekday": _weekday_full(lo_date), "kcal": round(lo_kcal)},
         "previous_week_avg_kcal": prev_avg,
-        "per_day": [
-            {
-                "weekday": _weekday_full(d),
-                "date": d,
-                "kcal": round(v),
-                "vs_target": round(v - target),
-            }
-            for d, v in sorted_days
-        ],
+        "per_day": [_per_day(d, v) for d, v in sorted_days],
     })
 
 
@@ -2964,12 +3115,17 @@ async def _calorie_ai_summaries(
         name = db.get_user_nickname(user_id) or row["username"]
         # "Joshua @poshy" — friendly name plus the (non-pinging) mention.
         who = f"**{name}** <@{user_id}>"
-        target = float(row["daily_target_kcal"])
+        target_rows = db.nutrition_target_rows(user_id)
         days = _calorie_week_days(guild_id, user_id, start_iso, end_iso)
         if not days:
             blocks.append(f"{who} — no intake logged this week.")
             continue
         avg = sum(days.values()) / len(days)
+        # Average the targets that were actually in force on the days they
+        # logged, so the fallback line stays honest for a weekday/weekend split.
+        target = targets_mod.mean_target(
+            target_rows, [date.fromisoformat(d) for d in days],
+        ) or float(row["daily_target_kcal"])
         stats = (
             f"{len(days)}/7 days logged · avg "
             f"{calories.format_kcal(avg)}/day · target "
@@ -2980,7 +3136,9 @@ async def _calorie_ai_summaries(
             prev_days = _calorie_week_days(
                 guild_id, user_id, prev_start_iso, start_iso,
             )
-            payload = _build_calorie_ai_payload(name, target, days, prev_days)
+            payload = _build_calorie_ai_payload(
+                name, target_rows, days, prev_days,
+            )
             try:
                 raw = await asyncio.to_thread(
                     gemini_client.generate,
@@ -3051,13 +3209,23 @@ def _protein_weekly_blocks(
         user_id = int(row["user_id"])
         name = db.get_user_nickname(user_id) or row["username"]
         who = f"**{name}** <@{user_id}>"
-        target = float(row["daily_target_g"])
+        target_rows = db.nutrition_target_rows(user_id)
         days = _protein_week_days(guild_id, user_id, start_iso, end_iso)
         if not days:
             blocks.append(f"{who} — no protein logged this week.")
             continue
+        # "Over" is judged per day against that day's own ceiling — someone on a
+        # higher weekend max isn't over on a big Saturday.
+        intake = {date.fromisoformat(d): v for d, v in days.items()}
+        resolved = targets_mod.resolve_days(target_rows, intake)
         avg = sum(days.values()) / len(days)
-        over = sum(1 for v in days.values() if v > target)
+        over = sum(
+            1 for d, v in intake.items()
+            if resolved[d].protein.value and v > resolved[d].protein.value
+        )
+        target = targets_mod.mean_target(
+            target_rows, intake, targets_mod.MACRO_PROTEIN,
+        ) or float(row["daily_target_g"])
         tail = f" · ⚠️ over {over}/{len(days)} days" if over else ""
         blocks.append(
             f"{who} — {len(days)}/7 days · avg "
@@ -3853,7 +4021,8 @@ async def _refresh_calorie_reply(
     suffix = _target_suffix(after.author, target)
     body = (
         f"🍽️ **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
-        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        # Today's target, to match the today-scoped total just computed.
+        + _calorie_status_for(target_id, total)
         + "\n✏️ *(updated from an edit)*"
     )
     try:
@@ -13098,7 +13267,25 @@ def _build_progress_payload(
             "protein_total_window": round(pro_total),
             "protein_entries_window": pro_entries,
             "protein_days_logged_window": pro_days,
+            # None unless they run different weekday/weekend targets — the goal
+            # numbers above are then just today's, and the coach needs to know
+            # a big Saturday may be entirely on plan.
+            "split_targets": _split_targets_payload(user_id),
         },
+    }
+
+
+def _split_targets_payload(user_id: int) -> dict | None:
+    """The user's weekday/weekend targets for AI payloads, or None if they run
+    one target every day."""
+    wd, we = _band_targets(user_id)
+    if not (wd.kcal.split or wd.protein.split):
+        return None
+    return {
+        "weekday_calorie_goal_kcal": wd.kcal.value,
+        "weekend_calorie_goal_kcal": we.kcal.value,
+        "weekday_protein_goal_g": wd.protein.value,
+        "weekend_protein_goal_g": we.protein.value,
     }
 
 
@@ -13270,6 +13457,35 @@ _CALORIES_NOT_SET_MSG = (
     "daily target first (e.g. `2500` or `8700kj`)."
 )
 
+# What someone types into a `weekend:` option to say "no separate weekend
+# target, just use my normal one".
+_CLEAR_WORDS = {"none", "off", "no", "same", "clear", "-", "unset"}
+
+
+def _parse_weekend_option(raw: str | None, parse, limit: float):
+    """Read a ``weekend:`` command option into what the DB layer expects.
+
+    Three outcomes, because "don't touch it" and "clear it" are different
+    things: ``KEEP`` when the option was omitted (re-running setup to nudge the
+    weekday number shouldn't quietly discard a weekend target), ``None`` when
+    they asked to clear it, otherwise the parsed amount. Returns
+    ``(value, error)`` — ``error`` is a ready-to-send string when unparseable.
+    """
+    if raw is None:
+        return KEEP, None
+    text = raw.strip().lower()
+    if text in _CLEAR_WORDS:
+        return None, None
+    parsed = parse(raw)
+    amount = parsed[0] if isinstance(parsed, tuple) else parsed
+    if amount is None or amount <= 0:
+        return KEEP, "Couldn't read that weekend amount."
+    if amount > limit:
+        return KEEP, (
+            f"That weekend target is over {limit:,.0f}/day — looks like a typo."
+        )
+    return amount, None
+
 
 def _today_window() -> tuple[str, str]:
     """UTC ISO bounds of the current local (DISPLAY_TIMEZONE) day."""
@@ -13282,7 +13498,19 @@ def _today_window() -> tuple[str, str]:
     )
 
 
-def _calorie_status_line(total: float, target: float) -> str:
+def _target_label_suffix(label: str | None) -> str:
+    """Discord subtext naming the active target set, or nothing.
+
+    ``label`` is None unless the user actually runs different weekday and
+    weekend targets, so someone with one all-week goal never sees a banner
+    telling them which of one set is in force.
+    """
+    return f"\n-# {label}" if label else ""
+
+
+def _calorie_status_line(
+    total: float, target: float, label: str | None = None,
+) -> str:
     bar = calories.progress_bar(total, target)
     remaining = target - total
     if remaining >= 0:
@@ -13292,6 +13520,93 @@ def _calorie_status_line(total: float, target: float) -> str:
     return (
         f"`{bar}` {calories.format_kcal(total)} / "
         f"{calories.format_kcal(target)} · {tail}"
+        + _target_label_suffix(label)
+    )
+
+
+def _reply_targets(
+    user_id: int, logged_at: datetime | None = None,
+) -> targets_mod.Resolved:
+    """The targets to render a *log reply* against.
+
+    Like :func:`_targets_on`, except a day with no target at all borrows today's.
+    That happens when someone stopped tracking for a stretch, started again, and
+    is now backdating an entry into the gap: scoring it against nothing would
+    render "200 cal / 0 cal · 200 cal over target".
+
+    Analytics must keep using :func:`_targets_on` — there a day with no target
+    is a real gap, and quietly lending it today's number would invent adherence
+    figures for days the user wasn't tracking.
+    """
+    resolved = _targets_on(user_id, logged_at)
+    if logged_at is None or (
+        resolved.kcal.value is not None and resolved.protein.value is not None
+    ):
+        return resolved
+
+    def _borrow(
+        own: targets_mod.MacroTarget, now: targets_mod.MacroTarget,
+    ) -> targets_mod.MacroTarget:
+        if own.value is not None:
+            return own
+        # A borrowed number belongs to *today's* band, so the entry day's
+        # "Using Weekend Targets" caption wouldn't describe it. Say nothing.
+        return targets_mod.MacroTarget(now.value, now.scope, split=False)
+
+    today = _targets_on(user_id)
+    return targets_mod.Resolved(
+        day=resolved.day,
+        kcal=_borrow(resolved.kcal, today.kcal),
+        protein=_borrow(resolved.protein, today.protein),
+    )
+
+
+def _reply_label(
+    resolved: targets_mod.Resolved, *, calories: bool, protein: bool,
+) -> str | None:
+    """The single weekday/weekend banner for a reply, describing only the macros
+    that reply actually shows.
+
+    ``Resolved.label`` is true when *either* macro splits, so a calorie-only
+    reply would otherwise announce "Using Weekend Targets" to someone whose
+    calories are the same every day and whose protein happens to differ.
+    """
+    macros = []
+    if calories:
+        macros.append(targets_mod.MACRO_KCAL)
+    if protein:
+        macros.append(targets_mod.MACRO_PROTEIN)
+    for macro in macros:
+        label = resolved.label_for(macro)
+        if label:
+            return label
+    return None
+
+
+def _calorie_status_for(
+    user_id: int, total: float, logged_at: datetime | None = None,
+) -> str:
+    """Calorie status line against the target in force on the entry's own day.
+
+    The one-call form callers should reach for: it can't accidentally score a
+    backdated Sunday entry against Monday's target the way passing a
+    separately-fetched goal row around could.
+    """
+    resolved = _reply_targets(user_id, logged_at)
+    return _calorie_status_line(
+        total, resolved.kcal.value or 0.0,
+        resolved.label_for(targets_mod.MACRO_KCAL),
+    )
+
+
+def _protein_status_for(
+    user_id: int, total: float, logged_at: datetime | None = None,
+) -> str:
+    """Protein status line against the ceiling in force on the entry's own day."""
+    resolved = _reply_targets(user_id, logged_at)
+    return _protein_status_line(
+        total, resolved.protein.value or 0.0,
+        resolved.label_for(targets_mod.MACRO_PROTEIN),
     )
 
 
@@ -13301,9 +13616,11 @@ def _calorie_status_line(total: float, target: float) -> str:
 )
 @app_commands.describe(
     target='Daily target, e.g. "2500", "2500c", or "8700kj".',
+    weekend='Optional different target for Sat/Sun, e.g. "3000". "same" clears it.',
 )
 async def calories_setup_cmd(
     interaction: discord.Interaction, target: str,
+    weekend: str | None = None,
 ) -> None:
     parsed = calories.parse_energy(target)
     if parsed is None or parsed[0] <= 0:
@@ -13320,19 +13637,100 @@ async def calories_setup_cmd(
             ephemeral=True,
         )
         return
+    weekend_kcal, err = _parse_weekend_option(
+        weekend, calories.parse_energy, _MAX_TARGET_KCAL,
+    )
+    if err:
+        await interaction.response.send_message(
+            f"{err} Try `3000`, `3000c`, `12500kj`, or `same` to drop it.",
+            ephemeral=True,
+        )
+        return
     guild_id = _ctx_guild_id(interaction)
     db.calorie_goal_set(
         guild_id, interaction.user.id, _display_name(interaction.user), kcal,
+        weekend_kcal,
     )
     converted = (
         f" (converted from {target.strip()})" if unit == "kj" else ""
     )
+    # Re-resolve rather than echo the inputs: it accounts for a weekend override
+    # that was already in place and left untouched by this call.
+    wd, we = _band_targets(interaction.user.id)
+    if wd.kcal.split:
+        head = (
+            f"🍎 Calorie targets set — weekdays "
+            f"**{calories.format_kcal(wd.kcal.value or 0.0)}**{converted}, "
+            f"weekends **{calories.format_kcal(we.kcal.value or 0.0)}**."
+        )
+    else:
+        head = (
+            f"🍎 Daily calorie target set to "
+            f"**{calories.format_kcal(kcal)}**{converted}, every day."
+        )
     await interaction.response.send_message(
-        f"🍎 Daily calorie target set to "
-        f"**{calories.format_kcal(kcal)}**{converted}.\n"
+        f"{head}\n"
         "Log what you eat with `/calories add` (kcal or kJ — I'll convert), "
         "check in with `/calories today`, and you'll be included in the "
         "Sunday weekly report."
+    )
+
+
+@calories_group.command(
+    name="targets",
+    description="Show your weekday and weekend calorie + protein targets.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def calories_targets_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
+    wd, we = _band_targets(target_user.id)
+    today = _targets_on(target_user.id)
+    if today.kcal.value is None and today.protein.value is None:
+        msg = (
+            "You're not tracking calories or protein yet — start with "
+            "`/calories setup` or `/protein setup`."
+            if target_user == interaction.user
+            else f"{target_user.display_name} isn't tracking nutrition."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    def _amounts(band: targets_mod.Resolved) -> str:
+        bits = []
+        if band.kcal.value is not None:
+            bits.append(calories.format_kcal(band.kcal.value))
+        if band.protein.value is not None:
+            bits.append(f"{protein_mod.format_grams(band.protein.value)} protein")
+        return " · ".join(bits) or "—"
+
+    if today.split:
+        lines = [
+            f"`Weekday  ` {_amounts(wd)}"
+            + (" ← **today**" if not today.is_weekend else ""),
+            f"`Weekend  ` {_amounts(we)}"
+            + (" ← **today**" if today.is_weekend else ""),
+            f"\n-# {today.label}",
+        ]
+    else:
+        lines = [
+            f"`Every day` {_amounts(today)}",
+            "\n-# One target, seven days a week. Add a weekend one with "
+            "`/calories setup <target> weekend:<target>`.",
+        ]
+    embed = discord.Embed(
+        title=f"🎯 Nutrition targets — {target_user.display_name}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -13409,7 +13807,7 @@ async def calories_add_cmd(
     await interaction.response.send_message(
         f"🍽️ Logged **{logged_label}**{converted}{note_part}"
         f"{_backdate_label(logged_at)}\n"
-        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        + _calorie_status_for(interaction.user.id, total, logged_at)
         + _streak_suffix(_calorie_streak(interaction.user.id))
     )
 
@@ -13442,7 +13840,9 @@ async def calories_today_cmd(
     )
     total = sum(float(r["kcal"]) for r in entries)
     lines = [
-        _calorie_status_line(total, float(goal["daily_target_kcal"])),
+        _calorie_status_line(
+            total, float(goal["daily_target_kcal"]), goal["label"],
+        ),
     ]
     if entries:
         lines.append("")
@@ -13492,29 +13892,41 @@ async def calories_week_cmd(
         return
     _label, start_iso, end_iso = _week_window()
     day_totals = _calorie_week_days(guild_id, target_user.id, start_iso, end_iso)
-    target_kcal = float(goal["daily_target_kcal"])
     today = datetime.now(DISPLAY_TZ).date()
+    week = [today - timedelta(days=n) for n in range(6, -1, -1)]
+    # Each day is scored against the target that was in force on that day, so a
+    # goal changed mid-week doesn't retroactively re-grade the days before it.
+    day_targets = targets_mod.resolve_days(
+        db.nutrition_target_rows(target_user.id), week,
+    )
     lines = []
     logged_days = 0
-    for offset in range(6, -1, -1):
-        day = today - timedelta(days=offset)
+    target_sum = 0.0
+    for day in week:
         key = day.isoformat()
         day_name = _WEEKDAY_NAMES[day.weekday()][:3]
+        target_kcal = day_targets[day].kcal.value or 0.0
         total = day_totals.get(key)
         if total is None:
             lines.append(f"`{day_name}` — nothing logged")
             continue
         logged_days += 1
+        target_sum += target_kcal
         bar = calories.progress_bar(total, target_kcal)
         lines.append(
             f"`{day_name}` `{bar}` {calories.format_kcal(total)}"
         )
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
+        avg_target = target_sum / logged_days
         lines.append(
             f"\nAvg on logged days: **{calories.format_kcal(avg)}** vs "
-            f"target {calories.format_kcal(target_kcal)}"
+            f"target {calories.format_kcal(avg_target)}"
         )
+        lines.extend(_band_breakdown_lines(
+            day_totals, day_targets, calories.format_kcal,
+            targets_mod.MACRO_KCAL,
+        ))
     streak = _calorie_streak(target_user.id)
     if streak >= 2:
         lines.append(f"🔥 **{streak} day** logging streak")
@@ -13551,9 +13963,7 @@ async def calories_undo_cmd(interaction: discord.Interaction) -> None:
         total, _n = db.calorie_total_between(
             guild_id, interaction.user.id, *_today_window(),
         )
-        lines.append(
-            _calorie_status_line(total, float(goal["daily_target_kcal"]))
-        )
+        lines.append(_calorie_status_for(interaction.user.id, total))
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -13606,7 +14016,7 @@ async def calories_edit_cmd(
         f"✏️ Updated last entry "
         f"**{calories.format_kcal(float(old['kcal']))}** → "
         f"**{calories.format_kcal(kcal)}**{converted}\n"
-        + _calorie_status_line(total, float(goal["daily_target_kcal"]))
+        + _calorie_status_for(interaction.user.id, total)
     )
 
 
@@ -13870,10 +14280,27 @@ async def calories_tdee_cmd(
         )
         return
 
-    target_kcal = float(goal["daily_target_kcal"])
+    # The projection multiplies a daily gap by seven, so it has to run against
+    # the mean of the seven targets actually coming up — for a 1,500/2,200
+    # weekday/weekend split that's 1,700/day, not either number on its own.
+    today = targets_mod.local_today()
+    target_rows = db.nutrition_target_rows(target_user.id)
+    week_ahead = [today + timedelta(days=n) for n in range(7)]
+    target_kcal = targets_mod.mean_target(target_rows, week_ahead)
+    if target_kcal is None:  # pragma: no cover - goal is not None above
+        target_kcal = float(goal["daily_target_kcal"])
     gap = target_kcal - est.tdee_kcal   # negative = target sits in a deficit
     projected_kg_wk = gap * 7.0 / tdee_lib.KCAL_PER_KG
     direction = "below" if gap < 0 else "above"
+    wd, we = _band_targets(target_user.id)
+    if wd.kcal.split:
+        target_desc = (
+            f"Your targets (weekdays {calories.format_kcal(wd.kcal.value or 0)}, "
+            f"weekends {calories.format_kcal(we.kcal.value or 0)} — averaging "
+            f"{calories.format_kcal(target_kcal)}/day)"
+        )
+    else:
+        target_desc = f"Your target ({calories.format_kcal(target_kcal)})"
     trend = (
         f"{est.kg_per_week:+.2f} kg/week "
         f"({est.start_kg:.1f} → {est.end_kg:.1f} kg)"
@@ -13888,7 +14315,7 @@ async def calories_tdee_cmd(
         "",
         f"**Estimated maintenance ≈ {calories.format_kcal(est.tdee_kcal)}/day** "
         f"({calories.kcal_to_kj(est.tdee_kcal):,.0f} kJ)",
-        f"Your target ({calories.format_kcal(target_kcal)}) sits "
+        f"{target_desc} sits "
         f"≈ **{calories.format_kcal(abs(gap))} {direction}** maintenance → "
         f"≈ **{projected_kg_wk:+.2f} kg/week** if you keep hitting it.",
     ]
@@ -14117,6 +14544,10 @@ async def calories_estimate_cmd(
         logged_protein = True
     window = _day_window_for(logged_at)
     total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
+    day_targets = _reply_targets(interaction.user.id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=True, protein=logged_protein,
+    )
     conf = f" · confidence: {result.confidence}" if result.confidence else ""
     parts = [f"**{calories.format_kcal(result.kcal)}**"]
     if logged_protein:
@@ -14124,14 +14555,19 @@ async def calories_estimate_cmd(
     lines = [
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}"
         f"{_backdate_label(logged_at)}",
-        _calorie_status_line(total, float(goal["daily_target_kcal"])),
+        _calorie_status_line(
+            total, day_targets.kcal.value or 0.0,
+            None if logged_protein else day_label,
+        ),
     ]
     if logged_protein:
         pro_total, _ = db.protein_total_between(
             guild_id, interaction.user.id, *window,
         )
         lines.append(
-            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+            _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            )
         )
     lines.append(
         "*AI estimate — `/calories undo` to remove, `/calories edit` to correct.*"
@@ -14267,6 +14703,10 @@ async def calories_label_cmd(
         logged_protein = True
     window = _day_window_for(logged_at)
     total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
+    day_targets = _reply_targets(interaction.user.id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=True, protein=logged_protein,
+    )
     parts = [f"**{calories.format_kcal(kcal)}**"]
     if logged_protein:
         parts.append(f"**{protein_mod.format_grams(pro_grams)}** protein")
@@ -14274,13 +14714,18 @@ async def calories_label_cmd(
         f"\n🍽️ Logged {' + '.join(parts)} for **{grams:g} g**"
         f"{_backdate_label(logged_at)}"
     )
-    lines.append(_calorie_status_line(total, float(goal["daily_target_kcal"])))
+    lines.append(_calorie_status_line(
+        total, day_targets.kcal.value or 0.0,
+        None if logged_protein else day_label,
+    ))
     if logged_protein:
         pro_total, _ = db.protein_total_between(
             guild_id, interaction.user.id, *window,
         )
         lines.append(
-            _protein_status_line(pro_total, float(pro_goal["daily_target_g"]))
+            _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            )
         )
     lines.append(
         "*Read by AI — `/calories undo` if it misread the label.*"
@@ -14516,9 +14961,13 @@ def _protein_week_days(
 @protein_group.command(
     name="setup", description="Set your daily protein max (grams).",
 )
-@app_commands.describe(target='Daily max in grams, e.g. "180".')
+@app_commands.describe(
+    target='Daily max in grams, e.g. "180".',
+    weekend='Optional different max for Sat/Sun, e.g. "200". "same" clears it.',
+)
 async def protein_setup_cmd(
     interaction: discord.Interaction, target: str,
+    weekend: str | None = None,
 ) -> None:
     grams = protein_mod.parse_protein_amount(target)
     if grams is None or grams <= 0:
@@ -14533,12 +14982,33 @@ async def protein_setup_cmd(
             ephemeral=True,
         )
         return
+    weekend_g, err = _parse_weekend_option(
+        weekend, protein_mod.parse_protein_amount, _MAX_PROTEIN_TARGET_G,
+    )
+    if err:
+        await interaction.response.send_message(
+            f"{err} Try `200`, or `same` to drop it.", ephemeral=True,
+        )
+        return
     guild_id = _ctx_guild_id(interaction)
     db.protein_goal_set(
         guild_id, interaction.user.id, _display_name(interaction.user), grams,
+        weekend_g,
     )
+    wd, we = _band_targets(interaction.user.id)
+    if wd.protein.split:
+        head = (
+            f"🥩 Protein maxes set — weekdays "
+            f"**{protein_mod.format_grams(wd.protein.value or 0.0)}**, weekends "
+            f"**{protein_mod.format_grams(we.protein.value or 0.0)}**."
+        )
+    else:
+        head = (
+            f"🥩 Daily protein max set to "
+            f"**{protein_mod.format_grams(grams)}**, every day."
+        )
     await interaction.response.send_message(
-        f"🥩 Daily protein max set to **{protein_mod.format_grams(grams)}**.\n"
+        f"{head}\n"
         "Log it with `/protein add <grams>` or just type `40p` in chat, and "
         "check in with `/protein today`. I'll flag when you go over."
     )
@@ -14591,7 +15061,7 @@ async def protein_add_cmd(
     await interaction.response.send_message(
         f"🥩 Logged **{protein_mod.format_grams(amount)}** protein{note_part}"
         f"{_backdate_label(logged_at)}\n"
-        + _protein_status_line(total, float(goal["daily_target_g"]))
+        + _protein_status_for(interaction.user.id, total, logged_at)
         + _streak_suffix(_protein_streak(interaction.user.id))
     )
 
@@ -14621,7 +15091,11 @@ async def protein_today_cmd(
         guild_id, target_user.id, *_today_window(),
     )
     total = sum(float(r["grams"]) for r in entries)
-    lines = [_protein_status_line(total, float(goal["daily_target_g"]))]
+    lines = [
+        _protein_status_line(
+            total, float(goal["daily_target_g"]), goal["label"],
+        ),
+    ]
     if entries:
         lines.append("")
         for r in entries:
@@ -14668,19 +15142,25 @@ async def protein_week_cmd(
         return
     _label, start_iso, end_iso = _week_window()
     day_totals = _protein_week_days(guild_id, target_user.id, start_iso, end_iso)
-    target_g = float(goal["daily_target_g"])
     today = datetime.now(DISPLAY_TZ).date()
+    week = [today - timedelta(days=n) for n in range(6, -1, -1)]
+    # Each day against the ceiling that was in force on that day.
+    day_targets = targets_mod.resolve_days(
+        db.nutrition_target_rows(target_user.id), week,
+    )
     lines = []
     logged_days = 0
-    for offset in range(6, -1, -1):
-        day = today - timedelta(days=offset)
+    target_sum = 0.0
+    for day in week:
         key = day.isoformat()
         day_name = _WEEKDAY_NAMES[day.weekday()][:3]
+        target_g = day_targets[day].protein.value or 0.0
         total = day_totals.get(key)
         if total is None:
             lines.append(f"`{day_name}` — nothing logged")
             continue
         logged_days += 1
+        target_sum += target_g
         bar = calories.progress_bar(total, target_g)
         over = " ⚠️" if total > target_g else ""
         lines.append(
@@ -14690,8 +15170,12 @@ async def protein_week_cmd(
         avg = sum(day_totals.values()) / logged_days
         lines.append(
             f"\nAvg on logged days: **{protein_mod.format_grams(avg)}** vs "
-            f"max {protein_mod.format_grams(target_g)}"
+            f"max {protein_mod.format_grams(target_sum / logged_days)}"
         )
+        lines.extend(_band_breakdown_lines(
+            day_totals, day_targets, protein_mod.format_grams,
+            targets_mod.MACRO_PROTEIN, noun="max",
+        ))
     streak = _protein_streak(target_user.id)
     if streak >= 2:
         lines.append(f"🔥 **{streak} day** logging streak")
@@ -14728,7 +15212,7 @@ async def protein_undo_cmd(interaction: discord.Interaction) -> None:
         total, _n = db.protein_total_between(
             guild_id, interaction.user.id, *_today_window(),
         )
-        lines.append(_protein_status_line(total, float(goal["daily_target_g"])))
+        lines.append(_protein_status_for(interaction.user.id, total))
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -14778,7 +15262,7 @@ async def protein_edit_cmd(
         f"✏️ Updated last entry "
         f"**{protein_mod.format_grams(float(old['grams']))}** → "
         f"**{protein_mod.format_grams(amount)}** protein\n"
-        + _protein_status_line(total, float(goal["daily_target_g"]))
+        + _protein_status_for(interaction.user.id, total)
     )
 
 

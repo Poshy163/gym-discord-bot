@@ -51,12 +51,17 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from . import game_icons, presence
+from . import game_icons, presence, targets
 
 LOG = logging.getLogger("gymbot.webui")
 
 SESSION_COOKIE = "gymdash_session"
 SESSION_TTL_SECONDS = 7 * 24 * 3600  # a week
+
+# Typo guards on the nutrition-target form, mirroring the bot's slash commands
+# (app.bot._MAX_TARGET_KCAL / _MAX_PROTEIN_TARGET_G).
+_MAX_TARGET_KCAL = 20_000
+_MAX_TARGET_PROTEIN_G = 500
 
 # A callable the bot can inject so the dashboard can resync members/roles on
 # demand (the "Refresh" button). Optional — None disables the button.
@@ -424,6 +429,10 @@ def build_app(
             "calorie_streak": calorie_streak(uid) if calorie_streak else None,
             "protein_streak": protein_streak(uid) if protein_streak else None,
             "nutrition": {
+                # ``calorie_goal``/``protein_goal`` are the targets in force
+                # TODAY (weekday or weekend, whichever applies) — that's what
+                # the progress bars are measured against. The weekday/weekend
+                # pair below is what the settings form edits.
                 "calorie_goal": (
                     cal_goal["daily_target_kcal"] if cal_goal else None
                 ),
@@ -432,6 +441,7 @@ def build_app(
                     pro_goal["daily_target_g"] if pro_goal else None
                 ),
                 "protein_today": pro_today,
+                "targets": _targets_dict(db, uid),
             },
             "foods": [_food_dict(r) for r in db.calorie_food_list(gid, uid)],
             "lift_goals": [
@@ -917,6 +927,51 @@ def build_app(
         )
         return web.json_response({"ok": True})
 
+    async def api_nutrition_targets(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild and user required")
+
+        def _optional(key: str, limit: float) -> float | None:
+            raw = body.get(key)
+            if raw in (None, "", "null"):
+                return None
+            try:
+                value = float(raw)
+            except (ValueError, TypeError):
+                raise web.HTTPBadRequest(text=f"invalid {key}")
+            if not 0 < value <= limit:
+                raise web.HTTPBadRequest(text=f"{key} out of range")
+            return value
+
+        kcal = _optional("calorie_weekday", _MAX_TARGET_KCAL)
+        weekend_kcal = _optional("calorie_weekend", _MAX_TARGET_KCAL)
+        protein_g = _optional("protein_weekday", _MAX_TARGET_PROTEIN_G)
+        weekend_protein_g = _optional("protein_weekend", _MAX_TARGET_PROTEIN_G)
+        # A weekend override with no weekday target underneath it would leave
+        # Mon-Fri untracked while Sat/Sun kept a goal — almost certainly a
+        # half-filled form rather than what anyone meant.
+        if weekend_kcal is not None and kcal is None:
+            raise web.HTTPBadRequest(text="weekday calorie target required")
+        if weekend_protein_g is not None and protein_g is None:
+            raise web.HTTPBadRequest(text="weekday protein target required")
+
+        member = db.get_member(gid, uid)
+        username = member["display_name"] if member else str(uid)
+        db.web_nutrition_targets_set(
+            gid, uid, username, kcal=kcal, weekend_kcal=weekend_kcal,
+            protein_g=protein_g, weekend_protein_g=weekend_protein_g,
+            actor_name=_actor(request),
+        )
+        return web.json_response({"ok": True})
+
     async def api_food_delete(request: web.Request) -> web.Response:
         _require(request)
         try:
@@ -1175,6 +1230,7 @@ def build_app(
         web.post("/api/protein/delete", api_protein_delete),
         web.post("/api/foods/set", api_food_set),
         web.post("/api/foods/delete", api_food_delete),
+        web.post("/api/nutrition/targets", api_nutrition_targets),
         web.post("/api/resync", api_resync),
         web.get("/api/channels", api_channels),
         web.post("/api/invite", api_invite),
@@ -1248,6 +1304,33 @@ def _food_dict(r) -> dict:
         "display": r["display"],
         "kcal": r["kcal"],
         "protein_g": r["protein_g"],
+    }
+
+
+def _targets_dict(db, user_id: int) -> dict:
+    """The four editable target fields, plus which set is live right now.
+
+    Weekend values are null when the user runs one target all week, which is
+    exactly what the settings form shows as an empty "same as weekday" box.
+    Both bands are resolved against the next day of their kind, so a rule that
+    only starts applying tomorrow still shows up in the form today.
+    """
+    rows = db.nutrition_target_rows(user_id)
+    today = targets.local_today()
+    days = [today + timedelta(days=n) for n in range(7)]
+    weekday = targets.resolve(rows, next(d for d in days if not targets.is_weekend(d)))
+    weekend = targets.resolve(rows, next(d for d in days if targets.is_weekend(d)))
+    live = targets.resolve(rows, today)
+    return {
+        "calorie_weekday": weekday.kcal.value,
+        "calorie_weekend": weekend.kcal.value if weekend.kcal.split else None,
+        "protein_weekday": weekday.protein.value,
+        "protein_weekend": (
+            weekend.protein.value if weekend.protein.split else None
+        ),
+        "split": live.split,
+        "is_weekend": live.is_weekend,
+        "label": live.label,
     }
 
 
@@ -1498,6 +1581,11 @@ background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/sv
 background-repeat:no-repeat;background-position:.6rem center}
 .search:focus{outline:none;border-color:#6366f1}
 
+/* weekday/weekend target summary under the nutrition bars */
+.tgt{margin-top:.9rem;border-top:1px solid var(--line);padding-top:.6rem}
+.tgt-row{display:flex;justify-content:space-between;align-items:center;gap:.6rem;
+font-size:.82rem;padding:.22rem 0;color:var(--muted)}
+.tgt-row.tgt-live{color:var(--text);font-weight:600}
 /* progress bars (nutrition + goals) */
 .pgoal{margin:.5rem 0}
 .pgrow{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:.3rem}
@@ -1688,11 +1776,12 @@ const ACTION_LABEL={
   food_set:"🍴 food saved",food_delete:"🗑️ food removed",
   goal_set:"🎯 goal set",goal_remove:"🎯 goal removed",
   calorie_goal_set:"🎯 calorie goal",calorie_goal_remove:"🛑 calorie tracking off",
+  nutrition_targets_set:"🎯 nutrition targets",
   protein_goal_set:"🎯 protein goal",protein_goal_remove:"🛑 protein tracking off",
   presence_track_start:"🎮 tracking started",presence_track_stop:"🛑 tracking stopped",
   bodyweight_log:"⚖️ bodyweight"};
 function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
-let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],auditOffset=0,auditRows=[],ALL_ROLES=[];
+let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],currentNutrition=null,auditOffset=0,auditRows=[],ALL_ROLES=[];
 // Current search term, persisted across live re-renders so typing isn't lost.
 let SEARCH="";
 
@@ -1720,6 +1809,58 @@ function bar(label,val,goal,unit,warnOver){
   return `<div class="pgoal"><div class="pgrow"><span>${label}</span>
     <span><b>${Math.round(val)}</b> / ${Math.round(goal)}${unit}${over?(warnOver?' ⚠️ over':' ✓ over'):''}</span></div>
     <div class="ptrack"><div class="pfill" style="width:${pct(val,goal)}%;background:${col}"></div></div></div>`;
+}
+/* Which of the two target sets today falls under. Silent for anyone running a
+   single all-week target — there'd be no other set to be using instead. */
+function activeTargetPill(t){
+  if(!t||!t.split)return "";
+  return `<span class="pill">${t.is_weekend?"🌤️":"📅"} ${esc(t.label||"")}</span>`;
+}
+function targetsTable(t,uid){
+  t=t||{};
+  const edit=`<a class="link" onclick="targetsDialog('${uid}')">edit</a>`;
+  const fmt=(v,unit)=>v==null?'<span class="faint">—</span>':`${Math.round(v)}${unit}`;
+  if(!t.split){
+    const none=t.calorie_weekday==null&&t.protein_weekday==null;
+    return `<div class="tgt"><div class="tgt-row"><span class="faint">Every day</span>
+      <span>${none?'<span class="faint">no targets set</span>':
+        `${fmt(t.calorie_weekday," kcal")} · ${fmt(t.protein_weekday," g")}`}</span>${edit}</div></div>`;
+  }
+  const row=(name,cal,pro,live)=>`<div class="tgt-row${live?" tgt-live":""}">
+    <span>${name}${live?' <span class="faint">· today</span>':''}</span>
+    <span>${fmt(cal," kcal")} · ${fmt(pro," g")}</span></div>`;
+  return `<div class="tgt">
+    ${row("Weekdays",t.calorie_weekday,t.protein_weekday,!t.is_weekend)}
+    ${row("Weekends",t.calorie_weekend,t.protein_weekend,t.is_weekend)}
+    <div class="tgt-row"><span></span><span></span>${edit}</div></div>`;
+}
+function targetsDialog(uid){
+  const t=(currentNutrition&&currentNutrition.targets)||{};
+  const dlg=document.getElementById("editDlg");
+  const v=x=>x==null?"":Math.round(x);
+  dlg.innerHTML=`<h2>Nutrition targets</h2>
+    <p class="faint" style="margin:.2rem 0 .8rem">Leave a weekend box empty to use the
+      weekday target all week. Clearing a weekday box turns that tracker off.
+      Changes apply from today — past days keep the targets they had.</p>
+    <label>Weekday calories (kcal)</label><input id="t_cw" type="number" value="${v(t.calorie_weekday)}">
+    <label>Weekend calories (kcal)</label><input id="t_ce" type="number" value="${v(t.calorie_weekend)}" placeholder="same as weekday">
+    <label>Weekday protein (g)</label><input id="t_pw" type="number" value="${v(t.protein_weekday)}">
+    <label>Weekend protein (g)</label><input id="t_pe" type="number" value="${v(t.protein_weekend)}" placeholder="same as weekday">
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
+    <button class="btn primary" onclick="targetsSave('${uid}')">Save</button></div>`;
+  dlg.showModal();
+}
+async function targetsSave(uid){
+  const g=id=>{const s=document.getElementById(id).value.trim();return s===""?null:s;};
+  const body={guild,user:uid,calorie_weekday:g("t_cw"),calorie_weekend:g("t_ce"),
+    protein_weekday:g("t_pw"),protein_weekend:g("t_pe")};
+  if(body.calorie_weekend!=null&&body.calorie_weekday==null){
+    toast("Set a weekday calorie target first");return;}
+  if(body.protein_weekend!=null&&body.protein_weekday==null){
+    toast("Set a weekday protein target first");return;}
+  const r=await post("/api/nutrition/targets",body);
+  document.getElementById("editDlg").close();
+  toast(r&&r.ok?"Saved ✓":"Failed");memberView(uid);
 }
 function sparkline(pts){
   if(!pts||pts.length<2)return '<div class="faint">Not enough data for a trend.</div>';
@@ -1849,7 +1990,7 @@ async function memberView(uid){
   const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
   const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[];
-  currentFoods=foods;
+  currentFoods=foods;currentNutrition=n;
   v.innerHTML=`<div class="crumb" onclick="go('members')">← Members</div>
     <div class="hero">${avatar(uid,m.display_name,m.avatar,72)}
       <div><h2>${esc(m.display_name||uid)}</h2>
@@ -1863,9 +2004,11 @@ async function memberView(uid){
       ${stat(o.bodyweight?o.bodyweight.weight_kg+" kg":"—","Bodyweight")}
       ${stat(Math.round(cal.total||0),"kcal logged")}${stat(Math.round(pro.total||0),"g protein")}</div>
     <div class="grid2">
-      <div class="box"><h3>Today's nutrition</h3>
+      <div class="box"><h3 style="display:flex;justify-content:space-between;align-items:center">
+        <span>Today's nutrition</span>${activeTargetPill(n.targets)}</h3>
         ${bar("Calories",n.calorie_today,n.calorie_goal," kcal",false)}
-        ${bar("Protein",n.protein_today,n.protein_goal," g",true)}</div>
+        ${bar("Protein",n.protein_today,n.protein_goal," g",true)}
+        ${targetsTable(n.targets,uid)}</div>
       <div class="box"><h3>Bodyweight trend</h3>${sparkline(bw)}</div>
     </div>
     <div class="grid2">

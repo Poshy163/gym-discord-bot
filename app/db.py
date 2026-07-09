@@ -7,8 +7,10 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+
+from . import targets
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lifts (
@@ -247,9 +249,51 @@ CREATE TABLE IF NOT EXISTS auto_untimeout (
     PRIMARY KEY (guild_id, user_id)
 );
 
--- Calorie tracking. ``calorie_goals`` holds each user's daily intake target
--- (stored in kcal — the bot converts kJ on the way in). Having a row here is
--- what marks a user as "doing" calorie tracking for the weekly AI summary.
+-- Per-day nutrition targets — the source of truth for what a user is aiming at
+-- on any given date, and what ``calorie_goals``/``protein_goals`` below were
+-- replaced by.
+--
+-- One row per (user, macro, scope, effective_from):
+--   macro           'kcal' or 'protein_g'. The two trackers are independent
+--                   everywhere else in the bot, so they get independent rows —
+--                   turning calorie tracking off must not disturb a protein
+--                   ceiling.
+--   scope           which days the rule covers: 'default' (every day),
+--                   'weekend' (Sat/Sun), and — reserved — 'weekday', 'dow:N',
+--                   'date:YYYY-MM-DD'. Most specific match wins.
+--   value           the target. NULL is meaningful: it says "this rule sets
+--                   nothing", which is how an override gets cleared, and how
+--                   tracking gets switched off, WITHOUT deleting the rows that
+--                   already-lived-through days resolve against.
+--   effective_from  a LOCAL YYYY-MM-DD; the rule applies from that day on.
+--                   Editing a goal appends a row rather than overwriting one,
+--                   so last week keeps scoring against last week's target. Rows
+--                   dated in the future are ignored until they arrive.
+--
+-- Targets are per-user/global like the goal tables they replace; ``guild_id``
+-- only records where a goal was last set, for DM attribution and audit.
+-- app/targets.py owns the matching and priority rules.
+CREATE TABLE IF NOT EXISTS nutrition_targets (
+    user_id        INTEGER NOT NULL,
+    guild_id       INTEGER NOT NULL,
+    username       TEXT    NOT NULL,
+    macro          TEXT    NOT NULL,
+    scope          TEXT    NOT NULL,
+    value          REAL,
+    effective_from TEXT    NOT NULL,
+    set_at         TEXT    NOT NULL,
+    PRIMARY KEY (user_id, macro, scope, effective_from)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nutrition_targets_user
+    ON nutrition_targets (user_id, macro);
+
+-- LEGACY (read-only since nutrition_targets landed). These held one all-week
+-- target per user. ``_backfill_nutrition_targets`` copies them across as
+-- 'default'-scope rules effective from the beginning of time, which is what
+-- makes a pre-existing single goal keep applying seven days a week — to new
+-- days and to every day already logged. Nothing writes them any more; they are
+-- kept so a rollback to an older build still finds its data.
 CREATE TABLE IF NOT EXISTS calorie_goals (
     guild_id          INTEGER NOT NULL,
     user_id           INTEGER NOT NULL,
@@ -527,6 +571,19 @@ CREATE TABLE IF NOT EXISTS user_dm_prefs (
 """
 
 
+class _Keep:
+    """Sentinel type for :data:`KEEP`."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<keep>"
+
+
+#: "Leave this setting exactly as it is." Needed wherever ``None`` already means
+#: something: clearing a weekend override is ``None``, whereas not mentioning it
+#: at all is ``KEEP``.
+KEEP = _Keep()
+
+
 def _normalize_iso(dt: datetime | None) -> str:
     """Always store timestamps as UTC ISO-8601, regardless of caller tz."""
     if dt is None:
@@ -752,7 +809,44 @@ class Database:
                     "VALUES ('hevy_equip_recanon_v1', 'done')"
                 )
             self._consolidate_global_goals()
+            # Must follow consolidation: it guarantees one legacy row per user,
+            # so the backfill has an unambiguous target to copy.
+            self._backfill_nutrition_targets()
             self._recanonicalize_equipment()
+
+    def _backfill_nutrition_targets(self) -> None:
+        """Copy legacy ``calorie_goals``/``protein_goals`` into ``nutrition_targets``.
+
+        Each becomes a 'default'-scope rule effective from the beginning of
+        time, so a user who only ever set one calorie and one protein goal keeps
+        getting exactly that target seven days a week — on new days, and on
+        every day they had already logged before this table existed.
+
+        Deliberately unconditional rather than gated on an ``app_meta`` flag:
+        the primary key makes ``INSERT OR IGNORE`` a no-op on re-run, and a flag
+        set during the very first open of an *empty* database would skip the
+        backfill forever if legacy rows showed up later (which is exactly what
+        the older tests, and a rollback-then-roll-forward, do). Both source
+        tables hold at most one row per tracking user, so the scan is trivial.
+
+        A user who has since switched tracking off has a NULL-valued rule dated
+        later than the epoch, and that rule still wins — re-inserting the old
+        row here cannot silently re-enable them.
+        """
+        for table, column, macro in (
+            ("calorie_goals", "daily_target_kcal", targets.MACRO_KCAL),
+            ("protein_goals", "daily_target_g", targets.MACRO_PROTEIN),
+        ):
+            self._connection.execute(
+                f"""
+                INSERT OR IGNORE INTO nutrition_targets
+                    (user_id, guild_id, username, macro, scope, value,
+                     effective_from, set_at)
+                SELECT user_id, guild_id, username, ?, ?, {column}, ?, set_at
+                FROM {table}
+                """,
+                (macro, targets.SCOPE_DEFAULT, targets.BEGINNING_OF_TIME),
+            )
 
     def _consolidate_global_goals(self) -> None:
         """Collapse calorie/protein/lift goals to one row per user.
@@ -3543,68 +3637,258 @@ class Database:
             ))
 
     # ------------------------------------------------------------------
+    # Nutrition targets (per-day calorie/protein goals)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _target_rows(c: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
+        """Target rules for one user, on an already-open connection."""
+        return list(c.execute(
+            "SELECT macro, scope, value, effective_from, set_at, username, "
+            "guild_id FROM nutrition_targets WHERE user_id = ? "
+            "ORDER BY effective_from, set_at",
+            (user_id,),
+        ))
+
+    def nutrition_target_rows(self, user_id: int) -> list[sqlite3.Row]:
+        """Every target rule for one user — a handful of rows.
+
+        :func:`app.targets.resolve` turns these into the numbers in force on a
+        given day. Callers that need a whole week should fetch once and resolve
+        per day rather than asking the database seven times.
+        """
+        with self._conn() as c:
+            return self._target_rows(c, user_id)
+
+    def nutrition_targets_on(
+        self, user_id: int, day: date | None = None,
+    ) -> targets.Resolved:
+        """The calorie and protein targets in force for ``user_id`` on ``day``
+        (today in DISPLAY_TIMEZONE when omitted)."""
+        return targets.resolve(
+            self.nutrition_target_rows(user_id), day or targets.local_today(),
+        )
+
+    def _target_effective_from(
+        self, c: sqlite3.Connection, user_id: int, macro: str,
+    ) -> str:
+        """When rules written now should start applying.
+
+        A user's *first* rules for a macro backdate to the beginning of time, so
+        they cover entries chat-backfill already logged before setup was run.
+        Every later edit takes effect today, leaving the days they have already
+        lived through resolving against what was true at the time.
+
+        Call this **once** per command and pass the answer to every write it
+        makes: a first-time ``/calories setup 1500 weekend:2200`` writes two
+        rules, and asking again between them would backdate the weekday rule but
+        not the weekend one.
+        """
+        row = c.execute(
+            "SELECT 1 FROM nutrition_targets WHERE user_id = ? AND macro = ? "
+            "LIMIT 1",
+            (user_id, macro),
+        ).fetchone()
+        if row is None:
+            return targets.BEGINNING_OF_TIME
+        return targets.local_today().isoformat()
+
+    def _nutrition_target_write(
+        self, c: sqlite3.Connection, guild_id: int, user_id: int, username: str,
+        macro: str, scope: str, value: float | None, effective_from: str,
+    ) -> None:
+        """Upsert one rule. ``value=None`` writes the "sets nothing" tombstone
+        that clears an override (or switches a tracker off) without touching the
+        rules older days resolve against."""
+        c.execute(
+            """
+            INSERT INTO nutrition_targets
+                (user_id, guild_id, username, macro, scope, value,
+                 effective_from, set_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (user_id, macro, scope, effective_from) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                username = excluded.username,
+                value    = excluded.value,
+                set_at   = excluded.set_at
+            """,
+            (
+                user_id, guild_id, username, macro, scope,
+                None if value is None else float(value),
+                effective_from, _normalize_iso(None),
+            ),
+        )
+
+    def _nutrition_tracking_off(
+        self, c: sqlite3.Connection, user_id: int, username: str,
+        guild_id: int, macro: str,
+    ) -> bool:
+        """Switch a macro's tracker off by tombstoning every scope that
+        currently sets a value. Returns False when there was nothing to stop.
+
+        Every scope has to be tombstoned, not just ``default`` — a weekend
+        override outranks the default rule, so nulling only the default would
+        leave Saturdays still carrying a target.
+        """
+        live = targets.resolve(
+            self._target_rows(c, user_id), targets.local_today(),
+        )
+        macro_target = (
+            live.kcal if macro == targets.MACRO_KCAL else live.protein
+        )
+        if macro_target.value is None:
+            return False
+        scopes = {
+            row["scope"] for row in c.execute(
+                "SELECT DISTINCT scope FROM nutrition_targets "
+                "WHERE user_id = ? AND macro = ? AND value IS NOT NULL",
+                (user_id, macro),
+            )
+        }
+        effective_from = self._target_effective_from(c, user_id, macro)
+        for scope in scopes:
+            self._nutrition_target_write(
+                c, guild_id, user_id, username, macro, scope, None,
+                effective_from,
+            )
+        return True
+
+    def _tracked_users(
+        self, guild_id: int, macro: str, day: date | None = None,
+    ) -> list[dict]:
+        """Members of this guild whose ``macro`` tracker is on for ``day``.
+
+        Tracking is global (rules carry whichever server they were last set in),
+        so membership is matched against the **members mirror** for this guild;
+        otherwise someone who set their goal in another server would silently
+        drop out of this guild's report. One query, grouped and resolved in
+        Python — a guild has a handful of tracking members, not thousands.
+        """
+        day = day or targets.local_today()
+        with self._conn() as c:
+            rows = list(c.execute(
+                "SELECT t.user_id, t.username, t.macro, t.scope, t.value, "
+                "       t.effective_from, t.set_at "
+                "FROM nutrition_targets t "
+                "JOIN members m ON m.user_id = t.user_id AND m.guild_id = ? "
+                "WHERE m.present = 1 AND t.macro = ? "
+                "ORDER BY t.effective_from, t.set_at",
+                (guild_id, macro),
+            ))
+        by_user: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_user.setdefault(int(row["user_id"]), []).append(row)
+
+        field = (
+            "daily_target_kcal" if macro == targets.MACRO_KCAL
+            else "daily_target_g"
+        )
+        out: list[dict] = []
+        for user_id, user_rows in by_user.items():
+            resolved = targets.resolve(user_rows, day)
+            macro_target = (
+                resolved.kcal if macro == targets.MACRO_KCAL
+                else resolved.protein
+            )
+            if macro_target.value is None:
+                continue  # tracker switched off
+            out.append({
+                "user_id": user_id,
+                "username": user_rows[-1]["username"],
+                field: macro_target.value,
+            })
+        out.sort(key=lambda r: r["username"])
+        return out
+
+    # ------------------------------------------------------------------
     # Calorie tracking
     # ------------------------------------------------------------------
 
     def calorie_goal_set(
         self, guild_id: int, user_id: int, username: str,
         daily_target_kcal: float,
+        weekend_kcal: float | None | _Keep = KEEP,
     ) -> None:
-        """Create or update a user's daily calorie target (kcal).
+        """Set the user's all-week calorie target, and optionally a weekend one.
 
-        Tracking is **per-user / global**: setting it consolidates to a single
-        row (any copy under another server is cleared first), so the goal applies
-        in every server and in DMs.
+        ``daily_target_kcal`` is the number that applies to any day no more
+        specific rule covers — so on its own it means the same target seven days
+        a week, exactly as before per-day targets existed.
+
+        ``weekend_kcal`` left at :data:`KEEP` leaves any existing weekend
+        override alone (re-running setup to nudge the weekday number shouldn't
+        quietly discard it); passing ``None`` clears it, and a number sets it.
+        Tracking is **per-user / global** — the goal applies in every server and
+        in DMs.
         """
         with self._conn() as c:
-            c.execute(
-                "DELETE FROM calorie_goals WHERE user_id = ? AND guild_id <> ?",
-                (user_id, guild_id),
+            effective_from = self._target_effective_from(
+                c, user_id, targets.MACRO_KCAL,
             )
-            c.execute(
-                """
-                INSERT INTO calorie_goals
-                    (guild_id, user_id, username, daily_target_kcal, set_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                    username          = excluded.username,
-                    daily_target_kcal = excluded.daily_target_kcal,
-                    set_at            = excluded.set_at
-                """,
-                (
-                    guild_id, user_id, username,
-                    float(daily_target_kcal), _normalize_iso(None),
-                ),
+            self._nutrition_target_write(
+                c, guild_id, user_id, username,
+                targets.MACRO_KCAL, targets.SCOPE_DEFAULT, daily_target_kcal,
+                effective_from,
             )
+            detail = f"calorie target {float(daily_target_kcal):.0f} kcal/day"
+            if weekend_kcal is not KEEP:
+                self._nutrition_target_write(
+                    c, guild_id, user_id, username,
+                    targets.MACRO_KCAL, targets.SCOPE_WEEKEND, weekend_kcal,
+                    effective_from,
+                )
+                detail += (
+                    " (weekend override cleared)" if weekend_kcal is None
+                    else f", weekends {float(weekend_kcal):.0f} kcal/day"
+                )
             self._audit_data(
                 c, guild_id, "calorie_goal_set",
-                subject_id=user_id, subject_name=username,
-                detail=f"calorie target {float(daily_target_kcal):.0f} kcal/day",
+                subject_id=user_id, subject_name=username, detail=detail,
             )
 
     def calorie_goal_get(
-        self, guild_id: int, user_id: int,
-    ) -> sqlite3.Row | None:
-        """The user's calorie goal, resolved **per-user** so it applies in every
-        server + DMs (prefers the current guild's row, else the most recent)."""
-        with self._conn() as c:
-            return c.execute(
-                "SELECT username, daily_target_kcal, set_at "
-                "FROM calorie_goals WHERE user_id = ? "
-                "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
-                (user_id, guild_id),
-            ).fetchone()
+        self, guild_id: int, user_id: int, day: date | None = None,
+    ) -> dict | None:
+        """The user's calorie target on ``day`` (today when omitted), or None
+        when they aren't tracking calories.
+
+        Keeps the shape the ~40 existing call sites read — ``daily_target_kcal``,
+        ``username``, ``set_at`` — and adds ``split``/``label`` for the surfaces
+        that show which set is active. ``guild_id`` is ignored: targets resolve
+        per-user so they apply in every server and in DMs. It stays in the
+        signature because callers pass it.
+        """
+        day = day or targets.local_today()
+        rows = self.nutrition_target_rows(user_id)
+        resolved = targets.resolve(rows, day)
+        if resolved.kcal.value is None:
+            return None
+        return {
+            "daily_target_kcal": resolved.kcal.value,
+            "username": rows[-1]["username"] if rows else "",
+            "set_at": rows[-1]["set_at"] if rows else "",
+            "split": resolved.kcal.split,
+            "label": resolved.label_for(targets.MACRO_KCAL),
+        }
 
     def calorie_goal_remove(self, guild_id: int, user_id: int) -> bool:
-        """Stop tracking everywhere (tracking is global). Entry history is kept
-        so re-enabling later still has the back data; only the goal row (the
-        opt-in marker) goes."""
+        """Stop tracking everywhere (tracking is global).
+
+        Entry history is kept so re-enabling later still has the back data, and
+        so are the target rules — a day that has already been logged still knows
+        what it was aiming at, so old reports keep reading correctly. Today
+        onward simply resolves to "no target".
+        """
         with self._conn() as c:
-            cur = c.execute(
-                "DELETE FROM calorie_goals WHERE user_id = ?",
+            row = c.execute(
+                "SELECT username FROM nutrition_targets WHERE user_id = ? "
+                "ORDER BY set_at DESC LIMIT 1",
                 (user_id,),
+            ).fetchone()
+            username = row["username"] if row else ""
+            ok = self._nutrition_tracking_off(
+                c, user_id, username, guild_id, targets.MACRO_KCAL,
             )
-            ok = (cur.rowcount or 0) > 0
             if ok:
                 self._audit_data(
                     c, guild_id, "calorie_goal_remove", subject_id=user_id,
@@ -3612,24 +3896,13 @@ class Database:
                 )
             return ok
 
-    def calorie_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
+    def calorie_tracked_users(
+        self, guild_id: int, day: date | None = None,
+    ) -> list[dict]:
         """Calorie-tracking members of this guild — the weekly AI summary
-        iterates this list.
-
-        Tracking is global (one goal row per user, tagged with whichever server
-        they last set it in), so membership is matched against the **members
-        mirror** for this guild rather than the goal's stored ``guild_id``;
-        otherwise someone who set their goal in another server would silently
-        drop out of this guild's report."""
-        with self._conn() as c:
-            return list(c.execute(
-                "SELECT g.user_id, g.username, g.daily_target_kcal "
-                "FROM calorie_goals g "
-                "JOIN members m ON m.user_id = g.user_id AND m.guild_id = ? "
-                "WHERE m.present = 1 "
-                "ORDER BY g.username",
-                (guild_id,),
-            ))
+        iterates this list. ``daily_target_kcal`` is the target in force on
+        ``day``; reports spanning a week re-resolve per day."""
+        return self._tracked_users(guild_id, targets.MACRO_KCAL, day)
 
     def calorie_add(
         self, guild_id: int, user_id: int, username: str, kcal: float,
@@ -3899,58 +4172,75 @@ class Database:
     def protein_goal_set(
         self, guild_id: int, user_id: int, username: str,
         daily_target_g: float,
+        weekend_g: float | None | _Keep = KEEP,
     ) -> None:
-        """Create or update a user's daily protein ceiling (grams).
+        """Set the user's all-week protein ceiling (grams), optionally with a
+        separate weekend one.
 
-        Tracking is **per-user / global**: setting it consolidates to a single
-        row, so the goal applies in every server and in DMs."""
+        ``daily_target_g`` covers any day no more specific rule matches, so on
+        its own it means the same ceiling seven days a week. ``weekend_g`` at
+        :data:`KEEP` leaves an existing weekend override alone, ``None`` clears
+        it, a number sets it. Per-user / global, like its calorie twin."""
         with self._conn() as c:
-            c.execute(
-                "DELETE FROM protein_goals WHERE user_id = ? AND guild_id <> ?",
-                (user_id, guild_id),
+            effective_from = self._target_effective_from(
+                c, user_id, targets.MACRO_PROTEIN,
             )
-            c.execute(
-                """
-                INSERT INTO protein_goals
-                    (guild_id, user_id, username, daily_target_g, set_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                    username       = excluded.username,
-                    daily_target_g = excluded.daily_target_g,
-                    set_at         = excluded.set_at
-                """,
-                (
-                    guild_id, user_id, username,
-                    float(daily_target_g), _normalize_iso(None),
-                ),
+            self._nutrition_target_write(
+                c, guild_id, user_id, username,
+                targets.MACRO_PROTEIN, targets.SCOPE_DEFAULT, daily_target_g,
+                effective_from,
             )
+            detail = f"protein max {float(daily_target_g):.0f} g/day"
+            if weekend_g is not KEEP:
+                self._nutrition_target_write(
+                    c, guild_id, user_id, username,
+                    targets.MACRO_PROTEIN, targets.SCOPE_WEEKEND, weekend_g,
+                    effective_from,
+                )
+                detail += (
+                    " (weekend override cleared)" if weekend_g is None
+                    else f", weekends {float(weekend_g):.0f} g/day"
+                )
             self._audit_data(
                 c, guild_id, "protein_goal_set",
-                subject_id=user_id, subject_name=username,
-                detail=f"protein max {float(daily_target_g):.0f} g/day",
+                subject_id=user_id, subject_name=username, detail=detail,
             )
 
     def protein_goal_get(
-        self, guild_id: int, user_id: int,
-    ) -> sqlite3.Row | None:
-        """The user's protein goal, resolved **per-user** so it applies in every
-        server + DMs (prefers the current guild's row, else the most recent)."""
-        with self._conn() as c:
-            return c.execute(
-                "SELECT username, daily_target_g, set_at "
-                "FROM protein_goals WHERE user_id = ? "
-                "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
-                (user_id, guild_id),
-            ).fetchone()
+        self, guild_id: int, user_id: int, day: date | None = None,
+    ) -> dict | None:
+        """The user's protein ceiling on ``day`` (today when omitted), or None
+        when they aren't tracking protein.
+
+        Same shape as :meth:`calorie_goal_get`: the ``daily_target_g`` key every
+        existing call site reads, plus ``split``/``label`` for surfaces that show
+        which set is active."""
+        day = day or targets.local_today()
+        rows = self.nutrition_target_rows(user_id)
+        resolved = targets.resolve(rows, day)
+        if resolved.protein.value is None:
+            return None
+        return {
+            "daily_target_g": resolved.protein.value,
+            "username": rows[-1]["username"] if rows else "",
+            "set_at": rows[-1]["set_at"] if rows else "",
+            "split": resolved.protein.split,
+            "label": resolved.label_for(targets.MACRO_PROTEIN),
+        }
 
     def protein_goal_remove(self, guild_id: int, user_id: int) -> bool:
-        """Stop protein tracking everywhere (global); logged history is kept."""
+        """Stop protein tracking everywhere (global); logged history and the
+        target rules behind it are kept, so old reports still read correctly."""
         with self._conn() as c:
-            cur = c.execute(
-                "DELETE FROM protein_goals WHERE user_id = ?",
+            row = c.execute(
+                "SELECT username FROM nutrition_targets WHERE user_id = ? "
+                "ORDER BY set_at DESC LIMIT 1",
                 (user_id,),
+            ).fetchone()
+            username = row["username"] if row else ""
+            ok = self._nutrition_tracking_off(
+                c, user_id, username, guild_id, targets.MACRO_PROTEIN,
             )
-            ok = (cur.rowcount or 0) > 0
             if ok:
                 self._audit_data(
                     c, guild_id, "protein_goal_remove", subject_id=user_id,
@@ -3958,19 +4248,13 @@ class Database:
                 )
             return ok
 
-    def protein_tracked_users(self, guild_id: int) -> list[sqlite3.Row]:
+    def protein_tracked_users(
+        self, guild_id: int, day: date | None = None,
+    ) -> list[dict]:
         """Protein-tracking members of this guild. Like its calorie twin,
         tracking is global so membership is matched against the members mirror
-        for this guild rather than the goal's stored ``guild_id``."""
-        with self._conn() as c:
-            return list(c.execute(
-                "SELECT g.user_id, g.username, g.daily_target_g "
-                "FROM protein_goals g "
-                "JOIN members m ON m.user_id = g.user_id AND m.guild_id = ? "
-                "WHERE m.present = 1 "
-                "ORDER BY g.username",
-                (guild_id,),
-            ))
+        for this guild rather than the rule's stored ``guild_id``."""
+        return self._tracked_users(guild_id, targets.MACRO_PROTEIN, day)
 
     def protein_add(
         self, guild_id: int, user_id: int, username: str, grams: float,
@@ -4758,22 +5042,19 @@ class Database:
         return [int(r["guild_id"]) for r in rows]
 
     def nutrition_home_guild(self, user_id: int) -> int | None:
-        """The guild a user's (global) calorie/protein goal row is filed under.
+        """The guild a user's (global) nutrition targets are filed under.
 
-        Tracking is global, but the goal row still carries the guild it was last
+        Targets are global, but each rule still carries the guild it was last
         set in. DM logging uses this to attribute a global entry to the same
         server as the user's other data when they haven't pinned one with
         ``/server``. Returns None if they aren't tracking anything."""
         with self._conn() as c:
-            for table in ("calorie_goals", "protein_goals"):
-                row = c.execute(
-                    f"SELECT guild_id FROM {table} WHERE user_id = ? "
-                    "ORDER BY set_at DESC LIMIT 1",
-                    (user_id,),
-                ).fetchone()
-                if row is not None:
-                    return int(row["guild_id"])
-        return None
+            row = c.execute(
+                "SELECT guild_id FROM nutrition_targets WHERE user_id = ? "
+                "ORDER BY set_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return None if row is None else int(row["guild_id"])
 
     def dm_guild_get(self, user_id: int) -> int | None:
         """The user's stored default guild for DM commands, if any."""
@@ -5106,6 +5387,62 @@ class Database:
             guild_id, "data", "food_set",
             actor_name=actor_name, subject_id=user_id, subject_name=username,
             detail=detail + " (web)",
+        )
+
+    def web_nutrition_targets_set(
+        self, guild_id: int, user_id: int, username: str, *,
+        kcal: float | None, weekend_kcal: float | None,
+        protein_g: float | None, weekend_protein_g: float | None,
+        actor_name: str,
+    ) -> None:
+        """Save all four target fields from the dashboard, and audit it.
+
+        Unlike the Discord commands, the dashboard form shows every field at
+        once, so every field is explicit: a blank weekday value means "stop
+        tracking this macro", and a blank weekend value means "no separate
+        weekend target" — not "leave whatever was there". That's why this takes
+        plain values rather than :data:`KEEP`.
+        """
+        with self._conn() as c:
+            pairs = (
+                (targets.MACRO_KCAL, kcal, weekend_kcal),
+                (targets.MACRO_PROTEIN, protein_g, weekend_protein_g),
+            )
+            for macro, base, weekend in pairs:
+                if base is None:
+                    self._nutrition_tracking_off(
+                        c, user_id, username, guild_id, macro,
+                    )
+                    continue
+                # Only tombstone the weekend rule when one is actually live —
+                # otherwise a plain weekday-only save litters the table with
+                # NULL rows that mean nothing. Read before writing the default.
+                live = targets.resolve(
+                    self._target_rows(c, user_id), targets.local_today(),
+                )
+                effective_from = self._target_effective_from(c, user_id, macro)
+                self._nutrition_target_write(
+                    c, guild_id, user_id, username,
+                    macro, targets.SCOPE_DEFAULT, base, effective_from,
+                )
+                if weekend is not None or live.macro(macro).split:
+                    self._nutrition_target_write(
+                        c, guild_id, user_id, username,
+                        macro, targets.SCOPE_WEEKEND, weekend, effective_from,
+                    )
+
+        def _fmt(value: float | None, unit: str) -> str:
+            return "off" if value is None else f"{value:.0f}{unit}"
+
+        self.add_audit(
+            guild_id, "data", "nutrition_targets_set",
+            actor_name=actor_name, subject_id=user_id, subject_name=username,
+            detail=(
+                f"calories {_fmt(kcal, ' kcal')} / "
+                f"{_fmt(weekend_kcal, ' kcal')} weekend, protein "
+                f"{_fmt(protein_g, 'g')} / "
+                f"{_fmt(weekend_protein_g, 'g')} weekend (web)"
+            ),
         )
 
     def web_food_delete(

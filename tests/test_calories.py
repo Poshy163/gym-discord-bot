@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from app import targets
 from app.calories import (
     format_kcal,
     kcal_to_kj,
@@ -257,6 +258,134 @@ def test_calorie_goal_remove_keeps_entries(db):
     assert db.calorie_goal_remove(1, 100) is False
 
 
+# ---- weekday / weekend targets ---------------------------------------------
+
+def _next(pred) -> date:
+    """The next local day matching ``pred``, starting today.
+
+    Rules written now take effect today, so tests have to ask about today or
+    later — asking about yesterday would (correctly) get the older answer.
+    """
+    day = targets.local_today()
+    while not pred(day):
+        day += timedelta(days=1)
+    return day
+
+
+def _weekday() -> date:
+    return _next(lambda d: not targets.is_weekend(d))
+
+
+def _weekend() -> date:
+    return _next(targets.is_weekend)
+
+
+def test_calorie_goal_without_weekend_applies_all_week(db):
+    # The old schema: one number, seven days a week, and no "which set" banner.
+    db.calorie_goal_set(1, 100, "alice", 1500)
+    for day in (_weekday(), _weekend()):
+        goal = db.calorie_goal_get(1, 100, day)
+        assert goal["daily_target_kcal"] == 1500
+        assert goal["split"] is False
+        assert goal["label"] is None
+
+
+def test_calorie_goal_weekend_override(db):
+    db.calorie_goal_set(1, 100, "alice", 1500, 2200)
+    weekday = db.calorie_goal_get(1, 100, _weekday())
+    assert weekday["daily_target_kcal"] == 1500
+    assert weekday["label"] == "Using Weekday Targets"
+    weekend = db.calorie_goal_get(1, 100, _weekend())
+    assert weekend["daily_target_kcal"] == 2200
+    assert weekend["label"] == "Using Weekend Targets"
+
+
+def test_first_setup_backdates_both_rules_together(db):
+    # A brand-new user's first targets cover the history chat-backfill wrote for
+    # them, and the weekday and weekend rules must backdate as one.
+    db.calorie_goal_set(1, 100, "alice", 1500, 2200)
+    assert db.calorie_goal_get(1, 100, date(2020, 1, 6))["daily_target_kcal"] == 1500
+    assert db.calorie_goal_get(1, 100, date(2020, 1, 4))["daily_target_kcal"] == 2200
+
+
+def test_resetting_the_weekday_target_keeps_the_weekend_override(db):
+    db.calorie_goal_set(1, 100, "alice", 1500, 2200)
+    db.calorie_goal_set(1, 100, "alice", 1600)  # weekend not mentioned
+    assert db.calorie_goal_get(1, 100, _weekday())["daily_target_kcal"] == 1600
+    assert db.calorie_goal_get(1, 100, _weekend())["daily_target_kcal"] == 2200
+
+
+def test_clearing_the_weekend_override_falls_back_to_the_weekday_target(db):
+    db.calorie_goal_set(1, 100, "alice", 1500, 2200)
+    db.calorie_goal_set(1, 100, "alice", 1500, None)  # explicit clear
+    goal = db.calorie_goal_get(1, 100, _weekend())
+    assert goal["daily_target_kcal"] == 1500
+    assert goal["split"] is False
+    assert goal["label"] is None
+
+
+def test_changing_a_goal_does_not_rescore_yesterday(db):
+    db.calorie_goal_set(1, 100, "alice", 1500)   # backdated to the epoch
+    db.calorie_goal_set(1, 100, "alice", 1800)   # takes effect today
+    yesterday = targets.local_today() - timedelta(days=1)
+    assert db.calorie_goal_get(1, 100, yesterday)["daily_target_kcal"] == 1500
+    assert db.calorie_goal_get(1, 100)["daily_target_kcal"] == 1800
+
+
+def test_removing_calorie_tracking_leaves_protein_and_history_alone(db):
+    db.calorie_goal_set(1, 100, "alice", 1500, 2200)
+    db.protein_goal_set(1, 100, "alice", 180)
+    assert db.calorie_goal_remove(1, 100) is True
+    # Off today, on both bands — a weekend override must not survive the opt-out.
+    assert db.calorie_goal_get(1, 100, _weekday()) is None
+    assert db.calorie_goal_get(1, 100, _weekend()) is None
+    # The other tracker is untouched...
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 180
+    # ...and days already logged still know what they were aiming at.
+    yesterday = targets.local_today() - timedelta(days=1)
+    assert db.calorie_goal_get(1, 100, yesterday) is not None
+
+
+def test_tracked_users_drops_someone_who_stopped_tracking(db):
+    db.calorie_goal_set(1, 100, "alice", 2500)
+    db.upsert_member(1, 100, "alice", "Alice")
+    assert [r["user_id"] for r in db.calorie_tracked_users(1)] == [100]
+    db.calorie_goal_remove(1, 100)
+    assert db.calorie_tracked_users(1) == []
+
+
+def test_legacy_goals_backfill_to_every_day_of_the_week(db, tmp_path):
+    # An old database, written before nutrition_targets existed.
+    with db._conn() as c:  # noqa: SLF001
+        c.execute(
+            "INSERT INTO calorie_goals "
+            "(guild_id, user_id, username, daily_target_kcal, set_at) "
+            "VALUES (7, 100, 'alice', 1900, '2026-01-01T00:00:00+00:00')"
+        )
+        c.execute(
+            "INSERT INTO protein_goals "
+            "(guild_id, user_id, username, daily_target_g, set_at) "
+            "VALUES (7, 100, 'alice', 150, '2026-01-01T00:00:00+00:00')"
+        )
+    db.close()
+    reopened = Database(tmp_path / "gym.sqlite3")
+    try:
+        for day in (_weekday(), _weekend(), date(2019, 5, 4)):
+            assert reopened.calorie_goal_get(7, 100, day)["daily_target_kcal"] == 1900
+            assert reopened.protein_goal_get(7, 100, day)["daily_target_g"] == 150
+        assert reopened.calorie_goal_get(7, 100)["split"] is False
+        assert reopened.nutrition_home_guild(100) == 7
+        rows = reopened.nutrition_target_rows(100)
+    finally:
+        reopened.close()
+    # Re-opening again must not duplicate the copied rules.
+    again = Database(tmp_path / "gym.sqlite3")
+    try:
+        assert len(again.nutrition_target_rows(100)) == len(rows) == 2
+    finally:
+        again.close()
+
+
 def test_calorie_tracked_users_scoped_to_membership(db):
     # Tracking is global, but a guild's report only lists that guild's current
     # members — matched against the members mirror, not the goal's stored guild.
@@ -286,12 +415,18 @@ def test_calorie_tracked_users_follows_member_across_servers(db):
 def test_global_goal_consolidation_migration(db, tmp_path):
     # Simulate an older DB with a separate goal row per server for one user,
     # then re-open it so the startup migration consolidates to the latest.
-    db.calorie_goal_set(1, 100, "alice", 2500)
+    # Written straight into the legacy tables: nothing writes them any more, so
+    # going through calorie_goal_set() wouldn't reproduce the old shape.
     with db._conn() as c:  # noqa: SLF001 - exercising the migration directly
         c.execute(
             "INSERT INTO calorie_goals "
             "(guild_id, user_id, username, daily_target_kcal, set_at) "
             "VALUES (2, 100, 'alice', 1800, '2000-01-01T00:00:00+00:00')"
+        )
+        c.execute(
+            "INSERT INTO calorie_goals "
+            "(guild_id, user_id, username, daily_target_kcal, set_at) "
+            "VALUES (1, 100, 'alice', 2500, '2099-01-01T00:00:00+00:00')"
         )
         c.execute(
             "INSERT INTO protein_goals "
@@ -316,6 +451,10 @@ def test_global_goal_consolidation_migration(db, tmp_path):
         # One row each, keeping the most-recently-set target.
         assert [r["daily_target_kcal"] for r in cal] == [2500]
         assert [r["daily_target_g"] for r in pro] == [180]
+        # ...and the surviving row is what the backfill carried across, so the
+        # old single goal now applies to every day of the week.
+        assert reopened.calorie_goal_get(1, 100)["daily_target_kcal"] == 2500
+        assert reopened.protein_goal_get(1, 100)["daily_target_g"] == 180
     finally:
         reopened.close()
 

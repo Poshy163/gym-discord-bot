@@ -102,6 +102,31 @@ def test_protein_goal_set_get_remove(db):
     assert db.protein_goal_remove(1, 100) is False
 
 
+def test_protein_weekend_override_and_independence(db):
+    from datetime import timedelta
+
+    from app import targets
+
+    today = targets.local_today()
+    days = [today + timedelta(days=n) for n in range(7)]
+    weekday = next(d for d in days if not targets.is_weekend(d))
+    weekend = next(d for d in days if targets.is_weekend(d))
+
+    db.calorie_goal_set(1, 100, "alice", 1500)
+    db.protein_goal_set(1, 100, "alice", 180, 200)
+    assert db.protein_goal_get(1, 100, weekday)["daily_target_g"] == 180
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 200
+    # Calories have no weekend rule, so they stay flat across the split.
+    assert db.calorie_goal_get(1, 100, weekend)["daily_target_kcal"] == 1500
+
+    # Turning protein off must not disturb the calorie tracker, and must clear
+    # the weekend ceiling too.
+    assert db.protein_goal_remove(1, 100) is True
+    assert db.protein_goal_get(1, 100, weekday) is None
+    assert db.protein_goal_get(1, 100, weekend) is None
+    assert db.calorie_goal_get(1, 100)["daily_target_kcal"] == 1500
+
+
 def test_protein_goal_and_total_are_global_per_user(db):
     db.protein_goal_set(1, 100, "alice", 180)
     # Goal resolves from any server / DM.

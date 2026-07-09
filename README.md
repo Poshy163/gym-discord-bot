@@ -100,10 +100,17 @@ Editing/cleanup of **your own** data is global too (`/change_weight`,
 
 Calories:
 
-- `/calories setup <target>` — set your daily intake target. Accepts kcal or
-  kJ (`2500`, `2500c`, `8700kj` — kJ is converted at 4.184 kJ/kcal).
+- `/calories setup <target> [weekend]` — set your daily intake target. Accepts
+  kcal or kJ (`2500`, `2500c`, `8700kj` — kJ is converted at 4.184 kJ/kcal).
+  On its own that one target applies **every day**. Add `weekend:` for a
+  different Saturday/Sunday target — `/calories setup 1500 weekend:2200` — and
+  each day is scored against whichever applies, with replies labelled *Using
+  Weekday Targets* / *Using Weekend Targets*. Re-running `setup` without
+  `weekend:` leaves an existing weekend target alone; `weekend:same` drops it.
+- `/calories targets [user]` — show both target sets and which one today falls
+  under.
 - `/calories add <amount> [note]` — log something you ate, again in kcal or
-  kJ. The reply shows a progress bar against your daily target.
+  kJ. The reply shows a progress bar against that day's target.
 - Or just type it in chat: a message that is **only** an amount — `650kcal`,
   `200c`, or `2700kj` — gets logged automatically, the bot reacts ✅ and
   replies with your running total. The message must be nothing but the amount
@@ -118,9 +125,11 @@ Calories:
   an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and
   combined posts; the reply notes the day it landed on. The slash commands take
   it too: `/calories add 650 day:yesterday`, `/protein add 40 day:monday`.
-- `/calories today [user]` — today's entries and total vs target.
+- `/calories today [user]` — today's entries and total vs today's target.
 - `/calories week [user]` — per-day totals for the last 7 days (with your 🔥
-  logging streak).
+  logging streak). Each day is measured against the target that was live on
+  that day; with weekday/weekend targets the footer also breaks out weekday and
+  weekend averages and adherence.
 - `/calories leaderboard` — ranks the server's trackers by current logging
   streak.
 - `/calories edit <amount> [note]` — fix the amount of your most recent entry.
@@ -137,6 +146,11 @@ Calories:
 Calorie tracking is **global per user** — your daily goal, saved foods and
 logged entries follow you across every server the bot is in, and in DMs. (Same
 for protein and bodyweight.)
+
+Targets are **effective-dated**: changing a goal applies from today onward, and
+days you've already logged keep being scored against the target that was live at
+the time — so bumping your goal on a Thursday never silently rewrites last
+week's report.
 
 Saved foods (personal name → calorie shortcuts):
 
@@ -166,7 +180,9 @@ report (see below).
 A lightweight, separate tracker for keeping protein **under** a daily ceiling
 (it flags when you go over, rather than nudging you to hit a goal).
 
-- `/protein setup <grams>` — set your daily max, e.g. `180`.
+- `/protein setup <grams> [weekend]` — set your daily max, e.g. `180`. Like
+  calories, that one number covers every day unless you add a separate weekend
+  max (`/protein setup 180 weekend:200`); `weekend:same` drops it again.
 - `/protein add <grams> [note]` — log protein, e.g. `/protein add 40 chicken`.
 - Or just type **`40p`** / **`40g protein`** / **`protein 40`** in chat — the
   bot reacts ✅ and replies with your running total vs your max (with a ⚠️ once
@@ -293,6 +309,11 @@ short Gemini-written summary for each member tracking via `/calories`
 protein check-in** (days logged, average vs max, and how often they went over).
 Without `GEMINI_API_KEY` the calorie section falls back to plain stats lines;
 the protein section is always plain stats.
+
+Every day in these reports is compared against the target that was active on
+that day, so someone running a bigger weekend target isn't scored as having
+overeaten on Saturday. For those members the AI summary also receives weekday
+and weekend averages so it can talk about the two bands separately.
 
 The channel comes from `WEEKLY_REPORT_CHANNEL_ID`, falling back to
 `DAILY_UPDATE_CHANNEL_ID` then `REMINDER_CHANNEL_ID`. Defaults are **Sunday

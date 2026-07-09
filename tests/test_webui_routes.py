@@ -863,3 +863,128 @@ def test_member_autountimeout_503_when_unwired(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+# ---- nutrition targets -----------------------------------------------------
+
+def _weekday_and_weekend():
+    """A weekday and a weekend day on or after today, since rules written now
+    take effect today."""
+    from datetime import timedelta
+
+    from app import targets
+
+    day = targets.local_today()
+    days = [day + timedelta(days=n) for n in range(7)]
+    return (
+        next(d for d in days if not targets.is_weekend(d)),
+        next(d for d in days if targets.is_weekend(d)),
+    )
+
+
+def test_nutrition_targets_saves_weekday_and_weekend(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5",
+                "calorie_weekday": 1500, "calorie_weekend": 2200,
+                "protein_weekday": 180, "protein_weekend": "",
+            })
+            assert r.status == 200
+            weekday, weekend = _weekday_and_weekend()
+            assert db.calorie_goal_get(1, 5, weekday)["daily_target_kcal"] == 1500
+            assert db.calorie_goal_get(1, 5, weekend)["daily_target_kcal"] == 2200
+            # A blank weekend protein box means "same all week", not "off".
+            assert db.protein_goal_get(1, 5, weekend)["daily_target_g"] == 180
+            # The change is auditable.
+            actions = [a["action"] for a in db.list_audit(1, subject_id=5)]
+            assert "nutrition_targets_set" in actions
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_nutrition_targets_blank_weekday_turns_a_tracker_off(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            db.calorie_goal_set(1, 5, "u5", 1500, 2200)
+            db.protein_goal_set(1, 5, "u5", 180)
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5",
+                "calorie_weekday": "", "calorie_weekend": "",
+                "protein_weekday": 190, "protein_weekend": "",
+            })
+            assert r.status == 200
+            weekday, weekend = _weekday_and_weekend()
+            # Calories off on BOTH bands — the weekend override must not survive.
+            assert db.calorie_goal_get(1, 5, weekday) is None
+            assert db.calorie_goal_get(1, 5, weekend) is None
+            assert db.protein_goal_get(1, 5)["daily_target_g"] == 190
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_nutrition_targets_rejects_weekend_without_weekday(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5",
+                "calorie_weekday": "", "calorie_weekend": 2200,
+            })
+            assert r.status == 400
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_nutrition_targets_rejects_out_of_range(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5", "calorie_weekday": 999_999,
+            })
+            assert r.status == 400
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5", "calorie_weekday": -5,
+            })
+            assert r.status == 400
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_nutrition_targets_requires_auth(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            r = await client.post("/api/nutrition/targets", json={
+                "guild": "1", "user": "5", "calorie_weekday": 1500,
+            })
+            assert r.status in (401, 403)
+        finally:
+            await client.close()
+            db.close()
+    _run(go())

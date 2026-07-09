@@ -39,6 +39,8 @@ from app.bot import (  # noqa: E402
     _ZERO_CALORIE_QUIPS,
     _ZERO_PROTEIN_QUIPS,
     DISPLAY_TZ,
+    _calorie_status_for,
+    _reply_label,
     db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
@@ -509,3 +511,80 @@ def test_protein_weekly_blocks_flags_over_max():
     blocks = _protein_weekly_blocks(g, start, end)
     assert any("Alice" in b for b in blocks)
     assert any("over" in b for b in blocks)
+
+
+# ---- weekday / weekend targets in log replies -------------------------------
+
+def _at(day):
+    """Noon on ``day``, in the display timezone, as a UTC timestamp."""
+    local = datetime.combine(day, datetime.min.time(), tzinfo=DISPLAY_TZ)
+    return local.replace(hour=12).astimezone(timezone.utc)
+
+
+def test_backdated_entry_is_scored_against_its_own_days_target():
+    from app import targets
+
+    uid = 8801
+    _bot_db.calorie_goal_set(1, uid, "Josh", 1500, 2200)
+    today = targets.local_today()
+    days = [today + timedelta(days=n) for n in range(7)]
+    weekday = next(d for d in days if not targets.is_weekend(d))
+    weekend = next(d for d in days if targets.is_weekend(d))
+
+    # The same 1,200 kcal reads differently depending on the day it belongs to.
+    assert "1,500 cal" in _calorie_status_for(uid, 1200, _at(weekday))
+    assert "Using Weekday Targets" in _calorie_status_for(uid, 1200, _at(weekday))
+    assert "2,200 cal" in _calorie_status_for(uid, 1200, _at(weekend))
+    assert "Using Weekend Targets" in _calorie_status_for(uid, 1200, _at(weekend))
+
+
+def test_single_target_user_sees_no_weekday_weekend_banner():
+    uid = 8802
+    _bot_db.calorie_goal_set(1, uid, "Old", 2000)
+    today = datetime.now(DISPLAY_TZ).date()
+    line = _calorie_status_for(uid, 900, _at(today))
+    assert "2,000 cal" in line
+    assert "Targets" not in line  # no "Using ... Targets" subtext at all
+
+
+def test_backdating_into_a_tracking_gap_borrows_todays_target():
+    # Stopped tracking yesterday, restarted today: an entry backdated into the
+    # gap must not render "200 cal / 0 cal · 200 cal over target".
+    from app import targets
+
+    uid = 8803
+    today = targets.local_today()
+    yesterday = today - timedelta(days=1)
+    _bot_db.calorie_goal_set(1, uid, "Josh", 1500)  # backdated to the epoch
+    with _bot_db._conn() as c:  # noqa: SLF001 - hand-build the gap
+        _bot_db._nutrition_target_write(  # noqa: SLF001
+            c, 1, uid, "Josh", "kcal", "default", None, yesterday.isoformat(),
+        )
+        _bot_db._nutrition_target_write(  # noqa: SLF001
+            c, 1, uid, "Josh", "kcal", "default", 1600, today.isoformat(),
+        )
+
+    assert _bot_db.nutrition_targets_on(uid, yesterday).kcal.value is None
+    assert "1,600 cal" in _calorie_status_for(uid, 200, _at(yesterday))
+    # A backdated day that *did* have a target still uses that one, not today's.
+    assert "1,500 cal" in _calorie_status_for(uid, 200, _at(today - timedelta(days=2)))
+
+
+def test_reply_banner_only_mentions_the_macros_the_reply_shows():
+    # Flat calories, weekend protein override. A calorie-only reply must not
+    # claim "Using Weekend Targets" when the calorie target never varies.
+    from app import targets
+
+    uid = 8804
+    _bot_db.calorie_goal_set(1, uid, "Josh", 2000)
+    _bot_db.protein_goal_set(1, uid, "Josh", 180, 200)
+    today = targets.local_today()
+    weekend = next(
+        today + timedelta(days=n) for n in range(7)
+        if targets.is_weekend(today + timedelta(days=n))
+    )
+    resolved = _bot_db.nutrition_targets_on(uid, weekend)
+    assert resolved.label == "Using Weekend Targets"  # something splits
+    assert _reply_label(resolved, calories=True, protein=False) is None
+    assert _reply_label(resolved, calories=False, protein=True) == "Using Weekend Targets"
+    assert _reply_label(resolved, calories=True, protein=True) == "Using Weekend Targets"
