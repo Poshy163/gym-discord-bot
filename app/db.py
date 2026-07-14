@@ -3942,6 +3942,16 @@ class Database:
                 )
             return new_id
 
+    def set_calorie_message_id(self, calorie_id: int, message_id: int) -> None:
+        """Link an already-inserted intake entry to the bot reply that logged
+        it, so a ❌ reaction on that reply can find and remove it. Used by
+        slash commands, whose reply id isn't known until after the insert."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE calorie_entries SET message_id = ? WHERE id = ?",
+                (message_id, calorie_id),
+            )
+
     def calorie_pop_last(
         self, guild_id: int, user_id: int,
         *, actor_id: int | None = None, actor_name: str | None = None,
@@ -4052,12 +4062,15 @@ class Database:
 
         Lets ❌ reaction-undo work on *legacy* logs (made before reply-tracking
         existed) by following the bot reply's reference back to the original
-        message. message_id is unique per entry (partial unique index)."""
+        message. message_id is globally unique per entry (partial unique index),
+        so a ``guild_id`` of 0 — a ❌ reaction in a DM, where the gateway gives
+        no guild id — matches regardless of the guild the entry was stored
+        under; a non-zero ``guild_id`` still scopes strictly as before."""
         with self._conn() as c:
             return c.execute(
                 "SELECT id, user_id, kcal, note FROM calorie_entries "
-                "WHERE guild_id = ? AND message_id = ?",
-                (guild_id, message_id),
+                "WHERE message_id = ? AND (? = 0 OR guild_id = ?)",
+                (message_id, guild_id, guild_id),
             ).fetchone()
 
     def update_calorie_entry(
@@ -4291,6 +4304,16 @@ class Database:
                 )
             return new_id
 
+    def set_protein_message_id(self, protein_id: int, message_id: int) -> None:
+        """Link an already-inserted protein entry to the bot reply that logged
+        it (slash-command counterpart to reply-tracking), so a ❌ reaction on
+        that reply removes it."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE protein_entries SET message_id = ? WHERE id = ?",
+                (message_id, protein_id),
+            )
+
     def protein_pop_last(
         self, guild_id: int, user_id: int,
         *, actor_id: int | None = None, actor_name: str | None = None,
@@ -4385,12 +4408,14 @@ class Database:
         self, guild_id: int, message_id: int,
     ) -> sqlite3.Row | None:
         """The protein entry created from a given source chat message, or None
-        (used by ❌ reaction-undo on protein/combined replies)."""
+        (used by ❌ reaction-undo on protein/combined replies). ``guild_id`` of
+        0 (a ❌ reaction in a DM) matches on the globally-unique message_id
+        regardless of guild; a non-zero ``guild_id`` scopes strictly."""
         with self._conn() as c:
             return c.execute(
                 "SELECT id, user_id, grams, note FROM protein_entries "
-                "WHERE guild_id = ? AND message_id = ?",
-                (guild_id, message_id),
+                "WHERE message_id = ? AND (? = 0 OR guild_id = ?)",
+                (message_id, guild_id, guild_id),
             ).fetchone()
 
     def delete_protein_entry(

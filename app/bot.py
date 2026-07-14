@@ -4333,7 +4333,9 @@ async def _handle_nutrition_reaction_undo(
     # already-undone ones whose text now starts with "~~").
     if reply_msg.author.id != (bot.user.id if bot.user else 0):
         return
-    if not reply_msg.content.startswith(("🍽️", "🥩", "🥗")):
+    # 🤖 covers the AI-estimate replies (`~...` and /calories estimate); the
+    # others are the manual calorie/protein/combined logs.
+    if not reply_msg.content.startswith(("🍽️", "🥩", "🥗", "🤖")):
         return
 
     guild_id = payload.guild_id or 0
@@ -4358,11 +4360,12 @@ async def _handle_nutrition_reaction_undo(
             removed_bits.append(calories.format_kcal(float(r["kcal"])))
     else:
         # Protein / combined / legacy: resolve via the referenced message and
-        # remove every nutrition entry it created.
+        # remove every nutrition entry it created. Chat replies point back to
+        # the source message; a slash-command followup (/calories estimate) has
+        # no reference, so fall back to the reply's own id — its entries are
+        # linked directly to it.
         ref = reply_msg.reference
-        original_id = ref.message_id if ref else None
-        if original_id is None:
-            return
+        original_id = (ref.message_id if ref else None) or payload.message_id
         cal_entry = db.get_calorie_entry_by_message(guild_id, int(original_id))
         pro_entry = db.get_protein_entry_by_message(guild_id, int(original_id))
         if cal_entry is None and pro_entry is None:
@@ -14547,7 +14550,7 @@ async def calories_estimate_cmd(
         return
     label = result.name or description.strip()[:60]
     note = f"{label} (AI estimate)"
-    db.calorie_add(
+    cal_id = db.calorie_add(
         guild_id, interaction.user.id, _display_name(interaction.user),
         result.kcal, note=note, raw=description.strip()[:80],
         logged_at=logged_at,
@@ -14555,8 +14558,9 @@ async def calories_estimate_cmd(
     pro_goal = db.protein_goal_get(guild_id, interaction.user.id)
     grams = result.protein_g or 0.0
     logged_protein = False
+    pro_id = 0
     if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
-        db.protein_add(
+        pro_id = db.protein_add(
             guild_id, interaction.user.id, _display_name(interaction.user),
             grams, note=note, raw=description.strip()[:80], logged_at=logged_at,
         )
@@ -14589,9 +14593,21 @@ async def calories_estimate_cmd(
             )
         )
     lines.append(
-        "*AI estimate — `/calories undo` to remove, `/calories edit` to correct.*"
+        "*AI estimate — ❌ or `/calories undo` to remove, "
+        "`/calories edit` to correct.*"
     )
-    await interaction.followup.send("\n".join(lines))
+    msg = await interaction.followup.send("\n".join(lines))
+    # Link the entries to this reply so a ❌ reaction (from the logger or an
+    # admin) removes them, then add the affordance. The followup id isn't known
+    # until after the insert, so we backfill message_id here.
+    if cal_id:
+        db.set_calorie_message_id(cal_id, msg.id)
+    if logged_protein and pro_id:
+        db.set_protein_message_id(pro_id, msg.id)
+    try:
+        await msg.add_reaction("❌")
+    except discord.HTTPException:
+        pass
 
 
 # Attachment guardrails for /calories label. Discord caps most uploads well

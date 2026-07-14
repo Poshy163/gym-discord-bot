@@ -700,6 +700,37 @@ def test_get_calorie_entry_by_message(db):
     assert db.get_calorie_entry_by_message(1, 0) is None
 
 
+def test_set_calorie_message_id_links_reply(db):
+    # /calories estimate inserts first (no message_id), then links the reply so
+    # a ❌ reaction can find the entry by the followup's own id.
+    eid = db.calorie_add(1, 100, "alice", 500, note="flat white (AI estimate)")
+    assert db.get_calorie_entry_by_message(1, 900) is None  # not linked yet
+    db.set_calorie_message_id(eid, 900)
+    row = db.get_calorie_entry_by_message(1, 900)
+    assert row is not None and row["id"] == eid and row["user_id"] == 100
+
+
+def test_set_protein_message_id_links_reply(db):
+    eid = db.protein_add(1, 100, "alice", 30, note="flat white (AI estimate)")
+    assert db.get_protein_entry_by_message(1, 900) is None
+    db.set_protein_message_id(eid, 900)
+    row = db.get_protein_entry_by_message(1, 900)
+    assert row is not None and row["id"] == eid and row["grams"] == 30.0
+
+
+def test_get_entry_by_message_dm_guild_agnostic(db):
+    # A ❌ reaction in a DM arrives with no guild id (looked up as 0). Since
+    # message_id is globally unique, the entry — stored under its resolved
+    # guild — must still resolve when guild_id is 0, but a *wrong* non-zero
+    # guild must not match.
+    cid = db.calorie_add(7, 100, "alice", 500, message_id=900)
+    pid = db.protein_add(7, 100, "alice", 30, message_id=900)
+    assert db.get_calorie_entry_by_message(0, 900)["id"] == cid   # DM lookup
+    assert db.get_protein_entry_by_message(0, 900)["id"] == pid
+    assert db.get_calorie_entry_by_message(7, 900)["id"] == cid   # correct guild
+    assert db.get_calorie_entry_by_message(8, 900) is None        # wrong guild
+
+
 def test_delete_calorie_entry_scoped(db):
     eid = db.calorie_add(1, 100, "alice", 1730, note="oops")
     # Wrong user can't delete it.
