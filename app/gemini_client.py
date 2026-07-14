@@ -107,8 +107,10 @@ def generate(
     ``temperature`` tunes creativity (lower = more focused/precise, higher =
     warmer/more varied) and ``max_output_tokens`` caps the reply length — both
     let callers shape the response per feature. ``thinking_budget`` opts a
-    request into deeper reasoning (flash defaults to 0 = off for latency); set a
-    small budget for genuinely analytical tasks. ``response_mime_type`` can be
+    request into deeper reasoning; when unset, thinking is disabled on flash
+    (budget 0) and pinned to the 128-token minimum on other 2.5 models (which
+    can't turn it off) so it never devours the token cap — see
+    :func:`_thinking_budget_for`. ``response_mime_type`` can be
     ``"application/json"`` to ask for structured output. ``images`` attaches
     inline image parts as ``(mime_type, raw_bytes)`` tuples ahead of the text
     prompt — used for vision tasks like reading nutrition labels. Transient failures
@@ -158,6 +160,22 @@ def generate(
     raise last_exc or GeminiError("Gemini request failed.")  # pragma: no cover
 
 
+def _thinking_budget_for(mdl: str, requested: int | None) -> int:
+    """Effective ``thinkingBudget`` for ``mdl``.
+
+    On Gemini 2.5 the "thinking" pass spends tokens from the same
+    ``maxOutputTokens`` allowance as the answer, so an uncapped thinking pass on
+    a tight cap can truncate or empty the reply. We therefore always pin a
+    budget: the caller's explicit ``requested`` value wins; otherwise thinking
+    is turned OFF (0) on flash/flash-lite, which accept a zero, and pinned to
+    128 — gemini-2.5-pro's minimum — on every other model, since pro can't
+    disable thinking and rejects a 0.
+    """
+    if requested is not None:
+        return requested
+    return 0 if "flash" in mdl.lower() else 128
+
+
 def _call_model(
     mdl: str,
     prompt: str,
@@ -179,17 +197,14 @@ def _call_model(
         gen_config["maxOutputTokens"] = max_output_tokens
     if response_mime_type is not None:
         gen_config["responseMimeType"] = response_mime_type
-    # 2.5 *flash* models default to an extended "thinking" pass that adds tens
-    # of seconds of latency (the usual cause of read timeouts here), so we
-    # default it OFF (budget 0). Callers can opt into a small budget for
-    # analytical work via ``thinking_budget``. Only flash/flash-lite accept a
-    # zero budget — pro rejects it — so gate the zero default on the model name.
-    if "flash" in mdl.lower():
-        gen_config["thinkingConfig"] = {
-            "thinkingBudget": thinking_budget if thinking_budget is not None else 0
-        }
-    elif thinking_budget is not None:
-        gen_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+    # 2.5 models run a "thinking" pass whose tokens are drawn from the SAME
+    # maxOutputTokens budget as the answer, so leaving it uncapped lets it
+    # devour a tight token cap and truncate (or empty) the reply — which then
+    # looks like a malformed response downstream. Always pin a budget so that
+    # can't happen on any model, flash or not (see _thinking_budget_for).
+    gen_config["thinkingConfig"] = {
+        "thinkingBudget": _thinking_budget_for(mdl, thinking_budget)
+    }
     # Image parts go first so the text prompt reads as a question *about* the
     # attached image(s) — the ordering Google's own docs use for vision.
     parts: list[dict] = [
@@ -284,16 +299,30 @@ def _parse_completion(resp) -> str:
     try:
         data = resp.json()
         candidate = data["candidates"][0]
-        parts = candidate["content"]["parts"]
+        # A truncated/blocked candidate can omit "content" entirely, so reach
+        # for the parts defensively rather than KeyError-ing on the happy path.
+        parts = candidate.get("content", {}).get("parts", []) or []
         text = "".join(p.get("text", "") for p in parts).strip()
-    except (KeyError, IndexError, ValueError) as exc:
+    except (KeyError, IndexError, ValueError, AttributeError) as exc:
         raise GeminiError(f"Unexpected Gemini response shape: {exc}") from exc
 
+    reason = str(candidate.get("finishReason", "") or "")
+    # MAX_TOKENS means the reply was cut off: on 2.5 the token cap is shared
+    # with the thinking pass, so a tight cap can truncate the answer mid-JSON.
+    # Whatever text came back is a partial fragment that parses as garbage
+    # downstream (the confusing "not in the expected format" errors), so fail
+    # here instead. Retryable so a configured backup model still gets a shot.
+    if reason == "MAX_TOKENS":
+        raise GeminiError(
+            "Gemini reply was cut off (finishReason=MAX_TOKENS) — the answer "
+            "or its thinking pass hit the token cap.",
+            status="MAX_TOKENS",
+            retryable=True,
+        )
     if not text:
-        reason = candidate.get("finishReason", "")
         raise GeminiError(
             f"Gemini returned no text (finishReason={reason!r}).",
-            status=str(reason) or None,
+            status=reason or None,
         )
     return text
 
@@ -325,6 +354,8 @@ def friendly_message(exc: GeminiError) -> str:
         )
     if code == 400 or status == "INVALID_ARGUMENT":
         return "🤖 The AI couldn't process that request."
+    if status == "MAX_TOKENS":
+        return "🤖 The AI's answer got cut off before it finished. Please try again."
     msg = str(exc).lower()
     if "not installed" in msg or "is not set" in msg:
         return "🤖 AI features aren't configured on this bot."

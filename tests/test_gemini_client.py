@@ -87,6 +87,15 @@ def _ok(text="hello"):
     return _Resp(200, {"candidates": [{"content": {"parts": [{"text": text}]}}]})
 
 
+def _finish(reason, text=""):
+    """A 200 whose candidate carries an explicit finishReason (e.g. a
+    truncated MAX_TOKENS reply that may still hold a partial ``text``)."""
+    cand: dict = {"finishReason": reason}
+    if text:
+        cand["content"] = {"parts": [{"text": text}]}
+    return _Resp(200, {"candidates": [cand]})
+
+
 def _err(code, status, msg="boom"):
     return _Resp(code, {"error": {"code": code, "message": msg, "status": status}})
 
@@ -179,6 +188,41 @@ def test_generate_flash_defaults_thinking_off(monkeypatch):
     ] == 0
 
 
+def test_generate_non_flash_gets_thinking_floor(monkeypatch):
+    # Non-flash models (e.g. pro) can't disable thinking; without a floor the
+    # default pass eats the token cap and truncates the reply. We pin the
+    # 128-token minimum so a caller-set max_output_tokens keeps real headroom.
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", retries=0)
+    assert fake.last_json["generationConfig"]["thinkingConfig"][
+        "thinkingBudget"
+    ] == 128
+
+
+def test_generate_non_flash_respects_explicit_budget(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+    fake = _FakeRequests([_ok("hi")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    gemini_client.generate("p", thinking_budget=256, retries=0)
+    assert fake.last_json["generationConfig"]["thinkingConfig"][
+        "thinkingBudget"
+    ] == 256
+
+
+def test_thinking_budget_for():
+    # flash/flash-lite default OFF; everything else floors at pro's minimum;
+    # an explicit request always wins.
+    assert gemini_client._thinking_budget_for("gemini-2.5-flash", None) == 0
+    assert gemini_client._thinking_budget_for("gemini-2.5-flash-lite", None) == 0
+    assert gemini_client._thinking_budget_for("gemini-2.5-pro", None) == 128
+    assert gemini_client._thinking_budget_for("gemini-2.5-pro", 768) == 768
+    assert gemini_client._thinking_budget_for("gemini-2.5-flash", 512) == 512
+
+
 def test_generate_json_mime_passthrough(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     fake = _FakeRequests([_ok("{}")])
@@ -249,3 +293,46 @@ def test_friendly_message_maps_known_failures():
     ).lower()
     # Unknown errors get the safe generic line, never the raw text.
     assert "failed" in fm(gemini_client.GeminiError("weird internal detail")).lower()
+
+
+# --- finishReason handling (truncated / cut-off replies) -------------------
+
+def test_generate_max_tokens_partial_text_raises(monkeypatch):
+    # A truncated reply (finishReason=MAX_TOKENS) that still carries a partial
+    # JSON fragment must NOT be returned as-is — it would parse as garbage
+    # downstream. Fail with a MAX_TOKENS GeminiError instead.
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([_finish("MAX_TOKENS", '{"kcal": 90, "name": "flat wh')])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError) as ei:
+        gemini_client.generate("hi", retries=0)
+    assert ei.value.status == "MAX_TOKENS"
+    assert ei.value.retryable is True
+
+
+def test_generate_max_tokens_empty_content_raises(monkeypatch):
+    # Thinking-exhausted case: candidate has a finishReason but no content/parts.
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([_finish("MAX_TOKENS")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError) as ei:
+        gemini_client.generate("hi", retries=0)
+    assert ei.value.status == "MAX_TOKENS"
+
+
+def test_generate_max_tokens_falls_back_to_backup(monkeypatch):
+    # A cut-off primary is retryable, so a configured backup model gets a shot.
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+    monkeypatch.setenv("BACKUP_GEMINI_MODEL", "gemini-2.5-flash")
+    fake = _FakeRequests([_finish("MAX_TOKENS", "{partial"), _ok("from backup")])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    assert gemini_client.generate("hi", retries=0) == "from backup"
+    assert fake.calls == 2
+
+
+def test_friendly_message_maps_max_tokens():
+    msg = gemini_client.friendly_message(
+        gemini_client.GeminiError("cut off", status="MAX_TOKENS")
+    ).lower()
+    assert "cut off" in msg and "try again" in msg

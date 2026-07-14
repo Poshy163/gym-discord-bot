@@ -1926,7 +1926,10 @@ async def _ai_estimate_meal(description: str) -> ai_food.MealEstimate | str:
             f"Estimate this: {description}",
             system=ai_food.ESTIMATE_SYSTEM,
             temperature=0.2,           # estimation, not creativity
-            max_output_tokens=200,
+            # Headroom over the model's thinking pass: on 2.5 the token cap is
+            # shared with reasoning, so 200 left the short JSON getting cut off
+            # (finishReason=MAX_TOKENS) on models that can't disable thinking.
+            max_output_tokens=512,
             response_mime_type="application/json",
         )
     except gemini_client.GeminiError as exc:

@@ -42,6 +42,14 @@ def test_parse_estimate_garbage():
     assert isinstance(parse_estimate("[1, 2, 3]"), str)
 
 
+def test_parse_estimate_truncated_json():
+    # A reply cut off at the token cap is not recoverable JSON. (The client now
+    # fails these on finishReason=MAX_TOKENS before they reach the parser, but
+    # the parser must still degrade to an error string, never raise.)
+    assert isinstance(parse_estimate('{"kcal": 90, "name": "flat wh'), str)
+    assert isinstance(parse_estimate('"a bare json string"'), str)
+
+
 def test_parse_estimate_string_numbers_and_negative_protein():
     est = parse_estimate('{"kcal": "1,050", "protein_g": -3, "name": "x"}')
     assert isinstance(est, MealEstimate)
