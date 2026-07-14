@@ -1926,15 +1926,22 @@ async def _ai_estimate_meal(description: str) -> ai_food.MealEstimate | str:
             f"Estimate this: {description}",
             system=ai_food.ESTIMATE_SYSTEM,
             temperature=0.2,           # estimation, not creativity
-            # Headroom over the model's thinking pass: on 2.5 the token cap is
-            # shared with reasoning, so 200 left the short JSON getting cut off
-            # (finishReason=MAX_TOKENS) on models that can't disable thinking.
-            max_output_tokens=512,
+            # The token cap is shared with the model's "thinking" pass, and
+            # thinking-capable models that can't disable it spend ~300 tokens
+            # reasoning even on this tiny prompt — so without generous headroom
+            # the JSON gets truncated (finishReason=MAX_TOKENS) and parses as
+            # garbage. 200 was the original bug; 768 clears every 2.5/3.x model.
+            max_output_tokens=768,
             response_mime_type="application/json",
         )
     except gemini_client.GeminiError as exc:
         return gemini_client.friendly_message(exc)
-    return ai_food.parse_estimate(raw)
+    result = ai_food.parse_estimate(raw)
+    if isinstance(result, str):
+        # Couldn't turn the reply into an estimate — log the raw reply so any
+        # recurrence is diagnosable (prose, non-object JSON, a decline, etc.).
+        LOG.warning("AI estimate parse failed (%s); raw reply: %r", result, raw[:500])
+    return result
 
 
 async def _handle_estimate_message(
@@ -3148,7 +3155,9 @@ async def _calorie_ai_summaries(
                     f"Weekly calorie data for {name}:\n{payload}",
                     system=_CALORIE_SUMMARY_SYSTEM,
                     temperature=0.6,  # a touch warmer for a personal recap
-                    max_output_tokens=400,
+                    # Headroom for the thinking pass on models that can't turn
+                    # it off (see _ai_estimate_meal) — else the JSON truncates.
+                    max_output_tokens=768,
                     response_mime_type="application/json",
                 )
                 verdict, tip = _parse_recap_json(raw)
@@ -3184,14 +3193,21 @@ def _parse_recap_json(raw: str) -> tuple[str | None, str | None]:
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
-        # Last resort: grab the outermost {...} span and retry.
+        # Grab the outermost {...} span, or repair an unterminated object (some
+        # models drop the closing brace even on a "complete" reply), and retry.
         start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end <= start:
+        span = text[start:end + 1] if start != -1 and end > start else None
+        data = None
+        for cand in (span, ai_food.repair_unterminated_json(text)):
+            if not cand:
+                continue
+            try:
+                data = json.loads(cand)
+                break
+            except (ValueError, TypeError):
+                data = None
+        if data is None:
             # No JSON at all — treat the whole thing as a verdict.
-            return text[:400] or None, None
-        try:
-            data = json.loads(text[start:end + 1])
-        except (ValueError, TypeError):
             return text[:400] or None, None
     if not isinstance(data, dict):
         return None, None
@@ -14641,7 +14657,9 @@ async def calories_label_cmd(
             "Read the nutrition information panel in this photo.",
             system=ai_food.LABEL_SYSTEM,
             temperature=0.1,           # transcription, not creativity
-            max_output_tokens=300,
+            # Headroom for the thinking pass on models that can't turn it off
+            # (see _ai_estimate_meal) — else the transcription JSON truncates.
+            max_output_tokens=768,
             response_mime_type="application/json",
             images=[(mime, blob)],
         )

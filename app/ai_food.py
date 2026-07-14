@@ -73,11 +73,64 @@ class LabelInfo:
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
+def _first_bracket(text: str) -> int | None:
+    """Index of the first ``{`` or ``[`` in ``text``, or None if neither."""
+    idxs = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    return min(idxs) if idxs else None
+
+
+def repair_unterminated_json(text: str) -> str | None:
+    """Best-effort close of a JSON object/array that ends without its closing
+    bracket(s).
+
+    Some models drop the final ``}`` even on a reply they report as complete —
+    notably ``gemini-3.5-flash`` under ``responseMimeType=application/json``,
+    which returns e.g. ``{"kcal": 120, ... "confidence": "high"`` with no
+    closing brace. Walk from the first bracket tracking string state, then
+    append whatever brackets are needed to balance it. Returns the repaired
+    string, or None when there's nothing open to fix (so callers only pay for
+    it when the plain parse already failed).
+    """
+    start = _first_bracket(text)
+    if start is None:
+        return None
+    stack: list[str] = []
+    in_str = escape = False
+    for ch in text[start:]:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if not stack and not in_str:
+        return None  # already balanced — the parse failed for some other reason
+    repaired = text[start:]
+    if in_str:
+        repaired += '"'              # close a dangling string
+    repaired = repaired.rstrip()
+    if repaired.endswith(","):       # drop a trailing comma before the closers
+        repaired = repaired[:-1]
+    closers = {"{": "}", "[": "]"}
+    repaired += "".join(closers[c] for c in reversed(stack))
+    return repaired
+
+
 def _extract_json(text: str) -> dict | None:
     """Pull the first JSON object out of a model reply.
 
-    Tries the raw text, then any fenced block, then the outermost {...} span.
-    Returns None when nothing parses to a dict.
+    Tries the raw text, then any fenced block, then the outermost {...} span,
+    then a bracket-balanced repair of an unterminated object (some models drop
+    the closing brace even on a reply they report as complete). Returns None
+    when nothing parses to a dict.
     """
     candidates = [text.strip()]
     m = _FENCE_RE.search(text)
@@ -86,6 +139,9 @@ def _extract_json(text: str) -> dict | None:
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         candidates.append(text[start : end + 1])
+    repaired = repair_unterminated_json(text)
+    if repaired is not None:
+        candidates.append(repaired)
     for cand in candidates:
         try:
             data = json.loads(cand)
