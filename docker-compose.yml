@@ -18,10 +18,15 @@ services:
       - "8081:8081"
     volumes:
       - gym-data:/data
-    # Nightly SQLite snapshots (BACKUP_* env vars) land in /data/backups inside
-    # this volume — surviving container rebuilds. For real disaster recovery,
-    # bind-mount that path to the host or sync it off-box, e.g.:
-    #   - ./backups:/data/backups
+      # Real disaster recovery: bind-mount the backup folder to the host so the
+      # nightly snapshots survive losing the gym-data volume. Uncomment this and
+      # set BACKUP_DIR=/data/backups in .env, then sync ./backups off-box (e.g.
+      # a cron running `rclone sync ./backups remote:gym-backups` or restic).
+      # The nightly job verifies each snapshot with PRAGMA integrity_check and
+      # logs an error if one is unreadable. NOTE: snapshots contain Fernet
+      # *ciphertext* only — back up your .env (the *_FERNET_KEY values) SEPARATELY
+      # or the encrypted Strava/Hevy/Revo credentials are unrecoverable.
+      # - ./backups:/data/backups
     # The bot has no HTTP surface, so health is "can we still open the SQLite
     # store?". Cheap and detects volume / disk issues early.
     healthcheck:

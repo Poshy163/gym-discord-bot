@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS bodyweights (
 CREATE INDEX IF NOT EXISTS idx_bodyweights_user
     ON bodyweights (guild_id, user_id, recorded_at);
 
+-- Bodyweight is global-per-user (guild 0); the latest/history lookups query on
+-- user_id alone, so give them an index that doesn't lead with guild_id.
+CREATE INDEX IF NOT EXISTS idx_bodyweights_user_global
+    ON bodyweights (user_id, recorded_at);
+
 -- Source-message ids whose lifts were explicitly removed via undo. The
 -- startup backfill consults this so it doesn't re-import a post the user
 -- already told us to forget. Cleared automatically when the user edits the
@@ -221,6 +226,11 @@ CREATE TABLE IF NOT EXISTS message_log (
 CREATE INDEX IF NOT EXISTS idx_message_log_user
     ON message_log (guild_id, user_id, at);
 
+-- The dashboard channel view filters (guild_id, channel_id) ORDER BY at DESC;
+-- without this it temp-sorts the whole guild's log on every page load.
+CREATE INDEX IF NOT EXISTS idx_message_log_channel
+    ON message_log (guild_id, channel_id, at);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_message_log_msgid
     ON message_log (guild_id, message_id) WHERE message_id IS NOT NULL;
 
@@ -322,6 +332,12 @@ CREATE TABLE IF NOT EXISTS calorie_entries (
 CREATE INDEX IF NOT EXISTS idx_calorie_entries_user
     ON calorie_entries (guild_id, user_id, logged_at);
 
+-- Calories are global-per-user (stored under guild 0), so the hot queries
+-- (undo, day totals, streak-saver loop) filter on user_id alone and can't use
+-- the guild-led index above without a full scan + temp sort.
+CREATE INDEX IF NOT EXISTS idx_calorie_entries_user_global
+    ON calorie_entries (user_id, logged_at);
+
 -- Per-user saved foods: a name → calorie shortcut so typing "coffee" logs a
 -- known amount. Scoped per (guild, user). ``name`` is stored normalized
 -- (lowercased, whitespace-collapsed) for lookups; ``display`` keeps the
@@ -398,6 +414,10 @@ CREATE TABLE IF NOT EXISTS protein_entries (
 
 CREATE INDEX IF NOT EXISTS idx_protein_entries_user
     ON protein_entries (guild_id, user_id, logged_at);
+
+-- Protein is global-per-user too; same rationale as idx_calorie_entries_user_global.
+CREATE INDEX IF NOT EXISTS idx_protein_entries_user_global
+    ON protein_entries (user_id, logged_at);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_protein_entries_dedupe
     ON protein_entries (message_id) WHERE message_id IS NOT NULL;
@@ -1004,6 +1024,33 @@ class Database:
                 target.close()
         tmp.replace(dest)
 
+    @staticmethod
+    def verify_snapshot(path: str | Path) -> tuple[bool, str]:
+        """Open a snapshot file read-only and confirm it's a usable backup.
+
+        Runs ``PRAGMA integrity_check`` and reads a couple of core tables so a
+        silently-corrupt snapshot is caught the night it happens rather than at
+        restore time. Returns ``(ok, detail)`` — ``detail`` is ``"ok"`` on
+        success or a short reason on failure. Never raises.
+        """
+        p = Path(path)
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            return False, f"open failed: {exc}"
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            result = (row[0] if row else "").strip().lower()
+            if result != "ok":
+                return False, f"integrity_check: {result or 'no result'}"
+            # Sanity-read a core table so a header-only/truncated file is caught.
+            conn.execute("SELECT COUNT(*) FROM lifts").fetchone()
+            return True, "ok"
+        except sqlite3.Error as exc:
+            return False, f"read failed: {exc}"
+        finally:
+            conn.close()
+
     @contextmanager
     def _conn(self):
         """Yield the shared connection inside an immediate transaction.
@@ -1033,15 +1080,23 @@ class Database:
         message_id: int | None = None,
         channel_id: int | None = None,
         logged_at: datetime | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> int:
         """Insert lifts. Returns the number of rows actually inserted
         (duplicates from the same message are ignored).
 
         The whole batch runs inside a single transaction (see ``_conn``),
         so a mid-batch failure won't leave half the lifts persisted.
+
+        ``actor_id``/``actor_name`` identify *who logged it* when that differs
+        from the target (proxy logging via ``@user bench 80kg``); they default
+        to the target so ordinary self-logging is unchanged.
         """
         if not lifts:
             return 0
+        act_id = actor_id if actor_id is not None else user_id
+        act_name = actor_name if actor_name is not None else username
         ts = _normalize_iso(logged_at)
         inserted = 0
         with self._conn() as c:
@@ -1067,7 +1122,7 @@ class Database:
                     if self.audit_live:
                         self._audit(
                             c, guild_id, "data", "lift_add",
-                            actor_id=user_id, actor_name=username,
+                            actor_id=act_id, actor_name=act_name,
                             subject_id=user_id, subject_name=username,
                             detail=f"{lift.equipment} {lift.weight_kg:g}kg",
                         )
@@ -1087,14 +1142,20 @@ class Database:
         message_id: int | None = None,
         channel_id: int | None = None,
         logged_at: datetime | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> list[int]:
         """Same as ``add_lifts`` but returns the row ids that were inserted.
 
         Used by ``/log``-style flows where there's no source message_id, so
         the reaction-undo path can target the exact rows we just created.
+        ``actor_id``/``actor_name`` credit the logger on proxy entries (see
+        ``add_lifts``); they default to the target.
         """
         if not lifts:
             return []
+        act_id = actor_id if actor_id is not None else user_id
+        act_name = actor_name if actor_name is not None else username
         ts = _normalize_iso(logged_at)
         ids: list[int] = []
         with self._conn() as c:
@@ -1121,7 +1182,7 @@ class Database:
                         if self.audit_live:
                             self._audit(
                                 c, guild_id, "data", "lift_add",
-                                actor_id=user_id, actor_name=username,
+                                actor_id=act_id, actor_name=act_name,
                                 subject_id=user_id, subject_name=username,
                                 detail=f"{lift.equipment} {lift.weight_kg:g}kg",
                             )
@@ -1226,19 +1287,30 @@ class Database:
                 (guild_id,),
             )]
 
-    def delete_equipment(self, guild_id: int, equipment: str) -> int:
+    def delete_equipment(
+        self, guild_id: int, equipment: str,
+        actor_id: int | None = None, actor_name: str | None = None,
+    ) -> int:
         """Delete every row for a given equipment name in a guild. Returns
-        the number of rows removed."""
+        the number of rows removed. Writes an ``equipment_purge`` audit row
+        crediting ``actor_id``/``actor_name`` (the admin who ran /purge)."""
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM lifts WHERE guild_id = ? AND equipment = ?",
                 (guild_id, equipment),
             )
-            return cur.rowcount or 0
+            removed = cur.rowcount or 0
+            self._audit(
+                c, guild_id, "data", "equipment_purge",
+                actor_id=actor_id, actor_name=actor_name,
+                detail=f"purged '{equipment}' ({removed} rows, guild-wide)",
+            )
+            return removed
 
     def rename_equipment(
         self, guild_id: int, src: str, dst: str,
         user_id: int | None = None,
+        actor_id: int | None = None, actor_name: str | None = None,
     ) -> int:
         """Re-label every row from equipment=src to equipment=dst. Returns
         the number of rows affected. The unique (message_id, equipment) index
@@ -1332,7 +1404,15 @@ class Database:
                     "WHERE user_id = ? AND equipment = ?",
                     (goal_user_id, src),
                 )
-            return cur.rowcount or 0
+            renamed = cur.rowcount or 0
+            scope = "global (per-user)" if user_id is not None else "guild-wide"
+            self._audit(
+                c, guild_id, "data", "equipment_rename",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=user_id,
+                detail=f"renamed '{src}' -> '{dst}' ({renamed} rows, {scope})",
+            )
+            return renamed
 
     def count_equipment_rows(
         self, guild_id: int, equipment: str,
@@ -1358,11 +1438,13 @@ class Database:
         equipment: str,
         date: str,
         user_id: int | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> int:
         """Delete entries matching equipment + YYYY-MM-DD date. A per-user
         delete is **global** (the user's matching rows in every server); a
         guild-wide delete (no user) stays scoped to the guild. Returns rows
-        deleted."""
+        deleted. Writes an ``entry_delete`` audit row when live."""
         if user_id is not None:
             sql = (
                 "DELETE FROM lifts WHERE user_id = ? AND equipment = ? "
@@ -1377,7 +1459,14 @@ class Database:
             params = [guild_id, equipment, date]
         with self._conn() as c:
             cur = c.execute(sql, params)
-            return cur.rowcount or 0
+            removed = cur.rowcount or 0
+            self._audit_data(
+                c, guild_id, "entry_delete",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=user_id,
+                detail=f"deleted '{equipment}' on {date} ({removed} rows)",
+            )
+            return removed
 
     def delete_entry_between(
         self,
@@ -1386,10 +1475,12 @@ class Database:
         start_iso: str,
         end_iso: str,
         user_id: int | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> int:
         """Delete entries matching equipment inside a UTC timestamp range. A
         per-user delete is **global**; a guild-wide delete stays scoped to the
-        guild."""
+        guild. Writes an ``entry_delete`` audit row when live."""
         if user_id is not None:
             sql = (
                 "DELETE FROM lifts WHERE user_id = ? AND equipment = ? "
@@ -1404,7 +1495,14 @@ class Database:
             params = [guild_id, equipment, start_iso, end_iso]
         with self._conn() as c:
             cur = c.execute(sql, params)
-            return cur.rowcount or 0
+            removed = cur.rowcount or 0
+            self._audit_data(
+                c, guild_id, "entry_delete",
+                actor_id=actor_id, actor_name=actor_name,
+                subject_id=user_id,
+                detail=f"deleted '{equipment}' {start_iso[:10]} ({removed} rows)",
+            )
+            return removed
 
     def _latest_lift(
         self,
@@ -2859,12 +2957,16 @@ class Database:
     def set_bodyweight(
         self, guild_id: int, user_id: int, weight_kg: float,
         recorded_at: datetime | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> None:
         """Record a new bodyweight measurement for a user.
 
         We append rather than overwrite so the user can see how their
         bodyweight has trended and so historical lifts can in principle
         be re-rendered against the bodyweight that was current at the time.
+        ``actor_id``/``actor_name`` credit the logger on proxy
+        (``@user bw 80kg``) entries; they default to the target.
         """
         ts = _normalize_iso(recorded_at)
         with self._conn() as c:
@@ -2875,6 +2977,8 @@ class Database:
             )
             self._audit_data(
                 c, guild_id, "bodyweight_log", subject_id=user_id,
+                actor_id=actor_id if actor_id is not None else user_id,
+                actor_name=actor_name,
                 detail=f"bodyweight {float(weight_kg):g} kg",
             )
 
@@ -3909,11 +4013,16 @@ class Database:
         note: str | None = None, raw: str | None = None,
         logged_at: datetime | None = None,
         message_id: int | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> int:
         """Insert one intake entry. Returns the new row id, or 0 if a row for
         this ``message_id`` already exists (dedupe, so backfill re-scans are
         safe). ``message_id`` is None for slash-command entries, which never
-        dedupe."""
+        dedupe. ``actor_id``/``actor_name`` credit the logger on proxy
+        (``@user 650kcal``) entries; they default to the target."""
+        act_id = actor_id if actor_id is not None else user_id
+        act_name = actor_name if actor_name is not None else username
         with self._conn() as c:
             try:
                 cur = c.execute(
@@ -3935,7 +4044,7 @@ class Database:
             if self.audit_live and new_id:
                 self._audit(
                     c, guild_id, "data", "calorie_add",
-                    actor_id=user_id, actor_name=username,
+                    actor_id=act_id, actor_name=act_name,
                     subject_id=user_id, subject_name=username,
                     detail=f"+{float(kcal):.0f} kcal"
                     + (f" ({note})" if note else ""),
@@ -4274,9 +4383,14 @@ class Database:
         note: str | None = None, raw: str | None = None,
         logged_at: datetime | None = None,
         message_id: int | None = None,
+        actor_id: int | None = None,
+        actor_name: str | None = None,
     ) -> int:
         """Insert one protein entry. Returns the new row id, or 0 if a row for
-        this ``message_id`` already exists (dedupe)."""
+        this ``message_id`` already exists (dedupe). ``actor_id``/``actor_name``
+        credit the logger on proxy entries; they default to the target."""
+        act_id = actor_id if actor_id is not None else user_id
+        act_name = actor_name if actor_name is not None else username
         with self._conn() as c:
             try:
                 cur = c.execute(
@@ -4297,7 +4411,7 @@ class Database:
             if self.audit_live and new_id:
                 self._audit(
                     c, guild_id, "data", "protein_add",
-                    actor_id=user_id, actor_name=username,
+                    actor_id=act_id, actor_name=act_name,
                     subject_id=user_id, subject_name=username,
                     detail=f"+{float(grams):.0f} g"
                     + (f" ({note})" if note else ""),

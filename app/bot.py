@@ -55,6 +55,7 @@ from .presence import (
     format_duration,
     is_online as _presence_is_online,
     nightly_sleep_sessions,
+    sleep_stats,
     summarize_activity_sets,
     summarize_presence,
 )
@@ -171,9 +172,11 @@ try:
 except ValueError:
     MAX_WEIGHT_KG = 500.0
 
-# Discord user IDs allowed to ❌-undo *any* tracked bot reply, not just their
-# own or the lift's target. Comma-separated. Defaults to the repo owner.
-_admins = os.getenv("ADMIN_USER_IDS", "1072114272064262154").strip()
+# Discord user IDs allowed to ❌-undo *any* tracked bot reply, run the
+# destructive maintenance commands (/purge, guild-wide/cross-user /rename), and
+# reach other admin surfaces. Comma-separated. Empty by default so a fresh
+# deployment grants nobody implicit admin — set ADMIN_USER_IDS to your own ID.
+_admins = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS: set[int] = {
     int(x) for x in _admins.split(",") if x.strip().isdigit()
 }
@@ -809,6 +812,26 @@ def _streak_suffix(streak: int) -> str:
     return f" · 🔥 {streak} day streak" if streak >= 2 else ""
 
 
+# Day counts that earn a public shout-out — mirrors the Revo weekly-streak
+# milestones, which until now were the ONLY streak celebrations in the bot.
+_STREAK_DAY_MILESTONES = (7, 14, 21, 30, 50, 75, 100, 150, 200, 250, 300, 365)
+
+
+def _streak_milestone_banner(
+    macro: str, streak: int, *, first_today: bool,
+) -> str:
+    """A channel-visible celebration line the day a logging streak reaches a
+    milestone. Because the streak advances only on the first entry of a day,
+    gating on ``first_today`` fires it exactly once per crossing (and never on
+    a backdated fill-in). Empty string when nothing to celebrate."""
+    if not first_today or streak not in _STREAK_DAY_MILESTONES:
+        return ""
+    return (
+        f"\n🎉 **Milestone!** {streak}-day {macro} logging streak — "
+        "keep it lit. 🔥"
+    )
+
+
 def _display_name(user: object) -> str:
     return str(
         getattr(user, "display_name", None)
@@ -876,30 +899,50 @@ def _target_suffix(author: object, target: object) -> str:
     return f" for **{_display_name(target)}**"
 
 
+def _lift_weight_ok(lift: Lift) -> bool:
+    """A lift's stored weight is sane. Bodyweight-only lifts legitimately carry
+    weight 0 (``Dips: BW``), so the >0 floor applies only to non-BW lifts —
+    this is what rejects junk like ``Farmer Walk - 0 Kgs`` without dropping a
+    real bodyweight exercise. The upper cap is MAX_WEIGHT_KG (0 = disabled)."""
+    if lift.weight_kg < 0:
+        return False
+    if lift.weight_kg == 0 and not lift.bodyweight_add:
+        return False
+    if MAX_WEIGHT_KG > 0 and lift.weight_kg > MAX_WEIGHT_KG:
+        return False
+    return True
+
+
 def _split_reasonable_lifts(lifts: list[Lift]) -> tuple[list[Lift], list[Lift]]:
-    if MAX_WEIGHT_KG <= 0:
-        return lifts, []
     accepted: list[Lift] = []
     rejected: list[Lift] = []
     for lift in lifts:
-        if lift.weight_kg > MAX_WEIGHT_KG:
-            rejected.append(lift)
-        else:
-            accepted.append(lift)
+        (accepted if _lift_weight_ok(lift) else rejected).append(lift)
     return accepted, rejected
 
 
 def _rejected_lifts_note(rejected: list[Lift]) -> str:
     if not rejected:
         return ""
-    lines = [
-        "",
-        (
-            f"⚠️ Skipped {_plural(len(rejected), 'lift')} over "
+    # Two rejection reasons read very differently, so label them separately.
+    too_heavy = [
+        lift for lift in rejected
+        if MAX_WEIGHT_KG > 0 and lift.weight_kg > MAX_WEIGHT_KG
+    ]
+    nonpositive = [lift for lift in rejected if lift.weight_kg <= 0]
+    lines: list[str] = [""]
+    if too_heavy:
+        lines.append(
+            f"⚠️ Skipped {_plural(len(too_heavy), 'lift')} over "
             f"{MAX_WEIGHT_KG:g}kg. If that was real, use `/log` after "
             "raising `MAX_WEIGHT_KG`."
-        ),
-    ]
+        )
+    if nonpositive:
+        lines.append(
+            f"⚠️ Skipped {_plural(len(nonpositive), 'lift')} with no real "
+            "weight (0kg). Post the weight (e.g. `farmer walk 40kg`), or add "
+            "`BW` for a bodyweight-only exercise."
+        )
     for lift in rejected[:5]:
         lines.append(
             f"• **{_safe_label(lift.equipment)}** — "
@@ -1450,6 +1493,8 @@ async def _store_lifts(
         message_id=message.id,
         channel_id=message.channel.id,
         logged_at=when,
+        actor_id=message.author.id,
+        actor_name=_display_name(message.author),
     )
 
 
@@ -1485,7 +1530,11 @@ async def _handle_bodyweight_message(
         return
 
     try:
-        db.set_bodyweight(guild_id, target_id, weight_kg)
+        db.set_bodyweight(
+            guild_id, target_id, weight_kg,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
+        )
     except Exception:
         LOG.exception("Failed to store bodyweight for user %s", target_id)
         return
@@ -1510,6 +1559,55 @@ async def _handle_bodyweight_message(
     )
 
 
+# Default evening time for the streak-saver DM someone opts into via the button.
+_STREAK_REMIND_HOUR = 20
+
+
+class StreakReminderView(discord.ui.View):
+    """One-tap opt-in to the evening streak-saver DM, offered at the moment a
+    calorie streak hits a milestone. This is the discovery fix for
+    ``/calories remind`` — the feature was fully built but sat behind the 21st
+    subcommand of the /calories group, so ``calorie_reminder_prefs`` had zero
+    rows. The button writes that row directly for the streak's owner."""
+
+    def __init__(self, target_id: int) -> None:
+        # A day to decide; after that the button goes inert (non-persistent).
+        super().__init__(timeout=86_400)
+        self.target_id = target_id
+
+    @discord.ui.button(
+        label="🔔 Protect this streak", style=discord.ButtonStyle.success,
+    )
+    async def enroll(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message(
+                "That's not your streak to protect 😄", ephemeral=True,
+            )
+            return
+        try:
+            db.calorie_reminder_set(self.target_id, _STREAK_REMIND_HOUR, 0)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to set streak reminder for %s", self.target_id)
+            await interaction.response.send_message(
+                "Couldn't set that up — try `/calories remind`.", ephemeral=True,
+            )
+            return
+        button.disabled = True
+        button.label = "🔔 Reminder on (8pm)"
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(
+            "Done — I'll DM you around 8pm on any day you haven't logged, so a "
+            "missed evening doesn't end your streak. Change the time or turn it "
+            "off any time with `/calories remind`.",
+            ephemeral=True,
+        )
+
+
 async def _reply_calorie_logged(
     message: discord.Message, target: object, goal: sqlite3.Row,
     added_kcal: float, label: str | None, *, entry_id: int = 0,
@@ -1531,6 +1629,18 @@ async def _reply_calorie_logged(
     total, _n = db.calorie_total_between(
         guild_id, target_id, *_day_window_for(logged_at),
     )
+    streak = _calorie_streak(target_id)
+    # First live entry of the day is what advances the streak, so it's the one
+    # moment to celebrate a milestone (skip backdated fill-ins).
+    banner = _streak_milestone_banner(
+        "calorie", streak, first_today=(logged_at is None and _n == 1),
+    )
+    # Offer one-tap streak protection at the celebration moment — but only to
+    # people who haven't already opted in, and not to veterans past 30 days who
+    # clearly don't want the nudge.
+    view: discord.ui.View | None = None
+    if banner and streak <= 30 and db.calorie_reminder_get(target_id) is None:
+        view = StreakReminderView(target_id)
     label_part = f" — {label}" if label else ""
     suffix = _target_suffix(message.author, target)
     try:
@@ -1538,8 +1648,10 @@ async def _reply_calorie_logged(
             f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
             f"{_backdate_label(logged_at)}\n"
             + _calorie_status_for(target_id, total, logged_at)
-            + _streak_suffix(_calorie_streak(target_id)),
+            + _streak_suffix(streak)
+            + banner,
             mention_author=False,
+            view=view,
         )
     except discord.HTTPException:
         return
@@ -1627,6 +1739,8 @@ async def _handle_calorie_message(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=message.content.strip()[:80],
             logged_at=logged_at, message_id=message.id,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
         )
     except Exception:
         LOG.exception("Failed to store calorie entry for user %s", target_id)
@@ -1695,6 +1809,8 @@ async def _handle_calorie_food_message(
         entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
         )
     except Exception:
         LOG.exception("Failed to store food entry for user %s", target_id)
@@ -1711,6 +1827,8 @@ async def _handle_calorie_food_message(
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+                actor_id=message.author.id,
+                actor_name=_display_name(message.author),
             )
             logged_protein = True
         except Exception:
@@ -1844,6 +1962,8 @@ async def _handle_calorie_meal_message(
         db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
         )
     except Exception:
         LOG.exception("Failed to store meal entry for user %s", target_id)
@@ -1856,6 +1976,8 @@ async def _handle_calorie_meal_message(
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+                actor_id=message.author.id,
+                actor_name=_display_name(message.author),
             )
             logged_protein = True
         except Exception:
@@ -2002,6 +2124,8 @@ async def _log_ai_estimate(
         db.calorie_add(
             guild_id, target_id, _display_name(target), est.kcal,
             note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
         )
     except Exception:
         LOG.exception("Failed to store AI estimate for user %s", target_id)
@@ -2014,6 +2138,8 @@ async def _log_ai_estimate(
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 note=note, raw=raw, logged_at=logged_at, message_id=message.id,
+                actor_id=message.author.id,
+                actor_name=_display_name(message.author),
             )
             logged_protein = True
         except Exception:
@@ -2122,6 +2248,8 @@ async def _handle_protein_message(
             guild_id, target_id, _display_name(target), grams,
             raw=message.content.strip()[:80],
             logged_at=logged_at, message_id=message.id,
+            actor_id=message.author.id,
+            actor_name=_display_name(message.author),
         )
     except Exception:
         LOG.exception("Failed to store protein entry for user %s", target_id)
@@ -2147,13 +2275,18 @@ async def _reply_protein_logged(
     total, _n = db.protein_total_between(
         guild_id, target_id, *_day_window_for(logged_at),
     )
+    streak = _protein_streak(target_id)
+    banner = _streak_milestone_banner(
+        "protein", streak, first_today=(logged_at is None and _n == 1),
+    )
     suffix = _target_suffix(message.author, target)
     try:
         reply = await message.reply(
             f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}"
             f"{_backdate_label(logged_at)}\n"
             + _protein_status_for(target_id, total, logged_at)
-            + _streak_suffix(_protein_streak(target_id)),
+            + _streak_suffix(streak)
+            + banner,
             mention_author=False,
         )
     except discord.HTTPException:
@@ -2202,6 +2335,8 @@ async def _handle_combined_nutrition(
             db.calorie_add(
                 guild_id, target_id, _display_name(target), kcal,
                 raw=raw, logged_at=logged_at, message_id=message.id,
+                actor_id=message.author.id,
+                actor_name=_display_name(message.author),
             )
             total, _n = db.calorie_total_between(
                 guild_id, target_id, *window,
@@ -2221,6 +2356,8 @@ async def _handle_combined_nutrition(
             db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 raw=raw, logged_at=logged_at, message_id=message.id,
+                actor_id=message.author.id,
+                actor_name=_display_name(message.author),
             )
             total, _n = db.protein_total_between(
                 guild_id, target_id, *window,
@@ -2725,7 +2862,18 @@ async def db_backup() -> None:
     except Exception:
         LOG.exception("Nightly DB backup failed")
         return
-    LOG.info("DB backup written: %s", dest)
+    # Confirm the snapshot is actually restorable before we trust it (and before
+    # rotation prunes older good copies). A corrupt snapshot is logged loudly but
+    # kept, so an operator can still inspect it.
+    try:
+        ok, detail = await asyncio.to_thread(db.verify_snapshot, dest)
+    except Exception:
+        LOG.exception("DB backup verification raised: %s", dest)
+    else:
+        if ok:
+            LOG.info("DB backup written and verified: %s", dest)
+        else:
+            LOG.error("DB backup FAILED verification (%s): %s", detail, dest)
     try:
         snaps = sorted(Path(BACKUP_DIR).glob("gym-*.sqlite3"))
         for old in snaps[: max(0, len(snaps) - BACKUP_KEEP)]:
@@ -2752,6 +2900,60 @@ def _daily_window(days_ago: int = 1) -> tuple[str, str, str]:
     )
 
 
+def _daily_nutrition_lines(
+    guild_id: int, day: date, start_iso: str, end_iso: str,
+) -> list[str]:
+    """Per-member calorie (and protein) totals for one local day, for the daily
+    recap. Only members who actually logged that day appear, ranked by calories.
+
+    Nutrition is global-per-user, so membership is scoped to this guild via
+    ``calorie_tracked_users``/``protein_tracked_users`` (which match the members
+    mirror); ``day`` resolves each person's effective target for that date."""
+    entries: list[tuple[str, int, float, float, int]] = []
+    for row in db.calorie_tracked_users(guild_id, day):
+        uid = int(row["user_id"])
+        total, _ = db.calorie_total_between(guild_id, uid, start_iso, end_iso)
+        if total <= 0:
+            continue
+        name = db.get_user_nickname(uid) or row["username"]
+        entries.append((
+            name, uid, total, float(row["daily_target_kcal"] or 0.0),
+            _calorie_streak(uid),
+        ))
+
+    # Protein for the same day, keyed by user so we can inline it and also list
+    # anyone who logged protein but no calories.
+    pro: dict[int, tuple[str, float]] = {}
+    for row in db.protein_tracked_users(guild_id, day):
+        uid = int(row["user_id"])
+        ptotal, _ = db.protein_total_between(guild_id, uid, start_iso, end_iso)
+        if ptotal > 0:
+            pro[uid] = (db.get_user_nickname(uid) or row["username"], ptotal)
+
+    if not entries and not pro:
+        return []
+
+    entries.sort(key=lambda e: e[2], reverse=True)
+    lines = ["\n🍽️ **Nutrition**"]
+    for name, uid, total, target, streak in entries[:8]:
+        tgt = f" / {calories.format_kcal(target)}" if target else ""
+        streak_txt = f" 🔥{streak}" if streak >= 2 else ""
+        extra = ""
+        if uid in pro:
+            _, ptotal = pro.pop(uid)
+            extra = f" · {protein_mod.format_grams(ptotal)} protein"
+        lines.append(
+            f"• **{name}** — {calories.format_kcal(total)}{tgt}"
+            f"{streak_txt}{extra}"
+        )
+    # Protein-only loggers (tracking protein but not calories).
+    for _uid, (name, ptotal) in pro.items():
+        lines.append(
+            f"• **{name}** — {protein_mod.format_grams(ptotal)} protein"
+        )
+    return lines
+
+
 def _daily_update_text(
     guild_id: int,
     date_label: str,
@@ -2763,13 +2965,29 @@ def _daily_update_text(
     activity = db.daily_activity(guild_id, start_iso, end_iso, limit=5)
     totals = activity["totals"]
     total_lifts = int(totals["total_lifts"] or 0)
+    try:
+        day = date.fromisoformat(date_label)
+    except ValueError:  # pragma: no cover - date_label is always ISO here
+        day = targets_mod.local_today()
+    nutrition = _daily_nutrition_lines(guild_id, day, start_iso, end_iso)
+
     if total_lifts == 0:
-        if not post_empty:
-            return None
-        return (
-            f"📊 **Daily gym update — {date_label}**\n"
-            "No lifts logged for this day. Fresh slate next session."
-        )
+        # Only stay silent when NOTHING happened — a day with nutrition activity
+        # but no lifts still posts (manual lifting is quiet; nutrition isn't).
+        if not nutrition:
+            if not post_empty:
+                return None
+            return (
+                f"📊 **Daily gym update — {date_label}**\n"
+                "No lifts logged for this day. Fresh slate next session."
+            )
+        lines = [
+            f"📊 **Daily gym update — {date_label}**",
+            "No lifts logged, but the kitchen was busy:",
+        ]
+        lines.extend(nutrition)
+        lines.append("\nUse `/calories week` or `/summary` to dig in.")
+        return "\n".join(lines)
 
     lifters = int(totals["lifters"] or 0)
     unique_equip = int(totals["unique_equip"] or 0)
@@ -2820,6 +3038,8 @@ def _daily_update_text(
                 f"• **{row['equipment']}** — {_plural(entries, 'entry', 'entries')}, "
                 f"{_plural(users, 'lifter')}"
             )
+
+    lines.extend(nutrition)
 
     lines.append("\nUse `/summary`, `/leaderboard`, or `/goals` to dig in.")
     return "\n".join(lines)
@@ -4109,6 +4329,8 @@ async def _handle_calorie_edit(
         entry_id = db.calorie_add(
             guild_id, target_id, _display_name(target), kcal,
             note=note, raw=after.content.strip()[:80], message_id=after.id,
+            actor_id=after.author.id,
+            actor_name=_display_name(after.author),
         )
         await _reply_calorie_logged(
             after, target, goal, kcal, note, entry_id=entry_id,
@@ -4710,7 +4932,11 @@ async def bodyweight_cmd(
         )
         return
 
-    db.set_bodyweight(guild_id, target.id, weight_kg)
+    db.set_bodyweight(
+        guild_id, target.id, weight_kg,
+        actor_id=interaction.user.id,
+        actor_name=_display_name(interaction.user),
+    )
     suffix = _target_suffix(interaction.user, target)
     await interaction.response.send_message(
         f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will now "
@@ -4788,6 +5014,8 @@ async def log_cmd(
         message_id=None,
         channel_id=interaction.channel_id,
         logged_at=logged_at,
+        actor_id=interaction.user.id,
+        actor_name=_display_name(interaction.user),
     )
     if inserted_ids:
         # If this is a brand-new equipment name (not in the built-in alias
@@ -5014,7 +5242,7 @@ async def sync_cmd(interaction: discord.Interaction) -> None:
         )
         return
     if result["action"] == "guild":
-        where = f"to this guild only (COMMAND_SCOPE=guild) — visible immediately"
+        where = "to this guild only (COMMAND_SCOPE=guild) — visible immediately"
     else:
         where = "globally — can take up to ~1h to appear in every server"
     await interaction.followup.send(
@@ -5423,6 +5651,90 @@ async def suppress_message_cmd(
     )
 
 
+# --- Context menus (right-click / long-press actions) ----------------------
+# Native Discord actions so the common "act on someone's already-typed message"
+# flows work with no message-ID copying (which on mobile needs Developer Mode).
+# Thin wrappers over the same handlers as /parse, /suppress_message and /stats.
+
+
+@bot.tree.context_menu(name="Log lifts from this")
+async def ctx_log_lifts(
+    interaction: discord.Interaction, message: discord.Message,
+) -> None:
+    """Parse and store the lifts in the right-clicked message (honours a leading
+    @mention target), the way /parse does — but without typing a message ID."""
+    target, content = _message_lift_target(message)
+    lifts = parse_message(
+        content, custom_aliases=_custom_alias_map(_ctx_guild_id(interaction)),
+    )
+    lifts, rejected_lifts = _split_reasonable_lifts(lifts)
+    if not lifts:
+        note = _rejected_lifts_note(rejected_lifts).lstrip()
+        await interaction.response.send_message(
+            note or "No lifts detected in that message.", ephemeral=True,
+        )
+        return
+    inserted = await _store_lifts(
+        message, lifts, target,
+        logged_at=_resolve_date_hint(
+            content, message.created_at.astimezone(DISPLAY_TZ),
+        ),
+    )
+    lines = [
+        f"Stored {_plural(inserted, 'new lift')} for {_display_name(target)}:"
+    ]
+    lines.extend(_format_lift_lines(lifts))
+    note = _rejected_lifts_note(rejected_lifts)
+    if note:
+        lines.append(note)
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.context_menu(name="Ignore (not a lift)")
+async def ctx_suppress_message(
+    interaction: discord.Interaction, message: discord.Message,
+) -> None:
+    """Admin: mark a message 'do not import' and remove any lifts it created —
+    the /suppress_message action, one tap on the offending message."""
+    if interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    guild_id = _ctx_guild_id(interaction)
+    removed = db.delete_lifts_for_message_any_user(guild_id, message.id)
+    already = db.is_message_suppressed(guild_id, message.id)
+    db.suppress_message(guild_id, message.id)
+    await interaction.response.send_message(
+        f"Won't import that message. Lifts removed: {removed}."
+        + ("" if not already else " (was already suppressed)"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.context_menu(name="Gym stats")
+async def ctx_gym_stats(
+    interaction: discord.Interaction, member: discord.Member,
+) -> None:
+    """Show a member's personal bests — the /stats action, with no typing, for
+    the members who've never run a slash command."""
+    if await _deny_invisible_target(interaction, member):
+        return
+    guild_id = _ctx_guild_id(interaction)
+    rows = db.personal_bests(guild_id, member.id)
+    if not rows:
+        await interaction.response.send_message(
+            f"No lifts logged for {member.display_name} yet.", ephemeral=True,
+        )
+        return
+    lines = [f"**{member.display_name} — personal bests**"]
+    for r in rows:
+        date = _format_date(r["set_on"])
+        lines.append(
+            f"• {r['equipment']}: {_format_weight(r['best'], bool(r['bw']))}"
+            f"  _(set {date})_"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 # Owner-only: download the live SQLite DB. Hard-coded to one user id so a
 # misconfigured ADMIN_USER_IDS env doesn't accidentally leak the DB.
 _DB_DUMP_OWNER_ID = 1072114272064262154
@@ -5642,6 +5954,14 @@ async def purge_cmd(
     interaction: discord.Interaction, equipment: str,
     confirm: bool = False,
 ) -> None:
+    # /purge wipes a lift name for the WHOLE guild — admins only, and every
+    # run is written to the audit log (see db.delete_equipment).
+    if interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(
+            "Admins only — /purge deletes a lift name for the whole server.",
+            ephemeral=True,
+        )
+        return
     guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     if not canon:
@@ -5668,7 +5988,10 @@ async def purge_cmd(
             ephemeral=True,
         )
         return
-    n = db.delete_equipment(guild_id, canon)
+    n = db.delete_equipment(
+        guild_id, canon,
+        actor_id=interaction.user.id, actor_name=interaction.user.display_name,
+    )
     await interaction.response.send_message(
         f"Removed {n} row(s) for `{canon}`.", ephemeral=True
     )
@@ -5719,6 +6042,17 @@ async def rename_cmd(
         target_user_id = interaction.user.id
         target_label = "your"
 
+    # Renaming someone else's rows or the whole guild is an admin action;
+    # renaming your own is always allowed. Every rename is audited.
+    rewrites_others = user is not None or scope_value == "all"
+    if rewrites_others and interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(
+            "Admins only — renaming another member's or the whole server's "
+            "rows. You can always rename your own (leave `user`/`scope` unset).",
+            ephemeral=True,
+        )
+        return
+
     guild_id = _ctx_guild_id(interaction)
     src = _resolve(guild_id, old)
     dst = _resolve(guild_id, new)
@@ -5764,7 +6098,10 @@ async def rename_cmd(
         )
         return
 
-    n = db.rename_equipment(guild_id, src, dst, user_id=target_user_id)
+    n = db.rename_equipment(
+        guild_id, src, dst, user_id=target_user_id,
+        actor_id=interaction.user.id, actor_name=interaction.user.display_name,
+    )
     if target_user_id is None:
         scope_msg = "guild-wide"
     elif target_user_id == interaction.user.id and user is None:
@@ -5803,12 +6140,21 @@ async def delete_entry_cmd(
         return
 
     target = user or interaction.user
+    # Deleting another member's entries is an admin action; your own is open.
+    if target.id != interaction.user.id and interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(
+            "Admins only — deleting another member's entries. "
+            "You can always delete your own (leave `user` unset).",
+            ephemeral=True,
+        )
+        return
     if await _deny_invisible_target(interaction, target):
         return
     canon = _resolve(_ctx_guild_id(interaction), equipment)
     start_iso, end_iso = _local_date_window(date)
     n = db.delete_entry_between(
-        _ctx_guild_id(interaction), canon, start_iso, end_iso, user_id=target.id
+        _ctx_guild_id(interaction), canon, start_iso, end_iso, user_id=target.id,
+        actor_id=interaction.user.id, actor_name=interaction.user.display_name,
     )
     await interaction.response.send_message(
         f"Deleted {n} entry(ies) for {target.display_name} — `{canon}` on {date}.",
@@ -13198,6 +13544,7 @@ def _build_progress_payload(
 
     summary = db.user_summary(guild_id, user_id)
     tonnage, _n = db.total_tonnage(guild_id, user_id)
+    revo = db.get_revo_account(user_id)
     cal_goal = db.calorie_goal_get(guild_id, user_id)
     pro_goal = db.protein_goal_get(guild_id, user_id)
     cal_total, cal_entries = db.calorie_total_between(
@@ -13294,6 +13641,51 @@ def _build_progress_payload(
             # a big Saturday may be entirely on plan.
             "split_targets": _split_targets_payload(user_id),
         },
+        # Real gym-attendance ground truth: lets the coach tell "didn't train"
+        # from "trained but didn't log" — e.g. a live Revo streak next to stale
+        # lift data means nudge the *logging*, not the training.
+        "attendance": {
+            "revo_linked": revo is not None,
+            "revo_streak_weeks": (
+                revo["last_streak_weeks"] if revo else None
+            ),
+            "revo_last_checkin": (
+                revo["last_checkin_date"] if revo else None
+            ),
+            "days_since_revo_checkin": _days_since(
+                revo["last_checkin_date"] if revo else None
+            ),
+        },
+        # Inferred from Discord presence, only for members who opted into /track.
+        # None otherwise so the model doesn't invent sleep advice from nothing.
+        "sleep": _coach_sleep_block(guild_id, user_id, days),
+    }
+
+
+def _coach_sleep_block(guild_id: int, user_id: int, days: int) -> dict | None:
+    """Nightly-sleep summary for the /coach payload, or None when the member
+    isn't presence-tracked (sleep is inferred from Discord online/offline, so
+    it only exists for /track opt-ins)."""
+    if not ENABLE_PRESENCE_TRACKING or not db.presence_is_tracked(
+        guild_id, user_id,
+    ):
+        return None
+    try:
+        sessions, _raw, _ws, _we = _collect_sleep_export(guild_id, user_id, days)
+    except Exception:  # pragma: no cover - defensive; presence is best-effort
+        return None
+    if not sessions:
+        return None
+    stats = sleep_stats(sessions)
+    return {
+        "nights_observed": stats["nights"],
+        "avg_sleep_hours": stats["avg_hours"],
+        "weekday_avg_hours": stats["weekday_avg"],
+        "weekend_avg_hours": stats["weekend_avg"],
+        "typical_bedtime": stats["bedtime"],
+        "typical_wake": stats["wake"],
+        "note": "Inferred from Discord presence — an approximation, not a "
+                "sleep tracker.",
     }
 
 
@@ -13472,7 +13864,9 @@ calories_group = app_commands.Group(
 # Sanity caps so a fat-fingered "25000" target or "65000kj" entry doesn't
 # wreck someone's stats. Entries are per-item, targets are per-day.
 _MAX_TARGET_KCAL = 20_000
-_MAX_ENTRY_KCAL = 10_000
+# Sanity ceiling for a single intake entry. A whole big day still fits, but
+# joke/typo posts like "9999c" bounce instead of poisoning averages and TDEE.
+_MAX_ENTRY_KCAL = 6_000
 
 _CALORIES_NOT_SET_MSG = (
     "You're not tracking calories yet — run `/calories setup` with your "
