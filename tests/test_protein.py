@@ -197,3 +197,175 @@ def test_get_and_delete_protein_entry_by_message(db):
     removed = db.delete_protein_entry(1, 100, eid)
     assert removed is not None and removed["grams"] == 40
     assert db.delete_protein_entry(1, 100, eid) is None
+
+
+# ---------------------------------------------------------------------------
+# Bodyweight-linked protein target (protein_bw_links + set_bodyweight)
+# ---------------------------------------------------------------------------
+
+def _week_days():
+    """(today, a_weekday, a_weekend_day) within the next 7 days — so each is on
+    or after today and resolves against the rules effective now."""
+    from datetime import timedelta
+
+    from app import targets
+
+    today = targets.local_today()
+    days = [today + timedelta(days=n) for n in range(7)]
+    weekday = next(d for d in days if not targets.is_weekend(d))
+    weekend = next(d for d in days if targets.is_weekend(d))
+    return today, weekday, weekend
+
+
+def test_protein_bw_link_crud(db):
+    assert db.protein_bw_link_get(100) is None
+    db.protein_bw_link_set(100, "alice")
+    link = db.protein_bw_link_get(100)
+    assert link["grams_per_kg"] == 1.0 and link["username"] == "alice"
+    # Upsert keeps one row and can carry a future non-1.0 ratio.
+    db.protein_bw_link_set(100, "alice", 1.6)
+    assert db.protein_bw_link_get(100)["grams_per_kg"] == 1.6
+    assert db.protein_bw_link_remove(100) is True
+    assert db.protein_bw_link_get(100) is None
+    assert db.protein_bw_link_remove(100) is False
+
+
+def test_set_bodyweight_without_link_leaves_protein_untouched(db):
+    # No link → a weigh-in must not invent a protein target, and returns None.
+    assert db.set_bodyweight(1, 100, 82.0) is None
+    assert db.protein_goal_get(1, 100) is None
+
+
+def test_bodyweight_link_updates_protein_on_change_but_not_on_same_weight(db):
+    _today, weekday, weekend = _week_days()
+    # Link at 82 kg the way /protein setup target:bodyweight does.
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", round(82.0))
+    assert db.protein_goal_get(1, 100, weekday)["daily_target_g"] == 82
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 82
+
+    # Re-logging the same weight writes nothing new and reports no change.
+    assert db.set_bodyweight(1, 100, 82.0) is None
+    defaults = [
+        r for r in db.nutrition_target_rows(100)
+        if r["macro"] == "protein_g" and r["scope"] == "default"
+    ]
+    assert len(defaults) == 1
+
+    # A real change moves it on every day and returns the new gram count.
+    assert db.set_bodyweight(1, 100, 84.3) == 84   # round(84.3)
+    assert db.protein_goal_get(1, 100, weekday)["daily_target_g"] == 84
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 84
+
+
+def test_bodyweight_link_preserves_history_on_change(db):
+    from datetime import timedelta
+
+    from app import targets
+
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", 82)   # effective from beginning of time
+    db.set_bodyweight(1, 100, 90.0)            # bumps it, effective today
+    today = targets.local_today()
+    assert db.protein_goal_get(1, 100, today)["daily_target_g"] == 90
+    # A day already lived through still resolves against the old ceiling.
+    yesterday = today - timedelta(days=1)
+    assert db.protein_goal_get(1, 100, yesterday)["daily_target_g"] == 82
+
+
+def test_bodyweight_link_neutralizes_weekend_override(db):
+    _today, weekday, weekend = _week_days()
+    # User first runs a weekday/weekend protein split.
+    db.protein_goal_set(1, 100, "alice", 180, 220)
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 220
+    # /protein setup target:bodyweight at 82 kg: link, derive the default, and
+    # clear the weekend override (weekend_g=None) exactly as the command does.
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", round(82.0), None)
+    assert db.protein_goal_get(1, 100, weekday)["daily_target_g"] == 82
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 82
+    assert db.protein_goal_get(1, 100, weekend)["split"] is False
+    # A later weigh-in keeps every day on the derived number.
+    assert db.set_bodyweight(1, 100, 85.0) == 85
+    assert db.protein_goal_get(1, 100, weekend)["daily_target_g"] == 85
+
+
+def test_bodyweight_link_honors_grams_per_kg_ratio(db):
+    # Storing the ratio lets a future cut use 1.6 g/kg with no schema change.
+    db.set_bodyweight(1, 100, 80.0)
+    db.protein_bw_link_set(100, "alice", 1.6)
+    db.protein_goal_set(1, 100, "alice", 100)   # a starting ceiling to move off
+    assert db.set_bodyweight(1, 100, 80.0) == 128   # round(80 * 1.6)
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 128
+
+
+def test_bodyweight_link_ignores_absurd_derived_target(db):
+    # A weigh-in past the derived-target backstop is still recorded, but must
+    # not push an absurd ceiling into the targets table.
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", 82)
+    assert db.set_bodyweight(1, 100, 600.0) is None       # 600 g > backstop
+    assert db.get_latest_bodyweight(1, 100)["weight_kg"] == 600.0
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 82   # unchanged
+
+
+def test_unlinking_stops_bodyweight_from_moving_protein(db):
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", 82)
+    assert db.protein_bw_link_remove(100) is True
+    # With the link gone a new weigh-in is inert for protein.
+    assert db.set_bodyweight(1, 100, 95.0) is None
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 82
+
+
+def test_bodyweight_link_update_keeps_home_guild(db):
+    # /protein setup target:bodyweight in Guild A files the targets under A.
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", round(82.0))
+    assert db.nutrition_home_guild(100) == 1
+    # A weigh-in typed in Guild B moves the derived number, but a weigh-in is
+    # not a nutrition command: it must not re-home the user's global targets to
+    # whichever server the scale reading happened in.
+    assert db.set_bodyweight(2, 100, 90.0) == 90
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 90
+    assert db.nutrition_home_guild(100) == 1
+
+
+def test_web_protein_off_toggle_unlinks_from_bodyweight(db):
+    # /protein setup target:bodyweight at 82 kg.
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", 82)
+    # The web dashboard turns protein tracking off (blank weekday). Tombstoning
+    # the target isn't enough — the link has to break too, or the next weigh-in
+    # silently re-arms the tracker the user just switched off.
+    db.web_nutrition_targets_set(
+        1, 100, "alice", kcal=2000, weekend_kcal=None,
+        protein_g=None, weekend_protein_g=None, actor_name="admin",
+    )
+    assert db.protein_bw_link_get(100) is None
+    assert db.protein_goal_get(1, 100) is None
+    assert db.set_bodyweight(1, 100, 90.0) is None
+    assert db.protein_goal_get(1, 100) is None
+
+
+def test_web_protein_fixed_number_unlinks_from_bodyweight(db):
+    # A fixed protein number set on the web, while linked, must break the link
+    # so a later weigh-in can't silently overwrite the chosen number — matching
+    # Discord's `/protein setup <n>`.
+    db.set_bodyweight(1, 100, 82.0)
+    db.protein_bw_link_set(100, "alice")
+    db.protein_goal_set(1, 100, "alice", 82)
+    db.web_nutrition_targets_set(
+        1, 100, "alice", kcal=None, weekend_kcal=None,
+        protein_g=150, weekend_protein_g=None, actor_name="admin",
+    )
+    assert db.protein_bw_link_get(100) is None
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 150
+    assert db.set_bodyweight(1, 100, 90.0) is None
+    assert db.protein_goal_get(1, 100)["daily_target_g"] == 150

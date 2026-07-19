@@ -59,6 +59,7 @@ from .presence import (
     summarize_activity_sets,
     summarize_presence,
 )
+from .voicetime import summarize_voice
 from . import __version__
 from . import ai_food
 from . import calories
@@ -1530,7 +1531,7 @@ async def _handle_bodyweight_message(
         return
 
     try:
-        db.set_bodyweight(
+        protein_grams = db.set_bodyweight(
             guild_id, target_id, weight_kg,
             actor_id=message.author.id,
             actor_name=_display_name(message.author),
@@ -1544,11 +1545,16 @@ async def _handle_bodyweight_message(
     except discord.HTTPException:
         pass
     suffix = _target_suffix(message.author, target)
+    protein_line = (
+        f"\n🥩 Protein max updated to {protein_grams} g (tied to bodyweight)."
+        if protein_grams is not None else ""
+    )
     try:
         await message.reply(
             f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will "
             "now show the true load on bodyweight-relative lifts (e.g. "
-            "assisted pull-ups, weighted dips).",
+            "assisted pull-ups, weighted dips)."
+            f"{protein_line}",
             mention_author=False,
         )
     except discord.HTTPException:
@@ -2604,6 +2610,14 @@ async def on_ready() -> None:
 
     if ENABLE_PRESENCE_TRACKING:
         _seed_tracked_presence_snapshots()
+
+    if ENABLE_VOICE_TRACKING:
+        # Reconcile mute/deafen state for anyone already in a call, so time
+        # muted across the restart is attributed correctly.
+        try:
+            _seed_voice_state_snapshots()
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to seed voice state snapshots")
 
     if (
         not REVO_DISABLED
@@ -4932,16 +4946,21 @@ async def bodyweight_cmd(
         )
         return
 
-    db.set_bodyweight(
+    protein_grams = db.set_bodyweight(
         guild_id, target.id, weight_kg,
         actor_id=interaction.user.id,
         actor_name=_display_name(interaction.user),
     )
     suffix = _target_suffix(interaction.user, target)
+    protein_line = (
+        f"\n🥩 Protein max updated to {protein_grams} g (tied to bodyweight)."
+        if protein_grams is not None else ""
+    )
     await interaction.response.send_message(
         f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will now "
         "show your true load on bodyweight-relative lifts (e.g. assisted "
         "pull-ups, weighted dips)."
+        f"{protein_line}"
     )
 
 
@@ -12715,10 +12734,18 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ) -> None:  # pragma: no cover - discord runtime path
-    """Log voice-channel join / leave / move transitions for all members.
+    """Log voice-channel join / leave / move transitions plus mute/deafen ones.
 
-    Only channel changes are recorded — mute/deafen/stream toggles (which also
-    fire this event with the same channel) are ignored.
+    Channel changes become 'join'/'leave'/'move' rows. Mute and deafen toggles
+    (which also fire this event, usually with no channel change) become
+    'mute_on'/'mute_off'/'deaf_on'/'deaf_off' rows — but only while the member
+    is in a channel, so app.voicetime can turn them into muted/deafened time.
+
+    We define muted = self_mute OR server mute and deafened = self_deaf OR
+    server deaf, recording the two raw signals independently (Discord auto-mutes
+    on deafen, so they usually move together, but the stats keep them apart).
+    A leave needs no synthetic mute_off: voicetime only counts muted/deafened
+    time while in a call, so leaving is already a hard boundary.
     """
     if not ENABLE_VOICE_TRACKING:
         return
@@ -12728,21 +12755,100 @@ async def on_voice_state_update(
         bc, ac = before.channel, after.channel
         bid = bc.id if bc else None
         aid = ac.id if ac else None
-        if bid == aid:
-            return  # mute/deafen/etc. — no channel change
-        if bc is None:
-            event, ch = "join", ac
-        elif ac is None:
-            event, ch = "leave", bc
-        else:
-            event, ch = "move", ac
-        db.voice_log_event(
-            member.guild.id, member.id, event,
-            channel_id=ch.id if ch else None,
-            channel_name=ch.name if ch else None,
-        )
+
+        def _log(event: str, ch) -> None:
+            db.voice_log_event(
+                member.guild.id, member.id, event,
+                channel_id=ch.id if ch else None,
+                channel_name=ch.name if ch else None,
+            )
+
+        b_muted = bool(before.self_mute or before.mute)
+        a_muted = bool(after.self_mute or after.mute)
+        b_deaf = bool(before.self_deaf or before.deaf)
+        a_deaf = bool(after.self_deaf or after.deaf)
+
+        if bid != aid:
+            # Channel presence changed.
+            if bc is None:
+                _log("join", ac)
+                # A fresh join can't trust `before` (it's the not-in-voice
+                # state), so seed the current mute/deafen so an already-muted
+                # join starts the clock at the join instant.
+                if a_muted:
+                    _log("mute_on", ac)
+                if a_deaf:
+                    _log("deaf_on", ac)
+            elif ac is None:
+                _log("leave", bc)
+                # No mute_off needed on leave (see docstring).
+            else:
+                _log("move", ac)
+                # Mute/deafen carries across a move; only log a real change.
+                if a_muted != b_muted:
+                    _log("mute_on" if a_muted else "mute_off", ac)
+                if a_deaf != b_deaf:
+                    _log("deaf_on" if a_deaf else "deaf_off", ac)
+            return
+
+        # Same channel: a mute/deafen/stream toggle. Only track while in voice.
+        if ac is None:
+            return
+        if a_muted != b_muted:
+            _log("mute_on" if a_muted else "mute_off", ac)
+        if a_deaf != b_deaf:
+            _log("deaf_on" if a_deaf else "deaf_off", ac)
     except Exception:
         LOG.exception("Failed to record voice state update")
+
+
+def _seed_voice_state_snapshots() -> None:  # pragma: no cover - discord runtime
+    """Reconcile logged voice state against reality for anyone in a call now.
+
+    Voice tracking is transition-based, so a restart can leave the log stale: a
+    member may have joined, muted, or unmuted while the bot was down. On_ready
+    we walk every occupied voice channel and, for each member, replay their
+    recent events (app.voicetime, no live flags = the log's own view) and
+    compare it to what Discord reports live. We write only the corrective
+    transitions needed to make them match — a 'join' when the log lost the
+    session entirely, and a mute/deafen toggle when the raw signal drifted.
+    Mirrors _seed_tracked_presence_snapshots. No-op when nothing diverged.
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=1)  # carry-in reaches further back than this
+    for guild in bot.guilds:
+        for ch in guild.voice_channels:
+            for m in ch.members:
+                try:
+                    rows = db.voice_events_for(guild.id, m.id, since=since, until=now)
+                    summary = summarize_voice(
+                        [(r["event"], r["at"]) for r in rows], since, now,
+                    )
+                    live_muted = bool(m.voice and (m.voice.self_mute or m.voice.mute))
+                    live_deaf = bool(m.voice and (m.voice.self_deaf or m.voice.deaf))
+                    log_muted = summary.muted_now
+                    log_deaf = summary.deafened_now
+
+                    def _log(event: str) -> None:
+                        db.voice_log_event(
+                            guild.id, m.id, event,
+                            channel_id=ch.id, channel_name=ch.name,
+                        )
+
+                    if not summary.in_call_now:
+                        # Log lost the session (joined during downtime / purged
+                        # history). Re-anchor; a join resets mute/deafen state.
+                        _log("join")
+                        log_muted = log_deaf = False
+                    if live_muted != log_muted:
+                        _log("mute_on" if live_muted else "mute_off")
+                    if live_deaf != log_deaf:
+                        _log("deaf_on" if live_deaf else "deaf_off")
+                except Exception:
+                    LOG.exception(
+                        "Failed to seed voice snapshot for user %s in guild %s",
+                        m.id, guild.id,
+                    )
 
 
 track_group = app_commands.Group(
@@ -13850,6 +13956,131 @@ async def track_now_cmd(
 
 
 bot.tree.add_command(track_group)
+
+
+# ---------------------------------------------------------------------------
+# Voice-time stats (/voice)
+# ---------------------------------------------------------------------------
+
+voice_group = app_commands.Group(
+    name="voice",
+    description="Voice-call time stats (in-call / muted / deafened).",
+)
+
+_VOICE_DISABLED_MSG = (
+    "Voice tracking is disabled. Set `ENABLE_VOICE_TRACKING=true` and restart "
+    "the bot to record voice join/leave/mute/deafen activity."
+)
+
+
+def _pct(part: float, whole: float) -> str:
+    """Render ``part/whole`` as a rounded percentage string (``0%`` if empty)."""
+    return f"{round(part / whole * 100) if whole else 0}%"
+
+
+@voice_group.command(
+    name="stats",
+    description="Show how long a member spent in voice, muted and deafened.",
+)
+@app_commands.describe(
+    user="The member to summarise.",
+    days="How many days back to summarise (1-90, default 7).",
+)
+async def voice_stats_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    days: int = 7,
+) -> None:
+    if not ENABLE_VOICE_TRACKING:
+        await interaction.response.send_message(_VOICE_DISABLED_MSG, ephemeral=True)
+        return
+    if days < 1 or days > 90:
+        await interaction.response.send_message(
+            "`days` must be between 1 and 90.", ephemeral=True,
+        )
+        return
+
+    guild_id = _ctx_guild_id(interaction)
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+    rows = db.voice_events_for(guild_id, user.id, since=window_start, until=now)
+
+    # Slash-command Member args come from interaction.resolved, which lacks
+    # voice state — re-fetch from the guild cache so the "still muted now"
+    # verification (and the open-interval gate) reads the real live state.
+    _g = _ctx_guild(interaction)
+    cached = _g.get_member(user.id) if _g is not None else None
+    vc = cached.voice if cached is not None else None
+    live_in_call = bool(vc and vc.channel)
+    live_muted = bool(vc and (vc.self_mute or vc.mute))
+    live_deaf = bool(vc and (vc.self_deaf or vc.deaf))
+
+    summary = summarize_voice(
+        [(r["event"], r["at"]) for r in rows],
+        window_start, now, now=now,
+        live_in_call=live_in_call,
+        live_muted=live_muted,
+        live_deafened=live_deaf,
+    )
+
+    if summary.in_call_seconds == 0 and not summary.in_call_now:
+        await interaction.response.send_message(
+            f"No voice activity recorded for {user.mention} in the last "
+            f"{days} day{'s' if days != 1 else ''}.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"🔊 Voice stats — {user.display_name}",
+        colour=EMBED_COLOUR,
+        description=f"Last **{days}** day{'s' if days != 1 else ''} of voice activity.",
+    )
+    embed.add_field(
+        name="🔊 In voice",
+        value=format_duration(summary.in_call_seconds),
+        inline=True,
+    )
+    embed.add_field(
+        name="🔈 Muted",
+        value=(
+            f"{format_duration(summary.muted_seconds)} "
+            f"({_pct(summary.muted_seconds, summary.in_call_seconds)})"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🔇 Deafened",
+        value=(
+            f"{format_duration(summary.deafened_seconds)} "
+            f"({_pct(summary.deafened_seconds, summary.in_call_seconds)})"
+        ),
+        inline=True,
+    )
+
+    # Live "right now" streaks, when Discord confirms the member is connected.
+    if summary.in_call_now:
+        now_lines = [f"🔊 In voice for {format_duration(summary.current_in_call_seconds)}"]
+        if summary.deafened_now:
+            now_lines.append(
+                f"🔇 Deafened for {format_duration(summary.current_deafened_seconds)}"
+            )
+        elif summary.muted_now:
+            now_lines.append(
+                f"🔈 Muted for {format_duration(summary.current_muted_seconds)}"
+            )
+        embed.add_field(name="Now", value="\n".join(now_lines), inline=False)
+
+    embed.set_footer(
+        text="Deafened time is a subset of muted time (deafening mutes your mic)."
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+bot.tree.add_command(voice_group)
 
 
 # ---------------------------------------------------------------------------
@@ -15389,21 +15620,72 @@ def _protein_week_days(
     return days
 
 
+# Words that, in the ``target`` slot, mean "tie my protein max to my
+# bodyweight" instead of a fixed number. Case-insensitive.
+_PROTEIN_BW_WORDS = {"bodyweight", "bw"}
+
+
 @protein_group.command(
     name="setup", description="Set your daily protein max (grams).",
 )
 @app_commands.describe(
-    target='Daily max in grams, e.g. "180".',
+    target='Daily max in grams (e.g. "180"), or "bodyweight" to tie it to your weight (1 g/kg).',
     weekend='Optional different max for Sat/Sun, e.g. "200". "same" clears it.',
 )
 async def protein_setup_cmd(
     interaction: discord.Interaction, target: str,
     weekend: str | None = None,
 ) -> None:
+    guild_id = _ctx_guild_id(interaction)
+    # "bodyweight"/"bw" ties the ceiling to the scale at 1 g/kg, updating itself
+    # on every weigh-in. A weekend override contradicts "same number every day",
+    # so refuse it here rather than silently linking and dropping their input.
+    if target.strip().lower() in _PROTEIN_BW_WORDS:
+        if weekend is not None:
+            await interaction.response.send_message(
+                "A bodyweight-linked max already applies every day, so it can't "
+                "take a separate weekend number. Run `/protein setup "
+                "target:bodyweight` on its own, or set a fixed number if you "
+                "want a weekend split.",
+                ephemeral=True,
+            )
+            return
+        row = db.get_latest_bodyweight(guild_id, interaction.user.id)
+        if row is None:
+            await interaction.response.send_message(
+                "I don't have a bodyweight on file for you yet — log one first "
+                "with `/bodyweight` or by typing `bw 80kg` in chat, then run "
+                "`/protein setup target:bodyweight`.",
+                ephemeral=True,
+            )
+            return
+        weight = float(row["weight_kg"])
+        grams = round(weight)
+        # Neutralise a live weekend protein override so the derived number is
+        # what resolves on Saturdays too; leave weekend untouched otherwise.
+        _wd, we = _band_targets(interaction.user.id)
+        weekend_g = None if we.protein.split else KEEP
+        db.protein_bw_link_set(
+            interaction.user.id, _display_name(interaction.user),
+        )
+        db.protein_goal_set(
+            guild_id, interaction.user.id, _display_name(interaction.user),
+            grams, weekend_g,
+        )
+        await interaction.response.send_message(
+            f"🥩 Protein max tied to your bodyweight: **{weight:g} kg → "
+            f"{grams} g/day**, every day. Log a new bodyweight any time "
+            "(`/bodyweight` or `bw 80kg`) and this updates itself.\n"
+            "Switch back to a fixed number any time with `/protein setup "
+            "<grams>`."
+        )
+        return
+
     grams = protein_mod.parse_protein_amount(target)
     if grams is None or grams <= 0:
         await interaction.response.send_message(
-            "Couldn't read that — give a number of grams, e.g. `180`.",
+            "Couldn't read that — give a number of grams (e.g. `180`) or "
+            "`bodyweight` to tie it to your weight.",
             ephemeral=True,
         )
         return
@@ -15421,7 +15703,9 @@ async def protein_setup_cmd(
             f"{err} Try `200`, or `same` to drop it.", ephemeral=True,
         )
         return
-    guild_id = _ctx_guild_id(interaction)
+    # A plain number is an explicit fixed target: break any bodyweight link so a
+    # later weigh-in doesn't quietly overwrite the number they just chose.
+    was_linked = db.protein_bw_link_remove(interaction.user.id)
     db.protein_goal_set(
         guild_id, interaction.user.id, _display_name(interaction.user), grams,
         weekend_g,
@@ -15438,8 +15722,12 @@ async def protein_setup_cmd(
             f"🥩 Daily protein max set to "
             f"**{protein_mod.format_grams(grams)}**, every day."
         )
+    unlink_note = (
+        "\n🔗 Unlinked from bodyweight — this is now a fixed number."
+        if was_linked else ""
+    )
     await interaction.response.send_message(
-        f"{head}\n"
+        f"{head}{unlink_note}\n"
         "Log it with `/protein add <grams>` or just type `40p` in chat, and "
         "check in with `/protein today`. I'll flag when you go over."
     )
@@ -15702,6 +15990,9 @@ async def protein_edit_cmd(
 )
 async def protein_stop_cmd(interaction: discord.Interaction) -> None:
     guild_id = _ctx_guild_id(interaction)
+    # Drop any bodyweight link too, otherwise the next weigh-in would silently
+    # re-arm a target the user just turned off.
+    db.protein_bw_link_remove(interaction.user.id)
     removed = db.protein_goal_remove(guild_id, interaction.user.id)
     if not removed:
         await interaction.response.send_message(

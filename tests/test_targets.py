@@ -230,6 +230,40 @@ def test_nulling_only_the_default_leaves_the_weekend_override_winning():
     assert resolve(rows, SAT).kcal.value == 2200
 
 
+# ---- bodyweight-linked protein resolves every day --------------------------
+
+# 2026-07-08 is a Wednesday — a plain weekday to contrast with SAT/SUN.
+WED = date(2026, 7, 8)
+
+
+def test_bodyweight_linked_protein_resolves_on_weekday_and_weekend():
+    # A bodyweight link writes one default-scope protein row (round(kg) grams).
+    # It has to resolve to the same number on every day, so verify a Wednesday
+    # and a Saturday directly rather than trusting the setup flow.
+    rows = [row(MACRO_PROTEIN, SCOPE_DEFAULT, 82)]
+    assert resolve(rows, WED).protein.value == 82
+    assert resolve(rows, SAT).protein.value == 82
+    assert resolve(rows, SAT).protein.split is False  # no weekend banner
+
+
+def test_bodyweight_link_tombstones_a_live_weekend_override():
+    # Linking neutralises an existing weekend protein override with a NULL
+    # weekend row so the derived number wins on Saturdays too — without deleting
+    # the history the old weekends were scored against.
+    rows = [
+        row(MACRO_PROTEIN, SCOPE_DEFAULT, 200, effective_from="2026-07-01"),
+        row(MACRO_PROTEIN, SCOPE_WEEKEND, 220, effective_from="2026-07-01"),
+        # The link fires on the 6th: a fresh default plus a weekend tombstone.
+        row(MACRO_PROTEIN, SCOPE_DEFAULT, 82, effective_from="2026-07-06"),
+        row(MACRO_PROTEIN, SCOPE_WEEKEND, None, effective_from="2026-07-06"),
+    ]
+    assert resolve(rows, WED).protein.value == 82
+    assert resolve(rows, SAT).protein.value == 82      # override cleared
+    assert resolve(rows, SAT).protein.split is False
+    # A Saturday before the link still remembers it was aiming at 220.
+    assert resolve(rows, date(2026, 7, 4)).protein.value == 220
+
+
 # ---- extensibility ---------------------------------------------------------
 
 def test_more_specific_scopes_win():

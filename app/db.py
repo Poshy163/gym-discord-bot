@@ -187,10 +187,22 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_events_user
     ON activity_events (guild_id, user_id, at);
 
--- Voice-channel tracking. Append-only log of voice transitions: ``event`` is
--- one of 'join', 'leave', 'move'. ``channel_id`` / ``channel_name`` is the
--- channel involved (the destination for join/move, the channel left for leave),
--- snapshotted at write time so the dashboard needn't resolve channels.
+-- Voice-channel tracking. Append-only log of voice transitions. ``event`` is:
+--   'join'  / 'leave' / 'move'  — channel-presence changes (the original kinds)
+--   'mute_on'  / 'mute_off'     — the member's *muted* signal flipped
+--   'deaf_on'  / 'deaf_off'     — the member's *deafened* signal flipped
+-- Muted means self_mute OR server mute; deafened means self_deaf OR server
+-- deaf. Discord's client auto-mutes your mic whenever you deafen, so a deafen
+-- almost always coincides with a mute — we still record the two raw signals
+-- independently so stats can tell muted-but-listening apart from deafened.
+-- Mute/deafen rows are only written while the member is in a channel, and only
+-- on an actual transition; app.voicetime reconstructs in-call / muted /
+-- deafened durations from the interleaved stream (a 'join' re-anchors mute and
+-- deafen state, and muted/deafened time is only counted while in a call).
+-- ``channel_id`` / ``channel_name`` is the channel involved (the destination
+-- for join/move, the channel left for leave, the current channel for a
+-- mute/deafen toggle), snapshotted at write time so the dashboard needn't
+-- resolve channels.
 CREATE TABLE IF NOT EXISTS voice_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id     INTEGER NOT NULL,
@@ -203,6 +215,15 @@ CREATE TABLE IF NOT EXISTS voice_events (
 
 CREATE INDEX IF NOT EXISTS idx_voice_events_guild
     ON voice_events (guild_id, at);
+
+-- voice_events_for() reads one member's history filtered by (guild_id,
+-- user_id, at) and runs unbounded-lower carry-in probes per signal group.
+-- The guild-only index above leads with guild_id/at, so those probes would
+-- walk the guild's whole voice log backward filtering user_id in memory —
+-- and every mute/deafen toggle is now logged, so the table grows fast. This
+-- user-leading index lets each per-member query seek straight to the rows.
+CREATE INDEX IF NOT EXISTS idx_voice_events_user
+    ON voice_events (guild_id, user_id, at);
 
 -- Message logging. When presence tracking is on, every message a tracked
 -- user sends is appended here with full content so the web dashboard can show
@@ -422,6 +443,22 @@ CREATE INDEX IF NOT EXISTS idx_protein_entries_user_global
 CREATE UNIQUE INDEX IF NOT EXISTS idx_protein_entries_dedupe
     ON protein_entries (message_id) WHERE message_id IS NOT NULL;
 
+-- Ties a user's protein ceiling to their latest bodyweight at ``grams_per_kg``
+-- grams of protein per kilogram. A row here means every ``set_bodyweight``
+-- re-derives the all-week protein target (round(weight_kg * grams_per_kg)) and
+-- writes a fresh effective-dated ``nutrition_targets`` row, so the ceiling
+-- follows the scale without the user re-running ``/protein setup``.
+-- ``grams_per_kg`` is stored even though the UI only ever writes the 1.0 g/kg
+-- floor today, so a future "tie me to 1.6 g/kg for my cut" is a value change,
+-- not a schema migration. Global per user, matching bodyweights and
+-- bodyweight_goals — one body, one link — so lookups are by user_id alone.
+CREATE TABLE IF NOT EXISTS protein_bw_links (
+    user_id      INTEGER PRIMARY KEY,
+    grams_per_kg REAL    NOT NULL DEFAULT 1.0,
+    username     TEXT,
+    created_at   TEXT
+);
+
 -- Maps the bot's calorie-log reply to the entry it created, so a ❌ reaction on
 -- that reply removes exactly that entry (per-entry undo, mirroring lifts).
 -- original_message_id is the chat message that triggered the log — suppressed on
@@ -602,6 +639,18 @@ class _Keep:
 #: something: clearing a weekend override is ``None``, whereas not mentioning it
 #: at all is ``KEEP``.
 KEEP = _Keep()
+
+
+#: Upper bound on a bodyweight-derived protein target, mirroring the bot's
+#: ``_MAX_PROTEIN_TARGET_G``. It lives here as a defensive backstop because
+#: :meth:`Database.set_bodyweight` is the Discord-free choke point and can be
+#: called directly (tests, future importers). In normal operation the bot's
+#: bodyweight commands already reject weights above ``MAX_WEIGHT_KG`` (500 by
+#: default) before ``set_bodyweight`` runs, so at the 1.0 g/kg ratio the derived
+#: target can't reach this cap anyway — the check exists so a raised
+#: ``MAX_WEIGHT_KG`` or a future ``grams_per_kg`` > 1 can't silently push an
+#: absurd ceiling into ``nutrition_targets``.
+_BW_LINK_MAX_TARGET_G = 500
 
 
 def _normalize_iso(dt: datetime | None) -> str:
@@ -2959,7 +3008,7 @@ class Database:
         recorded_at: datetime | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
-    ) -> None:
+    ) -> int | None:
         """Record a new bodyweight measurement for a user.
 
         We append rather than overwrite so the user can see how their
@@ -2967,6 +3016,12 @@ class Database:
         be re-rendered against the bodyweight that was current at the time.
         ``actor_id``/``actor_name`` credit the logger on proxy
         (``@user bw 80kg``) entries; they default to the target.
+
+        Returns the new protein ceiling (grams) when this weigh-in moved a
+        bodyweight-linked target, else None — so the reply sites can append a
+        "Protein max updated to X g" line. This is the single choke point every
+        bodyweight write goes through, which is why the link auto-update lives
+        here rather than in each caller.
         """
         ts = _normalize_iso(recorded_at)
         with self._conn() as c:
@@ -2981,6 +3036,70 @@ class Database:
                 actor_name=actor_name,
                 detail=f"bodyweight {float(weight_kg):g} kg",
             )
+            return self._apply_bodyweight_protein_link(
+                c, guild_id, user_id, float(weight_kg),
+            )
+
+    def _apply_bodyweight_protein_link(
+        self, c: sqlite3.Connection, guild_id: int, user_id: int,
+        weight_kg: float,
+    ) -> int | None:
+        """Re-derive a bodyweight-linked protein target after a new weigh-in.
+
+        No-op (returns None) unless the user has a link. When they do, the new
+        ceiling is ``round(weight_kg * grams_per_kg)`` and it's only written when
+        it differs from what currently resolves — repeated logs of the same
+        weight mustn't spam identical effective-dated rows. A derived value above
+        :data:`_BW_LINK_MAX_TARGET_G` is dropped rather than written (the
+        bodyweight is still recorded), so a fat-fingered weigh-in can't poison
+        the ceiling; see that constant for why this is a backstop, not the
+        primary guard.
+
+        Because a link neutralises any weekend override when it's created and the
+        setup flow refuses to add one while linked, only the ``default`` row
+        needs re-deriving here — it resolves on every day, weekday and weekend
+        alike.
+        """
+        link = c.execute(
+            "SELECT grams_per_kg, username FROM protein_bw_links "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if link is None:
+            return None
+        grams = int(round(weight_kg * float(link["grams_per_kg"])))
+        if grams <= 0 or grams > _BW_LINK_MAX_TARGET_G:
+            return None
+        current = targets.resolve(
+            self._target_rows(c, user_id), targets.local_today(),
+        ).protein.value
+        if current is not None and int(round(current)) == grams:
+            return None  # same weight (or same rounded target) — no new row
+        # Nutrition targets are global but each row records a home guild
+        # (nutrition_home_guild = newest set_at). A weigh-in is not a nutrition
+        # command, so it must not re-home the user's targets to whichever server
+        # the scale reading was typed in. Re-stamp the guild that home already
+        # resolves to; only fall back to the weigh-in guild when there's no
+        # prior target row to inherit from.
+        home = c.execute(
+            "SELECT guild_id FROM nutrition_targets WHERE user_id = ? "
+            "ORDER BY set_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        target_guild = (
+            int(home["guild_id"])
+            if home is not None and home["guild_id"] is not None
+            else guild_id
+        )
+        username = link["username"] or ""
+        detail = self._protein_goal_write(
+            c, target_guild, user_id, username, grams,
+        )
+        self._audit_data(
+            c, guild_id, "protein_goal_set", subject_id=user_id,
+            subject_name=username, detail=f"{detail} (tied to bodyweight)",
+        )
+        return grams
 
     def get_latest_bodyweight(
         self, guild_id: int, user_id: int,
@@ -3408,7 +3527,12 @@ class Database:
         channel_id: int | None = None, channel_name: str | None = None,
         at: datetime | None = None,
     ) -> None:
-        """Append a voice transition ('join' / 'leave' / 'move')."""
+        """Append a voice transition.
+
+        ``event`` is one of 'join'/'leave'/'move' (channel presence) or
+        'mute_on'/'mute_off'/'deaf_on'/'deaf_off' (mute/deafen signals) — see
+        the ``voice_events`` DDL comment for the full contract.
+        """
         with self._conn() as c:
             c.execute(
                 "INSERT INTO voice_events "
@@ -3422,10 +3546,15 @@ class Database:
         self, guild_id: int, since: datetime | None = None, limit: int = 100,
     ) -> list[sqlite3.Row]:
         """Recent voice transitions (newest first), capped at ``limit``, each
-        carrying the member's mirrored ``display_name`` and ``avatar``."""
+        carrying the member's mirrored ``display_name`` and ``avatar``.
+
+        Only channel-presence events ('join'/'leave'/'move') are returned — the
+        mute/deafen toggles would spam this human-readable feed (people mute and
+        unmute constantly), and app.voicetime aggregates them elsewhere.
+        """
         with self._conn() as c:
             params: list = [guild_id]
-            where = "ve.guild_id = ?"
+            where = "ve.guild_id = ? AND ve.event IN ('join', 'leave', 'move')"
             if since is not None:
                 where += " AND ve.at >= ?"
                 params.append(_normalize_iso(since))
@@ -3440,6 +3569,101 @@ class Database:
                 "ORDER BY ve.at DESC, ve.id DESC LIMIT ?",
                 params,
             ).fetchall()
+
+    def voice_events_for(
+        self, guild_id: int, user_id: int,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return one member's voice events (``event``, ``at``) in time order,
+        for app.voicetime to reconstruct in-call / muted / deafened durations.
+
+        Includes carry-in so the caller knows the member's state at ``since``
+        without processing all of history. Unlike presence — a single signal —
+        voice interleaves three independent ones, so we seed carry-in before
+        the window. Mute and deafen each seed only their single latest signal.
+        Channel presence needs more: app.voicetime re-anchors a stale mute or
+        deafen to off *only* on a 'join' (Discord doesn't reliably emit
+        mute_off on leave), while a 'move' deliberately preserves mute. If the
+        latest pre-window channel event is a 'move', the session's opening
+        'join' — the row that clears that stale state — would be lost, letting
+        a phantom mute bleed across the whole window. So the channel group
+        seeds *every* event since (and including) the most recent 'join', not
+        just the latest one. Replayed in timestamp order this reconstructs the
+        opening state correctly (a mute predating the last join is overridden
+        by that join's reset; a move after it keeps the mute alive).
+
+        Rows are ordered by (at, id) so a 'join' and the 'mute_on' the handler
+        writes at the same instant (an already-muted join) stay in insert order.
+        """
+        with self._conn() as c:
+            rows: list[sqlite3.Row] = []
+            if since is not None:
+                start_iso = _normalize_iso(since)
+                # Channel presence: seed every event back to the session's
+                # opening 'join' so the mute/deafen reset that join carries is
+                # never dropped behind a later 'move' (see docstring). With no
+                # prior 'join' to anchor to, a lone leave/move is all we have,
+                # so fall back to the single latest channel event.
+                last_join = c.execute(
+                    "SELECT at FROM voice_events "
+                    "WHERE guild_id = ? AND user_id = ? AND at < ? "
+                    "AND event = 'join' "
+                    "ORDER BY at DESC, id DESC LIMIT 1",
+                    (guild_id, user_id, start_iso),
+                ).fetchone()
+                if last_join is not None:
+                    rows.extend(c.execute(
+                        "SELECT event, at, id FROM voice_events "
+                        "WHERE guild_id = ? AND user_id = ? "
+                        "AND at >= ? AND at < ? "
+                        "AND event IN ('join', 'leave', 'move') "
+                        "ORDER BY at ASC, id ASC",
+                        (guild_id, user_id, last_join["at"], start_iso),
+                    ).fetchall())
+                else:
+                    prior = c.execute(
+                        "SELECT event, at, id FROM voice_events "
+                        "WHERE guild_id = ? AND user_id = ? AND at < ? "
+                        "AND event IN ('join', 'leave', 'move') "
+                        "ORDER BY at DESC, id DESC LIMIT 1",
+                        (guild_id, user_id, start_iso),
+                    ).fetchone()
+                    if prior is not None:
+                        rows.append(prior)
+                # Mute and deafen carry in only their single latest signal; a
+                # 'join' above overrides any that predates it.
+                for group in (
+                    ("mute_on", "mute_off"),
+                    ("deaf_on", "deaf_off"),
+                ):
+                    placeholders = ", ".join("?" for _ in group)
+                    prior = c.execute(
+                        "SELECT event, at, id FROM voice_events "
+                        "WHERE guild_id = ? AND user_id = ? AND at < ? "
+                        f"AND event IN ({placeholders}) "
+                        "ORDER BY at DESC, id DESC LIMIT 1",
+                        (guild_id, user_id, start_iso, *group),
+                    ).fetchone()
+                    if prior is not None:
+                        rows.append(prior)
+                params: list = [guild_id, user_id, start_iso]
+                where = "guild_id = ? AND user_id = ? AND at >= ?"
+            else:
+                params = [guild_id, user_id]
+                where = "guild_id = ? AND user_id = ?"
+            if until is not None:
+                where += " AND at <= ?"
+                params.append(_normalize_iso(until))
+            rows.extend(c.execute(
+                f"SELECT event, at, id FROM voice_events WHERE {where} "
+                "ORDER BY at ASC, id ASC",
+                params,
+            ).fetchall())
+            # Carry-in rows come from separate queries; merge everything into a
+            # single chronological stream (id breaks same-timestamp ties).
+            rows.sort(key=lambda r: (r["at"], r["id"]))
+            return rows
 
     # ------------------------------------------------------------------
     # Message logging (web dashboard activity feed)
@@ -4291,6 +4515,43 @@ class Database:
 
     # ---- protein (grams) -------------------------------------------------
 
+    def _protein_goal_write(
+        self, c: sqlite3.Connection, guild_id: int, user_id: int, username: str,
+        daily_target_g: float,
+        weekend_g: float | None | _Keep = KEEP,
+    ) -> str:
+        """Write the effective-dated protein target rows and return the audit
+        detail string. The all-week ``default`` row always, plus the ``weekend``
+        override when ``weekend_g`` isn't :data:`KEEP` (``None`` tombstones it).
+
+        Split out from :meth:`protein_goal_set` so the bodyweight-link
+        auto-update in :meth:`set_bodyweight` re-derives a target through the
+        exact same row-writing convention (one ``_target_effective_from`` call,
+        history-preserving new rows) instead of duplicating it. Takes an already
+        open connection so the caller controls the transaction and can audit
+        with its own context.
+        """
+        effective_from = self._target_effective_from(
+            c, user_id, targets.MACRO_PROTEIN,
+        )
+        self._nutrition_target_write(
+            c, guild_id, user_id, username,
+            targets.MACRO_PROTEIN, targets.SCOPE_DEFAULT, daily_target_g,
+            effective_from,
+        )
+        detail = f"protein max {float(daily_target_g):.0f} g/day"
+        if weekend_g is not KEEP:
+            self._nutrition_target_write(
+                c, guild_id, user_id, username,
+                targets.MACRO_PROTEIN, targets.SCOPE_WEEKEND, weekend_g,
+                effective_from,
+            )
+            detail += (
+                " (weekend override cleared)" if weekend_g is None
+                else f", weekends {float(weekend_g):.0f} g/day"
+            )
+        return detail
+
     def protein_goal_set(
         self, guild_id: int, user_id: int, username: str,
         daily_target_g: float,
@@ -4304,29 +4565,55 @@ class Database:
         :data:`KEEP` leaves an existing weekend override alone, ``None`` clears
         it, a number sets it. Per-user / global, like its calorie twin."""
         with self._conn() as c:
-            effective_from = self._target_effective_from(
-                c, user_id, targets.MACRO_PROTEIN,
+            detail = self._protein_goal_write(
+                c, guild_id, user_id, username, daily_target_g, weekend_g,
             )
-            self._nutrition_target_write(
-                c, guild_id, user_id, username,
-                targets.MACRO_PROTEIN, targets.SCOPE_DEFAULT, daily_target_g,
-                effective_from,
-            )
-            detail = f"protein max {float(daily_target_g):.0f} g/day"
-            if weekend_g is not KEEP:
-                self._nutrition_target_write(
-                    c, guild_id, user_id, username,
-                    targets.MACRO_PROTEIN, targets.SCOPE_WEEKEND, weekend_g,
-                    effective_from,
-                )
-                detail += (
-                    " (weekend override cleared)" if weekend_g is None
-                    else f", weekends {float(weekend_g):.0f} g/day"
-                )
             self._audit_data(
                 c, guild_id, "protein_goal_set",
                 subject_id=user_id, subject_name=username, detail=detail,
             )
+
+    # ---- protein <-> bodyweight link ------------------------------------
+
+    def protein_bw_link_set(
+        self, user_id: int, username: str | None = None,
+        grams_per_kg: float = 1.0,
+    ) -> None:
+        """Tie this user's protein ceiling to their bodyweight at
+        ``grams_per_kg`` g/kg (upsert). Recording the link does *not* itself
+        write a target row — the caller sets the initial target and every later
+        :meth:`set_bodyweight` re-derives it. Global per user."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO protein_bw_links
+                    (user_id, grams_per_kg, username, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    grams_per_kg = excluded.grams_per_kg,
+                    username     = excluded.username
+                """,
+                (user_id, float(grams_per_kg), username, _normalize_iso(None)),
+            )
+
+    def protein_bw_link_get(self, user_id: int) -> sqlite3.Row | None:
+        """The user's protein<->bodyweight link row, or None when not linked."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT user_id, grams_per_kg, username, created_at "
+                "FROM protein_bw_links WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+    def protein_bw_link_remove(self, user_id: int) -> bool:
+        """Drop the link. Returns True when one existed (so callers can say so
+        in their reply). Leaves the protein target itself in place — unlinking
+        just stops future weigh-ins from moving it."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM protein_bw_links WHERE user_id = ?", (user_id,),
+            )
+            return cur.rowcount > 0
 
     def protein_goal_get(
         self, guild_id: int, user_id: int, day: date | None = None,
@@ -5543,6 +5830,16 @@ class Database:
         plain values rather than :data:`KEEP`.
         """
         with self._conn() as c:
+            # The dashboard form is an explicit, full declaration of the protein
+            # target (there is no "bodyweight" option here), so any save breaks a
+            # bodyweight link — exactly like Discord's `/protein setup <n>` and
+            # `/protein stop` do. Without this, the link survives a web edit and
+            # the next weigh-in silently re-arms or overwrites what the user just
+            # set here. Done directly on the open connection because _conn isn't
+            # reentrant (its BEGIN IMMEDIATE would clash with a nested call).
+            c.execute(
+                "DELETE FROM protein_bw_links WHERE user_id = ?", (user_id,),
+            )
             pairs = (
                 (targets.MACRO_KCAL, kcal, weekend_kcal),
                 (targets.MACRO_PROTEIN, protein_g, weekend_protein_g),

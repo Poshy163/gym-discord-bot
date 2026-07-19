@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.db import Database
+from app.voicetime import summarize_voice
 
 
 @pytest.fixture()
@@ -359,6 +360,99 @@ def test_voice_events_logged_newest_first_with_member(db):
     assert len(db.voice_events_recent(1, limit=1)) == 1
     recent = db.voice_events_recent(1, since=base + timedelta(minutes=3))
     assert [r["event"] for r in recent] == ["leave"]
+
+
+def test_voice_events_recent_excludes_mute_deaf(db):
+    # The human-readable feed stays join/leave/move only; mute/deafen toggles
+    # (which app.voicetime consumes) are filtered out so it isn't spammed.
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.voice_log_event(1, 100, "join", channel_id=5, channel_name="G", at=base)
+    db.voice_log_event(1, 100, "mute_on", channel_id=5, channel_name="G",
+                       at=base + timedelta(minutes=1))
+    db.voice_log_event(1, 100, "deaf_on", channel_id=5, channel_name="G",
+                       at=base + timedelta(minutes=2))
+    db.voice_log_event(1, 100, "leave", channel_id=5, channel_name="G",
+                       at=base + timedelta(minutes=3))
+    assert [r["event"] for r in db.voice_events_recent(1)] == ["leave", "join"]
+
+
+def test_voice_events_for_carry_in_per_signal(db):
+    # voice_events_for seeds one carry-in per signal group (channel / mute /
+    # deafen) from before the window, then all in-window events, merged in
+    # chronological order — even when carry-in predates `since` by hours.
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.voice_log_event(1, 100, "join", channel_id=5, channel_name="G", at=base)
+    db.voice_log_event(1, 100, "mute_on", channel_id=5, channel_name="G",
+                       at=base + timedelta(minutes=1))
+    win_start = base + timedelta(hours=2)
+    db.voice_log_event(1, 100, "mute_off", channel_id=5, channel_name="G",
+                       at=win_start + timedelta(minutes=5))
+    db.voice_log_event(1, 100, "leave", channel_id=5, channel_name="G",
+                       at=win_start + timedelta(minutes=10))
+
+    rows = db.voice_events_for(
+        1, 100, since=win_start, until=win_start + timedelta(hours=1),
+    )
+    # Carry-in join + mute_on (from 2h before the window) then the in-window
+    # mute_off + leave, all in time order.
+    assert [r["event"] for r in rows] == ["join", "mute_on", "mute_off", "leave"]
+
+
+def test_voice_events_for_no_since_returns_all(db):
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    db.voice_log_event(1, 100, "join", channel_id=5, channel_name="G", at=base)
+    db.voice_log_event(1, 100, "leave", channel_id=5, channel_name="G",
+                       at=base + timedelta(minutes=5))
+    # A different user's rows never leak in.
+    db.voice_log_event(1, 200, "join", channel_id=5, channel_name="G", at=base)
+    rows = db.voice_events_for(1, 100)
+    assert [r["event"] for r in rows] == ["join", "leave"]
+
+
+def test_voice_events_for_carry_in_keeps_join_before_move(db):
+    # A stale mute/deafen from a session that left un-muted-off must not bleed
+    # across the window when the latest pre-window channel event is a 'move'.
+    # The session's opening 'join' (which resets mute/deafen) has to survive
+    # carry-in, or summarize_voice opens the window falsely muted for the whole
+    # span. Reproduces the over-count in the /voice stats review finding.
+    base = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+
+    def at(hours):
+        return base + timedelta(hours=hours)
+
+    # Session A: joined, muted+deafened, left WITHOUT a mute_off/deaf_off.
+    db.voice_log_event(1, 100, "join", at=at(-6))
+    db.voice_log_event(1, 100, "mute_on", at=at(-5))
+    db.voice_log_event(1, 100, "deaf_on", at=at(-5))
+    db.voice_log_event(1, 100, "leave", at=at(-4))
+    # Session B: rejoined clean, then changed rooms — the 'move' is now the most
+    # recent channel event before the window, hiding the reset 'join' behind it.
+    db.voice_log_event(1, 100, "join", at=at(-3))
+    db.voice_log_event(1, 100, "move", at=at(-2))
+    # In-window: the member genuinely mutes+deafens for the first time.
+    db.voice_log_event(1, 100, "mute_on", at=at(1))
+    db.voice_log_event(1, 100, "deaf_on", at=at(1))
+
+    rows = db.voice_events_for(1, 100, since=base, until=at(2))
+    # Carry-in now carries the session-B 'join' (back to which the channel
+    # group seeds), not just the trailing 'move'.
+    assert [r["event"] for r in rows] == [
+        "mute_on", "deaf_on", "join", "move", "mute_on", "deaf_on",
+    ]
+
+    s = summarize_voice(
+        [(r["event"], r["at"]) for r in rows],
+        base, at(2), now=at(2),
+        live_in_call=True, live_muted=True, live_deafened=True,
+    )
+    # 2h in call over the window; muted/deafened only for the in-window hour,
+    # not the whole window — and the current streak is measured from the real
+    # in-window toggle, not the 11h-old stale one.
+    assert s.in_call_seconds == 2 * 3600
+    assert s.muted_seconds == 1 * 3600
+    assert s.deafened_seconds == 1 * 3600
+    assert s.current_muted_seconds == 1 * 3600
+    assert s.current_deafened_seconds == 1 * 3600
 
 
 # --- concurrent activity snapshots ----------------------------------------
