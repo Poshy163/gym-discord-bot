@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.voicetime import summarize_voice
+from app.voicetime import VoiceSummary, summarize_voice
 
 
 UTC = timezone.utc
@@ -204,6 +204,43 @@ def test_fractions_zero_without_call_time():
     s = summarize_voice([], T0, T0 + timedelta(hours=1))
     assert s.muted_fraction() == 0.0
     assert s.deafened_fraction() == 0.0
+
+
+def test_active_seconds_is_in_call_minus_muted():
+    # 4h in call, muted only the middle hour → 3h audible/active.
+    events = [
+        ("join", _at(0)),
+        ("mute_on", _at(1)),
+        ("mute_off", _at(2)),
+        ("leave", _at(4)),
+    ]
+    s = summarize_voice(events, T0, T0 + timedelta(hours=5), live_in_call=False)
+    assert s.in_call_seconds == 4 * 3600
+    assert s.muted_seconds == 1 * 3600
+    assert s.active_seconds == 3 * 3600
+
+
+def test_active_seconds_zero_when_muted_entire_call():
+    # Joined already muted and never unmuted → no audible time at all.
+    events = [("join", _at(0)), ("mute_on", _at(0)), ("leave", _at(2))]
+    s = summarize_voice(events, T0, T0 + timedelta(hours=3), live_in_call=False)
+    assert s.in_call_seconds == 2 * 3600
+    assert s.muted_seconds == 2 * 3600
+    assert s.active_seconds == 0
+
+
+def test_active_seconds_equals_in_call_when_never_muted():
+    events = [("join", _at(0)), ("leave", _at(2))]
+    s = summarize_voice(events, T0, T0 + timedelta(hours=3), live_in_call=False)
+    assert s.muted_seconds == 0
+    assert s.active_seconds == s.in_call_seconds == 2 * 3600
+
+
+def test_active_seconds_never_negative_on_float_drift():
+    # Two separately-summed float accumulators can leave muted a hair above
+    # in-call; active must clamp to 0 rather than report a tiny negative.
+    s = VoiceSummary(in_call_seconds=100.0, muted_seconds=100.000000001)
+    assert s.active_seconds == 0.0
 
 
 def test_current_streak_measured_to_now_argument():

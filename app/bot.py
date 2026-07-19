@@ -14042,6 +14042,18 @@ async def voice_stats_cmd(
         value=format_duration(summary.in_call_seconds),
         inline=True,
     )
+    # Active = in-call while unmuted (the audible complement of Muted). All four
+    # totals stay inline: Discord packs 3 per row, so this reads as
+    # "In voice · Active · Muted" on the first row with Deafened — a sub-detail
+    # of Muted — wrapping onto the second, which keeps the grouping sensible.
+    embed.add_field(
+        name="🎙️ Active",
+        value=(
+            f"{format_duration(summary.active_seconds)} "
+            f"({_pct(summary.active_seconds, summary.in_call_seconds)})"
+        ),
+        inline=True,
+    )
     embed.add_field(
         name="🔈 Muted",
         value=(

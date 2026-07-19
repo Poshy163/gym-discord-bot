@@ -52,6 +52,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 from . import game_icons, presence, targets
+from .voicetime import summarize_voice
 
 LOG = logging.getLogger("gymbot.webui")
 
@@ -804,7 +805,64 @@ def build_app(
             }
             for r in db.voice_events_recent(gid, limit=100)
         ]
-        return web.json_response({"occupancy": occupancy, "events": events})
+
+        # Historical per-user totals over the last 7 days. The live snapshot only
+        # exposes *self* mute/deaf (server mute/deaf isn't in it) — acceptable
+        # here: it's just the tail-close hint for someone still connected, so a
+        # server-muted-only member counts as active until their next logged mute.
+        # A member present in the snapshot is verifiably in-call now; one absent
+        # gets all-False live flags, so any unterminated interval is dropped
+        # rather than accruing phantom time — the same conservative closed-tail
+        # behaviour as /voice stats on a cache miss.
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=7)
+        live_by_uid: dict[str, dict] = {}
+        for chan in occupancy:
+            for mem in chan.get("members", []):
+                live_by_uid[str(mem.get("user_id"))] = mem
+        # One voice_events_for + summarize_voice per member active in the window.
+        # Bounded by a guild's worth of members over 7 days of events; cheap at
+        # dashboard cadence, so it rides the existing liveVoice poll. Revisit
+        # only if a very large guild's voice log makes this loop noticeably slow.
+        # Candidate set = anyone with a logged event in the window UNION anyone
+        # currently in a channel. The live union matters for a member who joined
+        # >7d ago and has sat in-call ever since with no new event: they have no
+        # row at >= since, so voice_user_ids_since alone would drop them even
+        # though their 7-day in-call tail (accrued via the carry-in join) would
+        # top the table — matching what /voice stats reports for them.
+        candidates = set(db.voice_user_ids_since(gid, since))
+        candidates.update(int(u) for u in live_by_uid)
+        totals: list[dict] = []
+        for uid in sorted(candidates):
+            rows = db.voice_events_for(gid, uid, since=since, until=now)
+            live = live_by_uid.get(str(uid))
+            summary = summarize_voice(
+                [(r["event"], r["at"]) for r in rows],
+                since, now, now=now,
+                live_in_call=live is not None,
+                live_muted=bool(live and live.get("self_mute")),
+                live_deafened=bool(live and live.get("self_deaf")),
+            )
+            if summary.in_call_seconds == 0 and not summary.in_call_now:
+                continue  # only carry-in / a dropped phantom tail — nothing to show
+            member = db.get_member(gid, uid)
+            totals.append({
+                "user_id": str(uid),
+                "display_name": (
+                    member["display_name"] if member and member["display_name"]
+                    else str(uid)
+                ),
+                "avatar": member["avatar"] if member else None,
+                "in_call": summary.in_call_seconds,
+                "active": summary.active_seconds,
+                "muted": summary.muted_seconds,
+                "deafened": summary.deafened_seconds,
+            })
+        totals.sort(key=lambda t: t["in_call"], reverse=True)
+
+        return web.json_response(
+            {"occupancy": occupancy, "events": events, "totals": totals}
+        )
 
     async def api_blacklist_add(request: web.Request) -> web.Response:
         _require(request)
@@ -2607,7 +2665,7 @@ function setVcCount(d){const el=document.getElementById("vcCount");if(!el)return
   const inVc=(d.occupancy||[]).reduce((n,c)=>n+(c.members||[]).length,0);
   el.textContent=`· ${inVc} in voice now`;}
 function voiceBodyHTML(d){
-  const occ=d.occupancy||[], events=d.events||[];
+  const occ=d.occupancy||[], events=d.events||[], totals=d.totals||[];
   const occHtml=occ.length?occ.map(c=>`<div class="vc-chan">
       <div class="vc-chan-h">🔊 ${esc(c.channel_name)} <span class="faint">· ${(c.members||[]).length}</span></div>
       <div class="vc-members">${(c.members||[]).map(m=>`<div class="vc-mem" data-search="${esc((m.display_name||'').toLowerCase())}">
@@ -2617,6 +2675,20 @@ function voiceBodyHTML(d){
         ${m.self_deaf?'<span class="vc-ic" title="Deafened">🔇</span>':(m.self_mute?'<span class="vc-ic" title="Muted">🔈</span>':"")}
       </div>`).join("")}</div></div>`).join("")
     : '<div class="faint">Nobody is in a voice channel right now.</div>';
+  // 7-day per-user totals. Muted/deafened carry the % of in-call; a zero shows
+  // "—" so an unmuted/undeafened member doesn't read as a sub-minute stint. The
+  // <table> lets the tab's search box filter rows by member name for free.
+  const durCell=(sec,whole,withPct)=>!sec?'<span class="faint">—</span>'
+    :`${fmtPlaytime(sec)}${withPct?` <span class="faint">(${Math.round(pct(sec,whole))}%)</span>`:""}`;
+  const totHtml=totals.length?`<div class="tcard"><table><thead><tr>
+      <th>Member</th><th>In call</th><th>Active</th><th>Muted</th><th>Deafened</th></tr></thead>
+    <tbody>${totals.map(t=>`<tr>
+      <td>${who(t.user_id,t.display_name)}</td>
+      <td>${fmtPlaytime(t.in_call)}</td>
+      <td>${durCell(t.active)}</td>
+      <td>${durCell(t.muted,t.in_call,true)}</td>
+      <td>${durCell(t.deafened,t.in_call,true)}</td></tr>`).join("")}</tbody></table></div>`
+    : '<div class="faint">No voice time in the last 7 days.</div>';
   const logHtml=events.length?events.map(e=>{const m=VC_EV[e.event]||["•",e.event];
     return `<div class="vc-ev" data-search="${esc((e.display_name||'').toLowerCase())}">${avFor(e.user_id,e.display_name,24)}
       <span class="vc-ev-who"><a class="link" onclick="memberView('${e.user_id}')">${esc(e.display_name)}</a></span>
@@ -2624,6 +2696,8 @@ function voiceBodyHTML(d){
       <span class="vc-ev-ts">${fmtTs(e.at)}</span></div>`;}).join("")
     : '<div class="faint">No voice activity logged yet.</div>';
   return `<div class="vc-grid">${occHtml}</div>
+    <h3 style="margin:1.4rem 0 .6rem">Voice time (7 days)</h3>
+    ${totHtml}
     <h3 style="margin:1.4rem 0 .6rem">Recent voice activity</h3>
     <div class="vc-log">${logHtml}</div>`;
 }

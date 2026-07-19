@@ -84,6 +84,18 @@ class VoiceSummary:
     current_muted_seconds: float = 0.0
     current_deafened_seconds: float = 0.0
 
+    @property
+    def active_seconds(self) -> float:
+        """In-call time while *not* muted — the audible ("mic live") complement.
+
+        Purely derived: active is exactly in-call minus the muted overlap, so it
+        needs no timeline of its own. Deafened is a subset of muted, so muted
+        already absorbs it and active excludes it automatically. ``max(0, …)``
+        guards the sub-microsecond negative that can surface when ``muted`` and
+        ``in_call`` are summed from separate float accumulations.
+        """
+        return max(0.0, self.in_call_seconds - self.muted_seconds)
+
     def muted_fraction(self) -> float:
         """Muted time as a fraction of in-call time (0.0 when never in call)."""
         return self.muted_seconds / self.in_call_seconds if self.in_call_seconds else 0.0

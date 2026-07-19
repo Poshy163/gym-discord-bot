@@ -3665,6 +3665,24 @@ class Database:
             rows.sort(key=lambda r: (r["at"], r["id"]))
             return rows
 
+    def voice_user_ids_since(self, guild_id: int, since: datetime) -> list[int]:
+        """Distinct user_ids with any voice event at/after ``since`` in a guild.
+
+        Backs the dashboard's per-user voice-time table: it hands back the set
+        of members to summarise, and the caller then runs voice_events_for +
+        app.voicetime.summarize_voice for each. The (guild_id, user_id, at)
+        index — idx_voice_events_user — covers every column this reads, so the
+        DISTINCT resolves from the index without touching the table.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT user_id FROM voice_events "
+                "WHERE guild_id = ? AND at >= ? "
+                "ORDER BY user_id",
+                (guild_id, _normalize_iso(since)),
+            ).fetchall()
+            return [r["user_id"] for r in rows]
+
     # ------------------------------------------------------------------
     # Message logging (web dashboard activity feed)
     # ------------------------------------------------------------------

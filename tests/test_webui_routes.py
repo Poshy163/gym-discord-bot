@@ -265,6 +265,138 @@ def test_voice_without_snapshot_still_serves_events(tmp_path):
     _run(go())
 
 
+def test_voice_totals_summarise_sorted_with_active_and_muted_math(tmp_path):
+    """The 7-day totals give one summarised row per active member, sorted by
+    in-call desc, with active = in-call − muted and the muted %. A member in the
+    live snapshot has their still-open interval credited via the live flags; one
+    absent from it is summarised from the log alone (its clean leave here)."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.upsert_member(1, 200, "bob", "Bob")
+        # Alice: joined ~2h ago, muted ~1h ago, still connected & self-muted now
+        # (present in the snapshot) → ~2h in-call, ~1h muted, ~1h active.
+        db.voice_log_event(1, 100, "join", channel_id=5, channel_name="General",
+                           at=now - timedelta(hours=2))
+        db.voice_log_event(1, 100, "mute_on", channel_id=5, channel_name="General",
+                           at=now - timedelta(hours=1))
+        # Bob: a clean 30-min call that already ended; absent from the snapshot.
+        db.voice_log_event(1, 200, "join", channel_id=5, channel_name="General",
+                           at=now - timedelta(minutes=90))
+        db.voice_log_event(1, 200, "leave", channel_id=5, channel_name="General",
+                           at=now - timedelta(minutes=60))
+
+        async def fake_snapshot(gid):
+            # Snapshot carries only self mute/deaf (no server mute/deaf).
+            return [{"channel_id": "5", "channel_name": "General",
+                     "members": [{"user_id": "100", "display_name": "Alice",
+                                  "self_mute": True, "self_deaf": False}]}]
+
+        app = build_app(db=db, password="secret", voice_snapshot=fake_snapshot)
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/voice?guild=1")).json()
+            totals = d["totals"]
+            # Sorted by in-call desc: Alice (~2h) ahead of Bob (~30m).
+            assert [t["user_id"] for t in totals] == ["100", "200"]
+            a, b = totals
+            assert a["display_name"] == "Alice"
+            # Open mute interval credited to now via the live self_mute flag.
+            assert abs(a["in_call"] - 2 * 3600) < 5
+            assert abs(a["muted"] - 1 * 3600) < 5
+            assert abs(a["active"] - (a["in_call"] - a["muted"])) < 1e-6
+            assert a["deafened"] == 0
+            # Bob: closed 30-min call, never muted → all active.
+            assert abs(b["in_call"] - 30 * 60) < 5
+            assert b["muted"] == 0
+            assert abs(b["active"] - b["in_call"]) < 1e-6
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_voice_totals_absent_member_gets_closed_tail(tmp_path):
+    """A member absent from the live occupancy snapshot is summarised with
+    all-False live flags, so an unterminated trailing interval (bot restarted
+    mid-call) is dropped rather than accruing phantom time to now — only the
+    verified, already-closed portion of their history counts."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 300, "carol", "Carol")
+        # A clean 1h call that ended, then an open rejoin with no leave.
+        db.voice_log_event(1, 300, "join", channel_id=5, channel_name="General",
+                           at=now - timedelta(hours=3))
+        db.voice_log_event(1, 300, "leave", channel_id=5, channel_name="General",
+                           at=now - timedelta(hours=2))
+        db.voice_log_event(1, 300, "join", channel_id=5, channel_name="General",
+                           at=now - timedelta(minutes=30))
+
+        async def fake_snapshot(gid):
+            return []  # Carol is not connected right now.
+
+        app = build_app(db=db, password="secret", voice_snapshot=fake_snapshot)
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/voice?guild=1")).json()
+            totals = d["totals"]
+            assert [t["user_id"] for t in totals] == ["300"]
+            # Only the verified 1h closed segment survives; the open rejoin's
+            # tail would have added ~30m of phantom time if not gated off.
+            assert abs(totals[0]["in_call"] - 1 * 3600) < 5
+            assert abs(totals[0]["active"] - 1 * 3600) < 5
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_voice_totals_includes_live_member_with_no_recent_event(tmp_path):
+    """A member who joined >7 days ago and has sat in-call ever since (no new
+    join/leave/move/mute event in the window) has no voice row at >= since, so
+    voice_user_ids_since alone would drop them. The candidate set unions the
+    live occupancy, so their carry-in join still accrues the full 7-day tail and
+    they top the table — instead of showing in live occupancy but vanishing from
+    the totals directly below it."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 400, "dave", "Dave")
+        # Single join 8 days ago: nothing in the 7-day window, yet still connected.
+        db.voice_log_event(1, 400, "join", channel_id=5, channel_name="General",
+                           at=now - timedelta(days=8))
+
+        async def fake_snapshot(gid):
+            return [{"channel_id": "5", "channel_name": "General",
+                     "members": [{"user_id": "400", "display_name": "Dave"}]}]
+
+        app = build_app(db=db, password="secret", voice_snapshot=fake_snapshot)
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/voice?guild=1")).json()
+            # Present in live occupancy...
+            assert d["occupancy"][0]["members"][0]["user_id"] == "400"
+            # ...and no longer missing from the totals below it.
+            assert [t["user_id"] for t in d["totals"]] == ["400"]
+            # Full 7-day tail credited via the carry-in join + live_in_call.
+            assert abs(d["totals"][0]["in_call"] - 7 * 86400) < 5
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_activity_overlaps_and_resolves_icons(tmp_path):
     """The Activity tab credits overlapping games to each title, lists every
     currently-running game, honours the ?days window, and falls back to the
