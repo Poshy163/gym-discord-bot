@@ -28,13 +28,40 @@ Verified by re-testing every gated route with a confirmed L2 cookie (and various
 - **Only newly-accessible page:** `/portal/massage-chair.php` — renders a QR code (image only, no JSON).
 - Every other route below (`dashboard`, `profile`, `account`, `check-in`, `checkins`, `visits`, `history`, `qr-code-reader`, `membership`, `body-scan`, `scans`, `bookings`, `pilates`, `classes`, `bring-a-friend`, `vending`, `discounts`, all `/api/*` routes) **still 302s to `/portal/level-two-feature.php`** even when `membershipLevel == 2`.
 - Page byte-lengths of the always-accessible pages (`club-counter`, `rewards/*`) are **identical** for L1 and L2 — no extra data is rendered for L2 users.
-- Conclusion: those endpoints don't really exist on the web portal. Visit history / QR check-in / per-club timestamped data lives **only in the mobile app**, which talks to a different backend (likely a JSON API gated by an app-issued bearer token, not the `Member` cookie).
+- Conclusion: those endpoints don't really exist on the web portal. Visit history / QR check-in / per-club timestamped data lives **only in the mobile app**, which talks to a different backend — the **Netpulse (EGYM)** mobile API (see §7). ~~likely a JSON API gated by an app-issued bearer token~~ **Correction:** Netpulse auth is **not** an opaque bearer token — it's a **form-POST credential login** (`username`/`password`) that sets a `JSESSIONID` cookie, the same session-cookie shape as the web portal. Documented in `app/revo_netpulse.py`.
 
 > Implication for the bot: scraping the web portal will **never** give us per-visit timestamps or the specific club someone checked into. The `Attendance` rows in `ticket-tally.php` (date only, no club, no time) remain the most granular check-in signal available without reverse-engineering the mobile app.
 
+### 1.2 The `Invalid Access! B` guard (new 2026-07) — distinct from L2 gating
+
+`club-counter.php` and `massage-chair.php` — the *only* two pages that
+server-rendered dynamic in-club blobs (live occupancy + the access QR) — now
+return **HTTP 200, `Content-Type: text/html`, Content-Length 17, body exactly
+`Invalid Access! B`** (a PHP `die()` string). Reproduced under every variant:
+no-param, `?id=25` (the real fav club), alt param names, every Referer/Origin,
+full Chrome UA + `Sec-Fetch-*`, and session-priming.
+
+This is **not** membership gating and **not** a data move:
+
+- **Not L2 gating:** L2-gated routes 302-redirect; this returns a 200 with a
+  literal `die()` string and fires even though the `Member` cookie decodes
+  `membershipLevel == 2`.
+- **Not a data move:** all 9 alternate paths (`api/club-counter.php`,
+  `club-counter.json`, `rewards/api/*`, …) 302 → `/portal/`. There is no
+  endpoint/JS-var/JSON-key to retarget to. The all-clubs board **cannot** be
+  restored from the web.
+
+Pattern is consistent with an **IP / app-context allowlist** (in-club kiosk /
+app-webview), not a per-account check. Effect on code: `parse_club_counter()`
+now finds none of `clubCounterLists` / `barGraphData` / `favoriteClubId` and
+returns `({}, None)`, so `get_club_counter` degrades gracefully. `/busy` was
+rewritten to use the rewards-landing fav-club count instead (§3.5).
+
 ## 2. Endpoint inventory
 
-Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two-feature.php` (L2 only) · 🟡 marketing/static.
+Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/` (L2 only) · ⛔ access-guarded — 200 + `Invalid Access! B` (§1.2) · 🟡 marketing/static.
+
+> ⚠️ **Redirect-target drift (2026-07):** the 🚫/🔒 gated routes below now `302 → /portal/` (which 403s), **not** `/portal/level-two-feature.php` as the older text says. Accessibility is unchanged (still blocked); only the redirect target moved. `RevoClient._get()` treats any non-login 302 as an empty body, so this is docs-only.
 
 | Method | Path | Status | What it returns |
 |---|---|---|---|
@@ -42,7 +69,7 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two
 | POST | `/portal/login.php` | ✅ | Sets `Member` cookie, 302 → rewards |
 | GET | `/portal/` | 403 | (Direct index forbidden) |
 | GET | `/portal/api/` | ✅ | Returns literal `:)` — no JSON API mounted here |
-| GET | `/portal/club-counter.php` | ✅ | **Live occupancy for every club** + 24h history |
+| GET | `/portal/club-counter.php` | ⛔ | **Blocked (2026-07):** returns 200 + 17-byte `Invalid Access! B` (see §1.2). The all-clubs board is gone. Fav-club-only live count survives on the rewards landing (§3.5). |
 | GET | `/portal/rewards/` | ✅ | Rewards landing (ticket count + favourite-club summary) |
 | GET | `/portal/rewards/streaks.php` | ✅ | Current weekly streak + monthly check-in calendar |
 | GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance for any month (see §3.2.1) |
@@ -52,7 +79,7 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two
 | GET | `/portal/rewards/prize-pool.php` | ✅ | Same counters + current prize copy |
 | GET | `/portal/rewards/faq.php` | ✅ | Static |
 | GET | `/portal/rewards/terms-and-conditions.php` | ✅ | Static |
-| GET | `/portal/massage-chair.php` | ✅ (L2) | Renders a QR code image only — no JSON data |
+| GET | `/portal/massage-chair.php` | ⛔ | **Blocked (2026-07):** now hit by the same `Invalid Access! B` guard as club-counter (§1.2). (The `API/massage-chair-qr.php` JSON route still works, but the client never used it.) |
 | GET | `/portal/API/massage-chair-qr.php?hcId=<id>` | ✅ (L2) | **JSON** `{"qrCode":"qr_<uuid>","validUntilUtc":"<iso8601>"}` — the data the QR actually encodes. `$intHCID` is rendered into the page. |
 | GET | `/portal/API/` | ✅ | Returns literal `:)` (parallel to lowercase `/api/`) |
 | GET | `/portal/dashboard.php` | 🚫 | 302 → upgrade page **even at L2**. Mobile-app-only. |
@@ -70,7 +97,12 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/level-two
 
 ### 3.1 Club Counter — `/portal/club-counter.php`
 
-Inline `<script>` defines:
+> ⛔ **Dead since 2026-07** — the page is access-guarded (§1.2) and returns
+> `Invalid Access! B`. The shapes below are retained for reference only; nothing
+> here can be scraped any more. `/busy` now reads a single fav-club count from
+> the rewards landing (§3.5).
+
+Inline `<script>` defined (historically):
 
 ```js
 clubCounterLists = {
@@ -137,23 +169,37 @@ client as `RevoClient.get_streak_calendar(month, year) -> {dom: bool}`.
 
 ### 3.3 Tickets / Attendance log — `/portal/rewards/ticket-tally.php`
 
-Visible content (sample from this account):
+> ⚠️ **DOM reorder (2026-07):** each history row is now a three-column grid
+> block whose children are, in order, **DATE → DELTA → SOURCE** (it used to be
+> DELTA → SOURCE → DATE):
+> ```html
+> <div class="list … grid grid-cols-3 …">
+>   <div class="font-thin">17/07/2026</div>
+>   <div class="font-bold">+2 Tickets</div>
+>   <div class="font-thin">Attendance</div>
+> </div>
+> ```
+> The old flat regex (`\+?(\d+)\s*Tickets\s*([A-Za-z]+)\s*(date)`) assumed the
+> old order, so it paired each source with the **next-older** row's date and
+> dropped the newest row. `parse_tickets()` now iterates each `grid-cols-3`
+> "list" block and reads its three children positionally (robust against future
+> reorders). Also: **deltas doubled to `+2`** for recent grants (rows on/after
+> ~08/05/2026); older rows are still `+1`. The int-capture handles both.
+
+Visible content (sample, **current** order date → delta → source):
 ```
-Tickets Available: 10
-+1 Tickets  Attendance     11/05/2026
-+1 Tickets  Attendance     08/05/2026
-+1 Tickets  Attendance     07/05/2026
-+1 Tickets  Monthiversary  27/04/2026
-+1 Tickets  Attendance     23/04/2026
-+1 Tickets  Attendance     17/04/2026
-+1 Tickets  BONUSDAILY     14/04/2026
-+1 Tickets  Attendance     14/04/2026
-+1 Tickets  BONUSDAILY     07/04/2026
-+1 Tickets  Welcome        07/04/2026
+Tickets Available: 31
+17/07/2026  +2 Tickets  Attendance
+07/07/2026  +2 Tickets  Monthiversary
+03/07/2026  +2 Tickets  Attendance
 …
+08/05/2026  +1 Tickets  Attendance   ← last +1 before the +2 cutoff
+07/05/2026  +1 Tickets  Monthiversary
+…
+07/04/2026  +1 Tickets  Welcome      ← account/rewards start
 ```
-- "Tickets Available" is the headline number (digit-grouped — concatenate the four `<digit>` cells).
-- Each row = `(delta_int, source_string, date_dd/mm/yyyy)`.
+- "Tickets Available" is the headline number (digit-grouped — concatenate the single-digit `<span>` cells before "Tickets Available").
+- Each row = `(date_dd/mm/yyyy, delta_int, source_string)` in the DOM; `TicketRow` still exposes them as `(delta, source, date)`.
 - ⚠️ **`Attendance` rows are NOT a per-visit check-in log.** Verified 2026-06-12:
   the per-day streaks calendar (§3.2.1) showed check-ins on June 1, 10, 11, while
   ticket-tally's newest `Attendance` row was June 7 — days 10 and 11 never appeared.
@@ -166,11 +212,33 @@ Tickets Available: 10
 ### 3.4 Raffle / Prize pool
 
 - `raffle.php` — shows `Monthly Draw N days` and `Major Draw N days` countdowns; current ticket balance.
-- `prize-pool.php` — same numbers + current prize description (HTML-only; no structured field).
+- `prize-pool.php` — same numbers + current prize **copy**. Two blurbs render in
+  DOM order `[monthly, major]` as `<div class="py-3 px-1"><p>…</p></div>` blocks
+  (e.g. monthly *"EVERY GYM HAS A WINNER! Win Revo merch and 3 months free
+  membership!"*; major *"…$50,000 cash or a brand new BYD SEALION 7 car!"*).
+  Free-text only — no structured field. Parsed by
+  `revo_client.parse_prize_pool(html) -> {"monthly": str|None, "major": str|None}`
+  (`RevoClient.get_prize_pool()`); surfaced in `/revo_raffle` + `/revo_summary`.
+  Degrades to `None` per side if Revo rewords/moves a blurb.
 
 ### 3.5 Rewards landing — `/portal/rewards/`
 
-Renders ticket digits and the member's favourite-club name (e.g. `"Modbury"`).
+The landing renders the member's **favourite-club tile** as a single
+`<a href=".../portal/club-counter.php?id=<ID>">` block containing:
+- the fav club **id** in the href (`club-counter.php?id=25`),
+- three single-digit `<span>` cells for the **live head-count** (zero-padded,
+  e.g. `0`,`0`,`2` → `2`), and
+- the club **name** in a `rounded-full` white pill `<div>` (e.g. `Modbury`).
+
+This is the **only surviving live occupancy signal** now that `club-counter.php`
+is guarded (§1.2), and the **replacement source for the favourite club** now
+that the `favoriteClubId` JS var died with that page (it was returning `None`).
+
+Parsed by `revo_client.parse_rewards_landing(html) -> (fav_club_id, fav_club_name,
+in_club)` and exposed as `RevoClient.get_rewards_landing()`. `/busy` and
+`/revo_link`'s fav-club capture both read it. Limitation: it's only the
+**session account's own** fav club — not all clubs, and not an arbitrary club a
+requesting user names (point them at the Revo app's Live Member Counter).
 
 ## 4. Reference scraper
 
@@ -289,3 +357,32 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
   is cheap.
 - **`membershipLevel` upgrade:** if you upgrade to L2, *all* the 🔒 endpoints in §2 become
   worth re-investigating; that's where per-club, per-timestamp data lives.
+
+## 7. Mobile backend — Netpulse (EGYM)
+
+Revo's phone app (`com.netpulse.mobile.revofitness`) does **not** use the
+`revocentral` web portal above — it talks to a **Netpulse (EGYM)** white-label
+backend at `https://revofitness.netpulse.com/np/`. See **`app/revo_netpulse.py`**
+for the read-only client.
+
+- **Auth (corrects the old "bearer token" guess in §1.1):** a **form-POST
+  credential login** — `POST /np/exerciser/login` with `username`/`password`
+  sets a `JSESSIONID` cookie and returns the exerciser `uuid`. Same
+  session-cookie shape as the web portal; no phone-TLS interception needed.
+- **Occupancy & check-ins are NOT provisioned for Revo's tenant.**
+  `gym-busyness` returns `{"message":"The requested resource does not exist."}`
+  and `check-ins/history` returns `{"checkIns": []}`. Every club in the
+  directory reports `"mms": "perfectgym"` — **Revo runs member management /
+  access / occupancy on PerfectGym, not Netpulse**, so those endpoints are dark
+  here and can't be used to restore `/busy` or a per-visit feed.
+- **What Netpulse *does* give:** the member's **membership** (type/subtype/join
+  date) and a full **club directory** (name, suburb/state, hours, geo). Those
+  are the only two surfaces `app/revo_netpulse.py` exposes.
+- **Secrets:** the login + membership responses carry a `JSESSIONID`,
+  `externalAuthToken`/`IdToken`/`RefreshToken`, `egymAccountId`, and a
+  membership `barcode`/`agreementNumber`/`barcodeExpiresAt` (a live door-access
+  credential). The client never logs, returns, or stores them; the parsers are
+  the scrubbing boundary.
+- **Not the same vendor as bookings:** Revo's studio/pilates bookings run on
+  **Arbox** (`revoFitness.arbox.app.com`) — a different backend again, only
+  relevant if class bookings are ever wanted.

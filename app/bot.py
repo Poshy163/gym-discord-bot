@@ -8295,32 +8295,30 @@ def _drop_cached_client(user_id: int) -> None:
         _revo_user_clients.pop(user_id, None)
 
 
-def _format_busy_line(info: "revo_client.ClubInfo") -> str:
-    state = revo_client.state_for_club(info.name)
-    location = f"{info.name}, {state}" if state else info.name
-    return f"**{location}** — {info.in_club} in club right now (id={info.club_id})"
+def _format_busy_line(landing: "revo_client.RewardsLanding") -> str:
+    name = landing.fav_club_name or "Your club"
+    state = revo_client.state_for_club(landing.fav_club_name or "")
+    location = f"{name}, {state}" if state else name
+    if landing.in_club is None:
+        return f"🏋️ **{location}** — live count unavailable right now."
+    return f"🏋️ **{location}**: {landing.in_club} in club right now"
 
 
 @bot.tree.command(
     name="busy",
-    description="Show how busy a Revo Fitness club is right now.",
+    description="Show how busy your Revo club is right now (live count).",
 )
 @app_commands.describe(
-    club="Club name (substring match). Omit for the top 5 busiest right now.",
-    state='Filter the top-5 by state (SA/WA/VIC/NSW). Defaults to all clubs.',
+    club="Optional club name. The web now only exposes the linked account's favourite club.",
 )
-@app_commands.choices(state=[
-    app_commands.Choice(name="All clubs", value="all"),
-    app_commands.Choice(name="SA (South Australia)", value="SA"),
-    app_commands.Choice(name="WA (Western Australia)", value="WA"),
-    app_commands.Choice(name="VIC (Victoria)", value="VIC"),
-    app_commands.Choice(name="NSW (New South Wales)", value="NSW"),
-])
 async def busy_cmd(
     interaction: discord.Interaction,
     club: str | None = None,
-    state: str = "all",
 ) -> None:
+    # The all-clubs "busiest right now" board is gone: club-counter.php is
+    # access-guarded now. The rewards landing still renders the logged-in
+    # account's *own* favourite club + its live head-count, so /busy degrades
+    # to that single scoped count. See docs/REVO_PORTAL.md §3.1/§3.5.
     if REVO_DISABLED:
         await interaction.response.send_message(
             "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
@@ -8335,17 +8333,17 @@ async def busy_cmd(
 
     await interaction.response.defer(thinking=True)
 
-    def _do() -> tuple[dict[str, "revo_client.ClubInfo"], int | None] | str:
+    def _do() -> "revo_client.RewardsLanding | str":
         # 1) Try the shared env-var account first — keeps /busy working
         #    even for users who haven't linked yet.
         try:
-            return revo_client.shared_club_counter()
+            return revo_client.shared_rewards_landing()
         except revo_client.RevoUnavailable:
             pass  # fall through to per-user credentials
         except revo_client.RevoAuthError as exc:
             return f"auth-failed: {exc}"
         except Exception as exc:  # pragma: no cover - network
-            LOG.exception("Revo shared club-counter fetch failed")
+            LOG.exception("Revo shared rewards-landing fetch failed")
             return f"error: {exc}"
 
         # 2) Fall back to the invoking user's linked credentials.
@@ -8354,13 +8352,14 @@ async def busy_cmd(
             return "no-credentials"
         try:
             client = _client_for_user(row)
-            return revo_client.club_counter_with_client(client)
+            return revo_client.rewards_landing_with_client(client)
         except revo_client.RevoUnavailable as exc:
             return f"unavailable: {exc}"
         except revo_client.RevoAuthError as exc:
+            _drop_cached_client(interaction.user.id)
             return f"auth-failed: {exc}"
         except Exception as exc:  # pragma: no cover - network
-            LOG.exception("Revo per-user club-counter fetch failed")
+            LOG.exception("Revo per-user rewards-landing fetch failed")
             return f"error: {exc}"
 
     result = await bot.loop.run_in_executor(None, _do)
@@ -8370,7 +8369,7 @@ async def busy_cmd(
                 "🔒 Revo's live counter needs a logged-in session, but no "
                 "shared account is configured and you haven't linked yours.\n"
                 "Run `/help_revo_link` for a walkthrough, then `/revo_link "
-                "email:<you> password:<…>` to enable `/busy` for everyone.",
+                "email:<you> password:<…>` to enable `/busy`.",
                 ephemeral=True,
             )
             return
@@ -8379,35 +8378,33 @@ async def busy_cmd(
         )
         return
 
-    clubs, _favorite = result
-    if not clubs:
+    landing = result
+    if landing.fav_club_name is None and landing.in_club is None:
         await interaction.followup.send(
             "Revo returned no club data — try again shortly.", ephemeral=True,
         )
         return
 
+    # A club arg other than the account's fav can't be served: the web portal
+    # only exposes the fav club's live count now (all-clubs board is dead).
     if club:
-        match = revo_client.find_club(clubs, club)
-        if match is None:
-            sample = ", ".join(sorted(clubs)[:8])
+        fav = (landing.fav_club_name or "").lower()
+        q = club.strip().lower()
+        matches = bool(fav) and (q in fav or fav in q)
+        if not matches:
+            fav_txt = (
+                f" (**{landing.fav_club_name}**)" if landing.fav_club_name else ""
+            )
             await interaction.followup.send(
-                f"No Revo club matched `{club}`. Try one of: {sample}…",
+                "The web portal only exposes a live count for the linked "
+                f"account's **favourite club**{fav_txt} now — the all-clubs "
+                f"board was retired. For **{club}**, check the Live Member "
+                "Counter in the Revo app.",
                 ephemeral=True,
             )
             return
-        await interaction.followup.send(_format_busy_line(match))
-        return
 
-    visible = clubs
-    if state and state.upper() != "ALL":
-        filtered = revo_client.filter_clubs_by_state(clubs, state)
-        if filtered:
-            visible = filtered
-        # if filter matches nothing fall back to all clubs silently
-    top = sorted(visible.values(), key=lambda c: c.in_club, reverse=True)[:5]
-    lines = ["**Busiest Revo clubs right now**"]
-    lines.extend(f"• {_format_busy_line(c)}" for c in top)
-    await interaction.followup.send("\n".join(lines))
+    await interaction.followup.send(_format_busy_line(landing))
 
 
 @bot.tree.command(
@@ -8536,7 +8533,9 @@ async def revo_link_cmd(
             return f"error: {exc}"
         favorite = None
         try:
-            _clubs, favorite = client.get_club_counter()
+            # club-counter.php is access-guarded now; the favourite club id
+            # survives on the rewards landing (see F4 in docs/REVO_PORTAL.md).
+            favorite = client.get_rewards_landing().fav_club_id
         except Exception:  # pragma: no cover - non-fatal
             LOG.warning("Revo link: failed to capture favorite club", exc_info=True)
         try:
@@ -9161,7 +9160,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     row = db.get_revo_account(interaction.user.id)
     personal = row is not None
 
-    def _do() -> "tuple[int | None, dict[str, int | None]] | str":
+    def _do() -> "tuple[int | None, dict[str, int | None], dict[str, str | None]] | str":
         try:
             if row is not None:
                 client = _client_for_user(row)
@@ -9173,7 +9172,12 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
                 tickets, _rows = client.get_tickets()
             except Exception:  # pragma: no cover - non-fatal
                 LOG.warning("Revo raffle: ticket fetch failed", exc_info=True)
-            return tickets, raffle
+            prize: dict[str, str | None] = {"monthly": None, "major": None}
+            try:
+                prize = client.get_prize_pool()
+            except Exception:  # pragma: no cover - non-fatal
+                LOG.warning("Revo raffle: prize-pool fetch failed", exc_info=True)
+            return tickets, raffle, prize
         except revo_client.RevoUnavailable as exc:
             return f"no-credentials: {exc}"
         except revo_client.RevoAuthError as exc:
@@ -9199,7 +9203,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    tickets, raffle = result
+    tickets, raffle, prize = result
     lines = ["🎰 **Revo Raffle**"]
     if personal and tickets is not None:
         display = _bot_name(interaction.user.id, interaction.user.display_name)
@@ -9208,7 +9212,11 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
             "in the draw"
         )
     lines.append(_format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"))
+    if prize.get("monthly"):
+        lines.append(f"-# 🏆 {prize['monthly']}")
     lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
+    if prize.get("major"):
+        lines.append(f"-# 🏆 {prize['major']}")
     if not personal:
         lines.append("-# Link your account with `/revo_link` to show *your* ticket count.")
     await interaction.followup.send(
@@ -9267,11 +9275,17 @@ async def revo_summary_cmd(
             avail, _rows = client.get_tickets()
             raffle = client.get_raffle()
             calendar = client.get_streak_calendar(m, y)
+            prize: dict[str, str | None] = {"monthly": None, "major": None}
+            try:
+                prize = client.get_prize_pool()
+            except Exception:  # pragma: no cover - non-fatal
+                LOG.warning("Revo summary: prize-pool fetch failed", exc_info=True)
             return {
                 "streak": streak,
                 "tickets": avail,
                 "raffle": raffle,
                 "calendar": calendar,
+                "prize": prize,
             }
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(int(row["user_id"]))
@@ -9294,6 +9308,7 @@ async def revo_summary_cmd(
     tickets = result["tickets"]
     raffle = result["raffle"]
     calendar = result["calendar"] or {}
+    prize = result.get("prize") or {"monthly": None, "major": None}
     month_checkins = sum(1 for v in calendar.values() if v)
     month_name = today.strftime("%B")
     display = _bot_name(target.id, target.display_name)
@@ -9310,8 +9325,12 @@ async def revo_summary_cmd(
         f"📅 {month_name} check-ins: **{month_checkins}**",
         f"🎟️ Tickets available: {tickets_txt}",
         _format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"),
-        _format_draw_countdown(raffle.get("major_draw_days"), "Major"),
     ]
+    if prize.get("monthly"):
+        lines.append(f"-# 🏆 {prize['monthly']}")
+    lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
+    if prize.get("major"):
+        lines.append(f"-# 🏆 {prize['major']}")
     await interaction.followup.send(
         "\n".join(lines),
         allowed_mentions=discord.AllowedMentions.none(),

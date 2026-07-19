@@ -109,21 +109,157 @@ def test_parse_streak_calendar_empty_or_garbage():
     assert revo_client.parse_streak_calendar('{"weeks_data":"oops"}') == {}
 
 
-def test_parse_tickets_filters_available_pseudo_row():
-    html = """
-        <h1>10 Tickets Available</h1>
-        <ul>
-          <li>+1 Tickets Modbury 12/01/2025</li>
-          <li>+1 Tickets Nunawading 11/01/2025</li>
-          <li>+2 Tickets Modbury 09/01/2025</li>
-        </ul>
+# A faithful (synthetic) slice of ticket-tally.php in the current DOM shape:
+# a headline "Tickets Available" counter built from single-digit <span> cells,
+# then history rows as three-column grid blocks in DATE -> DELTA -> SOURCE
+# order. Recent grants are +2, older ones +1.
+_TICKET_TALLY_HTML = """
+<div id="tallyCounter">
+    <div class="flex text-[77px]/[.8] pt-2 font-extrabold">
+        <span class="font-gray-bold">0</span>
+        <span class="font-gray-bold">0</span>
+        <span class="font-gray-bold">0</span>
+        <span class="font-yellow-black">3</span>
+        <span class="font-yellow-black">1</span>
+        <span class="mx-auto text-[15px] mt-7">Tickets<br />Available</span>
+    </div>
+</div>
+<div class="pt-9 px-4 pb-3 ticket-tally-list text-sm">
+    <div class="list py-1 px-2 grid grid-cols-3 gap-0 mb-2">
+        <div class="font-thin">17/07/2026</div>
+        <div class="font-bold">+2 Tickets</div>
+<div class="font-thin">Attendance</div>            </div>
+    <div class="list py-1 px-2 grid grid-cols-3 gap-0 mb-2">
+        <div class="font-thin">07/07/2026</div>
+        <div class="font-bold">+2 Tickets</div>
+<div class="font-thin">Monthiversary</div>            </div>
+    <div class="list py-1 px-2 grid grid-cols-3 gap-0 mb-2">
+        <div class="font-thin">08/05/2026</div>
+        <div class="font-bold">+1 Tickets</div>
+<div class="font-thin">Attendance</div>            </div>
+    <div class="list py-1 px-2 grid grid-cols-3 gap-0 mb-2">
+        <div class="font-thin">07/04/2026</div>
+        <div class="font-bold">+1 Tickets</div>
+<div class="font-thin">Welcome</div>            </div>
+</div>
+"""
+
+
+def test_parse_tickets_new_row_order_dates_and_deltas():
+    """Regression: the row DOM was reordered to DATE -> DELTA -> SOURCE.
+
+    The old flat regex assumed DELTA -> SOURCE -> DATE, so it paired each source
+    with the *next-older* row's date and dropped the newest row entirely. The
+    per-block parse must keep each row's own three fields together — the newest
+    row is 17/07/2026 Attendance +2.
     """
-    avail, rows = revo_client.parse_tickets(html)
-    assert avail == 10
-    assert [r.source for r in rows] == ["Modbury", "Nunawading", "Modbury"]
-    assert rows[0].delta == 1
-    assert rows[2].delta == 2
-    assert rows[0].date == "12/01/2025"
+    avail, rows = revo_client.parse_tickets(_TICKET_TALLY_HTML)
+    assert avail == 31
+    assert len(rows) == 4
+    # Newest row's date is correct (the bug mangled exactly this).
+    assert rows[0].date == "17/07/2026"
+    assert rows[0].source == "Attendance"
+    assert rows[0].delta == 2
+    # Every source stays glued to its own date.
+    assert [(r.date, r.source, r.delta) for r in rows] == [
+        ("17/07/2026", "Attendance", 2),
+        ("07/07/2026", "Monthiversary", 2),
+        ("08/05/2026", "Attendance", 1),
+        ("07/04/2026", "Welcome", 1),
+    ]
+    # Both the doubled (+2) and legacy (+1) deltas parse.
+    assert {r.delta for r in rows} == {1, 2}
+
+
+def test_parse_tickets_filters_available_pseudo_row():
+    """An 'Available' source (should it ever render as a row) is dropped."""
+    html = """
+        <div class="list grid grid-cols-3">
+            <div>12/01/2025</div><div>+1 Tickets</div><div>Available</div>
+        </div>
+        <div class="list grid grid-cols-3">
+            <div>11/01/2025</div><div>+2 Tickets</div><div>Attendance</div>
+        </div>
+    """
+    _avail, rows = revo_client.parse_tickets(html)
+    assert [r.source for r in rows] == ["Attendance"]
+    assert rows[0].delta == 2
+    assert rows[0].date == "11/01/2025"
+
+
+def test_parse_tickets_empty_when_no_rows():
+    avail, rows = revo_client.parse_tickets("<html>nothing here</html>")
+    assert avail is None
+    assert rows == []
+
+
+def test_parse_rewards_landing_extracts_fav_club_and_count():
+    """The rewards landing renders the fav-club tile (id, name, live count)."""
+    html = """
+    <div class="live-from-box">
+        <a href="https://revocentral.revofitness.com.au/portal/club-counter.php?id=25">
+            <img src="live-counter-logo.png">
+            <div class="relative grid grid-cols-3 gap-0">
+                <hr/>
+                <div class="border text-center bg-white rounded-l-lg rounded-r-lg">
+                    <span class="">0</span>
+                </div>
+                <div class="border text-center bg-white rounded-lg">
+                    <span class="">0</span>
+                </div>
+                <div class="border text-center bg-white rounded-l-lg rounded-r-lg">
+                    <span class="">2</span>
+                </div>
+            </div>
+            <div class="font-black-bold text-center border-[2px] rounded-full bg-white w-full mt-1">
+                Modbury                    </div>
+        </a>
+    </div>
+    """
+    fav_id, name, in_club = revo_client.parse_rewards_landing(html)
+    assert fav_id == 25
+    assert name == "Modbury"
+    assert in_club == 2
+
+
+def test_parse_rewards_landing_missing_tile():
+    fav_id, name, in_club = revo_client.parse_rewards_landing("<html>no tile</html>")
+    assert (fav_id, name, in_club) == (None, None, None)
+
+
+def test_parse_prize_pool_monthly_then_major():
+    """Two blurbs in DOM order [monthly, major]; tags stripped, T&C line ignored."""
+    html = """
+    <div class="border rounded-2 my-6">
+        <h3><span>Monthly</span> Draw</h3>
+        <div class="py-3 px-1">
+            <p><strong>EVERY GYM HAS A WINNER!</strong><br />Win Revo merch and 3 months free membership!</p>
+            <h3 class="text-center mt-3">Find T&C's on the FAQ page</h3>
+        </div>
+    </div>
+    <div class="border rounded-2 my-6">
+        <h3><strong class="font-black italic">Major</strong> Draw</h3>
+        <div class="py-3 px-1">
+            <p>One lucky Revo member will get the choice between $50,000 cash or a brand new BYD SEALION 7 car!</p>
+            <h3 class="text-center mt-3">Find T&C's on the FAQ page</h3>
+        </div>
+    </div>
+    """
+    out = revo_client.parse_prize_pool(html)
+    assert out["monthly"] == (
+        "EVERY GYM HAS A WINNER! Win Revo merch and 3 months free membership!"
+    )
+    assert out["major"] == (
+        "One lucky Revo member will get the choice between "
+        "$50,000 cash or a brand new BYD SEALION 7 car!"
+    )
+    # The T&C <h3> in the same block must not leak into the blurb.
+    assert "FAQ" not in out["monthly"]
+
+
+def test_parse_prize_pool_degrades_to_none():
+    out = revo_client.parse_prize_pool("<html>no prizes here</html>")
+    assert out == {"monthly": None, "major": None}
 
 
 def test_parse_raffle_extracts_countdowns():

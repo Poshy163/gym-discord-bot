@@ -29,10 +29,15 @@ LOG = logging.getLogger("gymbot.revo")
 
 BASE_URL = "https://revocentral.revofitness.com.au"
 LOGIN_PATH = "/portal/login.php"
+# club-counter.php now returns a 17-byte "Invalid Access! B" behind a new
+# access guard (see docs/REVO_PORTAL.md) — the all-clubs board is dead. The
+# member's own favourite-club live count survives on the rewards landing.
 CLUB_COUNTER_PATH = "/portal/club-counter.php"
+REWARDS_PATH = "/portal/rewards/"
 STREAKS_PATH = "/portal/rewards/streaks.php"
 TICKETS_PATH = "/portal/rewards/ticket-tally.php"
 RAFFLE_PATH = "/portal/rewards/raffle.php"
+PRIZE_POOL_PATH = "/portal/rewards/prize-pool.php"
 
 USER_AGENT = "gym-discord-bot/0.1 (+https://github.com/Poshy163/gym-discord-bot)"
 REQUEST_TIMEOUT = 20
@@ -126,6 +131,19 @@ class TicketRow:
     date: str  # dd/mm/yyyy as displayed by the portal
 
 
+@dataclass(frozen=True)
+class RewardsLanding:
+    """The member-specific bits scraped from ``/portal/rewards/``.
+
+    This is what survives now that ``club-counter.php`` is access-guarded: the
+    account's *own* favourite club (id + name) and its live head-count. Any
+    field may be ``None`` if the landing didn't render the fav-club tile.
+    """
+    fav_club_id: Optional[int]
+    fav_club_name: Optional[str]
+    in_club: Optional[int]
+
+
 def parse_member_cookie(raw: str | None) -> tuple[Optional[int], Optional[int]]:
     """Decode the URL-encoded PHP-serialised ``Member`` cookie.
 
@@ -145,9 +163,18 @@ def parse_member_cookie(raw: str | None) -> tuple[Optional[int], Optional[int]]:
 
 
 def parse_club_counter(html: str) -> tuple[dict[str, ClubInfo], Optional[int]]:
-    """Parse ``/portal/club-counter.php``.
+    """Parse the (now-unavailable) all-clubs board from ``club-counter.php``.
 
     Returns ``(clubs_by_name, favorite_club_id)``.
+
+    .. deprecated::
+        ``club-counter.php`` now returns a 17-byte ``"Invalid Access! B"``
+        behind a new access guard, so on the live portal this parser finds
+        none of ``clubCounterLists`` / ``barGraphData`` / ``favoriteClubId``
+        and returns ``({}, None)``. The all-clubs "busiest right now" board
+        cannot be restored from the web. Use :func:`parse_rewards_landing` /
+        :meth:`RevoClient.get_rewards_landing` for the surviving fav-club live
+        count. Kept only so the parser + its tests still document the old shape.
     """
     clubs_match = re.search(r"clubCounterLists\s*=\s*(\{.*?\})\s*;", html, re.S)
     bars_match = re.search(r"barGraphData\s*=\s*(\[.*?\])\s*;", html, re.S)
@@ -181,6 +208,48 @@ def parse_club_counter(html: str) -> tuple[dict[str, ClubInfo], Optional[int]]:
 
     favorite = int(fav_match.group(1)) if fav_match else None
     return out, favorite
+
+
+# The rewards landing renders the member's favourite-club tile as a single
+# <a href="…/club-counter.php?id=<ID>"> block containing three single-digit
+# <span> head-count cells and a "rounded-full" white pill div with the club
+# name. This is the only live occupancy signal left after the club-counter
+# page was access-guarded.
+_FAV_CLUB_ID_RE = re.compile(r"club-counter\.php\?id=(\d+)")
+_FAV_CLUB_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*club-counter\.php\?id=\d+[^>]*>(.*?)</a>", re.I | re.S
+)
+_FAV_DIGIT_SPAN_RE = re.compile(r"<span[^>]*>\s*(\d)\s*</span>", re.I | re.S)
+_FAV_PILL_RE = re.compile(
+    r"<div[^>]*\brounded-full\b[^>]*>(.*?)</div>", re.I | re.S
+)
+
+
+def parse_rewards_landing(
+    html: str,
+) -> tuple[Optional[int], Optional[str], Optional[int]]:
+    """Parse ``/portal/rewards/`` for the fav-club tile.
+
+    Returns ``(fav_club_id, fav_club_name, in_club)`` — any element may be
+    ``None`` if the landing didn't render the tile. The head-count is the three
+    zero-padded ``<span>`` digit cells concatenated (e.g. ``0``,``0``,``2`` → 2).
+    """
+    id_m = _FAV_CLUB_ID_RE.search(html)
+    fav_id = int(id_m.group(1)) if id_m else None
+
+    anchor = _FAV_CLUB_ANCHOR_RE.search(html)
+    block = anchor.group(1) if anchor else ""
+
+    in_club: Optional[int] = None
+    name: Optional[str] = None
+    if block:
+        digits = _FAV_DIGIT_SPAN_RE.findall(block)
+        if digits:
+            in_club = int("".join(digits))
+        pill = _FAV_PILL_RE.search(block)
+        if pill:
+            name = _strip_tags(pill.group(1)) or None
+    return fav_id, name, in_club
 
 
 def parse_streak_weeks(html: str) -> Optional[int]:
@@ -251,9 +320,25 @@ def parse_streak_calendar(body: str) -> dict[int, bool]:
     return out
 
 
-_TICKET_ROW_RE = re.compile(
-    r"\+?(\d+)\s*Tickets\s*([A-Za-z]+)\s*(\d{2}/\d{2}/\d{4})"
+# Each ticket-tally history entry renders as a three-column grid "list" block.
+# As of ~2026-07 the child order inside the block is DATE -> DELTA -> SOURCE
+# (it used to be DELTA -> SOURCE -> DATE). We parse per block and read the three
+# children *positionally* rather than with a flat ordered regex, so a future
+# child reorder can't silently mis-pair a source with the wrong date (which is
+# exactly the bug the old flat regex had after this reorder — it dropped the
+# newest row and shifted every source onto the next-older row's date).
+_TICKET_BLOCK_OPEN_RE = re.compile(
+    r'<div\b[^>]*class="[^"]*\blist\b[^"]*\bgrid-cols-3\b[^"]*"[^>]*>',
+    re.I,
 )
+_TICKET_CELL_RE = re.compile(r"<div\b[^>]*>(.*?)</div>", re.I | re.S)
+_TICKET_DELTA_RE = re.compile(r"[-+]?(\d+)")
+_TICKET_DATE_RE = re.compile(r"\d{2}/\d{2}/\d{4}")
+
+
+def _strip_tags(fragment: str) -> str:
+    """Collapse an HTML fragment down to its visible text."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment)).strip()
 
 
 def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
@@ -261,10 +346,15 @@ def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
 
     Returns ``(available_tickets, history_rows_newest_first)``. The ``Available``
     pseudo-row that appears alongside the headline counter is filtered out.
+
+    The available balance comes from the headline counter (a run of single-digit
+    ``<span>`` cells before "Tickets Available"). Each history row is a
+    ``<div class="list … grid-cols-3 …">`` block whose three children are, in
+    order, the date, the ``+N Tickets`` delta, and the source label. Deltas of
+    ``+2`` (recent grants) and ``+1`` (older ones, pre-~08/05/2026) both parse.
     """
     text = re.sub(r"<script[\s\S]*?</script>", " ", html)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _strip_tags(text)
 
     avail: Optional[int] = None
     m = re.search(r"((?:\d\s*){1,6})Tickets\s+Available", text)
@@ -273,11 +363,30 @@ def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
         if digits:
             avail = int("".join(digits))
 
-    rows = [
-        TicketRow(delta=int(d), source=src, date=date)
-        for d, src, date in _TICKET_ROW_RE.findall(text)
-        if src != "Available"
-    ]
+    rows: list[TicketRow] = []
+    opens = list(_TICKET_BLOCK_OPEN_RE.finditer(html))
+    for idx, mo in enumerate(opens):
+        start = mo.end()
+        end = opens[idx + 1].start() if idx + 1 < len(opens) else len(html)
+        cells = [_strip_tags(c) for c in _TICKET_CELL_RE.findall(html[start:end])[:3]]
+        if len(cells) < 3:
+            continue
+        date_cell, delta_cell, source_cell = cells
+        date_m = _TICKET_DATE_RE.search(date_cell)
+        delta_m = _TICKET_DELTA_RE.search(delta_cell)
+        if not date_m or not delta_m:
+            continue
+        # The headline "Tickets Available" counter is not a grid-cols-3 block,
+        # but keep filtering an "Available" source defensively.
+        if source_cell == "Available":
+            continue
+        rows.append(
+            TicketRow(
+                delta=int(delta_m.group(1)),
+                source=source_cell,
+                date=date_m.group(0),
+            )
+        )
     return avail, rows
 
 
@@ -335,6 +444,29 @@ def parse_raffle(html: str) -> dict[str, Optional[int]]:
     }
 
 
+# prize-pool.php renders two prize blurbs in DOM order [monthly, major], each as
+# a <div class="py-3 px-1"><p>…</p></div> block. Free-text scrape — if Revo
+# rewords or moves the blurbs, the missing side degrades to None.
+_PRIZE_BLURB_RE = re.compile(
+    r'<div\b[^>]*class="[^"]*\bpy-3\b[^"]*\bpx-1\b[^"]*"[^>]*>.*?<p\b[^>]*>(.*?)</p>',
+    re.I | re.S,
+)
+
+
+def parse_prize_pool(html: str) -> dict[str, Optional[str]]:
+    """Extract the monthly + major prize copy from ``prize-pool.php``.
+
+    Returns ``{"monthly": str|None, "major": str|None}``. Blurbs are read in
+    DOM order (monthly first, major second); either is ``None`` if that block
+    is absent.
+    """
+    blurbs = [_strip_tags(m.group(1)) or None for m in _PRIZE_BLURB_RE.finditer(html)]
+    return {
+        "monthly": blurbs[0] if len(blurbs) >= 1 else None,
+        "major": blurbs[1] if len(blurbs) >= 2 else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
@@ -344,6 +476,12 @@ class _CountersCache:
     fetched_at: float = 0.0
     clubs: dict[str, ClubInfo] = field(default_factory=dict)
     favorite: Optional[int] = None
+
+
+@dataclass
+class _RewardsCache:
+    fetched_at: float = 0.0
+    landing: Optional["RewardsLanding"] = None
 
 
 class RevoClient:
@@ -426,7 +564,23 @@ class RevoClient:
     # ---- public read endpoints ----------------------------------------
 
     def get_club_counter(self) -> tuple[dict[str, ClubInfo], Optional[int]]:
+        """Fetch the (now-dead) all-clubs board — see :func:`parse_club_counter`.
+
+        ``club-counter.php`` is access-guarded now, so this degrades gracefully
+        to ``({}, None)``. Prefer :meth:`get_rewards_landing`.
+        """
         return parse_club_counter(self._get(CLUB_COUNTER_PATH))
+
+    def get_rewards_landing(self) -> RewardsLanding:
+        """Scrape the rewards landing for the account's fav-club live count."""
+        fav_id, fav_name, in_club = parse_rewards_landing(self._get(REWARDS_PATH))
+        return RewardsLanding(
+            fav_club_id=fav_id, fav_club_name=fav_name, in_club=in_club,
+        )
+
+    def get_prize_pool(self) -> dict[str, Optional[str]]:
+        """Fetch the current monthly + major prize copy."""
+        return parse_prize_pool(self._get(PRIZE_POOL_PATH))
 
     def get_streak_weeks(self) -> Optional[int]:
         return parse_streak_weeks(self._get(STREAKS_PATH))
@@ -482,6 +636,7 @@ class RevoClient:
 _shared_lock = threading.Lock()
 _shared_client: RevoClient | None = None
 _shared_counters = _CountersCache()
+_shared_rewards = _RewardsCache()
 
 
 def shared_client_from_env() -> RevoClient:
@@ -546,6 +701,40 @@ def club_counter_with_client(
             fetched_at=now, clubs=clubs, favorite=favorite,
         )
     return clubs, favorite
+
+
+def shared_rewards_landing() -> RewardsLanding:
+    """Cached wrapper around :meth:`RevoClient.get_rewards_landing`.
+
+    Backs ``/busy`` now that the all-clubs board is gone: it returns the
+    *shared env account's own* favourite club and its live head-count. The
+    :data:`CLUB_COUNTER_TTL_SECONDS` cache keeps a burst of ``/busy`` calls
+    from re-hitting the portal.
+
+    Only the shared account is cached here: unlike the old all-clubs board, a
+    rewards landing is *per-account*, so caching a per-user landing under a
+    global key would leak one member's club/count to another. Per-user callers
+    use :func:`rewards_landing_with_client` (uncached).
+    """
+    global _shared_rewards
+    now = time.monotonic()
+    with _shared_lock:
+        cache = _shared_rewards
+        if cache.landing is not None and (now - cache.fetched_at) < CLUB_COUNTER_TTL_SECONDS:
+            return cache.landing
+    landing = shared_client_from_env().get_rewards_landing()
+    with _shared_lock:
+        _shared_rewards = _RewardsCache(fetched_at=now, landing=landing)
+    return landing
+
+
+def rewards_landing_with_client(client: RevoClient) -> RewardsLanding:
+    """Rewards-landing fetch using the invoking user's *own* linked client.
+
+    Uncached on purpose (see :func:`shared_rewards_landing`): the landing is
+    account-specific, so it must not share the global shared-account cache.
+    """
+    return client.get_rewards_landing()
 
 
 # Known Revo club suburbs grouped by Australian state — used by
