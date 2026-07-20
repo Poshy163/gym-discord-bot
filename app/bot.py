@@ -71,6 +71,7 @@ from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
 from . import revo_netpulse
+from . import revo_perfectgym
 from . import targets as targets_mod
 from . import strava_client
 from . import strava_web
@@ -8309,15 +8310,35 @@ def _netpulse_client_for_user(row) -> "revo_netpulse.NetpulseClient":
     return client
 
 
+# PerfectGym (ClientPortal2) sessions are a *third* separate login — different
+# host + cookie again (the live-occupancy backend behind /busy). Same cache
+# pattern, keyed by user and built from the same stored credentials.
+_revo_perfectgym_clients: dict[int, "revo_perfectgym.PerfectGymClient"] = {}
+
+
+def _perfectgym_client_for_user(row) -> "revo_perfectgym.PerfectGymClient":
+    """Return a cached PerfectGymClient for a linked-account row."""
+    user_id = int(row["user_id"])
+    with _revo_clients_lock:
+        client = _revo_perfectgym_clients.get(user_id)
+        if client is None:
+            password = revo_client.decrypt_password(row["password_enc"])
+            client = revo_perfectgym.PerfectGymClient(row["email"], password)
+            _revo_perfectgym_clients[user_id] = client
+    return client
+
+
 def _drop_cached_client(user_id: int) -> None:
-    # Drop both backend sessions together: an auth failure on one usually means
-    # the stored password changed, which invalidates the other too.
+    # Drop all three backend sessions together: an auth failure on one usually
+    # means the stored password changed, which invalidates the others too.
     with _revo_clients_lock:
         _revo_user_clients.pop(user_id, None)
         _revo_netpulse_clients.pop(user_id, None)
+        _revo_perfectgym_clients.pop(user_id, None)
 
 
 def _format_busy_line(landing: "revo_client.RewardsLanding") -> str:
+    """Degraded single-club line from the web rewards landing (fallback source)."""
     name = landing.fav_club_name or "Your club"
     state = revo_client.state_for_club(landing.fav_club_name or "")
     location = f"{name}, {state}" if state else name
@@ -8326,27 +8347,92 @@ def _format_busy_line(landing: "revo_client.RewardsLanding") -> str:
     return f"🏋️ **{location}**: {landing.in_club} in club right now"
 
 
+def _format_busy_club_line(club: "revo_perfectgym.ClubOccupancy") -> str:
+    """Live count for one club, adding "X% of Y capacity" only when a cap exists."""
+    location = f"{club.name}, {club.state}" if club.state else club.name
+    line = f"🏋️ **{location}**: {club.count} in club right now"
+    # UsersLimit is null for almost every club — only show the percentage when
+    # the backend actually gives a capacity (and it's a sane, non-zero number).
+    if club.capacity:
+        pct = round(club.count / club.capacity * 100)
+        line += f" — {pct}% of {club.capacity} capacity"
+    return line
+
+
+def _format_busiest_board(
+    clubs: list["revo_perfectgym.ClubOccupancy"],
+    *,
+    state: str | None = None,
+    limit: int = 5,
+) -> str:
+    """Render a "🔥 Busiest right now" top-N board (scoped to *state* if given)."""
+    top = revo_perfectgym.top_busiest(clubs, limit=limit, state=state)
+    if not top:
+        return ""
+    scope = f" in {state}" if state else " nationwide"
+    medals = ("🥇", "🥈", "🥉")
+    lines = [f"🔥 **Busiest right now{scope}**"]
+    for i, c in enumerate(top):
+        rank = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{rank} {c.name} — {c.count}")
+    return "\n".join(lines)
+
+
+def _busy_fav_landing(user_id: int) -> "revo_client.RewardsLanding | None":
+    """Web rewards-landing fav club for /busy — home-club identity, and the
+    degraded single-club count when PerfectGym is down.
+
+    A *linked* caller's OWN landing wins so /busy shows THEIR home club and
+    scopes the busiest board to THEIR state; the shared env account is only the
+    unlinked / degradation fallback. Preferring the shared account first (as this
+    used to) stamps every linked user with the shared owner's club + state — a
+    WA-heavy shared account would then scope every SA/VIC/NSW caller's board to
+    WA. So try the caller's own credentials first, shared only if they're
+    unlinked or their landing yields nothing usable.
+    """
+    row = db.get_revo_account(user_id)
+    if row is not None:
+        try:
+            landing = revo_client.rewards_landing_with_client(_client_for_user(row))
+            if landing.fav_club_name or landing.in_club is not None:
+                return landing
+        except revo_client.RevoAuthError:
+            _drop_cached_client(user_id)
+        except Exception:  # pragma: no cover - network
+            LOG.exception("Revo per-user rewards-landing (busy identity) failed")
+    try:
+        landing = revo_client.shared_rewards_landing()
+        if landing.fav_club_name or landing.in_club is not None:
+            return landing
+    except revo_client.RevoUnavailable:
+        pass
+    except Exception:  # pragma: no cover - network
+        LOG.exception("Revo shared rewards-landing (busy identity) failed")
+    return None
+
+
 @bot.tree.command(
     name="busy",
-    description="Show how busy your Revo club is right now (live count).",
+    description="Live Revo occupancy: your club + the busiest gyms right now.",
 )
 @app_commands.describe(
-    club="Optional club name. The web now only exposes the linked account's favourite club.",
+    club="Optional club name/suburb. Omit to see your home club + the busiest board.",
 )
 async def busy_cmd(
     interaction: discord.Interaction,
     club: str | None = None,
 ) -> None:
-    # The all-clubs "busiest right now" board is gone: club-counter.php is
-    # access-guarded now. The rewards landing still renders the logged-in
-    # account's *own* favourite club + its live head-count, so /busy degrades
-    # to that single scoped count. See docs/REVO_PORTAL.md §3.1/§3.5.
+    # /busy reads Revo's real all-clubs live counter again — the same PerfectGym
+    # ClientPortal2 backend the iOS app uses (docs/REVO_PORTAL.md §8). It replaces
+    # the web club-counter.php board that was access-guarded in 2026-07. If
+    # PerfectGym is unavailable we degrade to the web rewards-landing fav-club
+    # count, then to a clear "temporarily unavailable" — /busy never hard-errors.
     if REVO_DISABLED:
         await interaction.response.send_message(
             "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
         )
         return
-    if not revo_client.available():
+    if not revo_perfectgym.available():
         await interaction.response.send_message(
             "Revo client unavailable — install the `requests` package.",
             ephemeral=True,
@@ -8354,79 +8440,124 @@ async def busy_cmd(
         return
 
     await interaction.response.defer(thinking=True)
+    user_id = interaction.user.id
 
-    def _do() -> "revo_client.RewardsLanding | str":
-        # 1) Try the shared env-var account first — keeps /busy working
-        #    even for users who haven't linked yet.
+    def _occupancy() -> list["revo_perfectgym.ClubOccupancy"]:
+        """All-clubs live occupancy: shared env account first, then linked creds.
+
+        Returns ``[]`` on any failure so the caller can degrade gracefully — a
+        burst of /busy calls shares one fetch via the module TTL cache.
+        """
         try:
-            return revo_client.shared_rewards_landing()
-        except revo_client.RevoUnavailable:
-            pass  # fall through to per-user credentials
-        except revo_client.RevoAuthError as exc:
-            return f"auth-failed: {exc}"
-        except Exception as exc:  # pragma: no cover - network
-            LOG.exception("Revo shared rewards-landing fetch failed")
-            return f"error: {exc}"
+            clubs = revo_perfectgym.shared_club_occupancy()
+            if clubs:
+                return clubs
+        except revo_perfectgym.PerfectGymUnavailable:
+            pass  # no shared account configured — try the user's own creds
+        except revo_perfectgym.PerfectGymAuthError:
+            LOG.warning("PerfectGym shared login failed for /busy")
+        except Exception:  # pragma: no cover - network
+            LOG.exception("PerfectGym shared occupancy fetch failed")
 
-        # 2) Fall back to the invoking user's linked credentials.
-        row = db.get_revo_account(interaction.user.id)
-        if row is None:
-            return "no-credentials"
-        try:
-            client = _client_for_user(row)
-            return revo_client.rewards_landing_with_client(client)
-        except revo_client.RevoUnavailable as exc:
-            return f"unavailable: {exc}"
-        except revo_client.RevoAuthError as exc:
-            _drop_cached_client(interaction.user.id)
-            return f"auth-failed: {exc}"
-        except Exception as exc:  # pragma: no cover - network
-            LOG.exception("Revo per-user rewards-landing fetch failed")
-            return f"error: {exc}"
+        row = db.get_revo_account(user_id)
+        if row is not None:
+            try:
+                client = _perfectgym_client_for_user(row)
+                clubs = revo_perfectgym.club_occupancy_with_client(client)
+                if clubs:
+                    return clubs
+            except revo_perfectgym.PerfectGymAuthError:
+                _drop_cached_client(user_id)
+                LOG.warning("PerfectGym per-user login failed for /busy")
+            except Exception:  # pragma: no cover - network
+                LOG.exception("PerfectGym per-user occupancy fetch failed")
+        return []
 
-    result = await bot.loop.run_in_executor(None, _do)
-    if isinstance(result, str):
-        if result == "no-credentials":
-            await interaction.followup.send(
-                "🔒 Revo's live counter needs a logged-in session, but no "
-                "shared account is configured and you haven't linked yours.\n"
+    def _do() -> tuple[str, bool]:
+        """Build the /busy reply text. Returns ``(message, ephemeral)``."""
+        occ = _occupancy()
+
+        # ---- with a club argument: look that club up in the live board ----
+        if club:
+            if occ:
+                match = revo_perfectgym.find_club(occ, club)
+                if match:
+                    return _format_busy_club_line(match), False
+                return (
+                    f"Couldn't find a Revo club matching **{club}**. Try the "
+                    "suburb name, or check the Live Member Counter in the Revo app.",
+                    True,
+                )
+            # PerfectGym down — degrade to the fav-club web count if it's this club.
+            landing = _busy_fav_landing(user_id)
+            if landing and landing.fav_club_name:
+                fav = landing.fav_club_name.lower()
+                q = club.strip().lower()
+                if q in fav or fav in q:
+                    return (
+                        _format_busy_line(landing)
+                        + "\n_(live all-clubs board temporarily unavailable — "
+                        "showing your linked club.)_",
+                        False,
+                    )
+            return (
+                "Revo's live counter is temporarily unavailable. Try again "
+                "shortly, or check the Live Member Counter in the Revo app.",
+                True,
+            )
+
+        # ---- no argument: home club count + busiest board ----
+        if occ:
+            landing = _busy_fav_landing(user_id)
+            home_name = landing.fav_club_name if landing else None
+            home = revo_perfectgym.find_club(occ, home_name) if home_name else None
+            lines: list[str] = []
+            state: str | None = None
+            if home:
+                lines.append(_format_busy_club_line(home))
+                state = home.state
+            elif home_name and landing and landing.in_club is not None:
+                # Fav known but somehow absent from the board — show its web count.
+                lines.append(_format_busy_line(landing))
+                state = revo_client.state_for_club(home_name)
+            # Scope the busiest board to the user's state when we know it, else
+            # nationwide. The label makes the scope explicit either way.
+            board = _format_busiest_board(occ, state=state)
+            if board:
+                lines.append(board)
+            if lines:
+                return "\n\n".join(lines), False
+            return "Revo's live counter returned no clubs — try again shortly.", True
+
+        # ---- PerfectGym down entirely: degrade to the web fav-club count ----
+        landing = _busy_fav_landing(user_id)
+        if landing and (landing.fav_club_name or landing.in_club is not None):
+            return (
+                _format_busy_line(landing)
+                + "\n_(live all-clubs board temporarily unavailable.)_",
+                False,
+            )
+
+        env_configured = bool(
+            os.environ.get("REVO_USER", "").strip()
+            and os.environ.get("REVO_PASS", "").strip()
+        )
+        if db.get_revo_account(user_id) is None and not env_configured:
+            return (
+                "🔒 Revo's live counter needs a logged-in session, but no shared "
+                "account is configured and you haven't linked yours.\n"
                 "Run `/help_revo_link` for a walkthrough, then `/revo_link "
                 "email:<you> password:<…>` to enable `/busy`.",
-                ephemeral=True,
+                True,
             )
-            return
-        await interaction.followup.send(
-            f"Couldn't fetch the live counter ({result}).", ephemeral=True,
+        return (
+            "Revo's live counter is temporarily unavailable. Try again shortly, "
+            "or check the Live Member Counter in the Revo app.",
+            True,
         )
-        return
 
-    landing = result
-    if landing.fav_club_name is None and landing.in_club is None:
-        await interaction.followup.send(
-            "Revo returned no club data — try again shortly.", ephemeral=True,
-        )
-        return
-
-    # A club arg other than the account's fav can't be served: the web portal
-    # only exposes the fav club's live count now (all-clubs board is dead).
-    if club:
-        fav = (landing.fav_club_name or "").lower()
-        q = club.strip().lower()
-        matches = bool(fav) and (q in fav or fav in q)
-        if not matches:
-            fav_txt = (
-                f" (**{landing.fav_club_name}**)" if landing.fav_club_name else ""
-            )
-            await interaction.followup.send(
-                "The web portal only exposes a live count for the linked "
-                f"account's **favourite club**{fav_txt} now — the all-clubs "
-                f"board was retired. For **{club}**, check the Live Member "
-                "Counter in the Revo app.",
-                ephemeral=True,
-            )
-            return
-
-    await interaction.followup.send(_format_busy_line(landing))
+    message, ephemeral = await bot.loop.run_in_executor(None, _do)
+    await interaction.followup.send(message, ephemeral=ephemeral)
 
 
 @bot.tree.command(

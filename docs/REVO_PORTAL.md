@@ -54,8 +54,16 @@ This is **not** membership gating and **not** a data move:
 Pattern is consistent with an **IP / app-context allowlist** (in-club kiosk /
 app-webview), not a per-account check. Effect on code: `parse_club_counter()`
 now finds none of `clubCounterLists` / `barGraphData` / `favoriteClubId` and
-returns `({}, None)`, so `get_club_counter` degrades gracefully. `/busy` was
-rewritten to use the rewards-landing fav-club count instead (§3.5).
+returns `({}, None)`, so `get_club_counter` degrades gracefully.
+
+> ✅ **Correction (2026-07, occupancy restored): the earlier "the all-clubs
+> board cannot be restored from the web" conclusion was too narrow — it only
+> ruled out the `revocentral` **web** portal.** The live all-clubs counter the
+> Revo **iOS app** shows is served by a *different* backend — **PerfectGym
+> ClientPortal2** — and a single authenticated GET there returns the live
+> head-count for every club at once. `/busy` now reads that (see **§8** and
+> `app/revo_perfectgym.py`); the rewards-landing fav-club count (§3.5) is kept
+> only as a graceful-degradation fallback.
 
 ## 2. Endpoint inventory
 
@@ -99,8 +107,9 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/` (L2 onl
 
 > ⛔ **Dead since 2026-07** — the page is access-guarded (§1.2) and returns
 > `Invalid Access! B`. The shapes below are retained for reference only; nothing
-> here can be scraped any more. `/busy` now reads a single fav-club count from
-> the rewards landing (§3.5).
+> here can be scraped any more. **The live all-clubs board was restored via a
+> different backend — PerfectGym ClientPortal2 (§8) — which is what `/busy` now
+> reads.** The rewards-landing fav-club count (§3.5) remains only as a fallback.
 
 Inline `<script>` defined (historically):
 
@@ -374,7 +383,9 @@ for the read-only client.
   and `check-ins/history` returns `{"checkIns": []}`. Every club in the
   directory reports `"mms": "perfectgym"` — **Revo runs member management /
   access / occupancy on PerfectGym, not Netpulse**, so those endpoints are dark
-  here and can't be used to restore `/busy` or a per-visit feed.
+  *here*. That `mms: perfectgym` signal is exactly what pointed us at the
+  **PerfectGym ClientPortal2** backend, whose occupancy endpoint **did** restore
+  `/busy` (see **§8**). (A per-visit feed is still unavailable.)
 - **What Netpulse *does* give:** the member's **membership** (type/subtype/join
   date) and a full **club directory** (name, suburb/state, hours, geo). Those
   are the only two surfaces `app/revo_netpulse.py` exposes.
@@ -386,3 +397,70 @@ for the read-only client.
 - **Not the same vendor as bookings:** Revo's studio/pilates bookings run on
   **Arbox** (`revoFitness.arbox.app.com`) — a different backend again, only
   relevant if class bookings are ever wanted.
+
+## 8. Live occupancy — PerfectGym ClientPortal2 (the source that restored `/busy`)
+
+Revo runs member management / access / **occupancy** on **PerfectGym** (every
+Netpulse club reports `"mms": "perfectgym"`, §7). The live "Members in club"
+counter shown in the Revo **iOS app** is served by PerfectGym's white-label
+**ClientPortal2** at `https://revofitness.perfectgym.com/ClientPortal2`, and a
+single authenticated GET returns the live head-count for **every club at once**.
+This is the **same backend the app uses**, and it is what restored `/busy` to a
+real all-clubs live board after the web `club-counter.php` was access-guarded
+(§1.2). Implemented in **`app/revo_perfectgym.py`**.
+
+- **Base:** `https://revofitness.perfectgym.com/ClientPortal2`
+- **LOGIN:** `POST /Auth/Login`, `Content-Type: application/json`, body
+  `{"RememberMe":false,"Login":<email>,"Password":<pw>}` → `200` + a
+  `Set-Cookie: CpAuthToken` that a `requests.Session` carries. The **response
+  body is the member profile** `{"User":{"Member":{"Id":<int>,
+  "HomeClubId":<int>,…}}}` — it is **PII**; the client reads only the non-secret
+  `HomeClubId` and never logs the body.
+- **OCCUPANCY (all clubs, one call):** `GET /Clubs/Clubs/GetMembersInClubs`
+  (send the `CpAuthToken` cookie; no CSRF needed for a GET) → `200` JSON:
+  ```json
+  {"UsersInClubList":[
+    {"ClubName":"Modbury","ClubAddress":"…Modbury SA 5092",
+     "UsersLimit":null,"UsersCountCurrentlyInClub":90},
+    …78 clubs…
+  ]}
+  ```
+  - `ClubName` (str), `ClubAddress` (str), `UsersCountCurrentlyInClub` (int —
+    **the live count**), `UsersLimit` (int|null — capacity, `null` for almost
+    every club). **There is no club-id field** in this payload, so the member's
+    home-club identity is resolved by *name* via the rewards-landing fav club
+    (§3.5), not by `HomeClubId`.
+  - Suburb/state are derived per club: **`revo_client.state_for_club(name)` is
+    the primary state source**, falling back to a `<Suburb> <STATE> <postcode?>`
+    tail parsed from `ClubAddress` (only ~14/78 addresses carry a state token).
+  - **Zero counts are real** (closed / overnight) — shown as `0`, not treated as
+    missing.
+- **Session expiry:** the occupancy GET redirects (3xx, with
+  `allow_redirects=False`) or `401`s; the client re-logs-in once and retries
+  (mirrors `RevoClient._get` / `revo_netpulse`).
+- **Secrets:** the `CpAuthToken` cookie and the profile body are secret/PII. The
+  client never logs, returns, or persists them; `parse_members_in_clubs()` is
+  the scrubbing boundary (public club fields only). Read-only: only the login
+  POST + the occupancy GET.
+
+Exposed as `PerfectGymClient.get_club_occupancy() -> list[ClubOccupancy(name,
+suburb, state, count, capacity)]`, with a module-level shared-from-env client +
+per-user factory and a ~60s TTL cache (`OCCUPANCY_TTL_SECONDS`) so a burst of
+`/busy` calls doesn't re-hit PerfectGym — mirroring the `revo_client` /
+`revo_netpulse` patterns.
+
+### 8.1 How `/busy` behaves now
+
+- **No club arg:** shows the member's **home club** live count (identity via the
+  rewards-landing fav club, count via the PerfectGym board) **plus a
+  "🔥 Busiest right now" top-5 board** — scoped to the user's state when it's
+  known (label says e.g. *"in SA"*), else nationwide.
+- **With a club arg:** case-insensitively finds that club/suburb in the board
+  and shows its count, appending *"X% of Y capacity"* **only when `UsersLimit`
+  is not null**.
+- **Graceful degradation:** prefers the shared `REVO_USER`/`REVO_PASS` account
+  (keeps `/busy` working for unlinked users), then the invoking user's linked
+  credentials. If PerfectGym is unavailable/login fails it falls back to the web
+  rewards-landing fav-club count (§3.5), then to a clear "live counter
+  temporarily unavailable" — `/busy` never hard-errors. Still gated by
+  `REVO_DISABLED` + `available()`.

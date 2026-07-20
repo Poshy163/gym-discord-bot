@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import discord
+import pytest
 
 # Ensure the bot doesn't try to connect on import — DISCORD_TOKEN isn't
 # read until run() so we mainly need a stable DB path.
@@ -588,3 +589,63 @@ def test_reply_banner_only_mentions_the_macros_the_reply_shows():
     assert _reply_label(resolved, calories=True, protein=False) is None
     assert _reply_label(resolved, calories=False, protein=True) == "Using Weekend Targets"
     assert _reply_label(resolved, calories=True, protein=True) == "Using Weekend Targets"
+
+
+# ---- /busy home-club identity (linked caller's OWN landing wins) ------------
+
+def test_busy_fav_landing_prefers_linked_callers_own_over_shared(monkeypatch):
+    """Regression: a *linked* caller's /busy must use THEIR fav club + state,
+    not the shared env account's. Preferring the shared landing first stamped
+    every linked user with the shared owner's club/state — a WA-heavy shared
+    account would then scope every SA/VIC/NSW caller's busiest board to WA.
+    """
+    import app.bot as bot
+    from app.revo_client import RewardsLanding
+
+    mine = RewardsLanding(fav_club_id=2, fav_club_name="Cannington", in_club=7)  # WA
+
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: {"user_id": uid})
+    monkeypatch.setattr(bot, "_client_for_user", lambda row: object())
+    monkeypatch.setattr(bot.revo_client, "rewards_landing_with_client", lambda c: mine)
+    # The shared landing must not even be consulted for a linked caller.
+    monkeypatch.setattr(
+        bot.revo_client, "shared_rewards_landing",
+        lambda: pytest.fail("shared landing must not be used for a linked caller"),
+    )
+
+    landing = bot._busy_fav_landing(4242)
+    assert landing is mine
+    assert landing.fav_club_name == "Cannington"
+
+
+def test_busy_fav_landing_falls_back_to_shared_when_unlinked(monkeypatch):
+    """An unlinked caller (no stored account) still gets /busy via the shared
+    env account — the documented normal deployment."""
+    import app.bot as bot
+    from app.revo_client import RewardsLanding
+
+    shared = RewardsLanding(fav_club_id=1, fav_club_name="Marion", in_club=12)  # SA
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: None)
+    monkeypatch.setattr(bot.revo_client, "shared_rewards_landing", lambda: shared)
+
+    landing = bot._busy_fav_landing(4242)
+    assert landing is shared
+    assert landing.fav_club_name == "Marion"
+
+
+def test_busy_fav_landing_linked_but_empty_falls_back_to_shared(monkeypatch):
+    """If a linked caller's own landing yields nothing usable (fav tile absent),
+    fall through to the shared account rather than returning an empty landing."""
+    import app.bot as bot
+    from app.revo_client import RewardsLanding
+
+    empty = RewardsLanding(fav_club_id=None, fav_club_name=None, in_club=None)
+    shared = RewardsLanding(fav_club_id=1, fav_club_name="Marion", in_club=12)
+
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: {"user_id": uid})
+    monkeypatch.setattr(bot, "_client_for_user", lambda row: object())
+    monkeypatch.setattr(bot.revo_client, "rewards_landing_with_client", lambda c: empty)
+    monkeypatch.setattr(bot.revo_client, "shared_rewards_landing", lambda: shared)
+
+    landing = bot._busy_fav_landing(4242)
+    assert landing is shared
