@@ -723,8 +723,13 @@ def shared_rewards_landing() -> RewardsLanding:
         if cache.landing is not None and (now - cache.fetched_at) < CLUB_COUNTER_TTL_SECONDS:
             return cache.landing
     landing = shared_client_from_env().get_rewards_landing()
-    with _shared_lock:
-        _shared_rewards = _RewardsCache(fetched_at=now, landing=landing)
+    # Don't cache a degenerate landing (parse miss / tile absent): caching an
+    # all-None result would wedge /busy on "unavailable" for the full TTL even
+    # after the portal recovers. Only a landing carrying real data is worth
+    # holding onto; an empty one falls through and is re-fetched next call.
+    if landing.fav_club_id is not None or landing.in_club is not None:
+        with _shared_lock:
+            _shared_rewards = _RewardsCache(fetched_at=now, landing=landing)
     return landing
 
 

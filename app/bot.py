@@ -70,6 +70,7 @@ from . import hevy_client
 from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
+from . import revo_netpulse
 from . import targets as targets_mod
 from . import strava_client
 from . import strava_web
@@ -8290,9 +8291,30 @@ def _client_for_user(row) -> "revo_client.RevoClient":
     return client
 
 
+# Netpulse (EGYM mobile backend) sessions are a *separate* login from the web
+# portal client above — different host + cookie — so they get their own cache,
+# keyed the same way and built from the same stored credentials.
+_revo_netpulse_clients: dict[int, "revo_netpulse.NetpulseClient"] = {}
+
+
+def _netpulse_client_for_user(row) -> "revo_netpulse.NetpulseClient":
+    """Return a cached NetpulseClient for a linked-account row."""
+    user_id = int(row["user_id"])
+    with _revo_clients_lock:
+        client = _revo_netpulse_clients.get(user_id)
+        if client is None:
+            password = revo_client.decrypt_password(row["password_enc"])
+            client = revo_netpulse.NetpulseClient(row["email"], password)
+            _revo_netpulse_clients[user_id] = client
+    return client
+
+
 def _drop_cached_client(user_id: int) -> None:
+    # Drop both backend sessions together: an auth failure on one usually means
+    # the stored password changed, which invalidates the other too.
     with _revo_clients_lock:
         _revo_user_clients.pop(user_id, None)
+        _revo_netpulse_clients.pop(user_id, None)
 
 
 def _format_busy_line(landing: "revo_client.RewardsLanding") -> str:
@@ -9280,12 +9302,24 @@ async def revo_summary_cmd(
                 prize = client.get_prize_pool()
             except Exception:  # pragma: no cover - non-fatal
                 LOG.warning("Revo summary: prize-pool fetch failed", exc_info=True)
+            # Membership tier + join date live on the EGYM/Netpulse mobile
+            # backend, not the web portal. Best-effort: a Netpulse outage or a
+            # missing dep must never sink the rest of the summary.
+            membership = None
+            try:
+                if revo_netpulse.available():
+                    membership = _netpulse_client_for_user(row).get_membership()
+            except Exception:  # pragma: no cover - non-fatal, best effort
+                LOG.warning(
+                    "Revo summary: Netpulse membership fetch failed", exc_info=True,
+                )
             return {
                 "streak": streak,
                 "tickets": avail,
                 "raffle": raffle,
                 "calendar": calendar,
                 "prize": prize,
+                "membership": membership,
             }
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(int(row["user_id"]))
@@ -9326,6 +9360,21 @@ async def revo_summary_cmd(
         f"🎟️ Tickets available: {tickets_txt}",
         _format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"),
     ]
+    membership = result.get("membership")
+    if membership is not None:
+        tier = " · ".join(
+            p for p in (membership.membership_type, membership.membership_subtype)
+            if p
+        )
+        since = ""
+        if membership.join_date:
+            try:
+                d = datetime.strptime(membership.join_date, "%Y-%m-%d")
+                since = f" — member since {d.day} {d.strftime('%b %Y')}"
+            except ValueError:
+                since = ""
+        if tier or since:
+            lines.insert(1, f"💳 {tier or 'Member'}{since}")
     if prize.get("monthly"):
         lines.append(f"-# 🏆 {prize['monthly']}")
     lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))

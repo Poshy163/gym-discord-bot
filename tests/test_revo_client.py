@@ -19,11 +19,11 @@ from app.db import Database
 def test_parse_member_cookie_extracts_id_and_level():
     raw = (
         "O%3A8%3A%22stdClass%22%3A2%3A%7B"
-        "s%3A2%3A%22id%22%3Bi%3A2298462%3B"
+        "s%3A2%3A%22id%22%3Bi%3A1234567%3B"
         "s%3A15%3A%22membershipLevel%22%3Bi%3A2%3B%7D"
     )
     member_id, level = revo_client.parse_member_cookie(raw)
-    assert member_id == 2298462
+    assert member_id == 1234567
     assert level == 2
 
 
