@@ -35,10 +35,39 @@ Security (hard rules — mirror :mod:`app.revo_client` / :mod:`app.revo_netpulse
 --------------------------------------------------------------------------------
 The login carries **secrets**: the ``CpAuthToken`` cookie and the member profile
 (name / email / photo / ids — PII). This client MUST NOT log them, MUST NOT
-return them from public methods, and MUST NOT persist them. The only thing
-extracted from the profile is the non-secret ``HomeClubId`` integer. The pure
-parser :func:`parse_members_in_clubs` is the scrubbing boundary — it reads only
-public club fields (name / suburb / state / live count / capacity).
+return them from public methods, and MUST NOT persist them. From the profile we
+keep only: the non-secret ``HomeClubId`` integer, a *non-sensitive* membership
+summary (:class:`MembershipStatus` — contract/payment/card flags, no identity),
+the member's ``FirstName`` (a non-secret display name, served by
+:meth:`~PerfectGymClient.get_first_name`), and — privately — the ``UserNumber``
+and the signed ``PhotoUrl``.
+
+``UserNumber`` is the **physical entry BARCODE** (an access credential). It is the
+**one** sensitive value a public method may return, exposed ONLY by
+:meth:`PerfectGymClient.get_card_number` for the ephemeral ``/revo_card`` reply.
+It MUST NEVER be logged, persisted, or placed in any other dataclass/repr.
+
+``PhotoUrl`` is a **short-lived signed CDN capability URL** (``…&sig=…``, valid
+~10 min): whoever holds it can fetch the member's photo without auth, so it MUST
+NEVER be logged or persisted. It is surfaced only by
+:meth:`PerfectGymClient.get_photo_url` (pass ``refresh=True`` to re-login for a
+fresh signature) so ``/seeprofile`` can download the bytes immediately; the login
+log line stays email + home_club_id only. :func:`download_photo` fetches those
+bytes (the signature *is* the credential — an unauthenticated GET).
+
+The pure parsers are the scrubbing boundaries: :func:`parse_members_in_clubs`
+(public occupancy fields), :func:`parse_club_list` (public directory/geo, no PII),
+and :func:`parse_membership_status` (non-sensitive contract flags only).
+
+Confirmed extra reads (do not re-probe)
+---------------------------------------
+* **CLUB DIRECTORY (public, no PII):** ``GET /ClientPortal2/Geo/GetClubList`` →
+  array of ``{Id, Name, Address, City:{Name}, ClubNumber, Latitude, Longitude,
+  OpeningDate, StateId}``. Occupancy has no club-id, so this is joined *by name*
+  for ids/geo. ``StateId`` is an opaque grouping key — state comes from
+  :func:`revo_client.state_for_club`, not from it. Cached with the long
+  ``CLUB_DIR_TTL_SECONDS`` (directory ≈ static), separate from the 60s occupancy
+  cache.
 
 Import-safe: ``requests`` is imported lazily so the bot boots without it — check
 :func:`available` (or catch :class:`PerfectGymUnavailable`) before use.
@@ -47,6 +76,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -63,6 +93,9 @@ LOG = logging.getLogger("gymbot.revo.perfectgym")
 PERFECTGYM_BASE = "https://revofitness.perfectgym.com/ClientPortal2"
 LOGIN_PATH = "/Auth/Login"
 OCCUPANCY_PATH = "/Clubs/Clubs/GetMembersInClubs"
+# Public, no-PII club directory (id + geo + opening date). The occupancy board
+# above carries no club-id, so we join to this directory *by name* for ids/geo.
+GEO_CLUBLIST_PATH = "/Geo/GetClubList"
 
 REQUEST_TIMEOUT = 30
 
@@ -70,6 +103,12 @@ REQUEST_TIMEOUT = 30
 # it for a minute — a burst of /busy calls (from anyone) then reuses one fetch
 # instead of re-hitting PerfectGym. Mirrors revo_client.CLUB_COUNTER_TTL_SECONDS.
 OCCUPANCY_TTL_SECONDS = 60
+
+# The club *directory* (names/ids/geo/opening dates) barely changes — a club
+# opens every few months — so it gets a MUCH longer TTL than the 60s occupancy
+# cache. Kept as a separate cache so a directory fetch never evicts (or is
+# evicted by) the fast-moving occupancy numbers.
+CLUB_DIR_TTL_SECONDS = 6 * 3600
 
 # Static, non-secret request identity. Content-Type must be JSON for the login
 # POST; the Origin/Referer mirror the SPA the endpoint expects.
@@ -160,6 +199,27 @@ def _as_opt_int(value: Any) -> Optional[int]:
         return value
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         return int(value.strip())
+    return None
+
+
+def _as_opt_float(value: Any) -> Optional[float]:
+    """Coerce a lat/lng to float, preserving ``None`` (a not-yet-geocoded club)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _as_opt_str(value: Any) -> Optional[str]:
+    """Return a stripped non-empty string, else ``None`` (whitespace is missing)."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return None
 
 
@@ -286,14 +346,219 @@ def top_busiest(
 
 
 # ---------------------------------------------------------------------------
+# Club directory + geo (public, no PII) — Geo/GetClubList
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ClubDirEntry:
+    """One club from the public ``Geo/GetClubList`` directory — no PII.
+
+    Every field here is public marketing/geo data (the same list the "find a
+    club" map draws from): the club's stable ``id``, name, street address, city,
+    marketing ``club_number``, latitude/longitude, ISO opening date, and the
+    derived AU ``state`` code. Carries nothing from the login profile.
+    """
+    id: Optional[int]
+    name: str
+    address: Optional[str]
+    city: Optional[str]
+    club_number: Optional[str]
+    lat: Optional[float]
+    lng: Optional[float]
+    opening_date: Optional[str]
+    state: Optional[str]
+
+
+def _city_name(value: Any) -> Optional[str]:
+    """City may arrive as ``{"Name": ...}`` (current shape) or a bare string."""
+    if isinstance(value, dict):
+        return _as_opt_str(value.get("Name"))
+    return _as_opt_str(value)
+
+
+def parse_club_list(payload: Any) -> list[ClubDirEntry]:
+    """Parse ``Geo/GetClubList`` into a list of :class:`ClubDirEntry` (public data).
+
+    Accepts the raw array, a ``{"...": [...]}`` wrapper, or a JSON string. The
+    ``state`` is derived from :func:`revo_client.state_for_club` (the bot's single
+    curated name→state source) — the payload's numeric ``StateId`` is only an
+    internal grouping key with no public code mapping, so it is intentionally
+    ignored. Entries without a usable ``Name`` are skipped; missing lat/lng are
+    preserved as ``None`` (some just-announced clubs aren't geocoded yet).
+    """
+    obj = _as_obj(payload)
+    if isinstance(obj, dict):
+        # Tolerate a wrapped array under any common key.
+        entries = obj.get("ClubList") or obj.get("Clubs") or obj.get("Data")
+    elif isinstance(obj, list):
+        entries = obj
+    else:
+        entries = None
+    if not isinstance(entries, list):
+        return []
+
+    out: list[ClubDirEntry] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = _as_opt_str(entry.get("Name"))
+        if not name:
+            continue
+        out.append(
+            ClubDirEntry(
+                id=_as_opt_int(entry.get("Id")),
+                name=name,
+                address=_as_opt_str(entry.get("Address")),
+                city=_city_name(entry.get("City")),
+                club_number=_as_opt_str(entry.get("ClubNumber")),
+                lat=_as_opt_float(entry.get("Latitude")),
+                lng=_as_opt_float(entry.get("Longitude")),
+                opening_date=_as_opt_str(entry.get("OpeningDate")),
+                # Primary + only source, consistent with parse_members_in_clubs.
+                state=revo_client.state_for_club(name),
+            )
+        )
+    return out
+
+
+def haversine_km(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
+    """Great-circle distance in km between two lat/lng points (mean Earth radius).
+
+    Pure and dependency-free — enough for "which clubs are near this one", where a
+    few-hundred-metres error over city distances is irrelevant.
+    """
+    r = 6371.0088  # mean Earth radius (km)
+    p1, p2 = math.radians(a_lat), math.radians(b_lat)
+    dphi = math.radians(b_lat - a_lat)
+    dlmb = math.radians(b_lng - a_lng)
+    h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(h)))
+
+
+def nearest_clubs(
+    entries: list[ClubDirEntry],
+    origin_name: str,
+    limit: int = 5,
+) -> list[ClubDirEntry]:
+    """Clubs sorted by distance from the named origin club (closest first).
+
+    Distance is measured **between clubs** in the directory — there is no external
+    geocoder, so ``origin_name`` must match a directory entry (case-insensitive).
+    The origin itself and any entry missing coordinates are excluded. Returns an
+    empty list when the origin is unknown or has no coordinates. Ties break on
+    name for a stable ordering.
+    """
+    q = (origin_name or "").strip().lower()
+    if not q:
+        return []
+    origin = next((e for e in entries if e.name.lower() == q), None)
+    if origin is None or origin.lat is None or origin.lng is None:
+        return []
+    scored: list[tuple[float, str, ClubDirEntry]] = []
+    for e in entries:
+        if e is origin or e.lat is None or e.lng is None:
+            continue
+        d = haversine_km(origin.lat, origin.lng, e.lat, e.lng)
+        scored.append((d, e.name.lower(), e))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [e for _, _, e in scored[: max(0, limit)]]
+
+
+@dataclass(frozen=True)
+class LocatedOccupancy:
+    """A :class:`ClubOccupancy` enriched with directory id/geo/opening date.
+
+    The occupancy board has no club-id, so :func:`join_occupancy_to_dir` attaches
+    the directory's ``id``/``lat``/``lng``/``opening_date`` by name. Still no PII —
+    both inputs are public. Unmatched occupancy rows keep ``None`` geo fields.
+    """
+    occupancy: ClubOccupancy
+    id: Optional[int]
+    lat: Optional[float]
+    lng: Optional[float]
+    opening_date: Optional[str]
+
+
+def join_occupancy_to_dir(
+    occupancy: list[ClubOccupancy],
+    directory: list[ClubDirEntry],
+) -> list[LocatedOccupancy]:
+    """Attach directory id/geo/opening-date to each occupancy row by club name.
+
+    Matching is case-insensitive on the club name. Every occupancy row is kept, in
+    order; an unmatched row is returned "as-is" (wrapped with ``None`` geo fields)
+    so a caller never loses a live count just because the directory lacks the club.
+    """
+    by_name = {e.name.lower(): e for e in directory}
+    out: list[LocatedOccupancy] = []
+    for occ in occupancy:
+        e = by_name.get(occ.name.lower())
+        out.append(
+            LocatedOccupancy(
+                occupancy=occ,
+                id=e.id if e else None,
+                lat=e.lat if e else None,
+                lng=e.lng if e else None,
+                opening_date=e.opening_date if e else None,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Membership status (non-sensitive slice of the login profile)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MembershipStatus:
+    """The non-sensitive membership summary from the login profile.
+
+    Deliberately a *narrow* projection of ``User.Member.NotificationsData`` — it
+    carries only the contract health flags a member sees on the portal dashboard
+    and NOTHING that identifies them: no UserNumber/barcode, no email, no photo,
+    no ids, no token. Safe to log or embed. ``payment_ok`` is the inverse of the
+    backend's ``HasInvalidContractPaymentMethod`` (portal shows the positive).
+    """
+    contract_status: Optional[str]
+    payment_ok: Optional[bool]
+    has_card: Optional[bool]
+
+
+def _as_opt_bool(value: Any) -> Optional[bool]:
+    """Return a real bool as-is, else ``None`` (a missing flag is unknown, not False)."""
+    return value if isinstance(value, bool) else None
+
+
+def parse_membership_status(profile: Any) -> MembershipStatus:
+    """Project a login profile's ``NotificationsData`` into a :class:`MembershipStatus`.
+
+    Never raises: a missing/garbage profile or absent ``NotificationsData`` yields
+    an all-``None`` status (unknown, not "bad"). ``payment_ok`` inverts
+    ``HasInvalidContractPaymentMethod`` so a missing flag stays ``None`` rather than
+    silently reading as "payment ok".
+    """
+    member = _member(_as_obj(profile))
+    nd = member.get("NotificationsData") if isinstance(member, dict) else None
+    if not isinstance(nd, dict):
+        return MembershipStatus(None, None, None)
+    has_invalid = _as_opt_bool(nd.get("HasInvalidContractPaymentMethod"))
+    return MembershipStatus(
+        contract_status=_as_opt_str(nd.get("ContractStatus")),
+        payment_ok=(not has_invalid) if has_invalid is not None else None,
+        has_card=_as_opt_bool(nd.get("HasMemberCardAssigned")),
+    )
+
+
+# ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
 
-def _home_club_id(body: Any) -> Optional[int]:
-    """Pull the non-secret ``User.Member.HomeClubId`` int from a login profile.
+def _member(body: Any) -> Optional[dict]:
+    """Return the ``User.Member`` profile dict, or ``None`` on any wrong shape.
 
-    Everything else in the profile (name / email / photo / member id) is PII and
-    is deliberately ignored — only this integer is kept.
+    Central navigator so the (non-secret) HomeClubId reader, the membership-status
+    projection and the (sensitive) card-number reader all agree on where the
+    profile lives without each re-walking the nesting.
     """
     if not isinstance(body, dict):
         return None
@@ -301,10 +566,71 @@ def _home_club_id(body: Any) -> Optional[int]:
     if not isinstance(user, dict):
         return None
     member = user.get("Member")
-    if not isinstance(member, dict):
+    return member if isinstance(member, dict) else None
+
+
+def _home_club_id(body: Any) -> Optional[int]:
+    """Pull the non-secret ``User.Member.HomeClubId`` int from a login profile.
+
+    Everything else in the profile (name / email / photo / member id) is PII and
+    is deliberately ignored — only this integer is kept.
+    """
+    member = _member(body)
+    if member is None:
         return None
     hc = member.get("HomeClubId")
     return hc if isinstance(hc, int) and not isinstance(hc, bool) else None
+
+
+def _first_name(body: Any) -> Optional[str]:
+    """Pull the non-secret ``User.Member.FirstName`` display name from a profile.
+
+    A plain first name is not an access credential — it is the value we use to
+    auto-populate the bot's display nickname on ``/revo_link`` and to label the
+    ``/seeprofile`` roster. Returns ``None`` for a missing/blank/garbage profile.
+    """
+    member = _member(body)
+    if member is None:
+        return None
+    fn = member.get("FirstName")
+    return fn.strip() if isinstance(fn, str) and fn.strip() else None
+
+
+def _photo_url(body: Any) -> Optional[str]:
+    """Pull ``User.Member.PhotoUrl`` — a SIGNED, short-lived CDN capability URL.
+
+    !!! SENSITIVE (capability URL) !!! The ``&sig=`` query param grants ~10 minutes
+    of *unauthenticated* read access to the member's photo; holding the URL is
+    enough to fetch the image. It MUST NEVER be logged or persisted — it is stashed
+    privately and surfaced only by :meth:`PerfectGymClient.get_photo_url` so the
+    bytes can be downloaded immediately (within the signature's validity).
+    """
+    member = _member(body)
+    if member is None:
+        return None
+    pu = member.get("PhotoUrl")
+    return pu.strip() if isinstance(pu, str) and pu.strip() else None
+
+
+def _user_number(body: Any) -> Optional[str]:
+    """Extract ``User.Member.UserNumber`` — the physical gym-entry BARCODE.
+
+    !!! SENSITIVE — this is an ACCESS CREDENTIAL, not just an id !!!
+    ``UserNumber`` is the number encoded on the member's card/turnstile barcode;
+    possessing it is enough to walk through a Revo door. It is the ONE sensitive
+    value :meth:`PerfectGymClient.get_card_number` is allowed to surface, and only
+    for the ephemeral ``/revo_card`` reply. It MUST NEVER be logged, cached to
+    disk, put in any other dataclass/repr, or returned by any other method.
+    """
+    member = _member(body)
+    if member is None:
+        return None
+    un = member.get("UserNumber")
+    if isinstance(un, str) and un.strip():
+        return un.strip()
+    if isinstance(un, int) and not isinstance(un, bool):
+        return str(un)
+    return None
 
 
 def _needs_relogin(response: Any) -> bool:
@@ -341,8 +667,22 @@ class PerfectGymClient:
         self._http.headers.update(DEFAULT_HEADERS)
         self._lock = threading.Lock()
         self._logged_in = False
-        # Non-secret session context (the only thing kept from the profile).
+        # Non-secret session context (the only *public* thing kept from the
+        # profile). home_club_id is a plain int; everything below is private.
         self.home_club_id: Optional[int] = None
+        # Non-sensitive membership summary (no PII) — served by
+        # get_membership_status(); private so it stays off the public surface.
+        self._membership: Optional[MembershipStatus] = None
+        # SENSITIVE: the entry barcode (UserNumber). Private, never logged, only
+        # ever handed out by get_card_number() for the ephemeral /revo_card path.
+        self._user_number: Optional[str] = None
+        # Non-secret display name from the profile — served by get_first_name(),
+        # used to auto-name the member in the bot on /revo_link + /seeprofile.
+        self._first_name: Optional[str] = None
+        # SENSITIVE (capability URL): the signed, ~10-min PhotoUrl. Private, NEVER
+        # logged; only get_photo_url() hands it out (refresh=True re-logs in for a
+        # fresh signature) so /seeprofile can download the bytes right away.
+        self._photo_url: Optional[str] = None
 
     # ---- auth ----------------------------------------------------------
 
@@ -374,9 +714,19 @@ class PerfectGymClient:
                 f"PerfectGym login failed for {self.email!r} (status {r.status_code})."
             )
         self.home_club_id = _home_club_id(body)
+        # Stash the two profile projections we serve later, straight off this
+        # login body (the confirmed contract: the login response *is* the
+        # profile). The membership summary is non-sensitive; the UserNumber is
+        # the sensitive entry barcode kept private for get_card_number().
+        self._membership = parse_membership_status(body)
+        self._user_number = _user_number(body)
+        # Non-secret first name + the signed (sensitive) photo URL. Re-read on
+        # every login so a refresh=True call refreshes the ~10-min photo signature.
+        self._first_name = _first_name(body)
+        self._photo_url = _photo_url(body)
         self._logged_in = True
-        # Non-secret log line only: email + the home-club integer. No token, no
-        # profile body.
+        # Non-secret log line only: email + the home-club integer. Never the
+        # token, the profile body, the membership flags, or the barcode.
         LOG.info(
             "PerfectGym login OK email=%s home_club_id=%s",
             self.email, self.home_club_id,
@@ -413,6 +763,96 @@ class PerfectGymClient:
         """Return live occupancy for every club (one backend call)."""
         return parse_members_in_clubs(self._get_json(OCCUPANCY_PATH))
 
+    def get_club_list(self) -> list[ClubDirEntry]:
+        """Return the public club directory (ids + geo + opening dates), no PII.
+
+        This is the raw fetch; the long-TTL caching lives at module level in
+        :func:`shared_club_list` / :func:`club_list_with_client`
+        (``CLUB_DIR_TTL_SECONDS``), kept separate from the 60s occupancy cache
+        because the directory barely changes.
+        """
+        return parse_club_list(self._get_json(GEO_CLUBLIST_PATH))
+
+    def get_membership_status(self) -> MembershipStatus:
+        """Return the non-sensitive membership summary (contract/payment/card).
+
+        Sourced from the login profile stashed at auth time; logs in first if the
+        session isn't established yet. Contains no PII, no barcode, no token.
+        """
+        if not self._logged_in:
+            self.login()
+        return self._membership or MembershipStatus(None, None, None)
+
+    def get_card_number(self) -> Optional[str]:
+        """Return the member's entry BARCODE (``UserNumber``) — SENSITIVE.
+
+        !!! This is the ONE sensitive value a public method may return. !!!
+        It is a physical access credential (what a Revo turnstile scans), intended
+        ONLY for the ephemeral ``/revo_card`` reply where bot.py renders it to a
+        barcode image. The caller MUST NOT log it, persist it, or place it in any
+        embed/message that survives. No other method exposes it, and it is kept out
+        of every dataclass/repr in this module.
+        """
+        if not self._logged_in:
+            self.login()
+        return self._user_number
+
+    def get_first_name(self) -> Optional[str]:
+        """Return the member's non-secret first name from the login profile.
+
+        Logs in first if the session isn't established yet. Used to auto-populate
+        the bot's display nickname on ``/revo_link`` and to label the
+        ``/seeprofile`` roster. Not an access credential — safe to display.
+        """
+        if not self._logged_in:
+            self.login()
+        return self._first_name
+
+    def get_photo_url(self, refresh: bool = False) -> Optional[str]:
+        """Return the member's SIGNED profile-photo URL — a capability URL.
+
+        !!! Capability URL — the caller MUST NOT log or persist it. !!! The
+        ``&sig=`` param grants ~10 minutes of unauthenticated read to the photo,
+        so the caller must download the bytes *immediately* (see
+        :func:`download_photo`) and let the URL expire.
+
+        Because the signature is short-lived, pass ``refresh=True`` to force a
+        fresh login first — that regenerates a currently-valid URL. With
+        ``refresh=False`` this returns whatever was stashed at the last login,
+        which may already have expired.
+        """
+        if refresh:
+            # Force a fresh login so the returned signature is currently valid.
+            # Mirrors the _get_json expiry path: flip the flag, then re-auth.
+            self._logged_in = False
+            self.login()
+        elif not self._logged_in:
+            self.login()
+        return self._photo_url
+
+
+def download_photo(url: str, timeout: int = REQUEST_TIMEOUT) -> bytes:
+    """Download the bytes behind a signed, short-lived member-photo URL.
+
+    The ``&sig=`` query param *is* the credential, so this is an unauthenticated
+    GET (no ``CpAuthToken`` cookie needed) against the CDN host. Callers MUST
+    invoke it immediately after ``get_photo_url(refresh=True)`` — within the
+    ~10-minute signature validity — and MUST NOT log the ``url`` (a capability
+    URL) or the returned bytes. Raises :class:`PerfectGymUnavailable` when the
+    optional ``requests`` dep is missing; propagates transport/HTTP errors to the
+    caller (which catches them WITHOUT logging the URL-bearing message).
+    """
+    if requests is None:
+        raise PerfectGymUnavailable(
+            "The 'requests' package is required to download member photos."
+        )
+    # A bare Session (not the authenticated client session) — the signature is
+    # the only credential the CDN needs, and we don't want the CpAuthToken cookie
+    # riding along to a third-party storage host.
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content
+
 
 # ---------------------------------------------------------------------------
 # Module-level "shared" client + TTL cache for read-only commands like /busy.
@@ -428,7 +868,16 @@ class _OccupancyCache:
     clubs: tuple[ClubOccupancy, ...] = field(default_factory=tuple)
 
 
+@dataclass
+class _DirectoryCache:
+    fetched_at: float = 0.0
+    entries: tuple[ClubDirEntry, ...] = field(default_factory=tuple)
+
+
 _shared_occupancy = _OccupancyCache()
+# Separate from occupancy: the directory changes on the order of months, so it
+# gets its own slot and the long CLUB_DIR_TTL_SECONDS TTL.
+_shared_directory = _DirectoryCache()
 
 
 def shared_client_from_env() -> PerfectGymClient:
@@ -497,3 +946,51 @@ def club_occupancy_with_client(client: PerfectGymClient) -> list[ClubOccupancy]:
     clubs = client.get_club_occupancy()
     _cache_put(now, clubs)
     return clubs
+
+
+def _dir_cache_get(now: float) -> Optional[list[ClubDirEntry]]:
+    with _shared_lock:
+        cache = _shared_directory
+        if cache.entries and (now - cache.fetched_at) < CLUB_DIR_TTL_SECONDS:
+            return list(cache.entries)
+    return None
+
+
+def _dir_cache_put(now: float, entries: list[ClubDirEntry]) -> None:
+    # Same guard as occupancy: never cache an empty fetch (it would wedge every
+    # directory read on "unavailable" for the whole 6h TTL).
+    if not entries:
+        return
+    global _shared_directory
+    with _shared_lock:
+        _shared_directory = _DirectoryCache(fetched_at=now, entries=tuple(entries))
+
+
+def shared_club_list() -> list[ClubDirEntry]:
+    """Cached public club directory via the shared env account (6h TTL).
+
+    The directory is public (no PII), so unlike the per-account rewards landing it
+    is safe to share-cache across all callers.
+    """
+    now = time.monotonic()
+    cached = _dir_cache_get(now)
+    if cached is not None:
+        return cached
+    entries = shared_client_from_env().get_club_list()
+    _dir_cache_put(now, entries)
+    return entries
+
+
+def club_list_with_client(client: PerfectGymClient) -> list[ClubDirEntry]:
+    """Cached public club directory using *any* authenticated client (6h TTL).
+
+    The directory is the same public list for everyone, so a per-user fetch safely
+    populates — and reuses — the shared long-TTL cache.
+    """
+    now = time.monotonic()
+    cached = _dir_cache_get(now)
+    if cached is not None:
+        return cached
+    entries = client.get_club_list()
+    _dir_cache_put(now, entries)
+    return entries

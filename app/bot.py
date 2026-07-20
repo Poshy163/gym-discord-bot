@@ -6481,6 +6481,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         name="🏋️ Revo Fitness",
         value=(
             "`/busy [club]` — live club occupancy\n"
+            "`/revo_clubs [club]` — club directory: your state, or one club + nearest gyms\n"
             "`/revo_link <email> <password>` — link your account (reply is private)\n"
             "`/help_revo_link` — public explainer for `/revo_link`\n"
             "`/revo_unlink` — remove the link\n"
@@ -6490,7 +6491,9 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/revo_calendar_compare` — side-by-side calendars for all linked members\n"
             "`/revo_summary` — streak, check-ins, tickets & next draw in one\n"
             "`/revo_tickets` — ticket balance & recent earning history\n"
-            "`/revo_raffle` — your tickets + monthly/major draw countdowns"
+            "`/revo_raffle` — your tickets + monthly/major draw countdowns\n"
+            "`/revo_card` — privately show YOUR entry barcode (ephemeral, your own card)\n"
+            "`/seeprofile` — roster of every linked member's Revo photo + name"
         ),
         inline=False,
     )
@@ -8337,6 +8340,148 @@ def _drop_cached_client(user_id: int) -> None:
         _revo_perfectgym_clients.pop(user_id, None)
 
 
+def _unique_nickname(first_name: str, user_id: int) -> str:
+    """Return a nickname based on ``first_name`` that no OTHER member holds.
+
+    Why disambiguate: auto-populated PerfectGym first names collide (two
+    'Josh'es), and the same ``user_nicknames`` table drives chat lift
+    attribution (:func:`_resolve_nickname_target`). A bare-name write on a
+    collision would make the resolver log one member's ``Josh squat 150kg``
+    under whichever row it matches first — silently misattributing, with the
+    second member unable to ever self-attribute. We append the smallest numeric
+    discriminator that makes the name unique — ``Josh``, ``Josh 2``, ``Josh 3``
+    — checked case-insensitively to mirror the resolver's prefix match. The
+    member's OWN existing row never counts as a collision, so re-linking is
+    idempotent (a returning member keeps their current name).
+    """
+    base = first_name.strip()
+    candidate = base
+    suffix = 2
+    while True:
+        owner = db.nickname_owner(candidate)
+        if owner is None or owner == user_id:
+            return candidate
+        candidate = f"{base} {suffix}"
+        suffix += 1
+
+
+def _apply_perfectgym_nickname(user_id: int) -> "str | None":
+    """Best-effort: set the bot-wide nickname to the member's PerfectGym first name.
+
+    Called right after a successful ``/revo_link`` (inside the executor, since it
+    logs in). ALWAYS overwrites this member's existing nickname (owner-approved)
+    so the display name tracks the freshly-linked account — ``db.set_user_nickname``
+    is an upsert, so this is a plain overwrite. The first name is first
+    disambiguated against OTHER members via :func:`_unique_nickname` so two
+    members sharing a first name never collide (which would misattribute
+    nickname-targeted chat lifts). Fully non-fatal: if the account row is gone,
+    the first name can't be fetched, or the write fails, it returns ``None`` and
+    leaves any existing nickname untouched rather than raising. Uses the member's
+    OWN per-user client (never the shared account). Returns the applied nickname
+    (possibly with a discriminator), or ``None`` when nothing was set.
+    """
+    row = db.get_revo_account(user_id)
+    if row is None:
+        return None
+    try:
+        first_name = _perfectgym_client_for_user(row).get_first_name()
+    except Exception:  # pragma: no cover - network/creds; non-fatal by design
+        LOG.warning("revo_link: PerfectGym first-name fetch failed", exc_info=True)
+        return None
+    if not first_name:
+        return None
+    nickname = _unique_nickname(first_name, user_id)
+    try:
+        db.set_user_nickname(user_id, nickname, user_id)
+    except Exception:  # pragma: no cover - db; non-fatal by design
+        LOG.warning("revo_link: set_user_nickname failed", exc_info=True)
+        return None
+    return nickname
+
+
+def _seeprofile_gather(rows) -> "tuple[list[tuple[int, str | None, bytes]], int]":
+    """Fetch each linked member's OWN photo + first name, downloading bytes now.
+
+    Runs synchronously (N logins + N downloads) — call it via ``run_in_executor``.
+    For EACH row it builds that member's OWN per-user PerfectGym client (never the
+    shared account, and never one member's client for another member's photo),
+    forces a fresh login for a currently-valid signed photo URL, then downloads the
+    image bytes immediately (the signed URL expires in ~10 min, so we never hand
+    the raw URL to Discord). Returns ``(results, failure_count)`` where results is a
+    list of ``(user_id, first_name, image_bytes)``.
+
+    Resilience + privacy: a per-member failure (login/creds error, no photo, or a
+    download error) is counted and skipped so one bad account never sinks the whole
+    roster. The signed photo URL is a capability URL — it is NEVER logged (nor are
+    the bytes); only the exception *type name* is logged, because a ``requests``
+    HTTP error's message embeds the signed URL.
+    """
+    results: "list[tuple[int, str | None, bytes]]" = []
+    failures = 0
+    for row in rows:
+        try:
+            uid = int(row["user_id"])
+            client = _perfectgym_client_for_user(row)  # this member's OWN creds
+            # refresh=True → re-login so the signature is fresh; download at once.
+            url = client.get_photo_url(refresh=True)
+            if not url:
+                failures += 1
+                continue
+            first_name = client.get_first_name()
+            data = revo_perfectgym.download_photo(url)  # url never logged
+            if not data:
+                failures += 1
+                continue
+            results.append((uid, first_name, data))
+        except Exception as exc:
+            # NEVER log the exception message/exc_info here: a requests HTTPError
+            # embeds the signed capability URL. The type name is safe + enough.
+            LOG.warning("seeprofile: skipped a member (%s)", type(exc).__name__)
+            failures += 1
+    return results, failures
+
+
+def _seeprofile_display_name(
+    interaction: discord.Interaction, uid: int, first_name: "str | None"
+) -> str:
+    """Label for a roster embed: the PerfectGym first name, else the guild name.
+
+    Prefers the member's PerfectGym ``first_name`` (what they're actually called);
+    falls back to their guild display name, then a global username, then a plain
+    ``Member`` so the embed always has a title even for an uncached user.
+    """
+    if first_name:
+        return first_name
+    guild = interaction.guild
+    if guild is not None:
+        member = guild.get_member(uid)
+        if member is not None:
+            return member.display_name
+    user = bot.get_user(uid)
+    if user is not None:
+        return user.display_name
+    return "Member"
+
+
+def _photo_file_ext(data: bytes) -> str:
+    """Best-effort image extension from the leading magic bytes (default ``jpg``).
+
+    Discord renders an ``attachment://`` embed image by the attachment's filename
+    extension, so we match it to the actual bytes (PerfectGym photos are usually
+    JPEG). Falls back to ``jpg`` for anything unrecognised — good enough for a
+    thumbnail and never fatal.
+    """
+    if data[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return "jpg"
+
+
 def _format_busy_line(landing: "revo_client.RewardsLanding") -> str:
     """Degraded single-club line from the web rewards landing (fallback source)."""
     name = landing.fav_club_name or "Your club"
@@ -8411,6 +8556,274 @@ def _busy_fav_landing(user_id: int) -> "revo_client.RewardsLanding | None":
     return None
 
 
+def _maps_link(lat: float | None, lng: float | None) -> str | None:
+    """Google-Maps search URL for a lat/lng pair, or ``None`` when not geocoded.
+
+    The club directory leaves ``lat``/``lng`` null for just-announced clubs, so a
+    caller must tolerate ``None`` (and simply omit the link).
+    """
+    if lat is None or lng is None:
+        return None
+    return f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+
+
+def _perfectgym_occupancy(user_id: int) -> list["revo_perfectgym.ClubOccupancy"]:
+    """All-clubs live occupancy: shared env account first, then the caller's linked
+    creds. Returns ``[]`` on any failure so callers degrade gracefully.
+
+    The occupancy board is the *same public all-clubs list for everyone*, so the
+    shared account is tried first (keeps it working for unlinked users) and a burst
+    of calls reuses one fetch via the module TTL cache. Mirrors the resolution the
+    /busy command used inline before it was hoisted here for reuse by /revo_clubs.
+    """
+    try:
+        clubs = revo_perfectgym.shared_club_occupancy()
+        if clubs:
+            return clubs
+    except revo_perfectgym.PerfectGymUnavailable:
+        pass  # no shared account configured — try the user's own creds
+    except revo_perfectgym.PerfectGymAuthError:
+        LOG.warning("PerfectGym shared login failed (occupancy)")
+    except Exception:  # pragma: no cover - network
+        LOG.exception("PerfectGym shared occupancy fetch failed")
+
+    row = db.get_revo_account(user_id)
+    if row is not None:
+        try:
+            client = _perfectgym_client_for_user(row)
+            clubs = revo_perfectgym.club_occupancy_with_client(client)
+            if clubs:
+                return clubs
+        except revo_perfectgym.PerfectGymAuthError:
+            _drop_cached_client(user_id)
+            LOG.warning("PerfectGym per-user login failed (occupancy)")
+        except Exception:  # pragma: no cover - network
+            LOG.exception("PerfectGym per-user occupancy fetch failed")
+    return []
+
+
+def _perfectgym_directory(user_id: int) -> list["revo_perfectgym.ClubDirEntry"]:
+    """Public club directory (ids + geo + opening dates): shared account first,
+    then the caller's linked creds. Returns ``[]`` on any failure.
+
+    The directory is public (no PII) and identical for everyone, so — like the
+    occupancy board — the shared account is fine and a per-user fetch safely
+    populates the shared long-TTL cache. Best-effort: a directory outage degrades
+    /revo_clubs and the /busy maps-link enrichment, never hard-errors them.
+    """
+    try:
+        entries = revo_perfectgym.shared_club_list()
+        if entries:
+            return entries
+    except revo_perfectgym.PerfectGymUnavailable:
+        pass  # no shared account configured — try the user's own creds
+    except revo_perfectgym.PerfectGymAuthError:
+        LOG.warning("PerfectGym shared login failed (directory)")
+    except Exception:  # pragma: no cover - network
+        LOG.exception("PerfectGym shared directory fetch failed")
+
+    row = db.get_revo_account(user_id)
+    if row is not None:
+        try:
+            client = _perfectgym_client_for_user(row)
+            entries = revo_perfectgym.club_list_with_client(client)
+            if entries:
+                return entries
+        except revo_perfectgym.PerfectGymAuthError:
+            _drop_cached_client(user_id)
+            LOG.warning("PerfectGym per-user login failed (directory)")
+        except Exception:  # pragma: no cover - network
+            LOG.exception("PerfectGym per-user directory fetch failed")
+    return []
+
+
+def _find_dir_entry(
+    directory: list["revo_perfectgym.ClubDirEntry"],
+    query: str,
+) -> "revo_perfectgym.ClubDirEntry | None":
+    """Case-insensitive club lookup over the directory (name then city).
+
+    Mirrors :func:`revo_perfectgym.find_club` (exact → prefix → substring) but over
+    :class:`ClubDirEntry`, so /revo_clubs can resolve a named club even when the
+    live occupancy board is temporarily down (directory is separately cached).
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+
+    def keys(e: "revo_perfectgym.ClubDirEntry") -> tuple[str, ...]:
+        return tuple(k.lower() for k in (e.name, e.city or "") if k)
+
+    for e in directory:  # exact
+        if any(k == q for k in keys(e)):
+            return e
+    for e in directory:  # prefix
+        if any(k.startswith(q) for k in keys(e)):
+            return e
+    for e in directory:  # substring
+        if any(q in k for k in keys(e)):
+            return e
+    return None
+
+
+def _format_revo_clubs_state_list(
+    directory: list["revo_perfectgym.ClubDirEntry"],
+    occupancy: list["revo_perfectgym.ClubOccupancy"],
+    state: str,
+) -> str:
+    """Render "Name — Suburb (X in club now)" for every club in *state*.
+
+    Joins the public directory to the live occupancy board *by name*, so each club
+    shows its current head-count when the board is up (and "count unavailable" when
+    it isn't). Alphabetical for a stable, scannable list.
+    """
+    st = state.strip().upper()
+    occ_by_name = {c.name.lower(): c for c in occupancy}
+    entries = sorted(
+        (e for e in directory if (e.state or "").upper() == st),
+        key=lambda e: e.name.lower(),
+    )
+    lines = [f"🏋️ **Revo clubs in {st}**"]
+    if not entries:
+        lines.append("_No clubs found for this state._")
+        return "\n".join(lines)
+    for e in entries:
+        occ = occ_by_name.get(e.name.lower())
+        suburb = e.city or (occ.suburb if occ else None)
+        count_txt = f"{occ.count} in club now" if occ is not None else "count unavailable"
+        if suburb and suburb.lower() != e.name.lower():
+            lines.append(f"• **{e.name}** — {suburb} ({count_txt})")
+        else:
+            lines.append(f"• **{e.name}** ({count_txt})")
+    return "\n".join(lines)
+
+
+def _format_revo_club_detail(
+    entry: "revo_perfectgym.ClubDirEntry",
+    occupancy: list["revo_perfectgym.ClubOccupancy"],
+    nearest: list["revo_perfectgym.ClubDirEntry"],
+) -> str:
+    """Render one club's card: address, maps link, state, live count + nearest 3.
+
+    ``occupancy`` is the full live board (joined by name for the club's own count
+    and each nearby club's count); ``nearest`` is :func:`revo_perfectgym.nearest_clubs`
+    output. Missing pieces (no geo, board down) are simply omitted.
+    """
+    occ_by_name = {c.name.lower(): c for c in occupancy}
+    header = f"🏋️ **{entry.name}**"
+    if entry.state:
+        header += f" — {entry.state}"
+    lines = [header]
+    if entry.address:
+        addr = entry.address
+        if entry.city and entry.city.lower() not in addr.lower():
+            addr = f"{addr}, {entry.city}"
+        lines.append(f"📍 {addr}")
+    link = _maps_link(entry.lat, entry.lng)
+    if link:
+        lines.append(f"🗺️ [Open in Google Maps]({link})")
+    own = occ_by_name.get(entry.name.lower())
+    lines.append(
+        f"👥 **{own.count}** in club right now" if own is not None
+        else "👥 Live count unavailable right now"
+    )
+    if nearest:
+        lines.append("")
+        lines.append("📌 **Nearest other clubs**")
+        for e in nearest:
+            piece = f"• **{e.name}**"
+            if (
+                entry.lat is not None and entry.lng is not None
+                and e.lat is not None and e.lng is not None
+            ):
+                km = revo_perfectgym.haversine_km(entry.lat, entry.lng, e.lat, e.lng)
+                piece += f" — {km:.1f} km"
+            near_occ = occ_by_name.get(e.name.lower())
+            if near_occ is not None:
+                piece += f" ({near_occ.count} in club now)"
+            lines.append(piece)
+    return "\n".join(lines)
+
+
+def _format_membership_status_line(
+    status: "revo_perfectgym.MembershipStatus | None",
+) -> str | None:
+    """"💳 Membership: {contract}" (+ ", payment issue ⚠" when payment isn't ok).
+
+    Returns ``None`` when the contract status is unknown, so callers degrade
+    silently rather than printing an empty/uninformative line.
+    """
+    if status is None or not status.contract_status:
+        return None
+    line = f"💳 Membership: {status.contract_status}"
+    if status.payment_ok is False:
+        line += ", payment issue ⚠"
+    return line
+
+
+def _summary_status_line(
+    status: "revo_perfectgym.MembershipStatus | None",
+    *,
+    is_self: bool,
+) -> str | None:
+    """Contract-status line for /revo_summary — SELF-ONLY.
+
+    /revo_summary replies PUBLICLY (it defers without ephemeral) and can be aimed
+    at any other linked member, so this must never surface a THIRD PARTY's contract
+    health: the rendered line can read "Suspended, payment issue ⚠" — a payment-
+    failure / suspension flag that is materially more sensitive than the already-
+    public membership tier. Returns ``None`` for a non-self lookup so only the
+    caller ever sees their own contract/payment standing (mirrors the self-only,
+    ephemeral /revo_card path).
+    """
+    if not is_self:
+        return None
+    return _format_membership_status_line(status)
+
+
+def _revo_card_client_for_user(
+    user_id: int,
+) -> "revo_perfectgym.PerfectGymClient | None":
+    """Resolve the PerfectGym client for /revo_card — the caller's OWN linked
+    account ONLY. Returns ``None`` when the user hasn't linked.
+
+    !!! CRITICAL SAFETY PROPERTY !!! /revo_card surfaces the physical entry
+    BARCODE (an access credential). This resolver reads ONLY
+    ``db.get_revo_account(user_id)`` and NEVER falls back to the shared
+    ``REVO_USER`` account the way /busy does — falling back would hand one member
+    the *host's* door barcode. Any change here must preserve "own creds only".
+    """
+    row = db.get_revo_account(user_id)
+    if row is None:
+        return None
+    return _perfectgym_client_for_user(row)
+
+
+def _render_card_barcode(number: str) -> "io.BytesIO | None":
+    """Render *number* as a Code128 PNG for /revo_card, or ``None`` if the optional
+    ``python-barcode`` lib is missing (the command then degrades to text).
+
+    Lazily imported (mirrors the optional-dep pattern) so the bot boots without the
+    lib. Code128 is used as the default symbology — the reply carries the "if it
+    doesn't scan, use the Revo app" caveat. NEVER logs *number* (a physical access
+    credential): the failure path logs a bare message with no value.
+    """
+    try:
+        barcode_mod = importlib.import_module("barcode")
+        writer_mod = importlib.import_module("barcode.writer")
+    except Exception:
+        return None
+    try:
+        code = barcode_mod.get("code128", number, writer=writer_mod.ImageWriter())
+        buf = io.BytesIO()
+        code.write(buf)  # PNG via the Pillow-backed ImageWriter
+        buf.seek(0)
+        return buf
+    except Exception:  # pragma: no cover - defensive; render lib edge cases
+        LOG.warning("revo_card: barcode render failed")  # no number in the log
+        return None
+
+
 @bot.tree.command(
     name="busy",
     description="Live Revo occupancy: your club + the busiest gyms right now.",
@@ -8442,47 +8855,41 @@ async def busy_cmd(
     await interaction.response.defer(thinking=True)
     user_id = interaction.user.id
 
-    def _occupancy() -> list["revo_perfectgym.ClubOccupancy"]:
-        """All-clubs live occupancy: shared env account first, then linked creds.
+    def _busy_maps_link(occ: list["revo_perfectgym.ClubOccupancy"], name: str) -> str | None:
+        """Best-effort Google-Maps link for the *named* club (geo enrichment).
 
-        Returns ``[]`` on any failure so the caller can degrade gracefully — a
-        burst of /busy calls shares one fetch via the module TTL cache.
+        Joins the live board to the public club directory (``join_occupancy_to_dir``)
+        so a named club can carry a maps link. The directory is separately cached and
+        the whole thing is wrapped defensively — a directory outage silently yields no
+        link, never breaking /busy.
         """
-        try:
-            clubs = revo_perfectgym.shared_club_occupancy()
-            if clubs:
-                return clubs
-        except revo_perfectgym.PerfectGymUnavailable:
-            pass  # no shared account configured — try the user's own creds
-        except revo_perfectgym.PerfectGymAuthError:
-            LOG.warning("PerfectGym shared login failed for /busy")
-        except Exception:  # pragma: no cover - network
-            LOG.exception("PerfectGym shared occupancy fetch failed")
-
-        row = db.get_revo_account(user_id)
-        if row is not None:
-            try:
-                client = _perfectgym_client_for_user(row)
-                clubs = revo_perfectgym.club_occupancy_with_client(client)
-                if clubs:
-                    return clubs
-            except revo_perfectgym.PerfectGymAuthError:
-                _drop_cached_client(user_id)
-                LOG.warning("PerfectGym per-user login failed for /busy")
-            except Exception:  # pragma: no cover - network
-                LOG.exception("PerfectGym per-user occupancy fetch failed")
-        return []
+        directory = _perfectgym_directory(user_id)
+        if not directory:
+            return None
+        located = {
+            j.occupancy.name.lower(): j
+            for j in revo_perfectgym.join_occupancy_to_dir(occ, directory)
+        }.get(name.lower())
+        return _maps_link(located.lat, located.lng) if located else None
 
     def _do() -> tuple[str, bool]:
         """Build the /busy reply text. Returns ``(message, ephemeral)``."""
-        occ = _occupancy()
+        # Shared env account first, then the caller's linked creds (hoisted so
+        # /revo_clubs reuses the exact same resolution + TTL cache).
+        occ = _perfectgym_occupancy(user_id)
 
         # ---- with a club argument: look that club up in the live board ----
         if club:
             if occ:
                 match = revo_perfectgym.find_club(occ, club)
                 if match:
-                    return _format_busy_club_line(match), False
+                    line = _format_busy_club_line(match)
+                    # Geo enrichment: attach a maps link when the directory has
+                    # coordinates for this club (best-effort, non-fatal).
+                    link = _busy_maps_link(occ, match.name)
+                    if link:
+                        line += f"\n🗺️ [Open in Google Maps]({link})"
+                    return line, False
                 return (
                     f"Couldn't find a Revo club matching **{club}**. Try the "
                     "suburb name, or check the Live Member Counter in the Revo app.",
@@ -8561,6 +8968,78 @@ async def busy_cmd(
 
 
 @bot.tree.command(
+    name="revo_clubs",
+    description="Revo club directory: clubs in your state, or one club's details + nearest gyms.",
+)
+@app_commands.describe(
+    club="Optional club name. Omit to list every club in your home state.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_clubs_cmd(
+    interaction: discord.Interaction,
+    club: str | None = None,
+) -> None:
+    # Public club directory (Geo/GetClubList) — no PII — joined to the live
+    # occupancy board so each club shows its current head-count. No arg lists the
+    # caller's home state; a club name shows that club's address, a Google-Maps
+    # link, state, live count and the nearest 3 other clubs. Mirrors /busy's
+    # gating + shared-vs-linked credential resolution (public data, shared ok).
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not revo_perfectgym.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    user_id = interaction.user.id
+
+    def _do() -> tuple[str, bool]:
+        directory = _perfectgym_directory(user_id)
+        if not directory:
+            return (
+                "Revo's club directory is temporarily unavailable. Try again "
+                "shortly, or check the Revo app.",
+                True,
+            )
+        occupancy = _perfectgym_occupancy(user_id)  # best-effort live counts
+
+        # ---- a named club: detail card + nearest 3 ----
+        if club:
+            entry = _find_dir_entry(directory, club)
+            if entry is None:
+                return (
+                    f"Couldn't find a Revo club matching **{club}**. Try the "
+                    "suburb name, or omit it to list your state's clubs.",
+                    True,
+                )
+            nearest = revo_perfectgym.nearest_clubs(directory, entry.name, limit=3)
+            return _format_revo_club_detail(entry, occupancy, nearest), False
+
+        # ---- no arg: every club in the caller's home state ----
+        landing = _busy_fav_landing(user_id)
+        home_name = landing.fav_club_name if landing else None
+        state = revo_client.state_for_club(home_name) if home_name else None
+        if not state:
+            return (
+                "Couldn't work out your home state. Name a club instead — e.g. "
+                "`/revo_clubs club:Modbury` — or link your account with "
+                "`/revo_link` so I know your home club.",
+                True,
+            )
+        return _format_revo_clubs_state_list(directory, occupancy, state), False
+
+    message, ephemeral = await bot.loop.run_in_executor(None, _do)
+    await interaction.followup.send(message, ephemeral=ephemeral)
+
+
+@bot.tree.command(
     name="help_revo_link",
     description="Public explainer for /revo_link — what it does and how it stores credentials.",
 )
@@ -8593,9 +9072,13 @@ async def help_revo_link_cmd(interaction: discord.Interaction) -> None:
             "• `/revo_streak_compare` — streak leaderboard for all linked members\n"
             "• `/revo_calendar` — your monthly check-in grid\n"
             "• `/revo_calendar_compare` — side-by-side calendar for everyone in the server\n"
+            "• `/revo_card` — privately show **your own** entry barcode "
+            "(always ephemeral — only you ever see it)\n"
+            "• `/seeprofile` — a roster of every linked member's Revo photo\n"
             "• Automatic attendance pings when you tap into your gym "
             "(posted in the configured notify channel)\n"
-            "• Your favourite club is auto-detected from your last visits"
+            "• Your favourite club is auto-detected from your last visits\n"
+            "• You're auto-named in the bot from your Revo first name"
         ),
         inline=False,
     )
@@ -8708,7 +9191,11 @@ async def revo_link_cmd(
         # Cache the freshly-authenticated client.
         with _revo_clients_lock:
             _revo_user_clients[interaction.user.id] = client
-        return (client.member_id, client.membership_level, favorite)
+        # Best-effort: auto-name the member from their PerfectGym first name so
+        # they show up as e.g. "Sean" across the bot. Always overwrites; never
+        # fatal (a failed fetch just leaves any existing nickname in place).
+        first_name = _apply_perfectgym_nickname(interaction.user.id)
+        return (client.member_id, client.membership_level, favorite, first_name)
 
     result = await bot.loop.run_in_executor(None, _do)
     if isinstance(result, str):
@@ -8716,17 +9203,21 @@ async def revo_link_cmd(
             f"Couldn't link your Revo account ({result}).", ephemeral=True,
         )
         return
-    member_id, level, favorite = result
+    member_id, level, favorite, first_name = result
     notify_line = (
         f"\n• Attendance notifications → <#{notify_id}>"
         if notify_id else "\n• No notification channel set — pings disabled."
+    )
+    # Only advertise the auto-nickname when we actually captured a first name.
+    nick_line = (
+        f"\n• You'll show up as **{first_name}** in the bot." if first_name else ""
     )
     await interaction.followup.send(
         "✅ Revo account linked!\n"
         f"• Member id: `{member_id}`\n"
         f"• Membership level: `{level}`\n"
         f"• Favorite club id: `{favorite}`"
-        f"{notify_line}\n\n"
+        f"{notify_line}{nick_line}\n\n"
         "🔐 Your password is stored encrypted. Even so, **consider rotating it** "
         "if you reuse it anywhere else.",
         ephemeral=True,
@@ -9444,6 +9935,21 @@ async def revo_summary_cmd(
                 LOG.warning(
                     "Revo summary: Netpulse membership fetch failed", exc_info=True,
                 )
+            # PerfectGym contract health (Current/Suspended + payment flag) — the
+            # target's OWN linked client, non-sensitive (no barcode/PII). Same
+            # best-effort contract as the Netpulse line above: a PerfectGym outage
+            # or missing dep must never sink the summary.
+            membership_status = None
+            try:
+                if revo_perfectgym.available():
+                    membership_status = (
+                        _perfectgym_client_for_user(row).get_membership_status()
+                    )
+            except Exception:  # pragma: no cover - non-fatal, best effort
+                LOG.warning(
+                    "Revo summary: PerfectGym membership status fetch failed",
+                    exc_info=True,
+                )
             return {
                 "streak": streak,
                 "tickets": avail,
@@ -9451,6 +9957,7 @@ async def revo_summary_cmd(
                 "calendar": calendar,
                 "prize": prize,
                 "membership": membership,
+                "membership_status": membership_status,
             }
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(int(row["user_id"]))
@@ -9506,6 +10013,14 @@ async def revo_summary_cmd(
                 since = ""
         if tier or since:
             lines.insert(1, f"💳 {tier or 'Member'}{since}")
+    # PerfectGym contract status (best-effort; silent when unknown or PG is down).
+    # SELF-ONLY — see _summary_status_line: this reply is public, so a third party's
+    # payment-failure / suspension flag must never be broadcast to the channel.
+    status_line = _summary_status_line(
+        result.get("membership_status"), is_self=(target == interaction.user)
+    )
+    if status_line:
+        lines.insert(1, status_line)
     if prize.get("monthly"):
         lines.append(f"-# 🏆 {prize['monthly']}")
     lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
@@ -9515,6 +10030,197 @@ async def revo_summary_cmd(
         "\n".join(lines),
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+@bot.tree.command(
+    name="revo_card",
+    description="Privately show YOUR Revo entry barcode (ephemeral, your own card only).",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def revo_card_cmd(interaction: discord.Interaction) -> None:
+    # SENSITIVE: this surfaces the caller's physical entry BARCODE (a door-access
+    # credential). Two hard rules enforced here:
+    #   1. EPHEMERAL on *every* path — no one else ever sees the barcode.
+    #   2. OWN creds ONLY (_revo_card_client_for_user reads only the caller's linked
+    #      account, NEVER the shared REVO_USER account — that would leak the host's
+    #      barcode). The barcode is rendered to a PNG and never logged.
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not revo_perfectgym.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    # OWN-only resolution (no shared fallback). Constructing the client does no
+    # network I/O (login is lazy), but resolving it EAGERLY decrypts the stored
+    # credential, which raises RevoUnavailable when the row is undecryptable —
+    # e.g. after a REVO_FERNET_KEY rotation leaves the ciphertext unreadable (the
+    # shared REVO_USER/REVO_PASS are plain env vars, so /busy keeps working and
+    # masks the breakage). That happens BEFORE we've acknowledged the interaction,
+    # so it must not propagate — Discord would show "application did not respond".
+    # Degrade to an ephemeral error the way every other Revo command does.
+    try:
+        client = _revo_card_client_for_user(interaction.user.id)
+    except revo_client.RevoUnavailable:
+        LOG.warning("revo_card: stored credential undecryptable", exc_info=True)
+        await interaction.response.send_message(
+            "Couldn't read your stored Revo credential (it may need re-linking). "
+            "Please run `/revo_link` again.",
+            ephemeral=True,
+        )
+        return
+    if client is None:
+        await interaction.response.send_message(
+            "Link your own account first with `/revo_link` (this shows YOUR "
+            "entry barcode).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    user_id = interaction.user.id
+
+    def _do() -> "dict[str, object] | str":
+        try:
+            number = client.get_card_number()  # SENSITIVE — never logged
+            status = None
+            try:
+                status = client.get_membership_status()
+            except Exception:  # pragma: no cover - non-fatal
+                LOG.warning("revo_card: membership status fetch failed", exc_info=True)
+            return {"number": number, "status": status}
+        except revo_perfectgym.PerfectGymAuthError as exc:
+            _drop_cached_client(user_id)
+            return f"auth-failed: {exc}"
+        except Exception as exc:  # pragma: no cover - network
+            LOG.exception("revo_card fetch failed")  # never logs the number
+            return f"error: {exc}"
+
+    result = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, str):
+        await interaction.followup.send(
+            f"Couldn't fetch your card ({result}).", ephemeral=True,
+        )
+        return
+
+    number = result["number"]
+    status = result["status"]
+    if not number:
+        await interaction.followup.send(
+            "Revo didn't return a card number for your account — check the Revo "
+            "app.",
+            ephemeral=True,
+        )
+        return
+
+    contract = _format_membership_status_line(status)
+    contract_txt = f"\n{contract}" if contract else ""
+    caveat = "\n-# Code128 barcode. If it doesn't scan, use the Revo app."
+
+    png = await bot.loop.run_in_executor(None, _render_card_barcode, number)  # type: ignore[arg-type]
+    if png is not None:
+        await interaction.followup.send(
+            content=(
+                "🎫 **Your Revo entry barcode** — private to you." + contract_txt
+                + caveat
+            ),
+            file=discord.File(png, filename="revo_card.png"),
+            ephemeral=True,
+        )
+    else:
+        # python-barcode not installed → degrade to the number as text. This
+        # reply is ephemeral (only the caller — the barcode's owner — sees it).
+        await interaction.followup.send(
+            content=(
+                f"🎫 **Your Revo entry barcode**: `{number}`" + contract_txt
+                + "\n-# Barcode image unavailable (install `python-barcode`). "
+                "If the number doesn't scan, use the Revo app."
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="seeprofile",
+    description="Roster of every linked member's Revo profile photo + first name.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def seeprofile_cmd(interaction: discord.Interaction) -> None:
+    # Owner-approved: this shows EVERY linked member's Revo photo. Hard rules:
+    #   * Each photo is fetched with THAT member's OWN per-user client
+    #     (_perfectgym_client_for_user) — never the shared REVO_USER account, and
+    #     never one member's client for another member's photo.
+    #   * The signed photo URL is a ~10-min capability URL: we download the bytes
+    #     immediately and attach them as in-memory files (attachment://) so the
+    #     raw URL never lands in message history — and it is NEVER logged.
+    if REVO_DISABLED:
+        await interaction.response.send_message(
+            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+        )
+        return
+    if not revo_perfectgym.available():
+        await interaction.response.send_message(
+            "Revo client unavailable — install the `requests` package.",
+            ephemeral=True,
+        )
+        return
+
+    rows = db.list_revo_accounts()
+    if not rows:
+        await interaction.response.send_message(
+            "Nobody's linked a Revo account yet — run `/revo_link` to be first.",
+            ephemeral=True,
+        )
+        return
+
+    # Slow: N logins + N downloads run in an executor. Public (a shared roster).
+    await interaction.response.defer(thinking=True)
+
+    results, failures = await bot.loop.run_in_executor(
+        None, _seeprofile_gather, rows,
+    )
+
+    if not results:
+        # Every linked member failed to load (bad creds / no photo / download
+        # error) — one friendly message rather than an empty roster.
+        await interaction.followup.send(
+            "Couldn't load any linked members' Revo photos right now — try again "
+            "in a bit."
+        )
+        return
+
+    # Discord caps a message at 10 embeds (and 10 attachments), so paginate the
+    # roster across as many followup messages as it takes.
+    chunk_size = 10
+    chunks = [results[i:i + chunk_size] for i in range(0, len(results), chunk_size)]
+    note = ""
+    if failures:
+        note = (
+            f"-# (couldn't load {failures} "
+            f"member{'s' if failures != 1 else ''})"
+        )
+    for idx, chunk in enumerate(chunks):
+        embeds: list[discord.Embed] = []
+        files: list[discord.File] = []
+        for uid, first_name, data in chunk:
+            fname = f"revo_{uid}.{_photo_file_ext(data)}"
+            files.append(discord.File(io.BytesIO(data), filename=fname))
+            embed = discord.Embed(
+                title=_seeprofile_display_name(interaction, uid, first_name),
+                colour=EMBED_COLOUR,
+            )
+            embed.set_image(url=f"attachment://{fname}")
+            embeds.append(embed)
+        # The "couldn't load N" note rides on the final message only.
+        content = note if (note and idx == len(chunks) - 1) else None
+        await interaction.followup.send(content=content, embeds=embeds, files=files)
 
 
 def _render_revo_calendar(
@@ -9879,50 +10585,10 @@ def _bot_name(user_id: int, discord_fallback: str) -> str:
     return f"{discord_fallback} ({nick})"
 
 
-@bot.tree.command(
-    name="set_nick",
-    description="Assign a bot-wide friendly nickname to a user (shown in all bot responses).",
-)
-@app_commands.describe(
-    member="The user to nickname.",
-    nickname="Friendly name to display (e.g. Cookie Monster, Sean). Clear it with /remove_nick.",
-)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def set_nick_cmd(
-    interaction: discord.Interaction,
-    member: discord.Member | discord.User,
-    nickname: app_commands.Range[str, 1, 32],
-) -> None:
-    db.set_user_nickname(member.id, nickname, interaction.user.id)
-    await interaction.response.send_message(
-        f"✅ **{member.display_name}** will now appear as **{nickname.strip()}** in bot responses.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(
-    name="remove_nick",
-    description="Remove a bot-wide nickname from a user.",
-)
-@app_commands.describe(member="The user whose nickname to remove.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def remove_nick_cmd(
-    interaction: discord.Interaction,
-    member: discord.Member | discord.User,
-) -> None:
-    removed = db.remove_user_nickname(member.id)
-    if removed:
-        await interaction.response.send_message(
-            f"🗑️ Nickname for **{member.display_name}** removed.",
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            f"**{member.display_name}** doesn't have a custom nickname set.",
-            ephemeral=True,
-        )
+# NOTE: the manual set_nick + remove_nick commands were retired — bot-wide
+# nicknames now auto-populate from the member's PerfectGym first name on
+# /revo_link (see _apply_perfectgym_nickname). The db helpers + _bot_name +
+# _resolve_nickname_target are still used for display + chat targeting.
 
 
 @bot.tree.command(
@@ -9935,7 +10601,9 @@ async def nicks_cmd(interaction: discord.Interaction) -> None:
     rows = db.list_user_nicknames()
     if not rows:
         await interaction.response.send_message(
-            "No nicknames set yet. Use `/set_nick` to add one.", ephemeral=True,
+            "No nicknames set yet — they're filled in automatically when you "
+            "run `/revo_link`.",
+            ephemeral=True,
         )
         return
     lines = ["**Bot-wide nicknames**"]

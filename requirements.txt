@@ -7,6 +7,11 @@ tzdata==2024.1
 # without them; the /busy, /revo_* and /strava_* commands report "unavailable".
 requests==2.32.3
 cryptography==43.0.1
+# Optional — only used by /revo_card to render the member's entry barcode as a
+# PNG. Imported lazily inside the command, so the bot still boots (and /revo_card
+# degrades to showing the number as text) when these aren't installed.
+python-barcode==0.15.1
+pillow==10.4.0
 # aiohttp is already pulled in transitively by discord.py (which requires
 # >=3.7.4,<4). The Strava webhook server (app/strava_web.py) imports it
 # directly, so pin it explicitly.

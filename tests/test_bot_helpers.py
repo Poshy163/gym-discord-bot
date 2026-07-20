@@ -6,9 +6,11 @@ We avoid importing discord runtime state by only touching pure functions.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import os
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -649,3 +651,555 @@ def test_busy_fav_landing_linked_but_empty_falls_back_to_shared(monkeypatch):
 
     landing = bot._busy_fav_landing(4242)
     assert landing is shared
+
+
+# ---- /revo_card credential resolution — OWN creds ONLY, never the shared -----
+# account. This is the command's critical safety property: /revo_card surfaces
+# the caller's physical entry BARCODE, so falling back to the shared REVO_USER
+# account would hand one member the *host's* door barcode.
+
+def _poison_shared_perfectgym(monkeypatch, bot):
+    """Make every shared-account entry point fail the test if it is called."""
+    import pytest as _pytest
+    for name in (
+        "shared_client_from_env",
+        "shared_club_occupancy",
+        "shared_club_list",
+    ):
+        monkeypatch.setattr(
+            bot.revo_perfectgym, name,
+            lambda *a, **k: _pytest.fail(
+                f"/revo_card must NEVER touch the shared account ({name})"
+            ),
+        )
+
+
+def test_revo_card_client_never_uses_shared_account(monkeypatch):
+    """A linked caller resolves to THEIR OWN per-user client — and the shared
+    REVO_USER account is never consulted on any path."""
+    import app.bot as bot
+
+    _poison_shared_perfectgym(monkeypatch, bot)
+    sentinel = object()
+    monkeypatch.setattr(
+        bot.db, "get_revo_account",
+        lambda uid: {"user_id": uid, "email": "me@example.com", "password_enc": "x"},
+    )
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", lambda row: sentinel)
+
+    assert bot._revo_card_client_for_user(4242) is sentinel
+
+
+def test_revo_card_client_refuses_unlinked_user(monkeypatch):
+    """An unlinked caller gets None (→ the command refuses) and the shared account
+    is NOT used as a fallback — even though one may be configured."""
+    import app.bot as bot
+
+    _poison_shared_perfectgym(monkeypatch, bot)
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: None)
+    # Building a per-user client must not even be attempted for an unlinked user.
+    monkeypatch.setattr(
+        bot, "_perfectgym_client_for_user",
+        lambda row: pytest.fail("no per-user client for an unlinked caller"),
+    )
+
+    assert bot._revo_card_client_for_user(999) is None
+
+
+def test_revo_card_acknowledges_when_credential_undecryptable(monkeypatch):
+    """A REVO_FERNET_KEY rotation leaves the stored credential undecryptable, so
+    resolving the per-user client raises RevoUnavailable BEFORE the interaction is
+    deferred. The command must still ACKNOWLEDGE the interaction with an ephemeral
+    error rather than let the exception propagate (which would leave Discord
+    showing 'application did not respond') — and it must never reach defer/network."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot.revo_perfectgym, "available", lambda: True)
+
+    def _boom(_uid):
+        raise bot.revo_client.RevoUnavailable("Stored Revo credential is unreadable.")
+
+    monkeypatch.setattr(bot, "_revo_card_client_for_user", _boom)
+
+    interaction = MagicMock()
+    interaction.user.id = 4242
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+
+    # Regression guard: if the resolution isn't wrapped, this asyncio.run re-raises.
+    asyncio.run(bot.revo_card_cmd.callback(interaction))
+
+    interaction.response.send_message.assert_awaited_once()
+    # Ephemeral (only the caller sees it) and it never deferred / hit the executor.
+    assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+    interaction.response.defer.assert_not_awaited()
+
+
+# ---- /revo_card barcode rendering — degrades without python-barcode ----------
+
+def test_render_card_barcode_none_when_lib_missing(monkeypatch):
+    """When python-barcode can't be imported, the renderer returns None so the
+    command degrades to showing the number as text (bot still works)."""
+    import app.bot as bot
+
+    real_import = bot.importlib.import_module
+
+    def _fake_import(name, *a, **k):
+        if name.startswith("barcode"):
+            raise ImportError("no barcode lib")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(bot.importlib, "import_module", _fake_import)
+    assert bot._render_card_barcode("TEST-BARCODE-0001") is None
+
+
+def test_render_card_barcode_never_logs_the_number(monkeypatch, caplog):
+    """A render failure must log a bare message — NEVER the barcode value (it's a
+    physical access credential)."""
+    import logging as _logging
+    import app.bot as bot
+
+    real_import = bot.importlib.import_module
+
+    class _BoomWriter:
+        pass
+
+    class _FakeBarcode:
+        @staticmethod
+        def get(symbology, number, writer=None):
+            raise RuntimeError("render exploded")
+
+    class _FakeWriterMod:
+        ImageWriter = _BoomWriter
+
+    def _fake_import(name, *a, **k):
+        if name == "barcode":
+            return _FakeBarcode
+        if name == "barcode.writer":
+            return _FakeWriterMod
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(bot.importlib, "import_module", _fake_import)
+    with caplog.at_level(_logging.WARNING):
+        assert bot._render_card_barcode("TEST-BARCODE-0001") is None
+    assert "TEST-BARCODE-0001" not in caplog.text  # number never hits the log
+
+
+# ---- pure formatters for /revo_clubs + the membership status line ------------
+
+def test_maps_link_requires_both_coords():
+    import app.bot as bot
+
+    assert bot._maps_link(None, 1.0) is None
+    assert bot._maps_link(1.0, None) is None
+    link = bot._maps_link(-34.829, 138.692)
+    assert link == "https://www.google.com/maps/search/?api=1&query=-34.829,138.692"
+
+
+def test_format_membership_status_line_cases():
+    import app.bot as bot
+    from app.revo_perfectgym import MembershipStatus as MS
+
+    assert bot._format_membership_status_line(MS("Current", True, True)) == (
+        "💳 Membership: Current"
+    )
+    # payment_ok False → the warning suffix is appended.
+    assert bot._format_membership_status_line(MS("Suspended", False, True)) == (
+        "💳 Membership: Suspended, payment issue ⚠"
+    )
+    # Unknown contract status (or None) → no line at all (degrade silently).
+    assert bot._format_membership_status_line(MS(None, None, None)) is None
+    assert bot._format_membership_status_line(None) is None
+
+
+def test_summary_status_line_is_self_only():
+    """The /revo_summary contract line is SELF-ONLY: it must never surface a third
+    party's payment-failure / suspension flag in the command's PUBLIC reply."""
+    import app.bot as bot
+    from app.revo_perfectgym import MembershipStatus as MS
+
+    suspended = MS("Suspended", False, True)
+    # Looking yourself up → your own contract standing is shown.
+    assert bot._summary_status_line(suspended, is_self=True) == (
+        "💳 Membership: Suspended, payment issue ⚠"
+    )
+    # Looking someone else up → suppressed entirely (no third-party disclosure),
+    # regardless of how bad their standing is.
+    assert bot._summary_status_line(suspended, is_self=False) is None
+    assert bot._summary_status_line(MS("Current", True, True), is_self=False) is None
+
+
+def _dir(name, city, lat, lng, state, id_=None):
+    from app.revo_perfectgym import ClubDirEntry
+    return ClubDirEntry(
+        id=id_, name=name, address=f"{name} Road", city=city,
+        club_number=None, lat=lat, lng=lng, opening_date=None, state=state,
+    )
+
+
+def _occ(name, count, state="SA", suburb=None):
+    from app.revo_perfectgym import ClubOccupancy
+    return ClubOccupancy(
+        name=name, suburb=suburb or name, state=state, count=count, capacity=None,
+    )
+
+
+def test_find_dir_entry_exact_prefix_substring_and_city():
+    import app.bot as bot
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.8, 138.6, "SA"),
+        _dir("Marion", "Oaklands Park", -35.0, 138.5, "SA"),
+    ]
+    assert bot._find_dir_entry(directory, "modbury").name == "Modbury"  # exact
+    assert bot._find_dir_entry(directory, "mar").name == "Marion"       # prefix
+    assert bot._find_dir_entry(directory, "oaklands").name == "Marion"  # city substr
+    assert bot._find_dir_entry(directory, "nope") is None
+    assert bot._find_dir_entry(directory, "") is None
+
+
+def test_format_revo_clubs_state_list_joins_counts_and_scopes_state():
+    import app.bot as bot
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.8, 138.6, "SA"),
+        _dir("Marion", "Oaklands Park", -35.0, 138.5, "SA"),
+        _dir("Cannington", "Cannington", -32.0, 115.9, "WA"),  # other state
+    ]
+    occupancy = [_occ("Modbury", 90), _occ("Marion", 40)]  # Cannington count absent
+
+    out = bot._format_revo_clubs_state_list(directory, occupancy, "sa")
+    assert "Revo clubs in SA" in out
+    # Alphabetical; suburb shown only when it differs from the club name.
+    assert "• **Marion** — Oaklands Park (40 in club now)" in out
+    assert "• **Modbury** (90 in club now)" in out
+    # A WA club is scoped out entirely.
+    assert "Cannington" not in out
+
+
+def test_format_revo_clubs_state_list_count_unavailable_when_board_down():
+    import app.bot as bot
+
+    directory = [_dir("Modbury", "Modbury", -34.8, 138.6, "SA")]
+    out = bot._format_revo_clubs_state_list(directory, [], "SA")  # no occupancy
+    assert "count unavailable" in out
+
+
+def test_format_revo_club_detail_has_address_maps_count_and_nearest():
+    import app.bot as bot
+    from app import revo_perfectgym as pg
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.829, 138.692, "SA", id_=25),
+        _dir("Marion", "Oaklands Park", -35.0, 138.55, "SA", id_=2),
+    ]
+    occupancy = [_occ("Modbury", 90), _occ("Marion", 40)]
+    entry = bot._find_dir_entry(directory, "modbury")
+    nearest = pg.nearest_clubs(directory, entry.name, limit=3)
+
+    out = bot._format_revo_club_detail(entry, occupancy, nearest)
+    assert "**Modbury** — SA" in out
+    assert "google.com/maps" in out
+    assert "**90** in club right now" in out
+    assert "Nearest other clubs" in out
+    # Nearby club carries its distance + live count.
+    assert "**Marion**" in out and "km" in out and "40 in club now" in out
+
+
+def test_format_revo_club_detail_degrades_without_geo_or_count():
+    import app.bot as bot
+
+    # No lat/lng → no maps link; no occupancy → "unavailable".
+    entry = _dir("Ghost", "Ghosttown", None, None, "SA")
+    out = bot._format_revo_club_detail(entry, [], [])
+    assert "google.com/maps" not in out
+    assert "Live count unavailable right now" in out
+
+
+# ---- auto-nickname from the PerfectGym first name on /revo_link --------------
+# Nicknames are no longer set by hand — a successful link overwrites the member's
+# bot-wide nickname with their PerfectGym first name (via their OWN client).
+
+def test_apply_perfectgym_nickname_overwrites_from_first_name(monkeypatch):
+    """The member's PerfectGym first name overwrites their bot-wide nickname, using
+    THEIR OWN per-user client, always overwriting (set_user_nickname is an upsert)."""
+    import app.bot as bot
+
+    row = {"user_id": 4242, "email": "me@example.com", "password_enc": "x"}
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: row)
+
+    fake_client = MagicMock()
+    fake_client.get_first_name.return_value = "Sean"
+    used_rows = []
+
+    def _client_for(r):
+        used_rows.append(r)
+        return fake_client
+
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", _client_for)
+
+    calls = []
+    monkeypatch.setattr(
+        bot.db, "set_user_nickname",
+        lambda uid, nick, set_by: calls.append((uid, nick, set_by)),
+    )
+
+    assert bot._apply_perfectgym_nickname(4242) == "Sean"
+    # Overwrite (unconditional upsert) with the fetched first name.
+    assert calls == [(4242, "Sean", 4242)]
+    # Built the client from THIS member's own row.
+    assert used_rows == [row]
+
+
+def test_apply_perfectgym_nickname_disambiguates_collision(monkeypatch):
+    """When another member already holds the fetched first name, the new member
+    gets a discriminated nickname ('Josh' -> 'Josh 2') instead of silently
+    sharing 'Josh' — a shared nickname would misattribute nickname-targeted chat
+    lifts (via _resolve_nickname_target) to whichever row matches first."""
+    import app.bot as bot
+
+    row = {"user_id": 999, "email": "bob@example.com", "password_enc": "x"}
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: row)
+
+    fake_client = MagicMock()
+    fake_client.get_first_name.return_value = "Josh"
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", lambda r: fake_client)
+
+    # "Josh" already belongs to a DIFFERENT member (111); "Josh 2" is free.
+    def _owner(nick):
+        return 111 if nick.strip().lower() == "josh" else None
+
+    monkeypatch.setattr(bot.db, "nickname_owner", _owner)
+    calls = []
+    monkeypatch.setattr(
+        bot.db, "set_user_nickname",
+        lambda uid, nick, set_by: calls.append((uid, nick, set_by)),
+    )
+
+    assert bot._apply_perfectgym_nickname(999) == "Josh 2"
+    assert calls == [(999, "Josh 2", 999)]
+
+
+def test_unique_nickname_idempotent_for_own_row(monkeypatch):
+    """A member's OWN existing nickname is not a collision, so re-linking keeps the
+    bare first name rather than climbing to 'Josh 2' on every link."""
+    import app.bot as bot
+
+    # The name is held, but by THIS same user — so no discriminator is added.
+    monkeypatch.setattr(bot.db, "nickname_owner", lambda nick: 4242)
+    assert bot._unique_nickname("Josh", 4242) == "Josh"
+
+
+def test_unique_nickname_climbs_past_multiple_collisions(monkeypatch):
+    """The discriminator increments until a free name is found ('Josh', 'Josh 2'
+    both taken -> 'Josh 3')."""
+    import app.bot as bot
+
+    taken = {"josh": 111, "josh 2": 222}
+    monkeypatch.setattr(
+        bot.db, "nickname_owner", lambda nick: taken.get(nick.strip().lower())
+    )
+    assert bot._unique_nickname("Josh", 999) == "Josh 3"
+
+
+def test_apply_perfectgym_nickname_non_fatal_when_fetch_fails(monkeypatch):
+    """A failed first-name fetch leaves any existing nickname untouched and never
+    raises — the link still succeeds."""
+    import app.bot as bot
+
+    monkeypatch.setattr(
+        bot.db, "get_revo_account",
+        lambda uid: {"user_id": 1, "email": "a@b.c", "password_enc": "x"},
+    )
+    boom = MagicMock()
+    boom.get_first_name.side_effect = RuntimeError("login failed")
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", lambda r: boom)
+    monkeypatch.setattr(
+        bot.db, "set_user_nickname",
+        lambda *a, **k: pytest.fail("must not set a nickname when the fetch fails"),
+    )
+    assert bot._apply_perfectgym_nickname(1) is None
+
+
+def test_apply_perfectgym_nickname_skips_blank_name(monkeypatch):
+    """No first name (None/blank) → no nickname write, returns None."""
+    import app.bot as bot
+
+    monkeypatch.setattr(
+        bot.db, "get_revo_account",
+        lambda uid: {"user_id": 1, "email": "a@b.c", "password_enc": "x"},
+    )
+    client = MagicMock()
+    client.get_first_name.return_value = None
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", lambda r: client)
+    monkeypatch.setattr(
+        bot.db, "set_user_nickname",
+        lambda *a, **k: pytest.fail("must not set a nickname with no first name"),
+    )
+    assert bot._apply_perfectgym_nickname(1) is None
+
+
+def test_apply_perfectgym_nickname_no_row_returns_none(monkeypatch):
+    """No linked row → nothing to name from → None (never raises)."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: None)
+    monkeypatch.setattr(
+        bot, "_perfectgym_client_for_user",
+        lambda r: pytest.fail("no client should be built without a row"),
+    )
+    assert bot._apply_perfectgym_nickname(999) is None
+
+
+# ---- /seeprofile roster gather — OWN creds per member, URL never logged ------
+
+def test_seeprofile_gather_uses_each_members_own_client(monkeypatch, caplog):
+    """Each member's photo is fetched with THAT member's OWN per-user client (never
+    the shared account, never one member's client for another), refreshed for a
+    valid signed URL, then downloaded immediately — and the signed URL is not logged."""
+    import app.bot as bot
+
+    rows = [
+        {"user_id": 1, "email": "a@x", "password_enc": "pa"},
+        {"user_id": 2, "email": "b@x", "password_enc": "pb"},
+    ]
+
+    clients_by_uid = {}
+
+    def _client_for(row):
+        uid = int(row["user_id"])
+        c = MagicMock(name=f"client{uid}")
+        c._row = row
+        c.get_photo_url.return_value = (
+            f"https://pgaustoragev2.perfectgymcdn.com/p{uid}.jpg?sig=SECRET-{uid}"
+        )
+        c.get_first_name.return_value = f"Name{uid}"
+        clients_by_uid[uid] = c
+        return c
+
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", _client_for)
+    monkeypatch.setattr(
+        bot.revo_perfectgym, "download_photo",
+        lambda url, timeout=None: b"\xff\xd8\xff" + url.encode()[-1:],
+    )
+    # The shared account must NEVER be consulted by /seeprofile.
+    for name in ("shared_client_from_env", "shared_club_occupancy",
+                 "shared_club_list"):
+        monkeypatch.setattr(
+            bot.revo_perfectgym, name,
+            lambda *a, **k: pytest.fail(f"/seeprofile must not touch shared ({name})"),
+        )
+
+    with caplog.at_level(logging.DEBUG):
+        results, failures = bot._seeprofile_gather(rows)
+
+    assert failures == 0
+    assert [uid for uid, _, _ in results] == [1, 2]
+    assert [name for _, name, _ in results] == ["Name1", "Name2"]
+    # Each photo fetched with a FRESH login (refresh=True) on THAT member's client.
+    clients_by_uid[1].get_photo_url.assert_called_once_with(refresh=True)
+    clients_by_uid[2].get_photo_url.assert_called_once_with(refresh=True)
+    assert clients_by_uid[1]._row is rows[0]
+    assert clients_by_uid[2]._row is rows[1]
+    # Signed capability URLs never reach the logs.
+    assert "SECRET-1" not in caplog.text
+    assert "SECRET-2" not in caplog.text
+    assert "sig=" not in caplog.text
+
+
+def test_seeprofile_gather_skips_failures_without_logging_url(monkeypatch, caplog):
+    """One bad account (login/photo/download error) is counted + skipped so it
+    never sinks the roster — and the URL-bearing error message is never logged."""
+    import app.bot as bot
+
+    rows = [
+        {"user_id": 1, "email": "a", "password_enc": "x"},
+        {"user_id": 2, "email": "b", "password_enc": "x"},
+    ]
+
+    good = MagicMock()
+    good.get_photo_url.return_value = "https://cdn/p.jpg?sig=GOODSIG"
+    good.get_first_name.return_value = "Good"
+
+    def _client_for(row):
+        if int(row["user_id"]) == 1:
+            bad = MagicMock()
+            # A requests HTTPError message embeds the signed URL — must NOT leak.
+            bad.get_photo_url.side_effect = RuntimeError(
+                "404 Client Error for url: https://cdn/p.jpg?sig=LEAKYSIG"
+            )
+            return bad
+        return good
+
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", _client_for)
+    monkeypatch.setattr(
+        bot.revo_perfectgym, "download_photo",
+        lambda url, timeout=None: b"\xff\xd8\xffB",
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        results, failures = bot._seeprofile_gather(rows)
+
+    assert failures == 1
+    assert [uid for uid, _, _ in results] == [2]  # bad member skipped, good kept
+    # The exception message (which embeds the signed URL) must NOT be logged.
+    assert "LEAKYSIG" not in caplog.text
+    assert "sig=" not in caplog.text
+
+
+def test_seeprofile_gather_no_photo_counts_as_failure(monkeypatch):
+    """A member with no PhotoUrl (None) is counted as a failure, not a crash."""
+    import app.bot as bot
+
+    client = MagicMock()
+    client.get_photo_url.return_value = None
+    monkeypatch.setattr(bot, "_perfectgym_client_for_user", lambda r: client)
+    monkeypatch.setattr(
+        bot.revo_perfectgym, "download_photo",
+        lambda *a, **k: pytest.fail("must not download when there is no URL"),
+    )
+    results, failures = bot._seeprofile_gather([{"user_id": 1}])
+    assert results == []
+    assert failures == 1
+
+
+# ---- retired manual nick commands: no command objects, no help references ----
+
+def test_manual_nick_commands_are_removed():
+    """set_nick / remove_nick are fully gone — no module symbol, no tree command."""
+    import app.bot as bot
+
+    assert not hasattr(bot, "set_nick_cmd")
+    assert not hasattr(bot, "remove_nick_cmd")
+    assert bot.bot.tree.get_command("set_nick") is None
+    assert bot.bot.tree.get_command("remove_nick") is None
+    # The kept pieces still exist (display + chat targeting rely on them).
+    assert hasattr(bot, "_bot_name")
+    assert hasattr(bot, "_resolve_nickname_target")
+    assert bot.bot.tree.get_command("nicks") is not None
+
+
+def test_no_dangling_set_remove_nick_strings_in_bot_source():
+    """No user-facing (or any) '/set_nick' / '/remove_nick' string survives in the
+    bot module — help text, command descriptions, and comments all cleaned up."""
+    import app.bot as bot
+
+    src = inspect.getsource(bot)
+    assert "/set_nick" not in src
+    assert "/remove_nick" not in src
+
+
+def test_help_text_has_no_retired_nick_commands():
+    """Belt-and-braces: the rendered /help and /help_revo_link embeds mention the
+    retired commands nowhere."""
+    import app.bot as bot
+
+    # These are app_commands.Command objects — inspect the underlying callback.
+    help_src = (
+        inspect.getsource(bot.help_cmd.callback)
+        + inspect.getsource(bot.help_revo_link_cmd.callback)
+        + inspect.getsource(bot.nicks_cmd.callback)
+    )
+    assert "set_nick" not in help_src
+    assert "remove_nick" not in help_src

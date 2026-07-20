@@ -2911,6 +2911,25 @@ class Database:
             ).fetchone()
             return row["nickname"] if row else None
 
+    def nickname_owner(self, nickname: str) -> int | None:
+        """Return the user_id currently holding ``nickname`` (case-insensitive),
+        or None if nobody does.
+
+        Used before auto-assigning a PerfectGym first name so two members who
+        share a first name don't end up sharing one nickname — the same table
+        drives chat lift attribution (:func:`_resolve_nickname_target`), and a
+        shared nickname would silently log one member's lift under the other.
+        Matched ``COLLATE NOCASE`` to mirror the resolver's case-insensitive
+        prefix match.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id FROM user_nicknames "
+                "WHERE nickname = ? COLLATE NOCASE",
+                (nickname.strip(),),
+            ).fetchone()
+            return int(row["user_id"]) if row else None
+
     def list_user_nicknames(self) -> list[sqlite3.Row]:
         """All rows from ``user_nicknames``, ordered by nickname."""
         with self._conn() as c:

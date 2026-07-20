@@ -590,3 +590,39 @@ def test_backup_to_produces_consistent_copy(db, tmp_path):
     # Re-running overwrites the same file without error (same-day re-backup).
     db.backup_to(dest)
     assert dest.exists()
+
+
+# ---- bot-wide nicknames: upsert overwrite (now populated from PerfectGym) -----
+
+def test_set_user_nickname_overwrites_existing(db):
+    """set_user_nickname is an upsert keyed on user_id, so re-setting overwrites in
+    place (one row per user). This is what /revo_link relies on to always replace a
+    member's nickname with their PerfectGym first name."""
+    db.set_user_nickname(4242, "OldNick", set_by=1)
+    assert db.get_user_nickname(4242) == "OldNick"
+
+    # Re-setting overwrites the value (and the actor), never inserts a duplicate.
+    db.set_user_nickname(4242, "Sean", set_by=4242)
+    assert db.get_user_nickname(4242) == "Sean"
+    rows = [r for r in db.list_user_nicknames() if r["user_id"] == 4242]
+    assert len(rows) == 1
+    assert rows[0]["nickname"] == "Sean"
+    assert rows[0]["set_by"] == 4242
+
+
+def test_set_user_nickname_strips_whitespace(db):
+    """A first name arriving with surrounding whitespace is stored trimmed."""
+    db.set_user_nickname(7, "  Testy  ", set_by=7)
+    assert db.get_user_nickname(7) == "Testy"
+
+
+def test_nickname_owner_case_insensitive_and_absent(db):
+    """nickname_owner resolves a name to its holder case-insensitively (mirroring
+    the chat resolver) and returns None when nobody holds it — this is what the
+    auto-nickname write uses to detect collisions between two members who share a
+    PerfectGym first name."""
+    db.set_user_nickname(4242, "Josh", set_by=4242)
+    assert db.nickname_owner("Josh") == 4242
+    assert db.nickname_owner("  josh  ") == 4242  # case- + whitespace-insensitive
+    assert db.nickname_owner("Joshua") is None  # not a prefix match, exact name only
+    assert db.nickname_owner("Sean") is None

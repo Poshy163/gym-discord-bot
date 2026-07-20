@@ -457,10 +457,180 @@ per-user factory and a ~60s TTL cache (`OCCUPANCY_TTL_SECONDS`) so a burst of
   known (label says e.g. *"in SA"*), else nationwide.
 - **With a club arg:** case-insensitively finds that club/suburb in the board
   and shows its count, appending *"X% of Y capacity"* **only when `UsersLimit`
-  is not null**.
+  is not null**. **Geo enrichment (2026-07):** the named-club line now also joins
+  the board to the club directory (`join_occupancy_to_dir`, §8.2) and appends a
+  **Google-Maps link** when the directory has coordinates for that club —
+  best-effort, so a directory outage silently omits the link and never breaks
+  `/busy`. State scoping continues to use `state_for_club` (unchanged).
 - **Graceful degradation:** prefers the shared `REVO_USER`/`REVO_PASS` account
   (keeps `/busy` working for unlinked users), then the invoking user's linked
   credentials. If PerfectGym is unavailable/login fails it falls back to the web
   rewards-landing fav-club count (§3.5), then to a clear "live counter
   temporarily unavailable" — `/busy` never hard-errors. Still gated by
+  `REVO_DISABLED` + `available()`. The shared-first-then-linked resolution is
+  hoisted to `bot._perfectgym_occupancy(user_id)` / `_perfectgym_directory(user_id)`
+  so `/revo_clubs` reuses the exact same logic + TTL caches.
+
+## 9. Club directory + geo — `Geo/GetClubList` (public, no PII)
+
+The occupancy board (§8) carries **no club-id and no coordinates**. The public
+club directory does — it's the same list the "find a club" map draws from — so
+it's joined to occupancy *by name* for ids/geo. Read-only, no PII.
+
+- **DIRECTORY:** `GET /ClientPortal2/Geo/GetClubList` (CpAuthToken cookie) →
+  `200` JSON array:
+  ```json
+  [
+    {"Id":25,"Name":"Modbury","Address":"976 North East Road",
+     "City":{"Id":"66731","Name":"Modbury","Country":"AU"},
+     "ClubNumber":"404","Latitude":-34.829,"Longitude":138.692,
+     "OpeningDate":"2022-11-01T00:00:00","StateId":3},
+    …
+  ]
+  ```
+  - Fields kept: `Id`, `Name`, `Address`, `City` (nested `{Name}` **or** a bare
+    string — both accepted), `ClubNumber`, `Latitude`/`Longitude` (float, `null`
+    for just-announced clubs → preserved as `None`), `OpeningDate`.
+  - **`StateId` is an opaque internal grouping key** with no public code mapping —
+    it is **intentionally ignored**. The AU state code comes from
+    `revo_client.state_for_club(name)` (the bot's single curated name→state
+    source), consistent with `parse_members_in_clubs`.
+- **Caching:** the directory changes on the order of *months*, so it gets its own
+  cache with a **6h TTL** (`CLUB_DIR_TTL_SECONDS`), separate from the 60s
+  occupancy cache so a directory fetch never evicts (or is evicted by) the
+  fast-moving counts.
+- **Secrets:** none — this endpoint returns no member data. `parse_club_list()`
+  is still the scrubbing boundary (whitelisted public fields only).
+
+Exposed as `PerfectGymClient.get_club_list() -> list[ClubDirEntry(id, name,
+address, city, club_number, lat, lng, opening_date, state)]`, with:
+- `haversine_km(a,b)` — pure great-circle distance (km).
+- `nearest_clubs(entries, origin_name, limit)` — clubs sorted by distance from a
+  named origin (origin + uncoordinated clubs excluded).
+- `join_occupancy_to_dir(occupancy, directory)` — attaches directory
+  `id`/`lat`/`lng`/`opening_date` to each occupancy row by name (unmatched rows
+  kept with `None` geo).
+- module-level `shared_club_list()` / `club_list_with_client(client)` (6h TTL).
+
+### 9.1 `/revo_clubs`
+
+- **No arg:** lists every club in the caller's **home state** (identity via the
+  rewards-landing fav club → `state_for_club`, same as `/busy`), each rendered
+  `Name — Suburb (X in club now)` by joining the live board. Degrades to
+  "count unavailable" per club when the board is down; if the home state can't be
+  determined it asks the user to name a club or link.
+- **Club arg:** that club's **address**, a **Google-Maps link** from lat/lng, its
+  **state**, its **live count**, and the **nearest 3 other clubs** (with distance
+  + each one's live count). Public data → shared account is fine; still gated by
   `REVO_DISABLED` + `available()`.
+- This supersedes the deferred Netpulse `/revo_clubs` idea — there is a **single**
+  clubs command, backed by PerfectGym `Geo/GetClubList`.
+
+## 10. Membership status slice — `User.Member.NotificationsData`
+
+The login response body (the member profile, §8) contains a
+`NotificationsData` object with the contract-health flags the portal dashboard
+shows. We project a **narrow, non-sensitive** slice of it — **no** UserNumber,
+email, photo, ids, or token:
+
+```json
+{"User":{"Member":{"NotificationsData":{
+  "ContractStatus":"Current",
+  "HasInvalidContractPaymentMethod":false,
+  "HasMemberCardAssigned":true,
+  "RemainingDeposit":0.0
+}}}}
+```
+
+- `parse_membership_status(profile) -> MembershipStatus(contract_status,
+  payment_ok, has_card)`. **`payment_ok` inverts** `HasInvalidContractPaymentMethod`
+  (the portal shows the positive), and a **missing** flag stays `None` — "unknown",
+  never a silent "ok". A missing/garbage profile yields all-`None`, never raises.
+- Stashed off the login body at auth time; served by
+  `PerfectGymClient.get_membership_status()`. Safe to log/embed (no identity).
+- **`/revo_summary`** now adds a best-effort line
+  `💳 Membership: {contract_status}` (`, payment issue ⚠` when `payment_ok is
+  False`) from the **target's own** linked client, wrapped like the Netpulse
+  membership line — a PerfectGym outage or missing dep degrades silently and never
+  sinks the rest of the summary.
+
+## 11. `/revo_card` — the member's entry barcode (SENSITIVE)
+
+`User.Member.UserNumber` is the **physical entry BARCODE** — an *access
+credential*, not just an id (possessing it is enough to walk through a Revo
+turnstile). `/revo_card` is the one feature that surfaces it, under hard rules:
+
+- **`get_card_number()` is the SOLE public exposure.** `UserNumber` is stashed on
+  a private `client._user_number`, appears in no dataclass/repr, and is **never
+  logged** (the login log line is email + home_club_id only). The
+  `test_get_card_number_is_the_only_public_barcode_exposure` test dynamically
+  calls every no-arg public method and asserts the barcode leaks from
+  `get_card_number()` and nowhere else.
+- **EPHEMERAL on every path** — `interaction.response`/`followup` are all
+  `ephemeral=True`, so no one but the caller ever sees the barcode.
+- **OWN creds ONLY.** Credential resolution is
+  `bot._revo_card_client_for_user(user_id)`, which reads **only**
+  `db.get_revo_account(user_id)` and **NEVER** falls back to the shared
+  `REVO_USER` account the way `/busy` does — falling back would hand one member
+  the *host's* door barcode. Unlinked → refused with "Link your own account first
+  with `/revo_link`". This is asserted by
+  `test_revo_card_client_never_uses_shared_account` +
+  `test_revo_card_client_refuses_unlinked_user`.
+- **Symbology: Code128** (the default when the exact symbology is undetermined).
+  Rendered to a PNG by a **lazily-imported** `python-barcode` (+ `pillow`) inside
+  the command; if the lib is missing the bot still boots and the command
+  **degrades to showing the number as text**. The reply carries the caveat
+  *"if it doesn't scan, use the Revo app."* `bot._render_card_barcode()` never
+  logs the number, even on a render failure.
+- The contract status (§10) is shown alongside the barcode.
+
+## 12. Member visit history — CONFIRMED UNREACHABLE (do not re-probe)
+
+Per-visit / per-club / per-timestamp check-in history is **not** available to a
+member client on **any** Revo backend:
+- **Web portal (`revocentral`):** every check-in/visit/history route 302s even at
+  L2 — mobile-app-only (§1.1, §2, §5-H).
+- **Netpulse (EGYM):** `check-ins/history` returns `{"checkIns": []}` and
+  occupancy isn't provisioned for Revo's tenant — Revo runs on PerfectGym (§7).
+- **PerfectGym ClientPortal2:** exposes live all-clubs occupancy (§8), the public
+  club directory (§9) and the login-profile membership slice (§10). It does **not**
+  expose a member-facing visit-history endpoint — that data lives behind the
+  **operator API** (staff/kiosk auth), which this project deliberately does not
+  touch. The per-day **streaks calendar** (§3.2.1) remains the finest check-in
+  signal available, and the attendance poller drives off it. **Do not re-probe for
+  a member visit-history endpoint — it is operator-API-only.**
+
+## 13. Profile first name + photo — `/seeprofile` and auto-nicknames
+
+The login profile (`User.Member`) also carries the member's `FirstName` (a
+non-secret display name) and `PhotoUrl`. Both are read off the stashed login body
+by two accessors on `PerfectGymClient`:
+
+- **`get_first_name()`** → the non-secret first name. Safe to display/log.
+- **`get_photo_url(refresh=False)`** → the `PhotoUrl`. This is a **signed, short-
+  lived CDN capability URL** (`https://pgaustoragev2.perfectgymcdn.com/…&sig=…`,
+  valid ~10 min): whoever holds it can fetch the photo with no auth, so it is
+  stashed on a private `client._photo_url`, appears in no dataclass/repr, and is
+  **NEVER logged** (the login log line stays email + home_club_id only). Because
+  the signature expires, pass `refresh=True` to force a fresh login (re-signing the
+  URL) before reading. `download_photo(url)` fetches the bytes with an
+  unauthenticated GET (the signature *is* the credential) — its callers download
+  immediately and catch errors **without** logging the URL-bearing message.
+
+**`/seeprofile`** (owner-approved) renders a roster of *every* linked member's Revo
+photo + first name — one embed per member (image = an attached in-memory file,
+title = the first name, falling back to the guild display name). It enumerates
+`db.list_revo_accounts()` and, for **each** member, builds **that member's OWN**
+per-user client (`_perfectgym_client_for_user` — never the shared account, never
+one member's client for another's photo), refreshes for a valid signed URL, and
+**downloads the bytes immediately** to attach them (the raw signed URL never lands
+in message history). The fan-out (N logins + downloads) runs in an executor;
+per-member failures are skipped with a trailing "(couldn't load N members)" note.
+
+**Auto-nicknames.** Bot-wide nicknames (`db.set_user_nickname`, surfaced via
+`_bot_name` and used for chat targeting by `_resolve_nickname_target`) now
+**auto-populate from the PerfectGym first name on `/revo_link`**: after a
+successful link the bot best-effort fetches `get_first_name()` via the member's new
+per-user client and overwrites their nickname (owner-approved; non-fatal if the
+fetch fails). The old manual `/set_nick` + `/remove_nick` commands were **retired**
+— nicknames are no longer set by hand.
