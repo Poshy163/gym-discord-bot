@@ -11491,14 +11491,35 @@ async def _strava_on_event(payload: dict) -> None:
         await _strava_handle_delete(row, activity_id)
 
 
+def _strava_scrub_secret(text: str, secret: str) -> str:
+    """Redact the Strava client_secret from an error string before it is logged.
+
+    The view/delete subscription endpoints carry client_secret as a *query param*
+    (Strava's API requires it there). We raise only the URL-free response body for
+    HTTP errors, but a *transient* requests failure (ConnectionError/timeout)
+    stringifies the full request URL — query string and all — so the secret can
+    still ride inside such an exception. This is the belt-and-braces net: strip
+    the secret out so no log line (transient retry warning, stale-drop warning)
+    can ever leak it. No-op when the secret is empty to avoid redacting nothing.
+    """
+    return text.replace(secret, "<redacted>") if secret else text
+
+
 async def _strava_ensure_subscription() -> str:
     """Make sure the app's single webhook subscription exists and points at our
     callback. Idempotent — safe to call on startup and on every link.
 
-    Returns a short status string ("exists" / "created:<id>" / "error:…" /
-    "unconfigured"). If a subscription exists with a *different* callback URL
-    (e.g. the public URL changed), it's deleted and recreated, since Strava
-    only allows one per application.
+    Returns a short status string ("exists:<id>" / "created:<id>" /
+    "autherror:<msg>" / "error:<msg>" / "unconfigured"). The two error prefixes
+    are distinct on purpose: "autherror:" is a *permanent* Strava rejection
+    (401/403 — e.g. the API app is Inactive/Forbidden) that retrying cannot fix,
+    while "error:" is a *transient* failure (network, tunnel not up yet) worth a
+    retry. Neither can contain the client_secret — view/delete now raise only the
+    URL-free response body (see strava_client.view_subscriptions).
+
+    If a subscription exists with a *different* callback URL (e.g. the public URL
+    changed), it's deleted and recreated, since Strava only allows one per
+    application.
     """
     global _strava_subscription_id
     cfg = _strava_cfg()
@@ -11514,14 +11535,33 @@ async def _strava_ensure_subscription() -> str:
         for s in subs:
             try:
                 strava_client.delete_subscription(cfg, int(s["id"]))
-            except Exception:  # pragma: no cover - best effort
-                LOG.warning("Strava: failed to drop stale subscription", exc_info=True)
+            except Exception as drop_exc:  # pragma: no cover - best effort
+                # Not exc_info=True: a transient ConnectionError's traceback would
+                # embed the secret-bearing request URL. Log the scrubbed message.
+                LOG.warning(
+                    "Strava: failed to drop stale subscription: %s",
+                    _strava_scrub_secret(str(drop_exc), cfg.client_secret),
+                )
         return f"created:{strava_client.create_subscription(cfg)}"
 
     try:
         result = await bot.loop.run_in_executor(None, _do)
+    except strava_client.StravaAuthError as exc:
+        # Only 401/403 is a *permanent* rejection (e.g. the API app is Inactive —
+        # Standard Tier now needs a Strava subscription): flag it so callers don't
+        # retry and can show the settings/api hint. A 429 (rate limit) or 5xx
+        # (Strava outage) reaches here as a StravaAuthError too, but is transient —
+        # fall through to the retrying "error:" branch. The message is Strava's
+        # URL-free response body; scrub anyway on the transient path for parity.
+        if exc.status_code in (401, 403):
+            return f"autherror:{exc}"
+        return f"error:{_strava_scrub_secret(str(exc), cfg.client_secret)}"
     except Exception as exc:  # pragma: no cover - network
-        return f"error:{exc}"
+        # Transient (network/tunnel-not-up) — safe/worth retrying. A requests
+        # ConnectionError stringifies the full request URL *including* the query
+        # string (which carries client_secret for view/delete); scrub it so the
+        # retry-warning log can never leak the secret.
+        return f"error:{_strava_scrub_secret(str(exc), cfg.client_secret)}"
     # Cache the live subscription id so the webhook handler can reject events
     # from any other (stale/spoofed) subscription.
     if ":" in result:
@@ -11534,7 +11574,13 @@ async def _strava_ensure_subscription() -> str:
 
 async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
     """Ensure the subscription a few seconds after boot, retrying so a tunnel
-    that isn't quite up yet doesn't permanently skip setup."""
+    that isn't quite up yet doesn't permanently skip setup.
+
+    The retry loop exists purely for *transient* failures (the public tunnel not
+    being reachable yet). A *permanent* auth failure ("autherror:", e.g. the
+    Strava app is Inactive/Forbidden) is not retryable, so we bail immediately
+    with one actionable warning rather than hammering the API four times.
+    """
     for attempt in range(4):
         await asyncio.sleep(8 if attempt else 4)
         result = await _strava_ensure_subscription()
@@ -11542,6 +11588,16 @@ async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
             LOG.info("Strava webhook subscription ready (%s)", result)
             return
         if result == "unconfigured":
+            return
+        if result.startswith("autherror:"):
+            # Permanent rejection — retrying won't help. Log the fix, then stop.
+            LOG.warning(
+                "Strava webhook subscription blocked: %s. The Strava API app is "
+                "likely Inactive/Forbidden — Standard Tier now requires a Strava "
+                "subscription for API access; check "
+                "https://www.strava.com/settings/api.",
+                result.split(":", 1)[1],
+            )
             return
         LOG.warning(
             "Strava auto-subscribe attempt %d/4 failed: %s", attempt + 1, result,
@@ -13357,6 +13413,16 @@ async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
         msg = f"ℹ️ Subscription already active: `{result.split(':', 1)[1]}`."
     elif result == "unconfigured":
         msg = "Strava isn't configured (need client id/secret + STRAVA_PUBLIC_URL)."
+    elif result.startswith("autherror:"):
+        # Permanent rejection (app Inactive/Forbidden) — point the owner at the
+        # real fix rather than showing a generic "failed". The message is
+        # Strava's URL-free body, so it can't leak the client_secret.
+        msg = (
+            f"⚠️ Strava rejected the request: {result.split(':', 1)[1]}\n"
+            "The API app is likely **Inactive/Forbidden** — Standard Tier now "
+            "requires a Strava subscription for API access. Check "
+            "<https://www.strava.com/settings/api>."
+        )
     else:
         msg = f"⚠️ Failed: {result}"
     await interaction.followup.send(msg, ephemeral=True)
@@ -13388,7 +13454,12 @@ async def strava_subscription_cmd(interaction: discord.Interaction) -> None:
             subs = strava_client.view_subscriptions(cfg)
         except Exception as exc:  # pragma: no cover - network
             subs = None
-            lines.append(f"• Subscription: ⚠️ check failed ({exc})")
+            # Scrub in case a transient requests error carries the secret-bearing
+            # URL — this string is shown in Discord, so it must be clean too.
+            lines.append(
+                "• Subscription: ⚠️ check failed "
+                f"({_strava_scrub_secret(str(exc), cfg.client_secret)})"
+            )
         if subs is not None:
             if subs:
                 for s in subs:
@@ -13444,7 +13515,9 @@ async def strava_unsubscribe_cmd(
             strava_client.delete_subscription(cfg, subscription_id)
             return f"🗑️ Deleted subscription `{subscription_id}`."
         except Exception as exc:  # pragma: no cover - network
-            return f"⚠️ Failed: {exc}"
+            # Scrub: a transient requests error can embed the secret-bearing URL,
+            # and this string is shown in Discord.
+            return f"⚠️ Failed: {_strava_scrub_secret(str(exc), cfg.client_secret)}"
 
     result = await bot.loop.run_in_executor(None, _do)
     await interaction.followup.send(result, ephemeral=True)

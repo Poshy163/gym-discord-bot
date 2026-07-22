@@ -10,7 +10,9 @@ import os
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
+import asyncio  # noqa: E402
 import json  # noqa: E402
+import logging  # noqa: E402
 
 import app.bot as bot_mod  # noqa: E402
 from app import strava_client  # noqa: E402
@@ -234,3 +236,197 @@ def test_build_calorie_ai_payload_no_previous_week():
         )
     )
     assert payload["previous_week_avg_kcal"] is None
+
+
+# ---------------------------------------------------------------------------
+# Webhook auto-subscribe: permanent (auth) failures must NOT retry, must log an
+# actionable hint, and must NEVER put the client_secret in a log line.
+# ---------------------------------------------------------------------------
+
+_FAKE_SECRET = "FAKE_SECRET_DO_NOT_LOG"
+_INACTIVE_403_BODY = (
+    '{"message":"Forbidden","errors":[{"resource":"Application",'
+    '"field":"Status","code":"Inactive"}]}'
+)
+
+
+async def _no_sleep(*_a, **_k):
+    return None
+
+
+class _SyncLoop:
+    """Runs the executor callable inline so _strava_ensure_subscription's
+    ``await bot.loop.run_in_executor(None, fn)`` works without a real loop."""
+
+    async def run_in_executor(self, _executor, func, *args):
+        return func(*args)
+
+
+def test_autosubscribe_stops_and_hints_on_permanent_403(monkeypatch, caplog):
+    """End-to-end: a real 403 (Inactive app) from view_subscriptions flows through
+    the real ensure + startup path. It must NOT retry (one HTTP call), must log
+    the settings/api hint, and the client_secret must never reach the log."""
+    # Configure Strava so _strava_cfg() is 'configured' with our fake secret.
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", _FAKE_SECRET)
+    monkeypatch.setenv("STRAVA_PUBLIC_URL", "https://bot.example.com/")
+    monkeypatch.delenv("STRAVA_REDIRECT_URI", raising=False)
+    monkeypatch.delenv("STRAVA_WEBHOOK_CALLBACK_URL", raising=False)
+
+    calls = {"get": 0}
+
+    class _Resp:
+        status_code = 403
+        text = _INACTIVE_403_BODY
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, timeout=None):
+            calls["get"] += 1
+            return _Resp()
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop())
+    monkeypatch.setattr(bot_mod.asyncio, "sleep", _no_sleep)
+
+    with caplog.at_level(logging.INFO, logger="gymbot"):
+        asyncio.run(bot_mod._strava_autosubscribe_startup())
+
+    # Permanent failure ⇒ exactly one attempt, no 4x hammering.
+    assert calls["get"] == 1
+    # The actionable hint is logged…
+    assert "https://www.strava.com/settings/api" in caplog.text
+    assert "Inactive" in caplog.text  # Strava's real reason is surfaced
+    # …and the secret NEVER is, anywhere in the captured logs.
+    assert _FAKE_SECRET not in caplog.text
+    assert "client_secret" not in caplog.text
+
+
+def test_ensure_subscription_classifies_autherror(monkeypatch):
+    """_strava_ensure_subscription must tag a StravaAuthError as 'autherror:'
+    (permanent) with the URL-free body — not the generic 'error:' prefix."""
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", _FAKE_SECRET)
+    monkeypatch.setenv("STRAVA_PUBLIC_URL", "https://bot.example.com/")
+
+    class _Resp:
+        status_code = 403
+        text = _INACTIVE_403_BODY
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, timeout=None):
+            return _Resp()
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop())
+
+    result = asyncio.run(bot_mod._strava_ensure_subscription())
+    assert result.startswith("autherror:")
+    assert "Inactive" in result
+    assert _FAKE_SECRET not in result
+    assert "client_secret" not in result
+
+
+def test_ensure_subscription_429_5xx_is_transient_not_autherror(monkeypatch):
+    """A 429/5xx reaches ensure() as a StravaAuthError too, but is transient: it
+    must classify as the retrying 'error:' prefix, NOT permanent 'autherror:',
+    so a rate-limit or Strava outage during startup isn't mistaken for an
+    Inactive app (and still never leaks the secret)."""
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", _FAKE_SECRET)
+    monkeypatch.setenv("STRAVA_PUBLIC_URL", "https://bot.example.com/")
+
+    class _Resp:
+        status_code = 503
+        text = "Service Unavailable"
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, timeout=None):
+            return _Resp()
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop())
+
+    result = asyncio.run(bot_mod._strava_ensure_subscription())
+    assert result.startswith("error:")
+    assert not result.startswith("autherror:")
+    assert _FAKE_SECRET not in result
+
+
+def test_autosubscribe_retries_transient_then_gives_up(monkeypatch, caplog):
+    """A *transient* 'error:' result keeps the original 4x retry loop and the
+    'gave up — check the public callback is reachable' give-up message."""
+    calls = {"n": 0}
+
+    async def _fake_ensure():
+        calls["n"] += 1
+        return "error:tunnel not up yet"
+
+    monkeypatch.setattr(bot_mod, "_strava_ensure_subscription", _fake_ensure)
+    monkeypatch.setattr(bot_mod.asyncio, "sleep", _no_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gymbot"):
+        asyncio.run(bot_mod._strava_autosubscribe_startup())
+
+    assert calls["n"] == 4  # transient ⇒ full retry budget
+    assert "gave up" in caplog.text
+    assert "settings/api" not in caplog.text  # not treated as permanent
+
+
+def test_autosubscribe_no_retry_on_autherror_prefix(monkeypatch, caplog):
+    """Unit-level classifier: an 'autherror:' result short-circuits to one
+    attempt and the actionable hint, without a full retry loop."""
+    calls = {"n": 0}
+
+    async def _fake_ensure():
+        calls["n"] += 1
+        return f"autherror:Subscription view failed (403): {_INACTIVE_403_BODY}"
+
+    monkeypatch.setattr(bot_mod, "_strava_ensure_subscription", _fake_ensure)
+    monkeypatch.setattr(bot_mod.asyncio, "sleep", _no_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gymbot"):
+        asyncio.run(bot_mod._strava_autosubscribe_startup())
+
+    assert calls["n"] == 1
+    assert "settings/api" in caplog.text
+    assert _FAKE_SECRET not in caplog.text
+
+
+def test_autosubscribe_transient_error_never_logs_secret(monkeypatch, caplog):
+    """A transient requests failure stringifies the secret-bearing request URL
+    (query string includes client_secret). The 'error:' path must scrub it so the
+    retry/give-up warnings can never leak the secret — while still retrying."""
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", _FAKE_SECRET)
+    monkeypatch.setenv("STRAVA_PUBLIC_URL", "https://bot.example.com/")
+
+    # Exactly what requests puts in a ConnectionError str(): the full URL with the
+    # secret in the query string. A plain RuntimeError is NOT a StravaAuthError,
+    # so ensure() classifies it as the transient "error:" branch.
+    leaky = (
+        "HTTPSConnectionPool(host='www.strava.com', port=443): Max retries "
+        "exceeded with url: /api/v3/push_subscriptions?client_id=123&"
+        f"client_secret={_FAKE_SECRET} (Caused by ConnectTimeoutError(...))"
+    )
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, timeout=None):
+            raise RuntimeError(leaky)
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop())
+    monkeypatch.setattr(bot_mod.asyncio, "sleep", _no_sleep)
+
+    result = asyncio.run(bot_mod._strava_ensure_subscription())
+    assert result.startswith("error:")            # transient, not autherror
+    assert _FAKE_SECRET not in result             # scrubbed at the source
+    assert "<redacted>" in result
+
+    with caplog.at_level(logging.WARNING, logger="gymbot"):
+        asyncio.run(bot_mod._strava_autosubscribe_startup())
+    assert "gave up" in caplog.text               # still retried to exhaustion
+    assert _FAKE_SECRET not in caplog.text         # and never leaked the secret

@@ -390,3 +390,126 @@ def test_list_strava_accounts(db):
         expires_at=1, scope=None, athlete_name=None,
     )
     assert {r["user_id"] for r in db.list_strava_accounts()} == {1, 2}
+
+
+# ---------------------------------------------------------------------------
+# Subscription management: the client_secret must never reach a log/exception
+# ---------------------------------------------------------------------------
+
+# A synthetic secret that must NEVER surface in any error message. If it ever
+# appears in a raised exception's str(), the leak regression is back.
+_FAKE_SECRET = "FAKE_SECRET_DO_NOT_LOG"
+
+# The real 403 body Strava returns once the API app is Inactive (Standard Tier
+# now requires a paid subscription). This is what callers *should* see.
+_INACTIVE_403_BODY = (
+    '{"message":"Forbidden","errors":[{"resource":"Application",'
+    '"field":"Status","code":"Inactive"}]}'
+)
+
+
+def _sub_cfg():
+    return strava_client.StravaConfig(
+        client_id="123",
+        client_secret=_FAKE_SECRET,
+        redirect_uri="https://bot.example.com/strava/callback",
+        webhook_callback_url="https://bot.example.com/strava/webhook",
+        verify_token="tok",
+    )
+
+
+class _FakeResp:
+    """Minimal stand-in for a requests.Response with a body but no URL."""
+
+    def __init__(self, status_code, text="", json_data=None):
+        self.status_code = status_code
+        self.text = text
+        self._json = json_data
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json")
+        return self._json
+
+    def raise_for_status(self):  # pragma: no cover - must never be called now
+        # requests' real HTTPError stringifies the full request URL (secret and
+        # all). The whole point of the fix is that our client never calls this,
+        # so blow up loudly if a regression reintroduces it.
+        raise AssertionError(
+            "raise_for_status() must not be used — it leaks the secret-bearing URL"
+        )
+
+
+def test_view_subscriptions_raises_body_not_secret_on_403(monkeypatch):
+    """A 403 (Inactive app) must raise StravaAuthError carrying Strava's BODY
+    (the real reason) but never the request URL or the client_secret."""
+    seen = {}
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, timeout=None):
+            seen["url"] = url
+            seen["params"] = params
+            return _FakeResp(403, text=_INACTIVE_403_BODY)
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+
+    with pytest.raises(strava_client.StravaAuthError) as exc_info:
+        strava_client.view_subscriptions(_sub_cfg())
+
+    msg = str(exc_info.value)
+    # The real reason (status + Inactive body) is surfaced…
+    assert "403" in msg
+    assert "Inactive" in msg
+    # …but the secret and the request URL never are.
+    assert _FAKE_SECRET not in msg
+    assert "client_secret" not in msg
+    assert "push_subscriptions" not in msg  # i.e. no URL/query string in message
+    # Sanity: the secret really was sent (as a query param, per Strava's API) —
+    # proving the test would catch a leak, not that the secret was simply absent.
+    assert seen["params"]["client_secret"] == _FAKE_SECRET
+
+
+def test_delete_subscription_error_carries_body_not_secret(monkeypatch):
+    """delete_subscription must also raise only the body, never the URL."""
+
+    class _FakeRequests:
+        @staticmethod
+        def delete(url, params=None, timeout=None):
+            return _FakeResp(403, text=_INACTIVE_403_BODY)
+
+    monkeypatch.setattr(strava_client, "requests", _FakeRequests)
+
+    with pytest.raises(strava_client.StravaAuthError) as exc_info:
+        strava_client.delete_subscription(_sub_cfg(), 999)
+
+    msg = str(exc_info.value)
+    assert "403" in msg
+    assert _FAKE_SECRET not in msg
+    assert "push_subscriptions" not in msg
+
+
+def test_strava_api_base_env_override(monkeypatch):
+    """STRAVA_API_BASE overrides the host (2027 migration is one env var), and
+    SUBSCRIPTION_URL derives from it; a trailing slash is stripped."""
+    import importlib
+
+    monkeypatch.setenv("STRAVA_API_BASE", "https://www.api-v3.strava.com/api/v3/")
+    try:
+        reloaded = importlib.reload(strava_client)
+        assert reloaded.API_BASE == "https://www.api-v3.strava.com/api/v3"
+        assert (
+            reloaded.SUBSCRIPTION_URL
+            == "https://www.api-v3.strava.com/api/v3/push_subscriptions"
+        )
+    finally:
+        # Restore the module to its default-host state so later tests (and other
+        # test modules sharing this module object) see unchanged behaviour.
+        monkeypatch.delenv("STRAVA_API_BASE", raising=False)
+        importlib.reload(strava_client)
+
+    assert strava_client.API_BASE == "https://www.strava.com/api/v3"
+    assert (
+        strava_client.SUBSCRIPTION_URL
+        == "https://www.strava.com/api/v3/push_subscriptions"
+    )

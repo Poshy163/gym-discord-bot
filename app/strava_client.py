@@ -36,7 +36,14 @@ LOG = logging.getLogger("gymbot.strava")
 AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
 TOKEN_URL = "https://www.strava.com/oauth/token"
 DEAUTHORIZE_URL = "https://www.strava.com/oauth/deauthorize"
-API_BASE = "https://www.strava.com/api/v3"
+# Strava is migrating its API host (www.strava.com/api/v3 → www.api-v3.strava.com)
+# over the 2026-06-01 → 2027-06-01 window. Reading the base from an env var means
+# the eventual cut-over is a one-env-var change (set STRAVA_API_BASE) with no code
+# deploy — the default preserves today's behaviour exactly. Everything below
+# (SUBSCRIPTION_URL and the f"{API_BASE}/..." call sites) derives from this, so a
+# single override moves them all. Auth for activity/athlete calls rides in the
+# Authorization: Bearer header, not the host, so the switch is host-only.
+API_BASE = os.getenv("STRAVA_API_BASE", "https://www.strava.com/api/v3").rstrip("/")
 SUBSCRIPTION_URL = f"{API_BASE}/push_subscriptions"
 
 # read = public profile; activity:read = the athlete's activities (incl. the
@@ -57,7 +64,17 @@ class StravaUnavailable(RuntimeError):
 
 
 class StravaAuthError(RuntimeError):
-    """Raised when an OAuth exchange/refresh fails (revoked, bad code, etc.)."""
+    """Raised when an OAuth exchange/refresh fails (revoked, bad code, etc.).
+
+    ``status_code`` carries the HTTP status when the error came from a non-2xx
+    response, so callers can tell a *permanent* rejection (401/403 — e.g. the
+    API app is Inactive) apart from a *transient* one (429 rate-limit / 5xx
+    outage) that is worth retrying. ``None`` when not HTTP-derived.
+    """
+
+    def __init__(self, *args: object, status_code: int | None = None) -> None:
+        super().__init__(*args)
+        self.status_code = status_code
 
 
 # Optional deps — imported lazily so the bot can boot without them.
@@ -564,26 +581,48 @@ def create_subscription(cfg: StravaConfig) -> int:
     )
     if r.status_code not in (200, 201):
         raise StravaAuthError(
-            f"Subscription create failed ({r.status_code}): {r.text[:300]}"
+            f"Subscription create failed ({r.status_code}): {r.text[:300]}",
+            status_code=r.status_code,
         )
     return int(r.json()["id"])
 
 
 def view_subscriptions(cfg: StravaConfig) -> list[dict[str, Any]]:
-    """List existing push subscriptions for this app."""
+    """List existing push subscriptions for this app.
+
+    Strava's view/delete subscription endpoints take the app credentials as GET
+    *query params* (a GET has no body), so ``client_secret`` unavoidably rides in
+    the request URL. That URL must therefore NEVER reach a log line. In
+    particular we do **not** call ``r.raise_for_status()``: its ``HTTPError``
+    stringifies the full request URL (secret and all), and callers log the
+    exception. Instead we mirror :func:`create_subscription` and raise the
+    response *body*, which is both URL-free and carries Strava's real reason —
+    e.g. a 403 with an "Inactive" application status once Standard Tier requires
+    a paid subscription for API access.
+    """
     _require_requests()
     r = requests.get(
         SUBSCRIPTION_URL,
         params={"client_id": cfg.client_id, "client_secret": cfg.client_secret},
         timeout=REQUEST_TIMEOUT,
     )
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise StravaAuthError(
+            f"Subscription view failed ({r.status_code}): {r.text[:300]}",
+            status_code=r.status_code,
+        )
     data = r.json()
     return data if isinstance(data, list) else []
 
 
 def delete_subscription(cfg: StravaConfig, subscription_id: int) -> None:
-    """Delete a push subscription by id."""
+    """Delete a push subscription by id.
+
+    Like :func:`view_subscriptions`, the credentials ride in the query string
+    (secret in the URL), so this deliberately raises only the response *body* on
+    failure — never ``r.raise_for_status()`` — keeping the secret-bearing URL out
+    of any exception message that a caller might log.
+    """
     _require_requests()
     r = requests.delete(
         f"{SUBSCRIPTION_URL}/{subscription_id}",
@@ -592,7 +631,8 @@ def delete_subscription(cfg: StravaConfig, subscription_id: int) -> None:
     )
     if r.status_code not in (200, 204):
         raise StravaAuthError(
-            f"Subscription delete failed ({r.status_code}): {r.text[:200]}"
+            f"Subscription delete failed ({r.status_code}): {r.text[:200]}",
+            status_code=r.status_code,
         )
 
 
