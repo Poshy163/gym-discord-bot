@@ -43,29 +43,32 @@ terminate TLS, so that:
 
 `docker-compose.yml` publishes `8080:8080` for this.
 
-## 3. Configure environment
+## 3. Configure it
 
-See `.env.example` for the full block. Minimum:
+Open the dashboard → **Settings → Strava** and fill in:
 
-```dotenv
-STRAVA_CLIENT_ID=12345
-STRAVA_CLIENT_SECRET=...
-STRAVA_PUBLIC_URL=https://bot.example.com
-STRAVA_FEED_CHANNEL_ID=123456789012345678
-STRAVA_WEBHOOK_VERIFY_TOKEN=some-random-string
-# Reuses REVO_FERNET_KEY if unset:
-STRAVA_FERNET_KEY=<fernet key>
-```
+| Field | Example |
+| --- | --- |
+| Client ID | `12345` |
+| Client secret | from the Strava API page |
+| Public base URL | `https://bot.example.com` |
+| Feed channel | the channel workouts should post to |
+| Webhook verify token | any random string |
 
-Generate a Fernet key:
+Save, then press **Apply & restart bot**.
 
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+You do **not** need to set an encryption key — the bot manages its own and
+stores it at `/data/.secret_key`. (Only set one explicitly if you are migrating
+an existing deployment and already have stored tokens. See
+[CONFIG.md](CONFIG.md#secrets-and-encryption).)
 
-The integration is **idle** (boots fine, does nothing) until `STRAVA_CLIENT_ID`,
-`STRAVA_CLIENT_SECRET` and `STRAVA_PUBLIC_URL` are all set. Set `STRAVA_DISABLED=1`
-to force it off.
+The integration is **idle** (boots fine, does nothing) until the client ID,
+client secret and public URL are all set. There is a **Disable Strava entirely**
+toggle in the same section to force it off.
+
+> Prefer configuring in `docker-compose.yml`? Every field above has an
+> equivalent environment variable, and environment values take priority. See
+> `.env.example`.
 
 ## 4. Webhook subscription (automatic)
 

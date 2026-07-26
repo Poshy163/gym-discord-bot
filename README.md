@@ -422,23 +422,37 @@ the bot in the Discord Developer Portal. Full setup is in
    commands run in DMs, enable the **User Install**
    integration under *Installation* in the Developer Portal (see
    [Direct messages](#direct-messages)).
-4. Clone this repo on your server and create `.env` from the template:
+4. Grab [`docker-compose.yml`](docker-compose.yml) and start it. There is
+   nothing to edit — it carries no configuration:
 
    ```bash
-   cp .env.example .env
-   # edit .env and paste DISCORD_TOKEN
+   docker compose up -d
    ```
 
-5. (Optional) set `GYM_CHANNEL_IDS` to a comma-separated list of channel IDs
-   so the bot only auto-parses the gym channel(s).
-6. Run it:
+5. Open `http://<your-host>:8099` and set a dashboard password.
+6. Go to **Settings → Discord**, paste your bot token, and save. The bot
+   connects within a few seconds.
+7. (Optional) In **Settings → Discord → Auto-scan channels**, list the channel
+   IDs you want parsed for lifts. Leave it blank to watch every channel.
 
-   ```bash
-   docker compose up -d --build
-   ```
+Everything else — reminders, the daily update, Strava, Revo, Hevy, AI features —
+is configured in the same Settings tab. See [docs/CONFIG.md](docs/CONFIG.md) for
+the full model, including how to pin values in compose if you prefer.
+
+> **Set the password promptly.** Between step 4 and step 5 anyone who can reach
+> port 8099 can claim the instance. Keep it on a LAN or behind a VPN/reverse
+> proxy.
 
 Data lives in the `gym-data` Docker volume at `/data/gym.sqlite3` — back it up
-if you care about your PRs.
+if you care about your PRs, **together with `/data/.secret_key`**, which is what
+decrypts your stored Strava/Revo/Hevy credentials.
+
+### Upgrading from a version configured with `.env`
+
+Just pull and restart. Your environment variables keep working and still take
+priority; on first boot they are imported into the Settings tab so you can
+delete them from your compose file whenever you like. Nothing changes until you
+do. Details in [docs/CONFIG.md](docs/CONFIG.md#upgrading-an-existing-deployment).
 
 ## Local development
 
@@ -446,12 +460,17 @@ if you care about your PRs.
 python -m venv .venv
 .venv\Scripts\activate      # PowerShell
 pip install -r requirements.txt
-copy .env.example .env      # edit token
-python -m app.bot
+python -m app.supervisor     # dashboard on :8081, bot starts once a token is set
 ```
 
-Set `GUILD_ID` in `.env` during development so slash commands register
-instantly on your test server instead of waiting for the global rollout.
+`python -m app.bot` still runs the bot directly if you'd rather skip the
+supervisor; it reads `DISCORD_TOKEN` from the environment (or a `.env` file) as
+it always has.
+
+During development set the command scope to `guild` and fill in a development
+guild ID — in the Settings tab, or as `COMMAND_SCOPE`/`GUILD_ID` environment
+variables — so slash commands register instantly on your test server instead of
+waiting for the global rollout.
 
 ## Notes on numbers
 

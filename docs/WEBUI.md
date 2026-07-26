@@ -68,45 +68,56 @@ without the actor — the row reads *"gained role Admin"* and the actor shows as
 
 ## Setup
 
-1. **Pick a password and a port.** In your `.env`:
+The dashboard is always on — it is where the bot is configured, so it cannot
+depend on the bot being configured. There is nothing to set up in advance.
 
-   ```dotenv
-   WEBUI_PASSWORD=choose-a-strong-secret
-   WEBUI_PORT=8081          # default; change if 8081 is taken
-   WEBUI_BIND_HOST=0.0.0.0  # bind address inside the container
-   ```
+1. **Start the container** and open `http://<host>:8099/` (the compose file maps
+   host 8099 to the container's 8081).
 
-   Leaving `WEBUI_PASSWORD` blank keeps the dashboard off. `WEBUI_DISABLED=1` is
-   a hard kill-switch that overrides a set password.
+2. **Set a password.** The first visit shows a setup page; choose a password of
+   at least 12 characters. From then on it's the normal login page.
 
-2. **Enable the Server Members intent.** The dashboard mirrors the guild's
-   members and roles and listens for member/role changes, which requires the
-   privileged **Server Members** intent. Turn it on in the
-   [Discord Developer Portal](https://discord.com/developers/applications) under
-   **Bot → Privileged Gateway Intents → Server Members Intent**. Enabling the
-   dashboard flips the intent on in code automatically, but Discord will refuse
-   the gateway connection if the portal toggle is off.
+   > **The claim window is open until you do this.** Anyone who can reach the
+   > port can set that password and take control of the bot. Keep it on a LAN or
+   > behind a VPN, or set the password immediately after starting the container.
+   > The claim is written to the audit log with the claiming IP.
 
-3. **Expose the port.** With Docker Compose the example already maps
-   `8081:8081`. Match the host port to `WEBUI_PORT` if you changed it.
+3. **Enter your Discord token** under **Settings → Discord**. The bot connects
+   within a few seconds.
 
-4. **Restart the bot.** On boot it logs `Web dashboard enabled on 0.0.0.0:8081`
-   and syncs the current member/role state into the database.
+4. **Turn on member mirroring** (optional) under **Settings → Dashboard →
+   Mirror members & roles**. This populates the Members and Roles tabs and the
+   audit log. It requires the privileged **Server Members** intent — turn it on
+   in the [Discord Developer Portal](https://discord.com/developers/applications)
+   under **Bot → Privileged Gateway Intents → Server Members Intent** *first*,
+   or Discord will refuse the gateway connection and the bot won't start.
 
-5. **Open it.** Browse to `http://<host>:8081/`, enter the password, and you're
-   in. Sessions are cookie-based and last a week; they reset when the bot
-   restarts.
+If you previously ran the dashboard with `WEBUI_PASSWORD` set, that password
+keeps working and there is no setup page — see
+[docs/CONFIG.md](CONFIG.md#upgrading-an-existing-deployment).
+
+Change the password later under **Settings → Dashboard account**. That signs
+out every existing session, including your own on other devices.
+
+Lost it? `docker compose exec gym-bot python -m app.supervisor reset-password`.
 
 ## Security notes
 
 - **Always front it with HTTPS** (a reverse proxy such as Caddy/nginx, or a
   VPN/Tailscale) in any non-trivial deployment. The login password and session
   cookie travel in plaintext over HTTP otherwise, and the dashboard exposes
-  member data.
+  member data. The session cookie is marked `Secure` automatically when the
+  request arrives over HTTPS.
 - The dashboard has a **single shared password**, no per-user accounts. Anyone
-  with the password can view and edit data. Treat it as operator-only.
-- Sessions live in memory, so a restart logs everyone out. There is no rate
-  limiting on the login form — keep the port off the public internet.
+  with the password can view and edit data, **including the Discord token and
+  the admin user list**. Treat it as full control of the bot.
+- The password is stored as a PBKDF2-HMAC-SHA256 hash (600,000 iterations), not
+  in plaintext.
+- The login form is rate limited: five wrong passwords from one IP triggers a
+  15-minute lockout. Note the client IP is taken from `X-Forwarded-For`, so the
+  limit is only as trustworthy as your proxy.
+- Sessions live in memory, so a restart of the *supervisor* logs everyone out.
+  A bot restart does not.
 
 ## How the data stays in sync
 
@@ -121,7 +132,14 @@ without the actor — the row reads *"gained role Admin"* and the actor shows as
 
 ## Turning it off
 
-Set `WEBUI_PASSWORD=` (blank) or `WEBUI_DISABLED=1` and restart. The server
-won't start, and the Server Members intent is no longer requested (unless
-`ENABLE_PRESENCE_TRACKING` also needs it). The mirrored tables are harmless if
-left in place.
+Set `WEBUI_DISABLED=1` in `docker-compose.yml` and restart. This is deliberately
+the **only** way to disable it — it is not editable from the dashboard, because
+turning off the dashboard from inside the dashboard would be a one-way door.
+
+With it off, the bot runs on whatever configuration is already stored plus your
+environment variables, and there is no way to change anything without editing
+compose again. The mirrored tables are harmless if left in place.
+
+To stop mirroring members and roles without disabling the dashboard, turn off
+**Settings → Dashboard → Mirror members & roles**. That also stops the bot
+requesting the Server Members intent (unless presence tracking still needs it).

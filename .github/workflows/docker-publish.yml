@@ -39,11 +39,19 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          # docker-compose.yml now pulls this image instead of building
+          # locally, so it has to cover the hosts people actually run it on.
+          # Without arm64 every Raspberry Pi, Apple Silicon machine and
+          # Graviton VPS would silently fall back to qemu emulation or fail.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

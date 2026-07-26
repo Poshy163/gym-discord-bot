@@ -7,6 +7,11 @@ venv/
 
 # Env / secrets
 .env
+# Encryption key for stored settings and linked Revo/Strava/Hevy credentials.
+# Lives next to the database, so a local run puts it here. Never commit it —
+# and back up the production one alongside /data, or those credentials are
+# unrecoverable. See docs/CONFIG.md.
+.secret_key
 
 # Local data
 *.sqlite3

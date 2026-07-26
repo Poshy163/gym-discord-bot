@@ -8,6 +8,7 @@ leaderboards.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import importlib
@@ -18,6 +19,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import sqlite3
 import tempfile
 import threading
@@ -63,6 +65,8 @@ from .voicetime import summarize_voice
 from . import __version__
 from . import ai_food
 from . import calories
+from . import config as config_mod
+from . import dayspans
 from . import food_lookup
 from . import game_icons
 from . import gemini_client
@@ -72,11 +76,13 @@ from . import protein as protein_mod
 from . import revo_client
 from . import revo_netpulse
 from . import revo_perfectgym
+from . import secretbox
 from . import targets as targets_mod
 from . import strava_client
 from . import strava_web
 from . import tdee as tdee_lib
 from . import webui
+from . import workerlink
 
 # Set of all alias phrases (canonical + aliases) the built-in table already
 # recognises, normalised. Used by /log to decide whether a logged equipment
@@ -93,272 +99,181 @@ load_dotenv()
 LOG = logging.getLogger("gymbot")
 
 
-class _JsonFormatter(logging.Formatter):
-    """Minimal JSON log formatter — chosen over python-json-logger to avoid
-    pulling in a dep just for one optional output mode. Container log shippers
-    (Loki, Datadog, etc.) generally prefer one JSON object per line."""
-
-    def format(self, record: logging.LogRecord) -> str:  # noqa: D401
-        payload = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
-        if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+# Moved to app/config.py so the supervisor can format its logs identically
+# without importing the bot. Re-exported under the old private name.
+_JsonFormatter = config_mod.JsonFormatter
 
 
-_log_handler = logging.StreamHandler()
-if os.getenv("LOG_FORMAT", "text").lower() == "json":
-    _log_handler.setFormatter(_JsonFormatter())
-else:
-    _log_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+# ---------------------------------------------------------------------------
+# Configuration.
+#
+# Every name bound by _bind_config() below is read LIVE from module scope inside
+# the function bodies further down this file, so rebinding one here changes
+# behaviour on the next call with no restart. The exceptions are the gateway
+# intents (folded in once, just below) and the @tasks.loop schedules (fixed at
+# decoration time) — those settings are marked apply="worker" in app/config.py
+# and get a process restart from the supervisor instead.
+#
+# Nothing in this file calls os.getenv any more. Resolution order is always
+# environment > database > code default; see app/config.py for why.
+# ---------------------------------------------------------------------------
+
+# Opened from the environment alone: this is the path used to OPEN the settings
+# store, so it is the one value that genuinely cannot live inside it. Under the
+# supervisor the schema is already migrated, so we must not race it.
+DB_PATH = config_mod.bootstrap_db_path()
+_UNDER_SUPERVISOR = os.getenv(workerlink.ROLE_ENV) == "worker"
+
+db = Database(
+    DB_PATH,
+    migrate=not _UNDER_SUPERVISOR,
+    busy_timeout_ms=5000 if _UNDER_SUPERVISOR else 0,
+)
+
+_box = secretbox.SecretBox.open_at(DB_PATH)
+CFG = config_mod.load(db, decrypt=_box.decryptor())
+config_mod.install_logging(CFG)
+
+
+def _bind_config(cfg: config_mod.Config) -> None:
+    """(Re)bind every config-derived module global from ``cfg``.
+
+    Called once at import, and again by the supervisor's ``reload_config`` RPC
+    when only apply="hot" settings changed.
+
+    Assignments must always REPLACE the object, never mutate one in place.
+    ``_run_startup_backfill`` iterates GYM_CHANNEL_IDS across awaits, and
+    mutating that set mid-iteration would raise RuntimeError, skip the tail of
+    the function and leave ``db.audit_live`` False for the rest of the process.
+    """
+    g = globals()
+
+    # -- Discord ----------------------------------------------------------
+    g["GYM_CHANNEL_IDS"] = set(cfg["GYM_CHANNEL_IDS"])
+    g["DEV_GUILD"] = (
+        discord.Object(id=cfg["GUILD_ID"]) if cfg["GUILD_ID"] else None
     )
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    handlers=[_log_handler],
-    force=True,
-)
+    g["COMMAND_SCOPE"] = cfg["COMMAND_SCOPE"]
+    g["ADMIN_USER_IDS"] = set(cfg["ADMIN_USER_IDS"])
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+    # -- Core parsing -----------------------------------------------------
+    g["MIN_LIFTS_FOR_AUTO"] = cfg["MIN_LIFTS_FOR_AUTO"]
+    g["PARSE_REPLY_MAX_ITEMS"] = cfg["PARSE_REPLY_MAX_ITEMS"]
+    g["BACKFILL_ON_START"] = cfg["BACKFILL_ON_START"]
+    g["BACKFILL_LIMIT"] = cfg["BACKFILL_LIMIT"]
+    g["SHOW_LB"] = cfg["SHOW_LB"]
+    g["MAX_WEIGHT_KG"] = cfg["MAX_WEIGHT_KG"]
+
+    # app.targets owns the timezone, but it is imported long before the
+    # database is open, so it can only see the environment on its own. Push the
+    # resolved value in first — otherwise a timezone set in the dashboard would
+    # be silently ignored — then re-export the names this file uses.
+    targets_mod.configure(cfg["DISPLAY_TIMEZONE"])
+    g["DISPLAY_TZ"] = targets_mod.DISPLAY_TZ
+    g["_tz_name"] = targets_mod.TZ_NAME
+
+    # -- Weekly reminder --------------------------------------------------
+    g["REMINDER_CHANNEL_ID"] = cfg["REMINDER_CHANNEL_ID"]
+    g["REMINDER_WEEKDAY"] = cfg["REMINDER_WEEKDAY"]
+    g["REMINDER_HOUR"] = cfg["REMINDER_HOUR"]
+    g["REMINDER_MINUTE"] = cfg["REMINDER_MINUTE"]
+    g["REMINDER_ROLE_ID"] = cfg["REMINDER_ROLE_ID"]
+
+    # -- Bodyweight reminder ----------------------------------------------
+    g["BODYWEIGHT_REMINDER_CHANNEL_ID"] = cfg["BODYWEIGHT_REMINDER_CHANNEL_ID"]
+    g["BODYWEIGHT_REMINDER_WEEKDAY"] = cfg["BODYWEIGHT_REMINDER_WEEKDAY"]
+    g["BODYWEIGHT_REMINDER_HOUR"] = cfg["BODYWEIGHT_REMINDER_HOUR"]
+    g["BODYWEIGHT_REMINDER_MINUTE"] = cfg["BODYWEIGHT_REMINDER_MINUTE"]
+    g["BODYWEIGHT_REMINDER_ROLE_ID"] = cfg["BODYWEIGHT_REMINDER_ROLE_ID"]
+
+    # -- Daily update -----------------------------------------------------
+    g["DAILY_UPDATE_CHANNEL_ID"] = cfg["DAILY_UPDATE_CHANNEL_ID"]
+    g["DAILY_UPDATE_HOUR"] = cfg["DAILY_UPDATE_HOUR"]
+    g["DAILY_UPDATE_MINUTE"] = cfg["DAILY_UPDATE_MINUTE"]
+    g["DAILY_UPDATE_POST_EMPTY"] = cfg["DAILY_UPDATE_POST_EMPTY"]
+
+    # -- Weekly report ----------------------------------------------------
+    g["WEEKLY_REPORT_CHANNEL_ID"] = cfg["WEEKLY_REPORT_CHANNEL_ID"]
+    g["WEEKLY_REPORT_WEEKDAY"] = cfg["WEEKLY_REPORT_WEEKDAY"]
+    g["WEEKLY_REPORT_HOUR"] = cfg["WEEKLY_REPORT_HOUR"]
+    g["WEEKLY_REPORT_MINUTE"] = cfg["WEEKLY_REPORT_MINUTE"]
+
+    # -- Backups (the loop itself runs in the supervisor) -----------------
+    g["BACKUP_DIR"] = cfg["BACKUP_DIR"]
+    g["BACKUP_KEEP"] = cfg["BACKUP_KEEP"]
+    g["BACKUP_HOUR"] = cfg["BACKUP_HOUR"]
+    g["BACKUP_MINUTE"] = cfg["BACKUP_MINUTE"]
+
+    # -- Feature toggles --------------------------------------------------
+    g["ENABLE_PRESENCE_TRACKING"] = cfg["ENABLE_PRESENCE_TRACKING"]
+    g["ENABLE_MESSAGE_LOGGING"] = cfg["ENABLE_MESSAGE_LOGGING"]
+    g["ENABLE_VOICE_TRACKING"] = cfg["ENABLE_VOICE_TRACKING"]
+    g["ENABLE_MEDIA_DOWNLOAD"] = cfg["ENABLE_MEDIA_DOWNLOAD"]
+    g["AUTO_UNTIMEOUT"] = cfg["AUTO_UNTIMEOUT"]
+    # Renamed from the old dashboard-enabled flag: the dashboard now always
+    # exists, so "is there a dashboard" would be permanently true — and this
+    # flag is what requests the PRIVILEGED Server Members intent, which Discord
+    # refuses for anyone who has not enabled it in the Developer Portal. See
+    # settings_service.seed_from_env_once for how existing deployments carry
+    # their current value across the upgrade.
+    g["ENABLE_MEMBER_MIRROR"] = cfg["ENABLE_MEMBER_MIRROR"]
+
+    # -- Message logging & media ------------------------------------------
+    g["MESSAGE_LOG_BACKFILL_DAYS"] = cfg["MESSAGE_LOG_BACKFILL_DAYS"]
+    g["MEDIA_MAX_MB"] = cfg["MEDIA_MAX_MB"]
+    g["MEDIA_DIR"] = cfg["MEDIA_DIR"]
+
+    # -- Game icons -------------------------------------------------------
+    g["GAME_ICONS_CACHE"] = cfg["GAME_ICONS_CACHE"]
+    g["GAME_ICONS_REFRESH_DAYS"] = cfg["GAME_ICONS_REFRESH_DAYS"]
+
+    # -- Dashboard (bind host/port belong to the supervisor) --------------
+    g["WEBUI_PASSWORD"] = cfg["WEBUI_PASSWORD"]
+    g["WEBUI_DISABLED"] = cfg["WEBUI_DISABLED"]
+    g["WEBUI_BIND_HOST"] = cfg["WEBUI_BIND_HOST"]
+    g["WEBUI_PORT"] = cfg["WEBUI_PORT"]
+
+    # -- Revo -------------------------------------------------------------
+    g["REVO_DISABLED"] = cfg["REVO_DISABLED"]
+    g["REVO_POLL_MINUTES"] = cfg["REVO_POLL_MINUTES"]
+    g["REVO_DEFAULT_NOTIFY_CHANNEL_ID"] = cfg["REVO_NOTIFY_CHANNEL_ID"]
+
+    # -- Strava -----------------------------------------------------------
+    g["STRAVA_DISABLED"] = cfg["STRAVA_DISABLED"]
+    g["STRAVA_FEED_CHANNEL_ID"] = cfg["STRAVA_FEED_CHANNEL_ID"]
+    g["STRAVA_BIND_HOST"] = cfg["STRAVA_BIND_HOST"]
+    g["STRAVA_PORT"] = cfg["STRAVA_PORT"]
+    g["STRAVA_MAPBOX_TOKEN"] = cfg["STRAVA_MAPBOX_TOKEN"]
+    g["STRAVA_MAP_STYLE"] = cfg["STRAVA_MAP_STYLE"]
+    g["STRAVA_SPORT_ALLOW"] = set(cfg["STRAVA_SPORT_TYPES"])
+    g["STRAVA_MIN_DISTANCE_M"] = cfg["STRAVA_MIN_DISTANCE_M"]
+    g["STRAVA_MIN_DURATION_S"] = cfg["STRAVA_MIN_DURATION_S"]
+    g["STRAVA_IMPERIAL"] = cfg["STRAVA_IMPERIAL"]
+    g["STRAVA_AUTO_SUBSCRIBE"] = cfg["STRAVA_AUTO_SUBSCRIBE"]
+
+    # -- Hevy -------------------------------------------------------------
+    g["HEVY_DISABLED"] = cfg["HEVY_DISABLED"]
+    g["HEVY_FEED_CHANNEL_ID"] = cfg["HEVY_FEED_CHANNEL_ID"]
+    g["HEVY_POLL_MINUTES"] = cfg["HEVY_POLL_MINUTES"]
+
+
+_bind_config(CFG)
+
+TOKEN = CFG["DISCORD_TOKEN"]
 if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN env var is required")
-
-DB_PATH = os.getenv("DB_PATH", "/data/gym.sqlite3")
-
-# Comma-separated list of channel IDs the bot should auto-scan. Empty = all.
-_ch = os.getenv("GYM_CHANNEL_IDS", "").strip()
-GYM_CHANNEL_IDS: set[int] = {int(x) for x in _ch.split(",") if x.strip().isdigit()}
-
-# Optional guild ID for instant slash-command sync during development.
-_gid = os.getenv("GUILD_ID", "").strip()
-DEV_GUILD: discord.Object | None = (
-    discord.Object(id=int(_gid)) if _gid.isdigit() else None
-)
-
-# Where slash commands get published:
-#   "global" (default) — registered application-wide so EVERY server the bot is
-#                        in gets them. First publish can take up to ~1h to
-#                        propagate through Discord; later updates are near-instant.
-#   "guild"            — registered only to GUILD_ID for instant updates while
-#                        developing. Other servers see no commands in this mode.
-# Most deployments want "global"; "guild" is a dev convenience.
-COMMAND_SCOPE = os.getenv("COMMAND_SCOPE", "global").strip().lower()
-
-# A parsed message must yield at least this many lifts before we auto-store it.
-# Keeps casual chatter out of the DB.
-MIN_LIFTS_FOR_AUTO = int(os.getenv("MIN_LIFTS_FOR_AUTO", "2"))
-
-# Keep parser confirmation replies readable when someone posts a full stats dump.
-# Use 0 to show every parsed lift.
-PARSE_REPLY_MAX_ITEMS = int(os.getenv("PARSE_REPLY_MAX_ITEMS", "15"))
-
-# On startup, scan recent history of every configured gym channel so posts made
-# while the bot was offline (or before it existed) get imported automatically.
-BACKFILL_ON_START = os.getenv("BACKFILL_ON_START", "true").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-# How far back to look per channel on startup. Use 0 for "no limit".
-BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "1000"))
-
-# When true, weights are displayed with a (≈N lb) suffix alongside kg. Helps
-# anyone reading who isn't on metric.
-SHOW_LB = os.getenv("SHOW_LB", "false").lower() in ("1", "true", "yes", "y", "on")
-
-# Guardrail against typos such as "2200kg" becoming a leaderboard PR. Set to
-# 0 to disable if your server genuinely needs to log heavier machine numbers.
-try:
-    MAX_WEIGHT_KG = float(os.getenv("MAX_WEIGHT_KG", "500"))
-except ValueError:
-    MAX_WEIGHT_KG = 500.0
-
-# Discord user IDs allowed to ❌-undo *any* tracked bot reply, run the
-# destructive maintenance commands (/purge, guild-wide/cross-user /rename), and
-# reach other admin surfaces. Comma-separated. Empty by default so a fresh
-# deployment grants nobody implicit admin — set ADMIN_USER_IDS to your own ID.
-_admins = os.getenv("ADMIN_USER_IDS", "").strip()
-ADMIN_USER_IDS: set[int] = {
-    int(x) for x in _admins.split(",") if x.strip().isdigit()
-}
-
-# Timezone used when rendering dates in user-facing messages. Defaults to
-# Australia/Adelaide (the author's crew). Falls back to UTC if zoneinfo isn't
-# available or the name is invalid. Owned by app.targets, which needs it to know
-# when a local Saturday starts; re-exported because most of the bot (and the
-# reminder/backup schedulers) reach for these names.
-DISPLAY_TZ = targets_mod.DISPLAY_TZ
-_tz_name = targets_mod.TZ_NAME
-
-# Weekly reminder: posts a "drop your current bests" nudge on a schedule.
-# REMINDER_CHANNEL_ID is required to enable it. Day/hour default to
-# Wednesday 12:00 local (DISPLAY_TIMEZONE).
-_rid = os.getenv("REMINDER_CHANNEL_ID", "").strip()
-REMINDER_CHANNEL_ID: int | None = int(_rid) if _rid.isdigit() else None
-# Python weekday: Monday=0 ... Sunday=6. Default Wednesday=2.
-REMINDER_WEEKDAY = int(os.getenv("REMINDER_WEEKDAY", "2"))
-REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "12"))
-REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "0"))
-# Optional role ID to ping in the reminder (as @&123). Leave blank for no ping.
-_role = os.getenv("REMINDER_ROLE_ID", "").strip()
-REMINDER_ROLE_ID: int | None = int(_role) if _role.isdigit() else None
-
-# Weekly bodyweight check-in reminder. Defaults to Monday 07:30 in the
-# DISPLAY_TIMEZONE so the user can update their bodyweight at the start of
-# the week. If BODYWEIGHT_REMINDER_CHANNEL_ID is blank, falls back to
-# REMINDER_CHANNEL_ID so a single channel setting covers both reminders.
-_bw_rid = os.getenv("BODYWEIGHT_REMINDER_CHANNEL_ID", "").strip()
-BODYWEIGHT_REMINDER_CHANNEL_ID: int | None = (
-    int(_bw_rid) if _bw_rid.isdigit() else REMINDER_CHANNEL_ID
-)
-BODYWEIGHT_REMINDER_WEEKDAY = int(os.getenv("BODYWEIGHT_REMINDER_WEEKDAY", "0"))
-BODYWEIGHT_REMINDER_HOUR = int(os.getenv("BODYWEIGHT_REMINDER_HOUR", "7"))
-BODYWEIGHT_REMINDER_MINUTE = int(os.getenv("BODYWEIGHT_REMINDER_MINUTE", "30"))
-_bw_role = os.getenv("BODYWEIGHT_REMINDER_ROLE_ID", "").strip()
-BODYWEIGHT_REMINDER_ROLE_ID: int | None = (
-    int(_bw_role) if _bw_role.isdigit() else None
-)
-
-# Daily update: posts yesterday's server activity summary on a schedule.
-# DAILY_UPDATE_CHANNEL_ID is required to enable it. Defaults to 08:00 local.
-_daily_id = os.getenv("DAILY_UPDATE_CHANNEL_ID", "").strip()
-DAILY_UPDATE_CHANNEL_ID: int | None = (
-    int(_daily_id) if _daily_id.isdigit() else None
-)
-DAILY_UPDATE_HOUR = int(os.getenv("DAILY_UPDATE_HOUR", "8"))
-DAILY_UPDATE_MINUTE = int(os.getenv("DAILY_UPDATE_MINUTE", "0"))
-DAILY_UPDATE_POST_EMPTY = os.getenv("DAILY_UPDATE_POST_EMPTY", "false").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-
-# Weekly report: posts a 7-day gym recap plus an AI calorie summary for every
-# member tracking via /calories. WEEKLY_REPORT_CHANNEL_ID falls back to
-# DAILY_UPDATE_CHANNEL_ID then REMINDER_CHANNEL_ID so existing setups get the
-# report without new config; leave all three blank to disable. Defaults to
-# Sunday 18:00 in DISPLAY_TIMEZONE.
-_weekly_rid = os.getenv("WEEKLY_REPORT_CHANNEL_ID", "").strip()
-WEEKLY_REPORT_CHANNEL_ID: int | None = (
-    int(_weekly_rid) if _weekly_rid.isdigit()
-    else (DAILY_UPDATE_CHANNEL_ID or REMINDER_CHANNEL_ID)
-)
-WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "6"))
-WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
-WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
-
-# Nightly SQLite backups: a consistent snapshot of the whole database written
-# via SQLite's online backup API, named gym-YYYYMMDD.sqlite3. Defaults to a
-# "backups" folder next to the DB (inside the gym-data volume under Docker).
-# BACKUP_KEEP is how many snapshots to retain (oldest pruned); 0 disables the
-# feature entirely. Runs daily at BACKUP_HOUR:BACKUP_MINUTE local time —
-# default 03:30, when nobody is logging.
-BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(
-    os.path.dirname(DB_PATH) or ".", "backups"
-)
-BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "14"))
-BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))
-BACKUP_MINUTE = int(os.getenv("BACKUP_MINUTE", "30"))
+    # NOT a message-carrying SystemExit. The supervisor only spawns us when a
+    # token exists, so reaching here means it was cleared between spawn and
+    # import. Exit 78 (EX_CONFIG) tells the supervisor "waiting for
+    # configuration", which is a quiet idle state rather than a crash loop.
+    raise SystemExit(78)
 
 # Bot "accent" colour for embeds.
 EMBED_COLOUR = discord.Colour.from_str("#f26522")
 
-db = Database(DB_PATH)
-
-# Presence tracking (/track) needs the privileged presences + members
-# intents. Both must also be flipped on in the Discord Developer Portal
-# for the bot user — without those toggles Discord refuses the gateway
-# connection. We default this OFF so the bot still boots for users who
-# don't need /track; opt in by setting ENABLE_PRESENCE_TRACKING=true and
-# enabling the toggles in the portal.
-ENABLE_PRESENCE_TRACKING = os.getenv(
-    "ENABLE_PRESENCE_TRACKING", "false"
-).lower() in ("1", "true", "yes", "y", "on")
-
-# Message logging for the web dashboard (app/webui.py). Captures every member's
-# messages — full content — across all channels, independent of the /track
-# opt-in list, so the dashboard can show a per-member message feed for the whole
-# server. Needs only the message_content intent (enabled below). Default ON;
-# set to a false-y value to disable.
-ENABLE_MESSAGE_LOGGING = os.getenv(
-    "ENABLE_MESSAGE_LOGGING", "true"
-).lower() in ("1", "true", "yes", "y", "on")
-
-# Auto un-timeout: whenever a member is timed out (their "communication disabled
-# until" is set to a future time), the bot immediately clears it again. Needs the
-# Moderate Members permission and a role above the target — Discord enforces both,
-# and the bot can never act on members it doesn't outrank or on the guild owner.
-# Requires the members intent (forced on below). Default ON; set to a false-y
-# value to disable. Every removal is recorded in the dashboard audit log.
-AUTO_UNTIMEOUT = os.getenv(
-    "AUTO_UNTIMEOUT", "true"
-).lower() in ("1", "true", "yes", "y", "on")
-
-# Where downloaded message media (images, videos, any uploaded file) is stored so
-# it survives Discord's expiring CDN links and message deletion. Defaults to a
-# "media" folder next to the SQLite database. Set MEDIA_DIR to override, or
-# ENABLE_MEDIA_DOWNLOAD=false to keep logging only the (expiring) remote URLs.
-ENABLE_MEDIA_DOWNLOAD = os.getenv(
-    "ENABLE_MEDIA_DOWNLOAD", "true"
-).lower() in ("1", "true", "yes", "y", "on")
-# Attachments larger than this are left as a remote URL rather than downloaded,
-# so a single huge upload can't blow up local disk. 0 means "no cap".
-try:
-    MEDIA_MAX_MB = float(os.getenv("MEDIA_MAX_MB", "50"))
-except ValueError:
-    MEDIA_MAX_MB = 50.0
-MEDIA_DIR = os.getenv("MEDIA_DIR") or os.path.join(
-    os.path.dirname(DB_PATH) or ".", "media"
-)
-
-# Game/activity icon map (app/game_icons.py). Fetched from Discord's public
-# detectable-apps list and cached here so the dashboard's Activity tab can show
-# real art for any game, refreshing weekly. Defaults next to the database; set
-# GAME_ICONS_REFRESH_DAYS=0 to force a refresh on every boot.
-GAME_ICONS_CACHE = os.getenv("GAME_ICONS_CACHE") or os.path.join(
-    os.path.dirname(DB_PATH) or ".", "game_icons.json"
-)
-try:
-    GAME_ICONS_REFRESH_DAYS = float(os.getenv("GAME_ICONS_REFRESH_DAYS", "7"))
-except ValueError:
-    GAME_ICONS_REFRESH_DAYS = 7.0
-# Load the cache (or bundled seed) now — cheap and network-free — so icons work
-# the moment the dashboard serves a request; the live refresh happens on_ready.
+# Load the icon cache (or bundled seed) now — cheap and network-free — so icons
+# work the moment the dashboard serves a request; the live refresh runs in the
+# supervisor.
 game_icons.configure(GAME_ICONS_CACHE)
-
-# How many days of channel history to scan on startup to seed the message log,
-# so the dashboard's activity feed has data the moment the bot comes up rather
-# than only from messages seen live. 0 disables the seed. Re-runs are cheap:
-# logging dedupes on message id and each boot only scans forward of the newest
-# already-logged message.
-try:
-    MESSAGE_LOG_BACKFILL_DAYS = int(os.getenv("MESSAGE_LOG_BACKFILL_DAYS", "30"))
-except ValueError:
-    MESSAGE_LOG_BACKFILL_DAYS = 30
-
-# Voice-channel tracking (app/webui.py "Voice" tab). Records join / leave / move
-# transitions and powers the live "who's in VC" view. Uses only the non-privileged
-# voice_states intent (already enabled below). Default ON; set to a false-y value
-# to disable.
-ENABLE_VOICE_TRACKING = os.getenv(
-    "ENABLE_VOICE_TRACKING", "true"
-).lower() in ("1", "true", "yes", "y", "on")
-
-# Web dashboard (app/webui.py). Enabled only when WEBUI_PASSWORD is set — the
-# dashboard exposes member/role/nutrition data so it must never run without a
-# login secret. It needs the Server Members privileged intent to mirror the
-# guild's members/roles and to receive member/role change events; flip that
-# toggle on in the Discord Developer Portal too.
-WEBUI_PASSWORD = os.getenv("WEBUI_PASSWORD", "").strip()
-WEBUI_DISABLED = os.getenv("WEBUI_DISABLED", "0").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-WEBUI_ENABLED = bool(WEBUI_PASSWORD) and not WEBUI_DISABLED
-WEBUI_BIND_HOST = os.getenv("WEBUI_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
-try:
-    WEBUI_PORT = int(os.getenv("WEBUI_PORT", "8081"))
-except ValueError:
-    WEBUI_PORT = 8081
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -366,7 +281,7 @@ intents.members = False
 if ENABLE_PRESENCE_TRACKING:
     intents.presences = True
     intents.members = True
-if WEBUI_ENABLED:
+if ENABLE_MEMBER_MIRROR:
     # Required to enumerate members/roles and receive on_member_* events.
     intents.members = True
 if AUTO_UNTIMEOUT:
@@ -736,78 +651,38 @@ _BAD_DAY_MSG = (
 )
 
 
-# How far back we scan when computing a logging streak. A run longer than this
-# is rare and still renders (capped at the window); keeps the query cheap.
-_STREAK_WINDOW_DAYS = 60
+# These five moved to app/dayspans.py so the supervisor can compute them from
+# the database without the bot running — the dashboard calls today_window and
+# both streak helpers synchronously, so they can never become async RPC hops.
+# The wrappers below keep every existing call site (and the tests that import
+# these names) working unchanged, and read DISPLAY_TZ live so a timezone change
+# applies on the next call.
+_STREAK_WINDOW_DAYS = dayspans.STREAK_WINDOW_DAYS
 
 
 def _logging_streak(days: set[date], today: date) -> int:
-    """Consecutive local days with an entry, ending today *or* yesterday.
-
-    Anchoring at either keeps the streak "alive" the morning after — it only
-    resets once a whole day passes with nothing logged. Pure + testable.
-    """
-    if today in days:
-        cursor = today
-    elif (today - timedelta(days=1)) in days:
-        cursor = today - timedelta(days=1)
-    else:
-        return 0
-    n = 0
-    while cursor in days:
-        n += 1
-        cursor -= timedelta(days=1)
-    return n
+    """Consecutive local days with an entry, ending today *or* yesterday."""
+    return dayspans.logging_streak(days, today)
 
 
 def _entry_local_days(entries: "list[sqlite3.Row]") -> set[date]:
-    """Set of DISPLAY_TZ calendar dates an entry list touches.
-
-    Buckets by *local* day (not the UTC date prefix) so streaks line up with the
-    user's own calendar — important in +HH:MM zones where a morning meal is the
-    previous UTC day."""
-    out: set[date] = set()
-    for r in entries:
-        try:
-            dt = datetime.fromisoformat(r["logged_at"])
-        except (ValueError, TypeError):
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        out.add(dt.astimezone(DISPLAY_TZ).date())
-    return out
+    """Set of DISPLAY_TZ calendar dates an entry list touches."""
+    return dayspans.entry_local_days(entries, DISPLAY_TZ)
 
 
 def _streak_window_iso() -> tuple[date, str, str]:
     """``(today_local, start_iso, end_iso)`` covering the streak look-back."""
-    today = datetime.now(DISPLAY_TZ).date()
-    start = datetime.combine(
-        today - timedelta(days=_STREAK_WINDOW_DAYS), dtime.min, tzinfo=DISPLAY_TZ,
-    )
-    end = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=DISPLAY_TZ)
-    return (
-        today,
-        start.astimezone(timezone.utc).isoformat(),
-        end.astimezone(timezone.utc).isoformat(),
-    )
+    return dayspans.streak_window(DISPLAY_TZ)
 
 
 def _calorie_streak(user_id: int) -> int:
     """Current consecutive-day calorie-logging streak for ``user_id`` (global)."""
-    today, start_iso, end_iso = _streak_window_iso()
-    days = _entry_local_days(
-        db.calorie_entries_between(0, user_id, start_iso, end_iso)
-    )
-    return _logging_streak(days, today)
+    return dayspans.calorie_streak(db, user_id, DISPLAY_TZ)
 
 
 def _protein_streak(user_id: int) -> int:
     """Current consecutive-day protein-logging streak for ``user_id`` (global)."""
-    today, start_iso, end_iso = _streak_window_iso()
-    days = _entry_local_days(
-        db.protein_entries_between(0, user_id, start_iso, end_iso)
-    )
-    return _logging_streak(days, today)
+    return dayspans.protein_streak(db, user_id, DISPLAY_TZ)
 
 
 def _streak_suffix(streak: int) -> str:
@@ -2428,22 +2303,9 @@ async def _handle_combined_nutrition(
         pass
 
 
-@tasks.loop(hours=24)
-async def game_icons_refresh() -> None:  # pragma: no cover - discord runtime
-    """Refresh the game-icon map from Discord's live list.
-
-    Runs on startup and daily thereafter; the refresh itself no-ops unless the
-    cache is older than GAME_ICONS_REFRESH_DAYS, so the large download happens
-    at most about once a week.
-    """
-    try:
-        await game_icons.refresh(
-            GAME_ICONS_CACHE, max_age_days=GAME_ICONS_REFRESH_DAYS,
-            force=GAME_ICONS_REFRESH_DAYS <= 0,
-        )
-    except Exception:
-        LOG.exception("Game-icon refresh failed")
-
+# The game-icon refresh moved to app/supervisor.py: it has no Discord
+# dependency, and the cache it fills is read by the dashboard, which now
+# outlives this process.
 
 _CMD_SIG_KEY = "command_sync_sig"
 
@@ -2552,18 +2414,13 @@ async def on_ready() -> None:
     if ENABLE_MESSAGE_LOGGING and MESSAGE_LOG_BACKFILL_DAYS > 0:
         bot.loop.create_task(_backfill_message_logs())
 
-    if WEBUI_ENABLED:
+    if ENABLE_MEMBER_MIRROR:
         LOG.info(
-            "Web dashboard ENABLED on port %d (Server Members intent in use). "
+            "Member/role mirroring ENABLED (Server Members intent in use). "
             "Make sure the Server Members intent is toggled on in the Discord "
-            "Developer Portal.",
-            WEBUI_PORT,
+            "Developer Portal."
         )
         bot.loop.create_task(_webui_sync_all_guilds())
-
-    # Keep the dashboard's game-icon map current (downloads only when stale).
-    if not game_icons_refresh.is_running():
-        game_icons_refresh.start()
 
     if REMINDER_CHANNEL_ID and not weekly_reminder.is_running():
         weekly_reminder.start()
@@ -2586,12 +2443,9 @@ async def on_ready() -> None:
         streak_saver_loop.start()
         LOG.info("Streak-saver reminder loop started (15 min cadence)")
 
-    if BACKUP_KEEP > 0 and not db_backup.is_running():
-        db_backup.start()
-        LOG.info(
-            "Nightly DB backup scheduled for %02d:%02d (%s) -> %s (keep %d)",
-            BACKUP_HOUR, BACKUP_MINUTE, _tz_name, BACKUP_DIR, BACKUP_KEEP,
-        )
+    # Nightly backups moved to app/supervisor.py so they keep running even when
+    # this process is stopped, restarting or quarantined — which is exactly
+    # when a good snapshot matters most.
 
     if DAILY_UPDATE_CHANNEL_ID and not daily_update.is_running():
         daily_update.start()
@@ -2859,49 +2713,11 @@ async def _before_streak_saver() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
 
 
-def _backup_time() -> dtime:
-    return _scheduled_time(BACKUP_HOUR, BACKUP_MINUTE)
-
-
-@tasks.loop(time=_backup_time())
-async def db_backup() -> None:
-    """Nightly consistent snapshot of the SQLite DB into BACKUP_DIR.
-
-    Uses the online backup API (safe against the live connection) and prunes
-    to the newest BACKUP_KEEP files. One snapshot per calendar day — re-runs
-    on the same day just overwrite that day's file.
-    """
-    stamp = datetime.now(DISPLAY_TZ).strftime("%Y%m%d")
-    dest = Path(BACKUP_DIR) / f"gym-{stamp}.sqlite3"
-    try:
-        await asyncio.to_thread(db.backup_to, dest)
-    except Exception:
-        LOG.exception("Nightly DB backup failed")
-        return
-    # Confirm the snapshot is actually restorable before we trust it (and before
-    # rotation prunes older good copies). A corrupt snapshot is logged loudly but
-    # kept, so an operator can still inspect it.
-    try:
-        ok, detail = await asyncio.to_thread(db.verify_snapshot, dest)
-    except Exception:
-        LOG.exception("DB backup verification raised: %s", dest)
-    else:
-        if ok:
-            LOG.info("DB backup written and verified: %s", dest)
-        else:
-            LOG.error("DB backup FAILED verification (%s): %s", detail, dest)
-    try:
-        snaps = sorted(Path(BACKUP_DIR).glob("gym-*.sqlite3"))
-        for old in snaps[: max(0, len(snaps) - BACKUP_KEEP)]:
-            old.unlink()
-            LOG.info("Pruned old DB backup: %s", old)
-    except OSError:
-        LOG.exception("Backup rotation failed")
-
-
-@db_backup.before_loop
-async def _before_db_backup() -> None:  # pragma: no cover - discord runtime
-    await bot.wait_until_ready()
+# The nightly backup moved to app/supervisor.py (backup_loop). It only ever
+# needed the database, and running it in the supervisor means snapshots keep
+# being written while this process is stopped, restarting or quarantined.
+# Because the supervisor re-reads config on each pass, the BACKUP_* settings
+# also became changeable without a restart.
 
 
 def _daily_window(days_ago: int = 1) -> tuple[str, str, str]:
@@ -8254,28 +8070,11 @@ alias_add_cmd.autocomplete("equipment")(_equipment_autocomplete)
 # Revo Fitness portal integration. See docs/REVO_PORTAL.md.
 # ---------------------------------------------------------------------------
 
-# Master kill-switch — set REVO_DISABLED=1 to skip every Revo command/poller
-# (useful if the portal blocks our scraper or we hit rate limits).
-REVO_DISABLED = os.getenv("REVO_DISABLED", "0").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-
-# How often to poll linked accounts for new check-ins. We read the per-day
-# streaks calendar (the real attendance signal); 10 minutes keeps the feed
-# feeling "live" while staying at the portal's documented ≥10-min politeness
-# floor (see docs/REVO_PORTAL.md §6). Override with REVO_POLL_MINUTES.
-try:
-    REVO_POLL_MINUTES = max(5, int(os.getenv("REVO_POLL_MINUTES", "10")))
-except ValueError:
-    REVO_POLL_MINUTES = 10
-
-# Optional global default channel for attendance notifications. Each linked
-# account can also pin its own notify_channel_id; this is just the fallback
-# when the user doesn't specify one at link time.
-_revo_ch = os.getenv("REVO_NOTIFY_CHANNEL_ID", "").strip()
-REVO_DEFAULT_NOTIFY_CHANNEL_ID: int | None = (
-    int(_revo_ch) if _revo_ch.isdigit() else None
-)
+# REVO_DISABLED, REVO_POLL_MINUTES and REVO_DEFAULT_NOTIFY_CHANNEL_ID are bound
+# by _bind_config() near the top of this file. REVO_USER, REVO_PASS and
+# REVO_FERNET_KEY stay environment-only: app/revo_client.py reads them directly
+# with os.getenv and is deliberately not touched by the config refactor, so the
+# supervisor exports the resolved values into this process's environment.
 
 # Per-user RevoClient cache so the poller doesn't construct + re-login a
 # fresh session on every cycle.
@@ -9088,8 +8887,8 @@ async def help_revo_link_cmd(interaction: discord.Interaction) -> None:
             "• Your password is encrypted with **Fernet (AES-128-CBC + HMAC)** "
             "before being written to the database — the plaintext never "
             "touches disk.\n"
-            "• Only the bot host (with the `REVO_FERNET_KEY` env var) can "
-            "decrypt it; rotating that key invalidates every stored password.\n"
+            "• Only the bot host (which holds the encryption key) can decrypt "
+            "it; rotating that key invalidates every stored password.\n"
             "• Use `/revo_unlink` any time to wipe your encrypted credentials."
         ),
         inline=False,
@@ -10787,89 +10586,24 @@ async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
 # loop to receive the OAuth redirect and the webhook events; on a new activity
 # we fetch the full details and post an embed to a single shared feed channel.
 
-STRAVA_DISABLED = os.getenv("STRAVA_DISABLED", "0").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-
-# Shared channel every linked athlete's new workouts post into.
-_strava_ch = os.getenv("STRAVA_FEED_CHANNEL_ID", "").strip()
-STRAVA_FEED_CHANNEL_ID: int | None = (
-    int(_strava_ch) if _strava_ch.lstrip("-").isdigit() else None
-)
-
-# Host/port the embedded web server binds to *inside* the container. The
-# externally reachable URL (used in the OAuth redirect + webhook callback) is
-# configured separately via STRAVA_PUBLIC_URL and read inside
-# strava_client.config_from_env() — they differ whenever a reverse proxy or
-# port mapping sits in front of the bot.
-STRAVA_BIND_HOST = os.getenv("STRAVA_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
-try:
-    STRAVA_PORT = int(os.getenv("STRAVA_PORT", "8080"))
-except ValueError:
-    STRAVA_PORT = 8080
+# All STRAVA_* and HEVY_* tunables are bound by _bind_config() near the top of
+# this file. The credential-shaped ones (STRAVA_CLIENT_ID/SECRET,
+# STRAVA_PUBLIC_URL, the redirect/webhook overrides, the verify token, and the
+# Fernet keys) stay environment-only because app/strava_client.py and
+# app/hevy_client.py read them directly with os.getenv; the supervisor exports
+# the resolved values into this process's environment.
 
 STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
-
-# ---------------------------------------------------------------------------
-# Hevy (hevyapp.com) integration. Per-user API key (no OAuth, no public server)
-# — the bot polls each linked member's recent workouts, imports them as lifts
-# and posts a feed embed. Enabled by default when deps + a Fernet key are present
-# and a feed channel is set; HEVY_DISABLED=1 turns it off entirely.
-# ---------------------------------------------------------------------------
-HEVY_DISABLED = os.getenv("HEVY_DISABLED", "0").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-_hevy_ch = os.getenv("HEVY_FEED_CHANNEL_ID", "").strip()
-HEVY_FEED_CHANNEL_ID: int | None = int(_hevy_ch) if _hevy_ch.isdigit() else None
-try:
-    HEVY_POLL_MINUTES = max(1, int(os.getenv("HEVY_POLL_MINUTES", "15")))
-except ValueError:
-    HEVY_POLL_MINUTES = 15
 HEVY_COLOUR = discord.Colour.from_str("#1d2330")  # Hevy's dark brand tone
-
-# Optional Mapbox token. When set, route maps are rendered over a real basemap
-# (streets/terrain) via Mapbox's Static Images API instead of the local
-# bare-line silhouette. Free tier covers far more than a hobby server needs.
-STRAVA_MAPBOX_TOKEN = os.getenv("STRAVA_MAPBOX_TOKEN", "").strip()
-# Mapbox style for route maps. Common picks: outdoors-v12 (trails/terrain),
-# streets-v12 (road map), satellite-streets-v12 (aerial + labels).
-STRAVA_MAP_STYLE = os.getenv("STRAVA_MAP_STYLE", "outdoors-v12").strip() or "outdoors-v12"
-
-# Optional posting filters. STRAVA_SPORT_TYPES is a comma-separated allow-list of
-# Strava sport_type values (e.g. "Run,Ride,WeightTraining"); empty = allow all.
-# Minimums skip trivially short activities (distance only applies to distance
-# sports). All optional — unset/0 disables the respective filter.
-_strava_sports = os.getenv("STRAVA_SPORT_TYPES", "").strip()
-STRAVA_SPORT_ALLOW: set[str] = {
-    s.strip().lower() for s in _strava_sports.split(",") if s.strip()
-}
-try:
-    STRAVA_MIN_DISTANCE_M = float(os.getenv("STRAVA_MIN_DISTANCE_M", "0") or 0)
-except ValueError:
-    STRAVA_MIN_DISTANCE_M = 0.0
-try:
-    STRAVA_MIN_DURATION_S = int(os.getenv("STRAVA_MIN_DURATION_S", "0") or 0)
-except ValueError:
-    STRAVA_MIN_DURATION_S = 0
-
-# Imperial display (miles/feet/°F) for Strava embeds. Defaults to metric.
-STRAVA_IMPERIAL = os.getenv("STRAVA_IMPERIAL", "0").lower() in (
-    "1", "true", "yes", "y", "on",
-)
-
-# Auto-create the webhook push subscription (one per app) on startup and when a
-# user links, so nobody has to run /strava_subscribe by hand. Requires the
-# callback URL to be publicly reachable at the time it runs. Default on.
-STRAVA_AUTO_SUBSCRIBE = os.getenv("STRAVA_AUTO_SUBSCRIBE", "1").lower() in (
-    "1", "true", "yes", "y", "on",
-)
 
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
 _strava_runner = None
 
 # AppRunner handle for the operator web dashboard (app/webui.py).
-_webui_runner = None
+#: AppRunner for the supervisor control socket (app/workerlink.py). Only set
+#: when this process was spawned by the supervisor.
+_rpc_runner = None
 
 # Live webhook subscription id (set once known via ensure/subscribe). The event
 # handler uses it to reject deliveries from any other subscription. None means
@@ -11614,8 +11348,9 @@ async def _start_strava_server() -> None:  # pragma: no cover - discord runtime
     if not _strava_enabled():
         if not STRAVA_DISABLED and strava_client.available() and not _strava_cfg().configured:
             LOG.info(
-                "Strava idle — set STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET and "
-                "STRAVA_PUBLIC_URL to enable workout posting."
+                "Strava idle — open the dashboard's Settings tab and fill in "
+                "the Strava client ID, client secret and public URL to enable "
+                "workout posting."
             )
         return
     cfg = _strava_cfg()
@@ -11644,54 +11379,70 @@ async def _start_strava_server() -> None:  # pragma: no cover - discord runtime
         LOG.exception("Failed to start Strava web server")
 
 
-async def _start_webui_server() -> None:  # pragma: no cover - discord runtime
-    """Start the operator web dashboard (no-op unless WEBUI_PASSWORD is set)."""
-    global _webui_runner
-    if not WEBUI_ENABLED:
-        if WEBUI_PASSWORD == "" and not WEBUI_DISABLED:
-            LOG.info(
-                "Web dashboard idle — set WEBUI_PASSWORD to enable it on port %d.",
-                WEBUI_PORT,
-            )
-        return
-    app = webui.build_app(
-        db=db,
-        password=WEBUI_PASSWORD,
-        resync=_webui_resync_guild,
-        today_window=_today_window,
-        list_channels=_webui_list_channels,
-        invite_user=_webui_invite_user,
-        set_member_role=_webui_set_member_role,
-        member_moderation=_webui_member_moderation,
-        remove_timeout=_webui_remove_timeout,
-        set_auto_untimeout=_webui_set_auto_untimeout,
-        announce_blacklist=_webui_announce_blacklist,
-        voice_snapshot=_webui_voice_snapshot,
-        presence_track=_webui_presence_track,
-        presence_enabled=ENABLE_PRESENCE_TRACKING,
-        calorie_streak=_calorie_streak,
-        protein_streak=_protein_streak,
-        media_dir=MEDIA_DIR if ENABLE_MEDIA_DOWNLOAD else None,
-        display_tz=DISPLAY_TZ,
-    )
-    try:
-        _webui_runner = await webui.start_server(
-            app, WEBUI_BIND_HOST, WEBUI_PORT,
-        )
-        LOG.info("Web dashboard enabled on %s:%d", WEBUI_BIND_HOST, WEBUI_PORT)
-    except Exception:
-        LOG.exception("Failed to start web dashboard server")
+# The operator dashboard used to be started here. It now lives in the
+# supervisor (app/supervisor.py), which serves it whether or not this process
+# is running — that is the whole point of the split, since a dashboard you can
+# only reach once the bot is working cannot be where you go to fix the bot.
+#
+# The _webui_* handlers below are unchanged; they are exposed to the supervisor
+# through RPC_METHODS instead of being passed to build_app directly.
+
+#: Calls the supervisor may make into this process. Everything here needs a
+#: live gateway — anything computable from SQLite alone stays in the supervisor
+#: so the dashboard keeps working while the bot is down.
+RPC_METHODS: dict[str, object] = {}
+
+
+def _register_rpc_methods() -> None:
+    """Populate RPC_METHODS once every handler above has been defined."""
+    RPC_METHODS.update({
+        "resync": _webui_resync_guild,
+        "list_channels": _webui_list_channels,
+        "invite_user": _webui_invite_user,
+        "set_member_role": _webui_set_member_role,
+        "member_moderation": _webui_member_moderation,
+        "remove_timeout": _webui_remove_timeout,
+        "set_auto_untimeout": _webui_set_auto_untimeout,
+        "announce_blacklist": _webui_announce_blacklist,
+        "voice_snapshot": _webui_voice_snapshot,
+        "presence_track": _webui_presence_track,
+        "reload_config": _rpc_reload_config,
+        "status": _rpc_status,
+    })
+
+
+def _rpc_reload_config() -> dict:
+    """Re-read settings and rebind the hot ones without restarting."""
+    _bind_config(config_mod.load(db, decrypt=_box.decryptor()))
+    LOG.info("Configuration reloaded from the dashboard.")
+    return {"ok": True}
+
+
+def _rpc_status() -> dict:
+    return {
+        "ready": bot.is_ready(),
+        "guilds": len(bot.guilds),
+        "latency_ms": round(bot.latency * 1000) if bot.latency else None,
+        "user": str(bot.user) if bot.user else None,
+    }
 
 
 @bot.event
 async def setup_hook() -> None:  # pragma: no cover - discord runtime
-    """Start the auxiliary web servers on the bot's event loop before connecting.
-
-    Each is independently optional: the bot still boots cleanly for users who
-    don't want Strava or the dashboard.
-    """
+    """Start the auxiliary servers on the bot's event loop before connecting."""
     await _start_strava_server()
-    await _start_webui_server()
+    if os.getenv(workerlink.ROLE_ENV) == "worker":
+        sock = os.getenv(workerlink.SOCKET_ENV)
+        if sock and workerlink.unix_sockets_supported():
+            _register_rpc_methods()
+            try:
+                global _rpc_runner
+                _rpc_runner = await workerlink.serve(sock, RPC_METHODS)
+            except Exception:
+                LOG.exception(
+                    "Could not start the control socket — the dashboard's "
+                    "live Discord actions will report the bot as offline."
+                )
 
 
 # Tear the auxiliary web servers down cleanly on shutdown by wrapping
@@ -11700,15 +11451,15 @@ _strava_orig_close = bot.close
 
 
 async def _close_with_strava() -> None:  # pragma: no cover - discord runtime
-    global _strava_runner, _webui_runner
-    for name, runner in (("Strava", _strava_runner), ("dashboard", _webui_runner)):
+    global _strava_runner, _rpc_runner
+    for name, runner in (("Strava", _strava_runner), ("control socket", _rpc_runner)):
         if runner is not None:
             try:
                 await runner.cleanup()
             except Exception:
                 LOG.warning("%s web server cleanup failed", name, exc_info=True)
     _strava_runner = None
-    _webui_runner = None
+    _rpc_runner = None
     await _strava_orig_close()
 
 
@@ -11720,7 +11471,7 @@ bot.close = _close_with_strava  # type: ignore[method-assign]
 #
 # Keeps the members / member_roles / guild_roles / guild_meta tables in step
 # with Discord and writes role/member changes to the audit log. Everything here
-# is gated on WEBUI_ENABLED (which also turns on the Server Members intent), so
+# is gated on ENABLE_MEMBER_MIRROR (which also turns on the Server Members intent), so
 # it's inert for deployments that don't run the dashboard.
 # ===========================================================================
 
@@ -12271,7 +12022,7 @@ async def _webui_presence_track(
 
 @bot.event
 async def on_member_join(member: "discord.Member") -> None:  # pragma: no cover
-    if not WEBUI_ENABLED:
+    if not ENABLE_MEMBER_MIRROR:
         return
     db.upsert_member(
         member.guild.id, member.id, member.name, _member_display(member),
@@ -12292,7 +12043,7 @@ async def on_member_join(member: "discord.Member") -> None:  # pragma: no cover
 
 @bot.event
 async def on_member_remove(member: "discord.Member") -> None:  # pragma: no cover
-    if not WEBUI_ENABLED:
+    if not ENABLE_MEMBER_MIRROR:
         return
     db.set_member_present(member.guild.id, member.id, False)
     db.add_audit(
@@ -12379,7 +12130,7 @@ async def on_member_update(
         await _maybe_auto_untimeout(before, after)
     except Exception:
         LOG.exception("Auto un-timeout handler failed")
-    if not WEBUI_ENABLED:
+    if not ENABLE_MEMBER_MIRROR:
         return
     gid = after.guild.id
     name = _member_display(after)
@@ -12432,7 +12183,7 @@ async def on_audit_log_entry_create(
     real time (needs the bot's View Audit Log permission + the non-privileged
     moderation intent, which is on by default), so we record the actor here.
     """
-    if not WEBUI_ENABLED or entry.guild is None:
+    if not ENABLE_MEMBER_MIRROR or entry.guild is None:
         return
     gid = entry.guild.id
     actor = entry.user
@@ -12519,7 +12270,7 @@ async def on_audit_log_entry_create(
 async def on_user_update(
     before: "discord.User", after: "discord.User",
 ) -> None:  # pragma: no cover - discord runtime
-    if not WEBUI_ENABLED or before.name == after.name:
+    if not ENABLE_MEMBER_MIRROR or before.name == after.name:
         return
     # A username change is global; reflect it in every guild we share.
     for guild in bot.guilds:
@@ -12541,7 +12292,7 @@ async def on_user_update(
 
 @bot.event
 async def on_guild_role_create(role: "discord.Role") -> None:  # pragma: no cover
-    if not WEBUI_ENABLED or role.is_default():
+    if not ENABLE_MEMBER_MIRROR or role.is_default():
         return
     db.upsert_role(
         role.guild.id, role.id, role.name, role.colour.value,
@@ -12555,7 +12306,7 @@ async def on_guild_role_create(role: "discord.Role") -> None:  # pragma: no cove
 
 @bot.event
 async def on_guild_role_delete(role: "discord.Role") -> None:  # pragma: no cover
-    if not WEBUI_ENABLED or role.is_default():
+    if not ENABLE_MEMBER_MIRROR or role.is_default():
         return
     db.delete_role(role.guild.id, role.id)
     db.add_audit(
@@ -12568,7 +12319,7 @@ async def on_guild_role_delete(role: "discord.Role") -> None:  # pragma: no cove
 async def on_guild_role_update(
     before: "discord.Role", after: "discord.Role",
 ) -> None:  # pragma: no cover - discord runtime
-    if not WEBUI_ENABLED or after.is_default():
+    if not ENABLE_MEMBER_MIRROR or after.is_default():
         return
     db.upsert_role(
         after.guild.id, after.id, after.name, after.colour.value,
@@ -12584,7 +12335,7 @@ async def on_guild_role_update(
 
 @bot.event
 async def on_guild_join(guild: "discord.Guild") -> None:  # pragma: no cover
-    if not WEBUI_ENABLED:
+    if not ENABLE_MEMBER_MIRROR:
         return
     _sync_guild_snapshot(guild)
 
@@ -13396,7 +13147,7 @@ async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
     cfg = _strava_cfg()
     if not cfg.configured or not cfg.webhook_callback_url:
         await interaction.response.send_message(
-            "Strava isn't configured (need client id/secret + STRAVA_PUBLIC_URL).",
+            "Strava isn't configured yet — an admin needs to fill in the Strava section of the dashboard Settings tab.",
             ephemeral=True,
         )
         return
@@ -13412,7 +13163,7 @@ async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
     elif result.startswith("exists"):
         msg = f"ℹ️ Subscription already active: `{result.split(':', 1)[1]}`."
     elif result == "unconfigured":
-        msg = "Strava isn't configured (need client id/secret + STRAVA_PUBLIC_URL)."
+        msg = "Strava isn't configured yet — an admin needs to fill in the Strava section of the dashboard Settings tab."
     elif result.startswith("autherror:"):
         # Permanent rejection (app Inactive/Forbidden) — point the owner at the
         # real fix rather than showing a generic "failed". The message is
@@ -16960,8 +16711,59 @@ async def protein_stop_cmd(interaction: discord.Interaction) -> None:
 bot.tree.add_command(protein_group)
 
 
+# Exit codes the supervisor reads to explain a stopped bot in plain English
+# instead of showing an opaque crash loop. Kept in sync with app/supervisor.py.
+EX_INTENT = 76   # a privileged intent is requested but not enabled
+EX_AUTH = 77     # Discord rejected the token
+EX_CONFIG = 78   # nothing to run yet — an idle state, not a failure
+
+
 def main() -> None:
-    bot.run(TOKEN, log_handler=None)
+    """Run the bot, mapping fatal startup problems onto explanatory exit codes.
+
+    Also installs the SIGTERM handler this process has never had. Without it,
+    `docker stop` (and every supervisor-initiated restart) waited out the grace
+    period and then SIGKILLed, skipping the Strava/RPC runner cleanup and the
+    database close, and leaving WAL recovery to the next open.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _terminate() -> None:
+        # bot.close is monkeypatched above to also clean up the aiohttp
+        # runners, so scheduling it here is what gives this process a graceful
+        # shutdown path.
+        loop.create_task(bot.close())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, AttributeError):
+            loop.add_signal_handler(sig, _terminate)
+
+    try:
+        loop.run_until_complete(bot.start(TOKEN))
+    except discord.LoginFailure:
+        LOG.error(
+            "Discord rejected the bot token. Paste a fresh one from the "
+            "Developer Portal into the dashboard's Settings tab."
+        )
+        raise SystemExit(EX_AUTH)
+    except discord.PrivilegedIntentsRequired:
+        LOG.error(
+            "Discord refused the gateway: this bot requests a privileged "
+            "intent that is not enabled for the application. Open "
+            "https://discord.com/developers/applications -> your app -> Bot -> "
+            "Privileged Gateway Intents and turn on the ones named above, or "
+            "turn off Presence tracking / Mirror members in the dashboard."
+        )
+        raise SystemExit(EX_INTENT)
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        with contextlib.suppress(Exception):
+            db.close()
+        loop.close()
 
 
 if __name__ == "__main__":

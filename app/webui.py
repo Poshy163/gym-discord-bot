@@ -41,13 +41,14 @@ GET  /healthz          Liveness probe (no auth).
 from __future__ import annotations
 
 import hmac
+import html
 import json
 import logging
 import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
@@ -95,6 +96,48 @@ PresenceTrackHandler = Callable[[int, int, bool, str], Awaitable[dict]]
 # reuses the bot's timezone-correct streak logic; None hides the streak chips.
 StreakHandler = Callable[[int], int]
 
+# Injected by app/supervisor.py. Typed loosely on purpose: app/webui.py must
+# not import app.settings_service or app.supervisor, or the module could no
+# longer be built in isolation by the tests.
+AuthProvider = Any        # app.settings_service.DbAuth
+SettingsProvider = Any    # app.settings_service.SettingsService
+SupervisorProvider = Any  # app.supervisor.WorkerSupervisor
+
+
+def _esc(text: str) -> str:
+    """Escape untrusted text before it goes into one of the HTML templates."""
+    return html.escape(str(text), quote=True)
+
+
+async def _json_body(request: "web.Request") -> dict:
+    """Parse a JSON request body, 400ing on anything that isn't an object."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="invalid json")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="expected a JSON object")
+    return body
+
+
+def _set_session_cookie(request: "web.Request", resp, token: str) -> None:
+    """Set the session cookie, adding Secure only when the request arrived
+    over HTTPS.
+
+    Setting Secure unconditionally would break every plain-HTTP LAN deployment
+    (the cookie would be set and never sent back), so it keys off the proxy's
+    X-Forwarded-Proto and the request scheme instead.
+    """
+    https = (
+        request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+        == "https"
+        or request.scheme == "https"
+    )
+    resp.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="Lax",
+        max_age=SESSION_TTL_SECONDS, secure=https,
+    )
+
 
 class _Sessions:
     """Tiny in-process session store: token -> expiry epoch."""
@@ -121,6 +164,10 @@ class _Sessions:
     def drop(self, token: str | None) -> None:
         if token:
             self._store.pop(token, None)
+
+    def clear(self) -> None:
+        """Invalidate every live session (used when the password is rotated)."""
+        self._store.clear()
 
 
 # Login brute-force guard: after this many wrong passwords from one IP within
@@ -163,7 +210,10 @@ class _LoginThrottle:
 def build_app(
     *,
     db,
-    password: str,
+    password: str = "",
+    auth: "AuthProvider | None" = None,
+    settings: "SettingsProvider | None" = None,
+    supervisor: "SupervisorProvider | None" = None,
     resync: ResyncHandler | None = None,
     today_window: Callable[[], tuple[str, str]] | None = None,
     list_channels: ChannelsHandler | None = None,
@@ -183,8 +233,18 @@ def build_app(
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
-    ``db`` is the shared :class:`app.db.Database`. ``password`` is the shared
-    login secret. ``resync`` (optional) re-pulls member/role state from Discord.
+    ``db`` is the shared :class:`app.db.Database`.
+
+    ``auth`` (optional) is an :class:`app.settings_service.DbAuth` providing the
+    hashed-password and first-boot claim flow. ``settings`` (optional) is an
+    :class:`app.settings_service.SettingsService` powering the Settings tab, and
+    ``supervisor`` (optional) is the process manager behind the bot-status card
+    and the Apply/restart button. When all three are None this behaves exactly
+    as it did before they existed: static ``password`` comparison, no setup
+    mode, no Settings tab — which is the shape every existing test uses.
+
+    ``password`` is the legacy shared login secret; ``auth`` supersedes it.
+    ``resync`` (optional) re-pulls member/role state from Discord.
     ``today_window`` (optional) returns the ``(start_iso, end_iso)`` of "today"
     in the bot's display timezone — used for today's nutrition totals; falls
     back to a UTC calendar day. ``list_channels`` / ``invite_user`` /
@@ -217,10 +277,20 @@ def build_app(
 
     # ---- auth helpers ----------------------------------------------------
 
+    def _claimed() -> bool:
+        """True once a password exists. Always True in the legacy static mode."""
+        return auth.is_claimed() if auth is not None else True
+
     def _authed(request: web.Request) -> bool:
         return sessions.valid(request.cookies.get(SESSION_COOKIE))
 
     def _require(request: web.Request) -> None:
+        # The unclaimed check comes FIRST and deliberately does not rely on
+        # "no session can exist yet". Binding the port without a password must
+        # not open a single API route, and leaning on session absence for that
+        # would be one refactor away from a data leak.
+        if not _claimed():
+            raise web.HTTPUnauthorized(text="setup required")
         if not _authed(request):
             raise web.HTTPUnauthorized(text="login required")
 
@@ -242,9 +312,58 @@ def build_app(
     # ---- auth routes -----------------------------------------------------
 
     async def login_get(request: web.Request) -> web.Response:
+        if not _claimed():
+            raise web.HTTPFound("/setup")
         if _authed(request):
             raise web.HTTPFound("/")
         return web.Response(text=LOGIN_HTML, content_type="text/html")
+
+    # ---- first-boot claim -------------------------------------------------
+
+    async def setup_get(request: web.Request) -> web.Response:
+        """The claim page. Unauthenticated by necessity — nothing exists yet."""
+        if _claimed():
+            raise web.HTTPFound("/login")
+        return web.Response(
+            text=SETUP_HTML.replace("<!--ERR-->", ""), content_type="text/html",
+        )
+
+    async def setup_post(request: web.Request) -> web.Response:
+        if _claimed():
+            raise web.HTTPFound("/login")
+        ip = _client_ip(request)
+        data = await request.post()
+        password = str(data.get("password", ""))
+        confirm = str(data.get("password2", ""))
+
+        error = None
+        if password != confirm:
+            error = "Those two passwords don't match."
+        else:
+            error = auth.claim(password, actor=_actor(request))
+
+        if error:
+            body = SETUP_HTML.replace(
+                "<!--ERR-->", f'<p class="err">{_esc(error)}</p>',
+            )
+            return web.Response(text=body, content_type="text/html", status=400)
+
+        # Record who took the instance. The claim is unauthenticated by design,
+        # so attribution is the only accountability available.
+        try:
+            db.add_audit(
+                0, "settings", "dashboard_claimed",
+                actor_name=_actor(request),
+                detail=f"Dashboard claimed from {ip}",
+            )
+        except Exception:  # noqa: BLE001 - never block setup on the audit write
+            LOG.warning("Could not audit the dashboard claim", exc_info=True)
+
+        token = sessions.create()
+        resp = web.HTTPFound("/")
+        _set_session_cookie(request, resp, token)
+        LOG.warning("Dashboard claimed from %s.", ip)
+        return resp
 
     async def login_post(request: web.Request) -> web.Response:
         ip = _client_ip(request)
@@ -263,14 +382,18 @@ def build_app(
         data = await request.post()
         supplied = str(data.get("password", ""))
         # Constant-time compare so the form can't be used as a timing oracle.
-        if password and hmac.compare_digest(supplied, password):
+        # ``auth`` (when injected) checks the stored PBKDF2 hash and the legacy
+        # environment pin; without it we fall back to the static comparison the
+        # module has always used.
+        if auth is not None:
+            ok = auth.verify(supplied)
+        else:
+            ok = bool(password) and hmac.compare_digest(supplied, password)
+        if ok:
             login_throttle.record_success(ip)
             token = sessions.create()
             resp = web.HTTPFound("/")
-            resp.set_cookie(
-                SESSION_COOKIE, token, httponly=True, samesite="Lax",
-                max_age=SESSION_TTL_SECONDS,
-            )
+            _set_session_cookie(request, resp, token)
             LOG.info("Dashboard login from %s", _actor(request))
             return resp
         login_throttle.record_failure(ip)
@@ -287,9 +410,126 @@ def build_app(
         return resp
 
     async def index(request: web.Request) -> web.Response:
+        if not _claimed():
+            raise web.HTTPFound("/setup")
         if not _authed(request):
             raise web.HTTPFound("/login")
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+    # ---- settings ---------------------------------------------------------
+
+    def _need_settings() -> None:
+        if settings is None:
+            raise web.HTTPServiceUnavailable(
+                text="Settings are not available in this deployment.",
+            )
+
+    async def api_settings(request: web.Request) -> web.Response:
+        _require(request)
+        _need_settings()
+        payload = settings.describe()
+        payload["worker"] = (
+            supervisor.status() if supervisor is not None
+            else {"state": "unknown", "headline": "", "log": [],
+                  "can_retry": False}
+        )
+        payload["history"] = [
+            {
+                "key": r["key"], "at": r["at"], "actor": r["actor"],
+                "redacted": bool(r["redacted"]),
+                "old": r["old_value"], "new": r["new_value"],
+            }
+            for r in db.settings_history(50)
+        ]
+        return web.json_response(payload)
+
+    async def api_settings_set(request: web.Request) -> web.Response:
+        _require(request)
+        _need_settings()
+        body = await _json_body(request)
+        key = str(body.get("key", ""))
+        if "value" not in body:
+            raise web.HTTPBadRequest(text="missing value")
+        value = body["value"]
+        result = settings.set(
+            key, None if value is None else str(value), actor=_actor(request),
+        )
+        if not result.get("ok"):
+            return web.json_response(result, status=400)
+        # Hot settings are pushed to a running bot immediately; everything else
+        # is staged so an operator editing four fields gets one restart.
+        if result.get("apply") == "hot" and supervisor is not None:
+            await supervisor.reload_hot()
+        return web.json_response(result)
+
+    async def api_settings_apply(request: web.Request) -> web.Response:
+        _require(request)
+        _need_settings()
+        if supervisor is None:
+            raise web.HTTPServiceUnavailable(text="No process manager.")
+        await supervisor.restart("settings applied")
+        return web.json_response({"ok": True})
+
+    async def api_settings_revert(request: web.Request) -> web.Response:
+        _require(request)
+        _need_settings()
+        result = settings.revert_to_last_good(actor=_actor(request))
+        if result.get("ok") and supervisor is not None:
+            await supervisor.restart("settings reverted")
+        return web.json_response(result)
+
+    async def api_worker(request: web.Request) -> web.Response:
+        _require(request)
+        if supervisor is None:
+            raise web.HTTPServiceUnavailable(text="No process manager.")
+        if request.method == "POST":
+            body = await _json_body(request)
+            action = str(body.get("action", ""))
+            if action == "restart":
+                await supervisor.restart("requested from the dashboard")
+            elif action == "stop":
+                await supervisor.stop()
+            else:
+                raise web.HTTPBadRequest(text="unknown action")
+        return web.json_response(supervisor.status())
+
+    async def api_settings_export(request: web.Request) -> web.Response:
+        _require(request)
+        _need_settings()
+        LOG.warning(
+            "Settings exported as .env by %s — this file contains every secret "
+            "in plaintext.", _actor(request),
+        )
+        return web.Response(
+            text=settings.export_env(),
+            content_type="text/plain",
+            headers={"Content-Disposition": 'attachment; filename="gym-bot.env"'},
+        )
+
+    async def api_timezones(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            from zoneinfo import available_timezones
+            zones = sorted(available_timezones())
+        except Exception:  # noqa: BLE001
+            zones = ["UTC"]
+        return web.json_response({"timezones": zones})
+
+    async def api_password(request: web.Request) -> web.Response:
+        _require(request)
+        if auth is None:
+            raise web.HTTPServiceUnavailable(text="Password changes are not "
+                                                  "available in this deployment.")
+        body = await _json_body(request)
+        error = auth.change(str(body.get("old", "")), str(body.get("new", "")))
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        # Rotating the password must invalidate existing cookies — otherwise a
+        # 7-day session minted with the OLD password keeps working, which is
+        # exactly what you are trying to stop when you rotate it.
+        sessions.clear()
+        LOG.warning("Dashboard password changed by %s.", _actor(request))
+        return web.json_response({"ok": True})
 
     # ---- JSON API: reads -------------------------------------------------
 
@@ -1221,7 +1461,20 @@ def build_app(
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
-    async def health(_request: web.Request) -> web.Response:
+    async def health(request: web.Request) -> web.Response:
+        """Liveness, deliberately NOT "is the Discord bot connected".
+
+        The supervisor staying up while the bot is down is the normal, intended
+        state during setup and reconfiguration, and it is exactly when the
+        container must keep running so the operator can fix it. Alerting that
+        wants the stricter test can ask for ``?require_worker=1``.
+        """
+        if request.query.get("require_worker") in ("1", "true", "yes"):
+            state = supervisor.status()["state"] if supervisor is not None else None
+            if state != "running":
+                return web.Response(
+                    text=f"bot not running (state={state})", status=503,
+                )
         return web.Response(text="ok")
 
     async def media(request: web.Request) -> web.StreamResponse:
@@ -1255,11 +1508,47 @@ def build_app(
         resp.headers.setdefault("Referrer-Policy", "same-origin")
         return resp
 
-    app = web.Application(middlewares=[_security_headers])
+    @web.middleware
+    async def _worker_guard(request: web.Request, handler):
+        """Turn "the bot process isn't up" into an honest 503.
+
+        Every live-Discord endpoint already 503s when its handler was never
+        injected, so this just extends the same contract to "injected, but the
+        bot is restarting right now" instead of surfacing a connection error.
+        """
+        try:
+            return await handler(request)
+        except Exception as exc:  # noqa: BLE001
+            if type(exc).__name__ != "WorkerDown":
+                raise
+            return web.json_response(
+                {
+                    "ok": False,
+                    "worker_down": True,
+                    "error": "The Discord bot isn't running right now. "
+                             "Check the Settings tab for why.",
+                },
+                status=503,
+            )
+
+    app = web.Application(middlewares=[_security_headers, _worker_guard])
     app.add_routes([
         web.get("/login", login_get),
         web.post("/login", login_post),
         web.post("/logout", logout_post),
+        # Unauthenticated by necessity — nothing exists to authenticate against
+        # until someone claims the instance. Both 302 to /login once claimed.
+        web.get("/setup", setup_get),
+        web.post("/setup", setup_post),
+        web.get("/api/settings", api_settings),
+        web.post("/api/settings", api_settings_set),
+        web.post("/api/settings/apply", api_settings_apply),
+        web.post("/api/settings/revert", api_settings_revert),
+        web.get("/api/settings/export", api_settings_export),
+        web.get("/api/settings/timezones", api_timezones),
+        web.get("/api/worker", api_worker),
+        web.post("/api/worker", api_worker),
+        web.post("/api/password", api_password),
         web.get("/logo.svg", logo),
         web.get("/", index),
         web.get("/api/guilds", api_guilds),
@@ -1483,6 +1772,39 @@ button:hover{filter:brightness(1.08)}
 </form></body></html>"""
 
 
+# Shown once, on a brand-new install, until someone sets a password. Reuses
+# LOGIN_HTML's stylesheet so the two pages are visually identical.
+SETUP_HTML = LOGIN_HTML.replace(
+    "<title>Gym Dashboard — Sign in</title>",
+    "<title>Gym Dashboard — Set up</title>",
+).replace(
+    """<form class="card" method="post" action="/login">
+<div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
+<label>Password</label>
+<input type="password" name="password" autofocus autocomplete="current-password">
+<!--ERR-->
+<button type="submit">Sign in</button>
+<p class="sub">Operator access only</p>
+</form></body></html>""",
+    """<form class="card" method="post" action="/setup">
+<div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
+<p class="sub" style="margin:0 0 1.25rem;text-align:left;color:#8b949e">
+Choose a password to secure this dashboard. You'll use it every time you sign
+in.</p>
+<label>New password</label>
+<input type="password" name="password" autofocus autocomplete="new-password"
+ minlength="12">
+<label>Confirm password</label>
+<input type="password" name="password2" autocomplete="new-password"
+ minlength="12">
+<!--ERR-->
+<button type="submit">Set password</button>
+<p class="sub">At least 12 characters. Until this is set, anyone who can reach
+this page can claim the bot — keep the port off the public internet.</p>
+</form></body></html>""",
+)
+
+
 DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gym Dashboard</title>
@@ -1622,6 +1944,31 @@ text-transform:uppercase;letter-spacing:.05em;margin:.7rem 0 .25rem}
 dialog input{width:100%;padding:.6rem .7rem;background:#0d1117;border:1px solid var(--line);
 border-radius:9px;color:var(--text);font:inherit}
 .dlg-actions{display:flex;gap:.6rem;justify-content:flex-end;margin-top:1.4rem}
+
+/* settings — form controls outside a dialog need their own rules */
+.setform{display:grid;gap:1.1rem}
+.setrow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);
+gap:.5rem 1.2rem;align-items:start;padding:.85rem 0;border-top:1px solid var(--line)}
+.setrow:first-child{border-top:0}
+.setrow .lbl{font-weight:550;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.setrow .hlp{grid-column:1;color:var(--muted);font-size:.82rem;margin-top:.25rem}
+.setrow .ctl{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.setrow input[type=text],.setrow input[type=password],.setrow select{
+flex:1 1 12rem;min-width:0;padding:.55rem .7rem;background:#0d1117;
+border:1px solid var(--line);border-radius:9px;color:var(--text);font:inherit}
+.setrow input:focus,.setrow select:focus{outline:none;border-color:var(--indigo);
+box-shadow:0 0 0 3px #6366f133}
+.setrow input:disabled,.setrow select:disabled{opacity:.55;cursor:not-allowed}
+.setnote{grid-column:1/-1;font-size:.82rem;margin:.35rem 0 0}
+.setnote.warn{color:#e3b341}
+.pin{background:#e3b34118;border-color:#e3b34155;color:#e3b341}
+.wlog{background:#0d1117;border:1px solid var(--line);border-radius:10px;
+padding:.7rem .9rem;overflow:auto;max-height:22rem;font-size:.8rem;
+white-space:pre-wrap;word-break:break-word;margin:.8rem 0 0}
+.wstat{display:flex;align-items:center;gap:.6rem;font-weight:550}
+.wdot{width:10px;height:10px;border-radius:50%;flex:none}
+.wdot.ok{background:#3fb950}.wdot.warn{background:#e3b341}
+.wdot.bad{background:#f85149}.wdot.idle{background:#6e7681}
 
 .toast{position:fixed;bottom:1.4rem;right:1.4rem;padding:.7rem 1.1rem;border-radius:11px;
 background:var(--panel2);border:1px solid var(--line);box-shadow:0 12px 30px #0007;
@@ -1817,7 +2164,8 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
 <div class="toast" id="toast"></div>
 <script>
 const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["sleep","💤"],["messages","💬"],["voice","🔊"],["roles","🛡️"],
-  ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"]];
+  ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"],
+  ["settings","⚙️"]];
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
   role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
@@ -1972,8 +2320,15 @@ async function loadRoles(){try{const d=await api(`/api/roles?guild=${guild}`);
 async function boot(){
   const g=await api("/api/guilds");if(!g)return;
   const sel=document.getElementById("guild");
-  if(!g.guilds.length){document.getElementById("view").innerHTML=
-    '<div class="empty">No guilds tracked yet. Once the bot syncs a server it appears here.</div>';return;}
+  // A brand-new install has no guilds yet, and the whole point of the Settings
+  // tab is to get from that state to a working bot. So render the nav FIRST and
+  // land on Settings, instead of returning early with an empty shell that has
+  // no way to reach anything.
+  if(!g.guilds.length){
+    tab="settings";renderNav();
+    sel.innerHTML='<option>No server yet</option>';
+    return render();
+  }
   sel.innerHTML=g.guilds.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join("");
   guild=g.guilds[0].id;renderNav();await loadAvatars();await loadRoles();render();
 }
@@ -1984,6 +2339,9 @@ async function resync(){if(!guild)return;toast("Syncing…");
 async function render(){
   const v=document.getElementById("view");
   clearLive();  // stop any prior tab's auto-refresh before drawing the new one
+  // Settings are global, so they must be reachable before any guild exists —
+  // this check has to come BEFORE the "Pick a guild" bail-out below.
+  if(tab==="settings"){v.innerHTML=spinner();return renderSettings(v);}
   if(!guild){v.innerHTML='<div class="empty">Pick a guild.</div>';return;}
   v.innerHTML=spinner();
   try{
@@ -1999,6 +2357,194 @@ async function render(){
     if(["lifts","calories","protein"].includes(tab))return renderData(v,tab);
   }catch(e){v.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
 }
+/* ---- settings ---------------------------------------------------------- */
+let SETTINGS=null;
+const WDOT={running:"ok",starting:"warn",restarting:"warn",
+  quarantined:"bad",not_configured:"idle",stopped:"idle",unknown:"idle"};
+
+async function renderSettings(v){
+  const d=await api("/api/settings");if(!d)return;
+  SETTINGS=d;
+  v.innerHTML=workerCard(d.worker)+cryptoCard(d.crypto)+pendingCard(d)
+    +d.groups.map(groupBox).join("")+accountBox()+historyBox(d.history);
+  // Keep the bot-status card honest without hammering the API.
+  setLive(pollWorker);
+}
+
+function workerCard(w){
+  if(!w)return"";
+  const cls=WDOT[w.state]||"idle";
+  const log=w.log&&w.log.length?`<pre class="wlog">${esc(w.log.join("\n"))}</pre>`:"";
+  const retry=w.can_retry
+    ?`<button class="btn sm" onclick="workerAction('restart')">Retry</button>
+       <button class="btn sm" onclick="revertSettings()">Revert last change</button>`
+    :`<button class="btn sm" onclick="workerAction('restart')">Restart bot</button>`;
+  return `<div class="box" style="margin-bottom:1rem">
+    <div class="wstat"><span class="wdot ${cls}"></span><span id="whead">${esc(w.headline||"")}</span></div>
+    ${log}
+    <div style="margin-top:.9rem;display:flex;gap:.5rem;flex-wrap:wrap">${retry}</div></div>`;
+}
+
+function cryptoCard(c){
+  if(!c||c.available)return"";
+  return `<div class="box" style="margin-bottom:1rem;border-color:#f8514955">
+    <b style="color:#f85149">Secrets are not encrypted</b>
+    <div class="faint" style="margin-top:.4rem">The <code>cryptography</code>
+    package isn't installed, so tokens and passwords are stored in plain text in
+    the database. Install it and restart to fix this.</div></div>`;
+}
+
+function pendingCard(d){
+  if(!d.pending||!d.pending.length)return"";
+  return `<div class="box" style="margin-bottom:1rem;border-color:#e3b34155">
+    <b>${d.pending.length} change${d.pending.length>1?"s":""} need a bot restart</b>
+    <div class="faint" style="margin:.4rem 0 .8rem">${d.pending.map(esc).join(", ")}</div>
+    <button class="btn" onclick="applySettings()">Apply &amp; restart bot</button></div>`;
+}
+
+function groupBox(g){
+  return `<div class="box" style="margin-bottom:1rem"><h3 style="margin-top:0">${esc(g.label)}</h3>
+    <div class="setform">${g.items.map(settingRow).join("")}</div></div>`;
+}
+
+function settingRow(s){
+  const id="set_"+s.key;
+  const chip=s.pinned
+    ?'<span class="pill pin" title="Set in docker-compose.yml — that wins over anything saved here">Pinned by environment</span>'
+    :(s.source==="default"?'<span class="pill faint">Default</span>':"");
+  const derived=s.derived!==undefined&&s.derived!==""
+    ?`<span class="pill faint" title="Inherited because this field is blank">Inherited: ${esc(s.derived)}</span>`:"";
+  const lock=!s.editable
+    ?'<span class="pill faint" title="Only settable in docker-compose.yml">compose only</span>':"";
+
+  let control;
+  const dis=s.editable?"":" disabled";
+  if(s.kind==="bool"){
+    const on=String(s.value).toLowerCase();
+    const isOn=["1","true","yes","y","on"].includes(on);
+    control=`<div class="seg" id="${id}" data-val="${isOn}">
+      <button class="${isOn?"on":""}" onclick="setBool('${s.key}',true)"${dis}>On</button>
+      <button class="${!isOn?"on":""}" onclick="setBool('${s.key}',false)"${dis}>Off</button></div>`;
+  }else if(s.choices&&s.choices.length){
+    control=`<select id="${id}"${dis}>`+s.choices.map(c=>
+      `<option value="${esc(c)}"${String(s.value)===c?" selected":""}>${esc(c)}</option>`).join("")
+      +`</select><button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`;
+  }else if(s.secret){
+    const hint=s.is_set?`<span class="faint">${esc(s.masked)}</span>`:'<span class="faint">not set</span>';
+    control=`<input type="password" id="${id}" placeholder="${s.is_set?"unchanged":"not set"}"
+      autocomplete="new-password"${dis}>${hint}
+      <button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`
+      +(s.is_set?`<button class="btn sm" onclick="clearSetting('${s.key}')"${dis}>Clear</button>`:"");
+  }else{
+    control=`<input type="text" id="${id}" value="${esc(s.value)}"${dis}>
+      <button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`;
+  }
+
+  const note=s.restart_note?`<div class="setnote warn">${esc(s.restart_note)}</div>`:"";
+  const stored=(s.pinned&&s.stored)
+    ?`<div class="setnote faint">Saved here: <b>${esc(s.stored)}</b> — takes effect once you remove it from docker-compose.yml.</div>`:"";
+  return `<div class="setrow">
+    <div><div class="lbl">${esc(s.label)} ${chip}${derived}${lock}</div>
+      ${s.help?`<div class="hlp">${esc(s.help)}</div>`:""}</div>
+    <div class="ctl">${control}</div>${note}${stored}</div>`;
+}
+
+async function saveSetting(key,valueOverride){
+  const el=document.getElementById("set_"+key);
+  let value=valueOverride;
+  if(value===undefined){
+    if(!el)return;
+    value=el.value;
+    // An empty secret box means "leave it alone", not "clear it" — clearing is
+    // an explicit button, so a stray Save can't wipe a token.
+    const s=findSetting(key);
+    if(s&&s.secret&&value==="")return toast("Nothing entered");
+  }
+  const r=await post("/api/settings",{key,value});
+  if(!r||!r.ok)return toast((r&&r.error)||"Save failed");
+  toast(r.effective?(r.needs_restart?"Saved — restart pending":"Saved ✓")
+                   :"Saved, but your compose file still overrides it");
+  render();
+}
+function clearSetting(key){
+  if(!confirm("Clear "+key+"? The bot will fall back to its default."))return;
+  post("/api/settings",{key,value:null}).then(r=>{
+    toast(r&&r.ok?"Cleared ✓":"Failed");render();});
+}
+function setBool(key,on){saveSetting(key,on?"true":"false");}
+function findSetting(key){
+  if(!SETTINGS)return null;
+  for(const g of SETTINGS.groups)for(const s of g.items)if(s.key===key)return s;
+  return null;
+}
+async function applySettings(){
+  toast("Restarting the bot…");
+  await post("/api/settings/apply",{});
+  setTimeout(render,1500);
+}
+async function revertSettings(){
+  if(!confirm("Revert to the last configuration the bot started with?\n\n"
+    +"Secrets can't be restored — any secret changed since then is cleared."))return;
+  const r=await post("/api/settings/revert",{});
+  toast(r&&r.ok?"Reverted ✓":((r&&r.error)||"Nothing to revert"));
+  setTimeout(render,1200);
+}
+async function workerAction(action){
+  toast(action==="restart"?"Restarting…":"Stopping…");
+  await post("/api/worker",{action});
+  setTimeout(render,1500);
+}
+async function pollWorker(){
+  try{
+    const w=await api("/api/worker");if(!w)return;
+    const head=document.getElementById("whead");
+    if(head&&w.headline)head.textContent=w.headline;
+  }catch(e){}
+}
+
+function accountBox(){
+  return `<div class="box" style="margin-bottom:1rem"><h3 style="margin-top:0">Dashboard account</h3>
+    <div class="setform"><div class="setrow">
+      <div><div class="lbl">Change password</div>
+        <div class="hlp">Signs out every other session, including your own on
+        other devices.</div></div>
+      <div class="ctl">
+        <input type="password" id="pw_old" placeholder="Current password" autocomplete="current-password">
+        <input type="password" id="pw_new" placeholder="New password (min 12)" autocomplete="new-password">
+        <button class="btn sm" onclick="changePassword()">Update</button></div>
+    </div>
+    <div class="setrow">
+      <div><div class="lbl">Export configuration</div>
+        <div class="hlp">Downloads a .env file reproducing every setting.
+        Contains all your secrets in plain text.</div></div>
+      <div class="ctl"><button class="btn sm" onclick="exportEnv()">Download .env</button></div>
+    </div></div></div>`;
+}
+async function changePassword(){
+  const oldPw=document.getElementById("pw_old").value;
+  const newPw=document.getElementById("pw_new").value;
+  const r=await post("/api/password",{old:oldPw,new:newPw});
+  if(r&&r.ok){toast("Password changed — signing you out");
+    setTimeout(()=>location.href="/login",900);}
+  else toast((r&&r.error)||"Failed");
+}
+function exportEnv(){
+  if(!confirm("This file contains every secret in plain text, including your "
+    +"Discord token.\n\nDownload it?"))return;
+  location.href="/api/settings/export";
+}
+
+function historyBox(h){
+  if(!h||!h.length)return"";
+  const rows=h.map(x=>`<tr><td class="faint">${esc((x.at||"").replace("T"," ").slice(0,16))}</td>
+    <td>${esc(x.key)}</td>
+    <td class="faint">${x.redacted?"(hidden)":esc(x.new===null?"cleared":String(x.new))}</td>
+    <td class="faint">${esc(x.actor||"")}</td></tr>`).join("");
+  return `<div class="box"><h3 style="margin-top:0">Recent changes</h3>
+    <div style="overflow-x:auto"><table><thead><tr><th>When</th><th>Setting</th>
+    <th>New value</th><th>By</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
 function stat(n,l){return `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`;}
 
 async function renderOverview(v){

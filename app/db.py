@@ -9,8 +9,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import targets
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable, Iterable
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lifts (
@@ -625,6 +629,49 @@ CREATE TABLE IF NOT EXISTS user_dm_prefs (
     default_guild_id INTEGER,
     updated_at       TEXT    NOT NULL
 );
+
+-- Operator-editable configuration, one row per key in app/config.py's SPEC.
+-- Read at boot by config.load(), which resolves environment > this table >
+-- code default. Environment always wins, so a row here can exist without being
+-- in effect; the dashboard shows that as a "Pinned by environment" chip.
+--
+-- ``value`` NULL means "explicitly cleared" and falls through to the code
+-- default. Rows are NEVER deleted: that is what lets the one-time environment
+-- seed be INSERT OR IGNORE and still never resurrect a value the operator
+-- deliberately cleared.
+--
+-- ``encrypted`` rows hold a Fernet token under the key at <db dir>/.secret_key;
+-- this layer never sees the plaintext, mirroring the convention already used by
+-- revo_account.password_enc and strava_account's token columns.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    encrypted  INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT    NOT NULL,
+    updated_by TEXT
+);
+
+-- Append-only change log powering the Settings tab's history panel and the
+-- "revert last change" button. ``audit_log`` is deliberately NOT reused: its
+-- guild_id is NOT NULL and every reader filters on it, so a global settings row
+-- would be written and then be invisible everywhere.
+--
+-- Secret changes record only that they happened: both value columns are NULL
+-- and ``redacted`` is 1, so the history can never be used to read a secret back
+-- out after it has been masked in the API.
+CREATE TABLE IF NOT EXISTS app_settings_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    rev       INTEGER NOT NULL,
+    key       TEXT    NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    redacted  INTEGER NOT NULL DEFAULT 0,
+    at        TEXT    NOT NULL,
+    actor     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_settings_history_rev
+    ON app_settings_history (rev DESC, id DESC);
 """
 
 
@@ -680,7 +727,21 @@ class Database:
     blocking sync code from worker threads (e.g. autocomplete callbacks).
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, migrate: bool = True,
+                 busy_timeout_ms: int = 0) -> None:
+        """Open (and by default migrate) the database at ``path``.
+
+        ``migrate=False`` is for the bot worker under the supervisor, which
+        must not run ``executescript``/``_migrate`` concurrently with the
+        supervisor that already did. It asserts the schema is present rather
+        than assuming, so a mis-ordered future refactor fails loudly here
+        instead of as "no such table" deep inside a command handler.
+
+        ``busy_timeout_ms`` defaults to 0 -- today's behaviour, where a write
+        that collides returns SQLITE_BUSY immediately. Only the two processes
+        that genuinely share the file set it, so the 100-odd existing tests and
+        ``scripts/cleanup_lift.py`` keep their current failure mode.
+        """
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -702,8 +763,23 @@ class Database:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.executescript(SCHEMA)
-        self._migrate()
+        if busy_timeout_ms > 0:
+            # Mandatory once the supervisor and the bot share this file:
+            # without it a BEGIN IMMEDIATE that collides with the other
+            # process's write fails instantly, and every dashboard save landing
+            # mid-write would 500.
+            self._connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        if migrate:
+            self._connection.executescript(SCHEMA)
+            self._migrate()
+        elif self._connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'app_settings'"
+        ).fetchone() is None:
+            raise RuntimeError(
+                "database has not been migrated -- the supervisor must open it "
+                "first. This process was started with migrate=False."
+            )
 
     def _migrate(self) -> None:
         """Apply lightweight, idempotent schema migrations.
@@ -5299,6 +5375,168 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    # ---- operator settings ----------------------------------------------
+    #
+    # Backing store for app/config.py. Everything here deals in raw strings;
+    # coercion, precedence and validation all live in the config module, which
+    # has no database dependency so it can be tested on its own.
+
+    #: How many history rows to retain. A convenience log, not an audit record
+    #: -- audit_log remains the durable trail for data mutations.
+    SETTINGS_HISTORY_KEEP = 2000
+
+    def settings_all(
+        self, *, decrypt: "Callable[[str], str] | None" = None,
+    ) -> dict[str, str | None]:
+        """Every stored setting as ``{key: value}``.
+
+        ``decrypt`` is applied to rows flagged encrypted. Pass None to get the
+        ciphertext -- which an export must never do, and which is why the
+        dashboard read path goes through :meth:`settings_rows` and redacts.
+        """
+        out: dict[str, str | None] = {}
+        with self._conn() as c:
+            for row in c.execute(
+                "SELECT key, value, encrypted FROM app_settings"
+            ):
+                value = row["value"]
+                if value is not None and row["encrypted"] and decrypt is not None:
+                    value = decrypt(value)
+                out[row["key"]] = value
+        return out
+
+    def settings_rows(self) -> list[sqlite3.Row]:
+        """Raw rows including metadata, for the Settings tab. Never decrypts."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT key, value, encrypted, updated_at, updated_by "
+                "FROM app_settings ORDER BY key"
+            ))
+
+    def settings_rev(self) -> int:
+        """The current configuration revision, incremented on every write."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM app_meta WHERE key = 'config_rev'"
+            ).fetchone()
+        try:
+            return int(row["value"]) if row and row["value"] else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def settings_set(
+        self, key: str, value: str | None, *, encrypted: bool = False,
+        actor: str | None = None,
+    ) -> int:
+        """Upsert one setting and append its history row atomically.
+
+        ``value=None`` means "explicitly cleared" -- the row stays so the
+        environment seed's INSERT OR IGNORE can never resurrect it, but
+        config.load() falls through to the code default.
+
+        Deliberately does NOT call ``add_audit``: that opens its own
+        transaction and ``_conn`` is not reentrant, so nesting them raises
+        "cannot start a transaction within a transaction".
+
+        Returns the new revision number.
+        """
+        now = _normalize_iso(None)
+        with self._conn() as c:
+            prev = c.execute(
+                "SELECT value, encrypted FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            rev_row = c.execute(
+                "SELECT value FROM app_meta WHERE key = 'config_rev'"
+            ).fetchone()
+            try:
+                rev = int(rev_row["value"]) + 1 if rev_row and rev_row["value"] else 1
+            except (TypeError, ValueError):
+                rev = 1
+
+            c.execute(
+                "INSERT INTO app_settings "
+                "(key, value, encrypted, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value = excluded.value, encrypted = excluded.encrypted, "
+                "updated_at = excluded.updated_at, "
+                "updated_by = excluded.updated_by",
+                (key, value, int(encrypted), now, actor),
+            )
+
+            # Once a key has ever held a secret, every history row for it stays
+            # redacted -- otherwise clearing a secret would write its old value
+            # into a table the dashboard displays.
+            redacted = int(bool(encrypted) or bool(prev and prev["encrypted"]))
+            c.execute(
+                "INSERT INTO app_settings_history "
+                "(rev, key, old_value, new_value, redacted, at, actor) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rev, key,
+                    None if redacted else (prev["value"] if prev else None),
+                    None if redacted else value,
+                    redacted, now, actor,
+                ),
+            )
+            c.execute(
+                "INSERT INTO app_meta (key, value) VALUES ('config_rev', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(rev),),
+            )
+            c.execute(
+                "DELETE FROM app_settings_history WHERE id <= "
+                "(SELECT MAX(id) - ? FROM app_settings_history)",
+                (self.SETTINGS_HISTORY_KEEP,),
+            )
+        return rev
+
+    def settings_seed(
+        self, pairs: "Iterable[tuple[str, str | None, bool]]", *,
+        actor: str = "env-seed",
+    ) -> int:
+        """INSERT OR IGNORE a batch of ``(key, value, encrypted)`` triples.
+
+        Never overwrites an existing row, so a re-run after a partial failure
+        is safe and an operator's dashboard edit can never be clobbered by a
+        later seed. Returns how many rows were actually inserted.
+        """
+        now = _normalize_iso(None)
+        inserted = 0
+        with self._conn() as c:
+            for key, value, encrypted in pairs:
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO app_settings "
+                    "(key, value, encrypted, updated_at, updated_by) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (key, value, int(encrypted), now, actor),
+                )
+                inserted += cur.rowcount or 0
+        return inserted
+
+    def settings_history(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Most recent settings changes, newest first."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT id, rev, key, old_value, new_value, redacted, at, actor "
+                "FROM app_settings_history ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ))
+
+    def settings_since(self, rev: int) -> list[sqlite3.Row]:
+        """History rows written after ``rev``, oldest first.
+
+        Used by the revert button to replay a bad batch back to the last
+        revision that produced a bot which actually started.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT id, rev, key, old_value, new_value, redacted, at, actor "
+                "FROM app_settings_history WHERE rev > ? ORDER BY id ASC",
+                (int(rev),),
+            ))
 
     # ---- role / member mirror -------------------------------------------
 

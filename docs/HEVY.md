@@ -23,24 +23,27 @@ Unlike Strava, Hevy uses a **per-user API key** (no OAuth) and the bot only make
 ## Requirements
 
 - **Hevy Pro** — the API key is a Pro feature (Hevy app → **Settings → API**).
-- The host sets a **Fernet key** so API keys are encrypted at rest. Reuses
-  `STRAVA_FERNET_KEY` / `REVO_FERNET_KEY` if present, or set `HEVY_FERNET_KEY`:
-  ```bash
-  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-  ```
+- Nothing else. API keys are encrypted at rest with a key the bot generates and
+  manages itself at `/data/.secret_key` — back that file up with your database.
 - `requests` and `cryptography` (already bundled for the Strava/Revo features).
 
-## Configuration (env)
+## Configuration
 
-| Variable | Default | Meaning |
+Dashboard → **Settings → Hevy**:
+
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `HEVY_DISABLED` | `0` | Set `1` to turn the integration off entirely. |
-| `HEVY_FEED_CHANNEL_ID` | — | Channel id for workout embeds. Unset → lifts still import, no feed post. |
-| `HEVY_POLL_MINUTES` | `15` | How often to poll Hevy for new workouts (minimum 1). |
-| `HEVY_FERNET_KEY` | — | Fernet key for encrypting API keys (falls back to the Strava/Revo key). |
+| Disable Hevy entirely | off | Turns the integration off. |
+| Feed channel | — | Channel for workout embeds. Blank → lifts still import, no feed post. |
+| Poll interval (minutes) | `15` | How often to check Hevy for new workouts (minimum 1). |
 
-The integration is **on by default** when `requests`/`cryptography` and a Fernet
-key are available; importing works even without a feed channel.
+Changing any of these stages a bot restart; press **Apply & restart bot**.
+
+The integration is **on by default** when `requests`/`cryptography` are
+available; importing works even without a feed channel.
+
+> These also have `HEVY_*` environment-variable equivalents, which take priority
+> if set. See `.env.example`.
 
 ## Member usage
 

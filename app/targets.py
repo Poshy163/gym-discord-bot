@@ -52,11 +52,30 @@ LOG = logging.getLogger(__name__)
 # imports DISPLAY_TZ from here.
 TZ_NAME = os.getenv("DISPLAY_TIMEZONE", "Australia/Adelaide").strip() or "UTC"
 DISPLAY_TZ: timezone | object = timezone.utc
-if ZoneInfo is not None:
-    try:
-        DISPLAY_TZ = ZoneInfo(TZ_NAME)
-    except Exception:  # noqa: BLE001 - unknown zone name, keep running on UTC
-        LOG.warning("Unknown DISPLAY_TIMEZONE=%r, falling back to UTC", TZ_NAME)
+
+
+def configure(name: str | None = None) -> None:
+    """(Re)resolve :data:`DISPLAY_TZ` from ``name``, or from the environment.
+
+    Called by ``app.bot._bind_config`` with the value the settings layer
+    resolved. Without this the timezone could only ever come from the
+    environment, because this module is imported long before the database is
+    open — so a timezone set only in the dashboard would be silently ignored.
+
+    Falls back to UTC on an unknown zone, matching the historic behaviour.
+    """
+    global TZ_NAME, DISPLAY_TZ
+    if name is not None:
+        TZ_NAME = name.strip() or "UTC"
+    DISPLAY_TZ = timezone.utc
+    if ZoneInfo is not None:
+        try:
+            DISPLAY_TZ = ZoneInfo(TZ_NAME)
+        except Exception:  # noqa: BLE001 - unknown zone name, keep running on UTC
+            LOG.warning("Unknown DISPLAY_TIMEZONE=%r, falling back to UTC", TZ_NAME)
+
+
+configure()
 
 
 def local_today() -> date:
