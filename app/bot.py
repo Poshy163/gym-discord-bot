@@ -15,6 +15,7 @@ import importlib
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -11419,10 +11420,15 @@ def _rpc_reload_config() -> dict:
 
 
 def _rpc_status() -> dict:
+    # discord.py reports latency as NaN before the first heartbeat ack and inf
+    # while the websocket is None. round() raises on both, which would make
+    # every liveness ping fail during connect and reconnect windows — and the
+    # dashboard would report a healthy bot as offline for all its live actions.
+    latency = bot.latency
     return {
         "ready": bot.is_ready(),
         "guilds": len(bot.guilds),
-        "latency_ms": round(bot.latency * 1000) if bot.latency else None,
+        "latency_ms": round(latency * 1000) if math.isfinite(latency) else None,
         "user": str(bot.user) if bot.user else None,
     }
 

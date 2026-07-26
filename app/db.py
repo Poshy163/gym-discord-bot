@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import config as _config
 from . import targets
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -5466,10 +5467,27 @@ class Database:
                 (key, value, int(encrypted), now, actor),
             )
 
-            # Once a key has ever held a secret, every history row for it stays
-            # redacted -- otherwise clearing a secret would write its old value
-            # into a table the dashboard displays.
-            redacted = int(bool(encrypted) or bool(prev and prev["encrypted"]))
+            # Redaction follows the key's DECLARED sensitivity, not whether
+            # encryption happened to succeed.
+            #
+            # Deriving it from the ``encrypted`` flag alone was a real leak: if
+            # the SecretBox is unavailable -- no cryptography package, or a
+            # zero-byte / unreadable /data/.secret_key -- SettingsService.set
+            # falls back to storing the value in the clear with encrypted=0.
+            # The first write of DISCORD_TOKEN would then land with redacted=0,
+            # putting the raw bot token into app_settings_history.new_value and
+            # rendering it in the dashboard's "Recent changes" table, on the
+            # same page that masks the field itself.
+            #
+            # The check lives here rather than in the caller because
+            # settings_set is also reached from revert_to_last_good and
+            # bootstrap_fernet, and the invariant belongs with the write.
+            spec = _config.SPEC.get(key)
+            redacted = int(
+                bool(encrypted)
+                or bool(prev and prev["encrypted"])
+                or bool(spec is not None and spec.secret)
+            )
             c.execute(
                 "INSERT INTO app_settings_history "
                 "(rev, key, old_value, new_value, redacted, at, actor) "

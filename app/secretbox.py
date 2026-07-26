@@ -25,6 +25,7 @@ defeat the point of unattended ``restart: unless-stopped``.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -108,7 +109,15 @@ class SecretBox:
             key = path.read_bytes().strip()
             if key:
                 return key
+            # A zero-byte key file (an interrupted first write, or a truncating
+            # restore) must be removed, not just logged about: the O_EXCL
+            # create below would raise FileExistsError, the handler would read
+            # the same empty bytes back, and the box would be permanently
+            # unavailable on an otherwise perfectly writable volume -- which in
+            # turn makes every secret fall back to being stored in the clear.
             LOG.warning("Encryption key at %s was empty -- regenerating.", path)
+            with contextlib.suppress(OSError):
+                path.unlink()
 
         path.parent.mkdir(parents=True, exist_ok=True)
         key = Fernet.generate_key()
@@ -119,7 +128,12 @@ class SecretBox:
         try:
             fd = os.open(path, flags, 0o600)
         except FileExistsError:
-            return path.read_bytes().strip()
+            # Another process won the race. Use its key -- but refuse to accept
+            # an empty one, which would silently disable encryption.
+            existing = path.read_bytes().strip()
+            if not existing:
+                raise OSError(f"encryption key at {path} is empty")
+            return existing
         with os.fdopen(fd, "wb") as fh:
             fh.write(key)
         LOG.info(

@@ -104,6 +104,33 @@ class DbAuth:
     def is_claimed(self) -> bool:
         return bool(self.env_password()) or bool(self.stored_hash())
 
+    def adopt_env_password(self) -> bool:
+        """Persist WEBUI_PASSWORD as a hash at boot, if nothing is stored yet.
+
+        Called by the supervisor before the dashboard binds. Without it, an
+        operator who upgrades with WEBUI_PASSWORD set and then removes it —
+        exactly what the new compose file and docs tell them to do — would boot
+        into an UNCLAIMED instance with the unauthenticated /setup form live,
+        while their real password sat unused. Adopting it here means removing
+        the variable changes nothing.
+
+        Returns True if a hash was written.
+        """
+        env_password = self.env_password()
+        if not env_password or self.stored_hash():
+            return False
+        try:
+            self._db.meta_set(META_PASSWORD_HASH, hash_password(env_password))
+        except Exception:  # noqa: BLE001
+            LOG.warning("Could not persist the dashboard password", exc_info=True)
+            return False
+        LOG.info(
+            "Adopted WEBUI_PASSWORD as the stored dashboard password. You can "
+            "now remove it from docker-compose.yml and keep signing in with "
+            "the same password."
+        )
+        return True
+
     # -- use ---------------------------------------------------------------
 
     def verify(self, supplied: str) -> bool:
@@ -112,9 +139,29 @@ class DbAuth:
         Both are accepted when both exist, so an operator can set a password in
         the dashboard, confirm it works, and only then remove the environment
         pin from their compose file.
+
+        On a successful environment-pin login with no stored hash yet, the
+        password is persisted as a hash. That closes a real hole: without it,
+        an operator who upgraded with WEBUI_PASSWORD set and then followed the
+        new compose file's advice to delete it would find the instance
+        UNCLAIMED on the next boot — the unauthenticated /setup form live again
+        for anyone who can reach the port. Persisting here means removing the
+        environment variable keeps the same password working instead.
         """
         env_password = self.env_password()
         if env_password and hmac.compare_digest(supplied, env_password):
+            if not self.stored_hash():
+                try:
+                    self._db.meta_set(
+                        META_PASSWORD_HASH, hash_password(env_password),
+                    )
+                    LOG.info(
+                        "Stored the dashboard password from WEBUI_PASSWORD so "
+                        "it keeps working if you remove that variable."
+                    )
+                except Exception:  # noqa: BLE001 - never block a valid login
+                    LOG.warning("Could not persist the dashboard password",
+                                exc_info=True)
             return True
         stored = self.stored_hash()
         return bool(stored) and verify_password(supplied, stored)
@@ -338,7 +385,25 @@ class SettingsService:
         caller surfaces that distinction rather than implying a full undo.
         """
         good = self.last_good_rev()
+        if good <= 0:
+            # settings_since(0) selects EVERY retained history row, which
+            # includes the bootstrap Fernet key written at rev 1 on every
+            # deployment. Replaying that would clear the key and make every
+            # linked Revo, Strava and Hevy credential permanently unreadable.
+            # Refuse rather than offer a button that destroys data.
+            return {"ok": False, "error": (
+                "No known-good configuration has been recorded yet, so there "
+                "is nothing safe to revert to. Fix the setting directly "
+                "instead."
+            )}
         rows = self._db.settings_since(good)
+        if not rows:
+            return {"ok": False, "error": "Nothing to revert."}
+
+        # Never revert an encryption key, whatever the history says. Rolling
+        # one back cannot restore the credentials encrypted under the current
+        # one, so it turns a bad config into unrecoverable data loss.
+        rows = [r for r in rows if not r["key"].endswith("_FERNET_KEY")]
         if not rows:
             return {"ok": False, "error": "Nothing to revert."}
 

@@ -100,9 +100,17 @@ def _stripped_or(fallback: str) -> Callable[[str], str]:
 
 
 def _floor_int(lo: int) -> Callable[[str], int]:
-    """``max(lo, int(raw))`` — the politeness floors on the two pollers."""
+    """``max(lo, int(raw))`` — the politeness floors on the two pollers and
+    the ``max(0, ...)`` guard in app/gemini_client.py."""
     def parse(raw: str) -> int:
         return max(lo, int(raw))
+    return parse
+
+
+def _floor_float(lo: float) -> Callable[[str], float]:
+    """``max(lo, float(raw))`` — gemini_client.retry_delay_seconds()."""
+    def parse(raw: str) -> float:
+        return max(lo, float(raw))
     return parse
 
 
@@ -313,7 +321,7 @@ _SETTINGS: tuple[Setting, ...] = (
        apply="hot", min=0, max=59, label="Backup minute"),
 
     # ---- Gemini (AI) -----------------------------------------------------
-    _S("GEMINI_API_KEY", "secret", "", "gemini", _str,
+    _S("GEMINI_API_KEY", "secret", "", "gemini", _strip,
        apply="worker", secret=True, sibling_env=True, label="Gemini API key",
        help="Enables AI food parsing and the weekly calorie summary."),
     _S("GEMINI_MODEL", "str", "", "gemini", _strip,
@@ -326,9 +334,11 @@ _SETTINGS: tuple[Setting, ...] = (
     _S("GEMINI_TIMEOUT", "int", "120", "gemini", _int,
        apply="worker", sibling_env=True, min=1, max=600,
        label="Request timeout (seconds)"),
-    _S("GEMINI_MAX_RETRIES", "int", "2", "gemini", _int,
+    # Both carry the max(0, ...) floors gemini_client applies, so a negative
+    # value clamps rather than reaching range() or asyncio.sleep().
+    _S("GEMINI_MAX_RETRIES", "int", "2", "gemini", _floor_int(0),
        apply="worker", sibling_env=True, min=0, max=10, label="Max retries"),
-    _S("GEMINI_RETRY_DELAY", "float", "0", "gemini", _float,
+    _S("GEMINI_RETRY_DELAY", "float", "0", "gemini", _floor_float(0.0),
        apply="worker", sibling_env=True, min=0, max=300,
        label="Fixed retry delay (seconds)",
        help="0 uses an escalating backoff instead."),
@@ -340,7 +350,9 @@ _SETTINGS: tuple[Setting, ...] = (
        apply="worker", sibling_env=True, label="Client ID"),
     _S("STRAVA_CLIENT_SECRET", "secret", "", "strava", _strip,
        apply="worker", secret=True, sibling_env=True, label="Client secret"),
-    _S("STRAVA_PUBLIC_URL", "str", "", "strava", _strip,
+    # rstrip('/') mirrors strava_client.config_from_env(), so a trailing slash
+    # cannot produce a '//strava/webhook' callback that Strava won't match.
+    _S("STRAVA_PUBLIC_URL", "str", "", "strava", _rstrip_slash,
        apply="worker", sibling_env=True, label="Public base URL",
        help="The externally reachable HTTPS base, e.g. "
             "https://strava.example.com. The OAuth callback and webhook URLs "
@@ -483,11 +495,19 @@ _SETTINGS: tuple[Setting, ...] = (
        help="0 forces a refresh on every boot."),
 
     # ---- Dashboard -------------------------------------------------------
+    # Deliberately env-only, and therefore rendered disabled. Authentication
+    # reads this from the process environment (or the stored PBKDF2 hash) and
+    # never from app_settings, so making it writable here would accept a new
+    # password, report success, and change nothing — while an operator who
+    # believed they had just rotated it would not set a real one. Rotation goes
+    # through Settings -> Dashboard account -> Change password.
     _S("WEBUI_PASSWORD", "secret", "", "webui", _strip,
-       apply="supervisor", secret=True, label="Dashboard password (legacy)",
-       help="Only for deployments that still pin a password in compose. When "
-            "set it overrides the password you set in the dashboard. Leave "
-            "blank and use Change password instead."),
+       apply="env-only", secret=True, label="Dashboard password (legacy)",
+       help="Read only from docker-compose.yml, for deployments that still pin "
+            "it there. It overrides the dashboard password while set. To change "
+            "your password use Change password below; to stop pinning it, "
+            "remove it from your compose file — the same password keeps "
+            "working."),
     _S("ENABLE_MEMBER_MIRROR", "bool", "false", "webui", _bool,
        apply="worker", label="Mirror members & roles",
        help="Populates the Members and Roles tabs and the audit log. Without "
@@ -710,12 +730,20 @@ def load(db: Any = None, env: Mapping[str, str] | None = None,
             sources[s.key] = "default"
             raws[s.key] = s.default
 
-    # Second pass: fallback chains fire only when a key's own raw value is
-    # empty, reproducing the pre-refactor `or` chains exactly. Order matters --
-    # WEEKLY_REPORT_CHANNEL_ID reads DAILY_UPDATE_CHANNEL_ID, which may itself
-    # be derived -- so this runs in registry order, which is dependency order.
+    # Second pass: fallback chains.
+    #
+    # The trigger is a falsy COERCED value, not an empty raw string. That
+    # distinction matters: the originals were written as
+    # ``int(x) if x.isdigit() else <fallback>``, so a non-numeric value fell
+    # back too. Keying off the raw string instead would mean a pasted "<#123>"
+    # mention silently disabled the bodyweight reminder rather than inheriting
+    # the weekly reminder's channel. None and "" are the only falsy results the
+    # derived settings can produce.
+    #
+    # Order matters -- WEEKLY_REPORT_CHANNEL_ID reads DAILY_UPDATE_CHANNEL_ID --
+    # so this runs in registry order, which is dependency order.
     for s in _SETTINGS:
-        if s.derive is not None and not raws[s.key].strip():
+        if s.derive is not None and not values[s.key]:
             try:
                 values[s.key] = s.derive(values)
             except Exception as exc:  # noqa: BLE001
@@ -754,13 +782,21 @@ def validate(key: str, raw: str) -> str | None:
         if s.max is not None and value > s.max:
             return f"Must be at most {_num(s.max)}."
 
-    if s.kind == "id" and not raw.strip().lstrip("-").isdigit():
-        # The coercion itself returns None for junk rather than raising, which
-        # would silently disable the very feature this field enables. Reject it
-        # at the point of entry instead, where we can explain how to get an ID.
-        return ("Must be a numeric Discord ID. Enable Developer Mode in "
-                "Discord (Settings -> Advanced), then right-click the channel "
-                "or role and choose Copy ID.")
+    if s.kind == "id":
+        # The coercion returns None for junk rather than raising, which would
+        # silently disable the very feature this field enables. Reject it at
+        # the point of entry instead, where we can explain how to get an ID.
+        #
+        # Only STRAVA_FEED_CHANNEL_ID accepts a leading '-'; for every other ID
+        # a negative value coerces to None, so accepting one here would store a
+        # value that reads back as "unset" while the UI said "Saved".
+        text = raw.strip()
+        ok = (text.lstrip("-").isdigit() if s.coerce is _snowflake_signed
+              else text.isdigit())
+        if not ok:
+            return ("Must be a numeric Discord ID. Enable Developer Mode in "
+                    "Discord (Settings -> Advanced), then right-click the "
+                    "channel or role and choose Copy ID.")
 
     if s.kind == "ids":
         bad = [x.strip() for x in raw.split(",")
@@ -841,9 +877,15 @@ def install_logging(cfg: Config) -> None:
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
         )
-    level = cfg["LOG_LEVEL"]
-    if isinstance(level, str) and not hasattr(logging, level.upper()):
-        LOG.warning("Unknown LOG_LEVEL=%r -- using INFO.", level)
+    # basicConfig only accepts an int or an UPPERCASE level name, so the value
+    # actually passed must be normalised -- not merely normalised for the
+    # check. Getting that wrong meant LOG_LEVEL=debug raised ValueError out of
+    # the supervisor before the dashboard had bound, crash-looping the
+    # container with no way in but hand-editing SQLite on the volume.
+    raw_level = str(cfg["LOG_LEVEL"]).strip()
+    level = raw_level.upper()
+    if not isinstance(getattr(logging, level, None), int):
+        LOG.warning("Unknown LOG_LEVEL=%r -- using INFO.", raw_level)
         level = "INFO"
     logging.basicConfig(level=level, handlers=[handler], force=True)
 

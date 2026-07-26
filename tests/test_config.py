@@ -14,6 +14,8 @@ the same fact, so a broken coercion function cannot pass it.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from app import config as config_mod
@@ -126,6 +128,15 @@ PRE_REFACTOR_DEFAULTS = {
     "MESSAGE_LOG_BACKFILL_DAYS": 30,
     "MEDIA_MAX_MB": 50.0,
     "GAME_ICONS_REFRESH_DAYS": 7.0,
+    # Fernet keys: unset by default, and only ever generated when none exists.
+    "REVO_FERNET_KEY": "",
+    "STRAVA_FERNET_KEY": "",
+    "HEVY_FERNET_KEY": "",
+    # Derived from DB_PATH's directory when blank, matching the old
+    # `os.getenv(K) or os.path.join(os.path.dirname(DB_PATH) or ".", ...)`.
+    "BACKUP_DIR": os.path.join("/data", "backups"),
+    "MEDIA_DIR": os.path.join("/data", "media"),
+    "GAME_ICONS_CACHE": os.path.join("/data", "game_icons.json"),
     # dashboard / storage / logging
     "WEBUI_PASSWORD": "",
     "WEBUI_DISABLED": False,
@@ -240,6 +251,58 @@ def test_load_survives_a_database_that_raises():
 def test_bodyweight_channel_inherits_the_reminder_channel():
     cfg = config_mod.load(None, {"REMINDER_CHANNEL_ID": "123"})
     assert cfg["BODYWEIGHT_REMINDER_CHANNEL_ID"] == 123
+
+
+def test_fallback_fires_on_a_malformed_value_not_just_an_empty_one():
+    """The originals were ``int(x) if x.isdigit() else <fallback>``.
+
+    A pasted Discord mention is non-empty but not a snowflake. If the fallback
+    only triggered on an empty string, this would silently disable the
+    bodyweight reminder instead of inheriting the weekly reminder's channel.
+    """
+    cfg = config_mod.load(None, {
+        "REMINDER_CHANNEL_ID": "987654321",
+        "BODYWEIGHT_REMINDER_CHANNEL_ID": "<#123456789>",
+    })
+    assert cfg["BODYWEIGHT_REMINDER_CHANNEL_ID"] == 987654321
+
+    cfg = config_mod.load(None, {
+        "DAILY_UPDATE_CHANNEL_ID": "555",
+        "WEEKLY_REPORT_CHANNEL_ID": "not-an-id",
+    })
+    assert cfg["WEEKLY_REPORT_CHANNEL_ID"] == 555
+
+
+def test_gemini_floors_clamp_negative_values():
+    """gemini_client wraps both in max(0, ...); a negative would otherwise
+    reach range() or asyncio.sleep()."""
+    assert config_mod.load(None, {"GEMINI_MAX_RETRIES": "-1"})[
+        "GEMINI_MAX_RETRIES"] == 0
+    assert config_mod.load(None, {"GEMINI_RETRY_DELAY": "-5"})[
+        "GEMINI_RETRY_DELAY"] == 0.0
+
+
+def test_public_url_loses_its_trailing_slash():
+    """Otherwise the derived callback is https://host//strava/webhook, which
+    Strava's subscription validation will not match."""
+    assert config_mod.load(None, {
+        "STRAVA_PUBLIC_URL": "https://strava.example.com/",
+    })["STRAVA_PUBLIC_URL"] == "https://strava.example.com"
+
+
+@pytest.mark.parametrize("level", ["debug", "Info", "WARNING", "warning"])
+def test_install_logging_accepts_any_case_of_level(level):
+    """basicConfig only takes an int or an UPPERCASE name.
+
+    Passing a lowercase level raised ValueError out of the supervisor before
+    the dashboard bound, crash-looping the container with no way to undo the
+    setting except editing SQLite on the volume.
+    """
+    config_mod.install_logging(config_mod.load(None, {"LOG_LEVEL": level}))
+
+
+def test_install_logging_survives_a_nonsense_level():
+    config_mod.install_logging(config_mod.load(None, {"LOG_LEVEL": "chatty"}))
 
 
 def test_bodyweight_channel_own_value_wins():

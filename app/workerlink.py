@@ -145,9 +145,16 @@ class WorkerLink:
             self._session = aiohttp.ClientSession(connector=connector)
 
     async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        # Drop the reference FIRST. If this coroutine is cancelled inside
+        # close(), leaving a closed-but-still-referenced session behind would
+        # make start() decline to rebuild it ("is not None") and every later
+        # RPC would raise "Session is closed" — surfacing as a 500 rather than
+        # the intended 503, because only WorkerDown is translated.
+        session, self._session = self._session, None
+        self.up = False
+        if session is not None:
+            with contextlib.suppress(Exception):
+                await session.close()
 
     async def reset(self) -> None:
         """Rebuild the session after a worker restart (the old socket is gone)."""

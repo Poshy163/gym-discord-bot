@@ -225,11 +225,11 @@ def build_app(
     announce_blacklist: BlacklistAnnouncer | None = None,
     voice_snapshot: VoiceSnapshotHandler | None = None,
     presence_track: PresenceTrackHandler | None = None,
-    presence_enabled: bool = False,
+    presence_enabled: "bool | Callable[[], bool]" = False,
     calorie_streak: StreakHandler | None = None,
     protein_streak: StreakHandler | None = None,
-    media_dir: str | None = None,
-    display_tz=timezone.utc,
+    media_dir: "str | Callable[[], str | None] | None" = None,
+    display_tz=timezone.utc,  # tzinfo, or a zero-arg callable returning one
 ) -> web.Application:
     """Construct the dashboard aiohttp application.
 
@@ -280,6 +280,24 @@ def build_app(
     def _claimed() -> bool:
         """True once a password exists. Always True in the legacy static mode."""
         return auth.is_claimed() if auth is not None else True
+
+    # ``media_dir``, ``display_tz`` and ``presence_enabled`` may each be given
+    # as a plain value (the legacy shape, still used by the tests) or as a
+    # zero-arg callable. The supervisor passes callables so that changing them
+    # in the Settings tab takes effect on the next request — otherwise they
+    # would be frozen at supervisor boot, and a "hot" setting that reported
+    # "Saved, no restart needed" would keep serving the old value until the
+    # whole container was restarted.
+
+    def _media_dir() -> "str | None":
+        return media_dir() if callable(media_dir) else media_dir
+
+    def _display_tz():
+        return display_tz() if callable(display_tz) else display_tz
+
+    def _presence_enabled() -> bool:
+        return bool(presence_enabled() if callable(presence_enabled)
+                    else presence_enabled)
 
     def _authed(request: web.Request) -> bool:
         return sessions.valid(request.cookies.get(SESSION_COOKIE))
@@ -575,7 +593,7 @@ def build_app(
                 )
             ]
             st = presence.sleep_stats(presence.nightly_sleep_sessions(
-                events, week_since, now, display_tz=display_tz,
+                events, week_since, now, display_tz=_display_tz(),
             ))
             if st["avg_hours"] is not None:
                 sleep_avgs.append(st["avg_hours"])
@@ -665,7 +683,7 @@ def build_app(
             "revo_linked": db.get_revo_account(uid) is not None,
             "presence_tracked": db.presence_is_tracked(gid, uid),
             "presence_tracking_available": bool(
-                presence_enabled and presence_track is not None
+                _presence_enabled() and presence_track is not None
             ),
             "calorie_streak": calorie_streak(uid) if calorie_streak else None,
             "protein_streak": protein_streak(uid) if protein_streak else None,
@@ -950,7 +968,7 @@ def build_app(
                 for r in db.presence_events_for(gid, uid, since=since, until=now)
             ]
             sessions = presence.nightly_sleep_sessions(
-                events, since, now, display_tz=display_tz,
+                events, since, now, display_tz=_display_tz(),
             )
             stats = presence.sleep_stats(sessions)
             users.append({
@@ -1033,7 +1051,19 @@ def build_app(
     async def api_voice(request: web.Request) -> web.Response:
         _require(request)
         gid = _guild_id(request)
-        occupancy = await voice_snapshot(gid) if voice_snapshot else []
+        # "Who's in VC right now" needs the bot; the join/leave log and the
+        # 7-day totals do not. Degrade to the history rather than failing the
+        # whole tab — the bot being down is the normal state during setup and
+        # reconfiguration, which is exactly when the dashboard has to stay
+        # useful.
+        occupancy = []
+        if voice_snapshot is not None:
+            try:
+                occupancy = await voice_snapshot(gid)
+            except Exception as exc:  # noqa: BLE001
+                if type(exc).__name__ != "WorkerDown":
+                    raise
+                LOG.debug("Voice snapshot unavailable — bot offline.")
         events = [
             {
                 "user_id": str(r["user_id"]),
@@ -1485,10 +1515,11 @@ def build_app(
         a crafted ``../`` can't read arbitrary files. Long-cached because each
         file is content-addressed by its immutable Discord attachment id."""
         _require(request)
-        if not media_dir:
+        root = _media_dir()
+        if not root:
             raise web.HTTPNotFound(text="media storage disabled")
         rel = request.match_info.get("path", "")
-        base = os.path.abspath(media_dir)
+        base = os.path.abspath(root)
         full = os.path.abspath(os.path.join(base, rel))
         if full != base and not full.startswith(base + os.sep):
             raise web.HTTPForbidden(text="bad path")
@@ -2340,8 +2371,15 @@ async function render(){
   const v=document.getElementById("view");
   clearLive();  // stop any prior tab's auto-refresh before drawing the new one
   // Settings are global, so they must be reachable before any guild exists —
-  // this check has to come BEFORE the "Pick a guild" bail-out below.
-  if(tab==="settings"){v.innerHTML=spinner();return renderSettings(v);}
+  // this check has to come BEFORE the "Pick a guild" bail-out below. It needs
+  // its own try/catch too: it sits outside the one below, so an error here
+  // (e.g. /api/settings 503 in a deployment built without a SettingsService)
+  // would otherwise leave the tab spinning forever with nothing shown.
+  if(tab==="settings"){
+    v.innerHTML=spinner();
+    try{return await renderSettings(v);}
+    catch(e){v.innerHTML='<div class="empty">Settings unavailable: '+esc(e.message)+'</div>';return;}
+  }
   if(!guild){v.innerHTML='<div class="empty">Pick a guild.</div>';return;}
   v.innerHTML=spinner();
   try{
@@ -2375,12 +2413,16 @@ function workerCard(w){
   if(!w)return"";
   const cls=WDOT[w.state]||"idle";
   const log=w.log&&w.log.length?`<pre class="wlog">${esc(w.log.join("\n"))}</pre>`:"";
+  // Revert is gated separately from Retry: with no recorded known-good
+  // revision there is nothing safe to roll back to, so the button is hidden
+  // rather than offered and then refused.
+  const revert=w.can_revert
+    ?` <button class="btn sm" onclick="revertSettings()">Revert last change</button>`:"";
   const retry=w.can_retry
-    ?`<button class="btn sm" onclick="workerAction('restart')">Retry</button>
-       <button class="btn sm" onclick="revertSettings()">Revert last change</button>`
+    ?`<button class="btn sm" onclick="workerAction('restart')">Retry</button>${revert}`
     :`<button class="btn sm" onclick="workerAction('restart')">Restart bot</button>`;
-  return `<div class="box" style="margin-bottom:1rem">
-    <div class="wstat"><span class="wdot ${cls}"></span><span id="whead">${esc(w.headline||"")}</span></div>
+  return `<div class="box" id="wcard" style="margin-bottom:1rem">
+    <div class="wstat"><span class="wdot ${cls}"></span><span>${esc(w.headline||"")}</span></div>
     ${log}
     <div style="margin-top:.9rem;display:flex;gap:.5rem;flex-wrap:wrap">${retry}</div></div>`;
 }
@@ -2495,10 +2537,16 @@ async function workerAction(action){
   setTimeout(render,1500);
 }
 async function pollWorker(){
+  // Re-render the whole status card, not just the headline. A bot that
+  // quarantines while this tab is open needs its dot, its stderr log and its
+  // Retry/Revert buttons to appear — those are the recovery controls the card
+  // exists to provide, and updating only the text left them invisible.
   try{
     const w=await api("/api/worker");if(!w)return;
-    const head=document.getElementById("whead");
-    if(head&&w.headline)head.textContent=w.headline;
+    const host=document.getElementById("wcard");
+    if(!host)return;
+    const next=workerCard(w);
+    if(host.outerHTML!==next)host.outerHTML=next;
   }catch(e){}
 }
 

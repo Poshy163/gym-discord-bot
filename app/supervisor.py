@@ -30,7 +30,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config as config_mod
-from . import dayspans, game_icons, secretbox, settings_service, webui, workerlink
+from . import (
+    dayspans, game_icons, secretbox, settings_service, targets, webui, workerlink,
+)
 from .db import Database
 from .settings_service import DbAuth, SettingsService
 
@@ -83,7 +85,11 @@ class WorkerSupervisor:
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task | None = None
         self._restart_handle: asyncio.TimerHandle | None = None
+        self._restart_task: asyncio.Task | None = None
         self._stopping = False
+        #: Set by stop()/restart() so _watch can tell a deliberate SIGTERM
+        #: apart from a crash.
+        self._intentional_stop = False
         self._consecutive_failures = 0
         self._backoff_index = 0
         self.state = WorkerState.NOT_CONFIGURED
@@ -104,6 +110,13 @@ class WorkerSupervisor:
             "log": list(self.stderr_tail) if self.state == WorkerState.QUARANTINED
             else [],
             "can_retry": self.state == WorkerState.QUARANTINED,
+            # Separate from can_retry: with no recorded known-good revision
+            # there is nothing safe to revert to, and offering the button
+            # anyway would invite an operator to destroy their configuration.
+            "can_revert": (
+                self.state == WorkerState.QUARANTINED
+                and self._settings.last_good_rev() > 0
+            ),
         }
 
     def _headline(self) -> str:
@@ -166,21 +179,40 @@ class WorkerSupervisor:
         started = asyncio.get_running_loop().time()
         healthy = asyncio.create_task(self._mark_healthy_after(proc))
         try:
-            await asyncio.gather(
-                self._pump_stderr(proc),
-                proc.wait(),
-            )
+            # stderr forwarding must never be able to take supervision down
+            # with it -- a single line over the stream limit would otherwise
+            # raise out of here, skip the bookkeeping below, and leave a dead
+            # bot permanently reported as "running" with no respawn.
+            pump = asyncio.create_task(self._pump_stderr(proc))
+            try:
+                await proc.wait()
+            finally:
+                await asyncio.wait({pump}, timeout=2)
+                pump.cancel()
         finally:
             healthy.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await healthy
+            # Cleared unconditionally: reconcile() and restart() both key off
+            # _proc being None, so failing to clear it here would wedge them.
+            self._proc = None
+            self.link.up = False
 
         code = proc.returncode
         self.last_exit_code = code
-        self._proc = None
-        self.link.up = False
         ran_for = asyncio.get_running_loop().time() - started
 
         if self._stopping:
             self.state = WorkerState.STOPPED
+            return
+
+        if self._intentional_stop:
+            # An operator pressed Stop, or a restart is about to respawn us.
+            # Neither is a crash: counting it as one would let two clicks of
+            # Stop fabricate a quarantine, and would log SIGTERM as a failure.
+            self._intentional_stop = False
+            self.state = WorkerState.STOPPED
+            self.detail = "Stopped from the dashboard."
             return
 
         if code == EX_CONFIG:
@@ -243,7 +275,19 @@ class WorkerSupervisor:
         if proc.stderr is None:
             return
         while True:
-            line = await proc.stderr.readline()
+            try:
+                line = await proc.stderr.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                # A single line longer than the stream limit (64 KiB) — a huge
+                # traceback or a dumped payload. Drop it and keep forwarding
+                # rather than letting one oversized line stop supervision.
+                LOG.warning("Dropped an oversized line from the bot's output.")
+                continue
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except Exception:  # noqa: BLE001
+                LOG.warning("Stopped forwarding the bot's output.", exc_info=True)
+                return
             if not line:
                 return
             text = line.decode(errors="replace").rstrip("\n")
@@ -257,22 +301,43 @@ class WorkerSupervisor:
             await self.reconcile()
 
     async def stop(self, *, graceful: bool = True) -> None:
-        """SIGTERM, then SIGKILL after the grace period."""
-        proc = self._proc
+        """SIGTERM, then SIGKILL after the grace period.
+
+        Returns only once ``_watch`` has finished its bookkeeping, so a caller
+        can rely on ``self._proc`` being None afterwards. Without that wait,
+        ``restart()`` raced the watcher: ``reconcile()`` saw a still-set
+        ``_proc``, no-oped, and the bot only came back later via the *failure*
+        backoff path — logging a misleading "exited with code -15".
+        """
+        proc, task = self._proc, self._task
         if proc is None or proc.returncode is not None:
+            if task is not None:
+                await asyncio.wait({task}, timeout=SHUTDOWN_GRACE_SECONDS)
             return
+
+        self._intentional_stop = True
         if graceful:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), SHUTDOWN_GRACE_SECONDS)
-                return
+                await asyncio.wait_for(
+                    asyncio.shield(proc.wait()), SHUTDOWN_GRACE_SECONDS,
+                )
             except asyncio.TimeoutError:
                 LOG.warning("Bot did not exit within %ss; killing it.",
                             SHUTDOWN_GRACE_SECONDS)
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+
+        # Let _watch run its finally block (which clears _proc) before we
+        # return, so the caller sees a settled state machine.
+        if task is not None:
+            await asyncio.wait({task}, timeout=SHUTDOWN_GRACE_SECONDS)
 
     async def restart(self, reason: str = "") -> None:
         """Bounce the worker now, clearing any quarantine."""
@@ -286,6 +351,7 @@ class WorkerSupervisor:
         with contextlib.suppress(FileNotFoundError, OSError):
             os.unlink(self._sock_path)
         self._settings.clear_pending()
+        self.state = WorkerState.RESTARTING
         await self.reconcile()
 
     def request_restart(self, reason: str = "") -> None:
@@ -293,18 +359,39 @@ class WorkerSupervisor:
         loop = asyncio.get_running_loop()
         if self._restart_handle is not None:
             self._restart_handle.cancel()
-        self._restart_handle = loop.call_later(
-            RESTART_DEBOUNCE_SECONDS,
-            lambda: asyncio.create_task(self.restart(reason)),
-        )
+
+        def _fire() -> None:
+            # Keep a strong reference: asyncio holds only a weak one, so a GC
+            # pass before the task's first suspension point can destroy it
+            # mid-flight, leaving the worker SIGTERMed and never respawned.
+            task = asyncio.create_task(self.restart(reason))
+            self._restart_task = task
+            task.add_done_callback(lambda _t: setattr(self, "_restart_task", None))
+
+        self._restart_handle = loop.call_later(RESTART_DEBOUNCE_SECONDS, _fire)
 
     async def reload_hot(self) -> bool:
-        """Push hot-reloadable settings into a running worker."""
+        """Push hot-reloadable settings into a running worker.
+
+        Retries through the ``up`` flag rather than trusting it: that flag is
+        only refreshed every 15 seconds, so within a window of a restart a hot
+        change would be written to the database, reported "Saved", and then
+        silently never reach the running bot.
+        """
+        if self._proc is None:
+            return False  # nothing running; the next spawn reads the DB anyway
         try:
+            await self.link.ping()
             await self.link.call("reload_config")
             return True
         except Exception as exc:  # noqa: BLE001
-            LOG.debug("Hot reload skipped (%s).", exc)
+            LOG.warning(
+                "Could not push the setting to the running bot (%s) — "
+                "restarting it so the change takes effect.", exc,
+            )
+            # Better a six-second bounce than a setting that says Saved and
+            # quietly does nothing.
+            await self.restart("hot reload unavailable")
             return False
 
     async def shutdown(self) -> None:
@@ -442,6 +529,15 @@ async def _run() -> int:
     settings_service.seed_from_env_once(db, box)
 
     settings = SettingsService(db, box)
+
+    # First boot only: bank the post-migration state as the revert baseline.
+    # Deliberately not unconditional -- _run() executes on every container
+    # start, and by then settings_rev() already includes whatever bad edit
+    # caused the restart, so overwriting would record that edit as known-good
+    # and destroy the only safe target.
+    if settings.last_good_rev() <= 0:
+        settings.mark_good(db.settings_rev())
+
     cfg = settings.current()
     config_mod.install_logging(cfg)
 
@@ -463,6 +559,15 @@ async def _run() -> int:
                     "then only come from environment variables.")
 
     auth = DbAuth(db, os.environ)
+    # Do this BEFORE the dashboard binds: it is what stops "remove
+    # WEBUI_PASSWORD from compose" from silently re-opening the unauthenticated
+    # claim form.
+    auth.adopt_env_password()
+
+    # app.targets binds the timezone at its own import, long before the
+    # database is open, so the dashboard would otherwise resolve weekday vs
+    # weekend nutrition targets in the wrong zone.
+    targets.configure(cfg["DISPLAY_TIMEZONE"])
     sock_path = str(run_dir / "worker.sock")
     supervisor = WorkerSupervisor(db, settings, sock_path=sock_path,
                                   run_dir=run_dir)
@@ -490,9 +595,16 @@ async def _run() -> int:
         announce_blacklist=supervisor.link.proxy("announce_blacklist"),
         voice_snapshot=supervisor.link.proxy("voice_snapshot"),
         presence_track=supervisor.link.proxy("presence_track"),
-        presence_enabled=bool(cfg["ENABLE_PRESENCE_TRACKING"]),
-        media_dir=cfg["MEDIA_DIR"] if cfg["ENABLE_MEDIA_DOWNLOAD"] else None,
-        display_tz=_tz_of(cfg),
+        # Callables, not values: these three change from the Settings tab, and
+        # freezing them at boot would make a setting that says "Saved, no
+        # restart needed" keep serving the old value until the container
+        # itself restarted.
+        presence_enabled=lambda: bool(settings.current()["ENABLE_PRESENCE_TRACKING"]),
+        media_dir=lambda: (
+            settings.current()["MEDIA_DIR"]
+            if settings.current()["ENABLE_MEDIA_DOWNLOAD"] else None
+        ),
+        display_tz=tz_of,
     )
 
     runner = None
