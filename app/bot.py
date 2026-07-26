@@ -2339,7 +2339,17 @@ def _command_tree_signature() -> str:
 
     cmds = sorted(bot.tree.get_commands(), key=lambda c: c.name)
     blob = json.dumps(
-        {"scope": COMMAND_SCOPE, "guild": _gid, "cmds": [sig(c) for c in cmds]},
+        {
+            "scope": COMMAND_SCOPE,
+            # Derived from DEV_GUILD rather than a second global, so the
+            # reload_config rebind has only one name to keep correct. Kept as a
+            # STRING to match the pre-refactor `_gid` (which came straight from
+            # os.getenv): an int here would change the fingerprint for every
+            # existing install and force one spurious sync against Discord's
+            # daily-rate-limited command endpoint on upgrade.
+            "guild": str(DEV_GUILD.id) if DEV_GUILD is not None else "",
+            "cmds": [sig(c) for c in cmds],
+        },
         sort_keys=True,
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -2366,7 +2376,7 @@ async def _sync_commands(*, force: bool = False) -> dict:
         LOG.info(
             "Synced %d slash commands to guild %s only "
             "(COMMAND_SCOPE=guild — other servers see nothing)",
-            len(synced), _gid,
+            len(synced), DEV_GUILD.id,
         )
     else:
         # Global: every server the bot is in gets the commands. If a guild was
