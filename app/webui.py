@@ -49,6 +49,9 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
+
+from yarl import URL  # already a hard dependency of aiohttp
 
 from aiohttp import web
 
@@ -104,9 +107,65 @@ SettingsProvider = Any    # app.settings_service.SettingsService
 SupervisorProvider = Any  # app.supervisor.WorkerSupervisor
 
 
+#: The dashboard's tabs, as ``(slug, icon)``. Single source of truth: the JS
+#: nav is generated from this, and every slug gets its own GET route so
+#: ``/overview``, ``/members`` etc. are real bookmarkable URLs rather than
+#: client-only state. Without the routes, a refresh or a shared link 404s.
+DASHBOARD_TABS: tuple[tuple[str, str], ...] = (
+    ("overview", "📊"),
+    ("members", "👥"),
+    ("activity", "🎮"),
+    ("sleep", "💤"),
+    ("messages", "💬"),
+    ("voice", "🔊"),
+    ("roles", "🛡️"),
+    ("leaderboard", "🏆"),
+    ("audit", "📜"),
+    ("lifts", "🏋️"),
+    ("calories", "🔥"),
+    ("protein", "🥩"),
+    ("settings", "⚙️"),
+)
+
+
 def _esc(text: str) -> str:
     """Escape untrusted text before it goes into one of the HTML templates."""
     return html.escape(str(text), quote=True)
+
+
+def _safe_next(raw: str | None) -> str:
+    """Sanitise a post-login redirect target.
+
+    ``next`` is attacker-controllable on an unauthenticated page, so anything
+    that is not plainly a same-origin absolute path collapses to ``/``. The
+    rejected cases, and why each matters:
+
+    * ``https://evil.example`` — absolute URL, another origin.
+    * ``//evil.example`` — protocol-relative; browsers treat it as another
+      origin even though it starts with a slash.
+    * ``/\\evil.example`` — browsers normalise backslashes to forward slashes,
+      so this becomes protocol-relative too. This is the bypass that catches
+      naive "starts with / and not //" checks.
+    * anything containing CR, LF, TAB or NUL — those would be smuggled into the
+      ``Location`` response header.
+    """
+    if not raw:
+        return "/"
+    if any(ch in raw for ch in "\r\n\t\x00"):
+        return "/"
+    if "\\" in raw:
+        return "/"
+    if not raw.startswith("/") or raw.startswith("//"):
+        return "/"
+    # Final catch-all: the value ends up in web.HTTPFound, which parses it with
+    # yarl. Something like "/[" raises ValueError("Invalid IPv6 URL") there and
+    # would surface as a 500 on the login POST -- losing the operator's sign-in
+    # to a crafted link. Parse it here instead and fall back quietly.
+    try:
+        URL(raw)
+    except Exception:  # noqa: BLE001 - any parse failure means "not usable"
+        return "/"
+    return raw
 
 
 async def _json_body(request: "web.Request") -> dict:
@@ -329,12 +388,26 @@ def build_app(
 
     # ---- auth routes -----------------------------------------------------
 
+    def _login_page(request: web.Request, error: str = "") -> str:
+        """LOGIN_HTML with the post-login target and any error filled in."""
+        nxt = _safe_next(request.query.get("next"))
+        # safe="/" so ?, = and & inside the target are percent-encoded. Leaving
+        # them literal split a multi-parameter target at the first & when the
+        # form was submitted -- "/activity?guild=1&days=30" came back as
+        # next="/activity?guild=1" plus a stray days=30, silently dropping part
+        # of the view the operator was returning to.
+        body = LOGIN_HTML.replace(
+            'action="/login"',
+            f'action="/login?next={_esc(quote(nxt, safe="/"))}"',
+        )
+        return body.replace("<!--ERR-->", error)
+
     async def login_get(request: web.Request) -> web.Response:
         if not _claimed():
             raise web.HTTPFound("/setup")
         if _authed(request):
-            raise web.HTTPFound("/")
-        return web.Response(text=LOGIN_HTML, content_type="text/html")
+            raise web.HTTPFound(_safe_next(request.query.get("next")))
+        return web.Response(text=_login_page(request), content_type="text/html")
 
     # ---- first-boot claim -------------------------------------------------
 
@@ -389,8 +462,8 @@ def build_app(
         if locked:
             mins = max(1, locked // 60)
             LOG.warning("Dashboard login blocked (locked out) from %s", ip)
-            body = LOGIN_HTML.replace(
-                "<!--ERR-->",
+            body = _login_page(
+                request,
                 f'<p class="err">Too many attempts. Try again in ~{mins} min.</p>',
             )
             return web.Response(
@@ -410,15 +483,13 @@ def build_app(
         if ok:
             login_throttle.record_success(ip)
             token = sessions.create()
-            resp = web.HTTPFound("/")
+            resp = web.HTTPFound(_safe_next(request.query.get("next")))
             _set_session_cookie(request, resp, token)
             LOG.info("Dashboard login from %s", _actor(request))
             return resp
         login_throttle.record_failure(ip)
         LOG.warning("Failed dashboard login from %s", ip)
-        body = LOGIN_HTML.replace(
-            "<!--ERR-->", '<p class="err">Wrong password.</p>'
-        )
+        body = _login_page(request, '<p class="err">Wrong password.</p>')
         return web.Response(text=body, content_type="text/html", status=401)
 
     async def logout_post(request: web.Request) -> web.Response:
@@ -431,7 +502,14 @@ def build_app(
         if not _claimed():
             raise web.HTTPFound("/setup")
         if not _authed(request):
-            raise web.HTTPFound("/login")
+            # Carry the requested view through the login round-trip, so a
+            # bookmarked /members/123 lands there instead of dumping you on the
+            # overview and making you navigate back.
+            target = request.path_qs
+            raise web.HTTPFound(
+                "/login" if target == "/"
+                else f"/login?next={quote(target, safe='')}"
+            )
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
     # ---- settings ---------------------------------------------------------
@@ -1582,6 +1660,12 @@ def build_app(
         web.post("/api/password", api_password),
         web.get("/logo.svg", logo),
         web.get("/", index),
+        # One route per tab, plus the member deep link, so these are real URLs
+        # that survive a refresh and can be shared. Registered explicitly
+        # rather than as a catch-all so they can never shadow /api/*, /login,
+        # /setup, /media/* or /healthz.
+        *(web.get(f"/{slug}", index) for slug, _icon in DASHBOARD_TABS),
+        web.get("/members/{user_id}", index),
         web.get("/api/guilds", api_guilds),
         web.get("/api/overview", api_overview),
         web.get("/api/members", api_members),
@@ -2194,9 +2278,10 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
 <dialog id="editDlg"></dialog>
 <div class="toast" id="toast"></div>
 <script>
-const TABS=[["overview","📊"],["members","👥"],["activity","🎮"],["sleep","💤"],["messages","💬"],["voice","🔊"],["roles","🛡️"],
-  ["leaderboard","🏆"],["audit","📜"],["lifts","🏋️"],["calories","🔥"],["protein","🥩"],
-  ["settings","⚙️"]];
+// Injected from DASHBOARD_TABS in app/webui.py so the nav and the server-side
+// routes cannot drift apart — every slug here must have a matching GET route
+// or a hard refresh on that URL would 404.
+const TABS=/*TABS*/;
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
   role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
@@ -2331,17 +2416,100 @@ function avatar(uid,name,url,size){size=size||30;const st=`width:${size}px;heigh
 function avFor(uid,name,size){const m=AV[uid];return avatar(uid,name||(m&&m.name),m&&m.avatar,size);}
 function who(uid,name){return `<span class="who">${avFor(uid,name)}<a class="link" onclick="memberView('${uid}')">${esc(name)}</a></span>`;}
 
-async function api(p){const r=await fetch(p);if(r.status===401){location.href="/login";return null;}
+// Bounce to login carrying the current view, so a session that expires while
+// you are on /members/123 returns you there instead of the overview.
+function toLogin(){
+  location.href="/login?next="+encodeURIComponent(location.pathname+location.search);
+}
+async function api(p){const r=await fetch(p);if(r.status===401){toLogin();return null;}
   if(!r.ok)throw new Error(await r.text());return r.json();}
 async function post(p,b){const r=await fetch(p,{method:"POST",
   headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
-  if(r.status===401){location.href="/login";return null;}return r.json();}
+  if(r.status===401){toLogin();return null;}return r.json();}
 function spinner(){return '<div class="center"><div class="spin"></div></div>';}
 
+/* ---- routing ------------------------------------------------------------
+   Every view has a real URL: /overview, /members, /members/<id>. Back then
+   returns to the previous tab instead of leaving the dashboard entirely, and
+   any view can be bookmarked, refreshed or opened in a new tab.
+   The guild rides along as ?guild=<id> so a shared link resolves to the same
+   server rather than whichever one happens to sort first. */
+const TAB_SLUGS=TABS.map(([t])=>t);
+
+function tabPath(t,uid){
+  const base=(t==="members"&&uid)?`/members/${encodeURIComponent(uid)}`:`/${t}`;
+  return guild?`${base}?guild=${encodeURIComponent(guild)}`:base;
+}
+let inPop=false;   // true while a popstate is being applied
+function pushPath(t,uid){
+  // Never push while handling Back/Forward. The browser has already moved the
+  // URL, and adding an entry here would leave Back pointing at the page you
+  // just came from — a trap worse than the friction this routing removes.
+  if(inPop)return;
+  const p=tabPath(t,uid);
+  // Idempotent otherwise: memberView() is also called to re-render after an
+  // edit, and those must not stack duplicate history entries that Back would
+  // then have to walk through one by one.
+  if(location.pathname+location.search===p)return;
+  history.pushState({t:t,uid:uid||null},"",p);
+}
+function parsePath(){
+  const seg=location.pathname.split("/").filter(Boolean);
+  const q=new URLSearchParams(location.search);
+  const t=(seg[0]&&TAB_SLUGS.includes(seg[0]))?seg[0]:null;
+  return {tab:t,uid:(t==="members"&&seg[1])?decodeURIComponent(seg[1]):null,
+          guild:q.get("guild")};
+}
+function applyRoute(t,uid){
+  tab=t;dataUserFilter=null;SEARCH="";currentMember=uid||null;
+  // memberView() bypasses render(), which is what normally stops the previous
+  // tab's auto-refresh. Without this, going Back from Settings into a member
+  // view leaves pollWorker hitting /api/worker every 15s for the life of the
+  // page, on every tab.
+  clearLive();
+  renderNav();
+  if(uid)return memberView(uid);
+  render();
+}
+window.addEventListener("popstate",async()=>{
+  const r=parsePath();
+  const sel=document.getElementById("guild");
+  const switched=r.guild&&r.guild!==guild;
+  if(switched){
+    guild=r.guild;if(sel)sel.value=guild;
+    // The avatar and role caches are per-server. Going Back across a server
+    // change without reloading them left the role dropdown listing the OTHER
+    // server's roles — and granting one POSTed a role id that doesn't exist
+    // in this guild, failing with a bare "Failed".
+    await loadAvatars();await loadRoles();
+  }
+  inPop=true;
+  // Safe to clear synchronously: memberView() calls pushPath() in its
+  // synchronous prefix, before its first await, so the only push this route
+  // can attempt has already been suppressed by the time applyRoute returns.
+  try{applyRoute(r.tab||"overview",r.uid);}
+  finally{inPop=false;}
+});
+
 function renderNav(){document.getElementById("nav").innerHTML=
-  TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" onclick="go('${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
-function go(t){tab=t;dataUserFilter=null;SEARCH="";renderNav();render();}
-async function onGuild(){guild=document.getElementById("guild").value;await loadAvatars();await loadRoles();render();}
+  TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" href="${tabPath(t)}" onclick="return navClick(event,'${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
+function navClick(e,t){
+  // Real hrefs, so middle-click and ctrl-click open a new tab natively. Only
+  // plain left-clicks are intercepted for client-side navigation.
+  if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0)return true;
+  e.preventDefault();go(t);return false;
+}
+function go(t){pushPath(t);applyRoute(t,null);}
+async function onGuild(){guild=document.getElementById("guild").value;
+  // A member id is scoped to one server, so it cannot survive a server switch —
+  // keeping it would leave the address bar pointing at a member page while the
+  // members LIST is on screen, and refreshing that URL would show an empty stub
+  // for a member who isn't in this server.
+  currentMember=null;
+  // replaceState, not push: switching server is a change to the current view,
+  // not a new place to go Back to.
+  history.replaceState({t:tab,uid:null},"",tabPath(tab,null));
+  renderNav();await loadAvatars();await loadRoles();render();}
 
 async function loadAvatars(){AV={};try{const d=await api(`/api/members?guild=${guild}`);
   if(d)for(const m of d.members)AV[m.user_id]={avatar:m.avatar,name:m.display_name};}catch(e){}}
@@ -2349,6 +2517,7 @@ async function loadRoles(){try{const d=await api(`/api/roles?guild=${guild}`);
   ALL_ROLES=(d&&d.roles)||[];}catch(e){ALL_ROLES=[];}}
 
 async function boot(){
+  const route=parsePath();
   const g=await api("/api/guilds");if(!g)return;
   const sel=document.getElementById("guild");
   // A brand-new install has no guilds yet, and the whole point of the Settings
@@ -2358,10 +2527,24 @@ async function boot(){
   if(!g.guilds.length){
     tab="settings";renderNav();
     sel.innerHTML='<option>No server yet</option>';
+    history.replaceState({t:"settings",uid:null},"","/settings");
     return render();
   }
   sel.innerHTML=g.guilds.map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join("");
-  guild=g.guilds[0].id;renderNav();await loadAvatars();await loadRoles();render();
+  // Honour ?guild= from the URL, but only if it is a server we actually have —
+  // otherwise a stale bookmark would leave every panel empty with no clue why.
+  const ids=g.guilds.map(x=>String(x.id));
+  guild=(route.guild&&ids.includes(route.guild))?route.guild:String(g.guilds[0].id);
+  sel.value=guild;
+  tab=route.tab||"overview";
+  currentMember=route.uid||null;
+  renderNav();
+  await loadAvatars();await loadRoles();
+  // Normalise the address bar (adds ?guild=, turns "/" into "/overview") without
+  // creating a history entry the user never navigated to.
+  history.replaceState({t:tab,uid:currentMember},"",tabPath(tab,currentMember));
+  if(currentMember)return memberView(currentMember);
+  render();
 }
 async function resync(){if(!guild)return;toast("Syncing…");
   const r=await post("/api/resync",{guild});await loadAvatars();
@@ -2637,7 +2820,10 @@ async function renderMembers(v){
 }
 
 async function memberView(uid){
-  tab="members";renderNav();currentMember=uid;
+  tab="members";currentMember=uid;renderNav();
+  // No-ops when the URL already points here, so the re-render after an edit
+  // (rename, role change, timeout removal) doesn't stack history entries.
+  pushPath("members",uid);
   const v=document.getElementById("view");v.innerHTML=spinner();
   const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
@@ -2843,7 +3029,10 @@ async function renderLeaderboard(v){
       <td class="muted">${fmtTs(r.set_on)}</td></tr>`).join("")||
       '<tr><td colspan="4" class="muted">No entries.</td></tr>'}</tbody></table></div>`;
 }
-function go2(t,uid){dataUserFilter=uid;tab=t;renderNav();render();}
+function go2(t,uid){
+  // Jump to a data tab pre-filtered to one member. The filter itself is
+  // transient (not in the URL), so Back returns to the unfiltered tab.
+  pushPath(t);dataUserFilter=uid;tab=t;SEARCH="";renderNav();render();}
 
 async function renderRoles(v){
   const d=await api(`/api/roles?guild=${guild}`);if(!d)return;
@@ -3298,4 +3487,22 @@ function voiceBodyHTML(d){
 
 boot();
 </script></body></html>"""
+
+
+# Generated from DASHBOARD_TABS so the nav and the URL routes share one source
+# of truth — a tab added to the nav but not to the routes would 404 on refresh.
+#
+# The precondition is checked BEFORE the replace. Asserting the marker is absent
+# afterwards would be a tautology: it passes both when the injection worked and
+# when the marker was renamed so the replace matched nothing. The latter ships a
+# page whose script starts `const TABS=;` — a SyntaxError that stops every
+# function in the file from being defined, leaving an empty nav over a permanent
+# spinner on every route.
+_TABS_MARKER = "/*TABS*/"
+assert DASHBOARD_HTML.count(_TABS_MARKER) == 1, (
+    f"expected exactly one {_TABS_MARKER} placeholder in DASHBOARD_HTML"
+)
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    _TABS_MARKER, json.dumps([list(t) for t in DASHBOARD_TABS], ensure_ascii=False),
+)
 
