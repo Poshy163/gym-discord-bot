@@ -1963,9 +1963,13 @@ form.inline{margin:0}
 /* nav */
 nav{display:flex;gap:.3rem;padding:.6rem 1.4rem;flex-wrap:wrap;
 border-bottom:1px solid var(--line);background:rgba(13,17,23,.4)}
+/* text-decoration:none is load-bearing: these carry real href attributes (so
+   middle-click opens a new tab), which means the browser's default link
+   underline applies unless it is turned off here. */
 nav a{display:flex;align-items:center;gap:.4rem;padding:.4rem .85rem;border-radius:9px;
-cursor:pointer;color:var(--muted);font-size:.92rem;font-weight:500;transition:.15s}
-nav a:hover{color:var(--text);background:#ffffff0a}
+cursor:pointer;color:var(--muted);font-size:.92rem;font-weight:500;transition:.15s;
+text-decoration:none}
+nav a:hover{color:var(--text);background:#ffffff0a;text-decoration:none}
 nav a.active{color:#fff;background:linear-gradient(90deg,#6366f133,#22d3ee22);
 box-shadow:inset 0 0 0 1px #6366f155}
 
