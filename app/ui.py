@@ -323,9 +323,6 @@ def diverging(
     fmt: Callable[[float], str],
     *,
     width: int = 8,
-    under: str = "under",
-    over: str = "over",
-    total: str = "total",
 ) -> str:
     """A fenced chart of *deviation from target*, growing both ways from a rule.
 
@@ -341,36 +338,44 @@ def diverging(
     Bars are scaled to the **largest deviation in this set**, which makes the
     shape maximally readable within one card but not comparable between cards —
     hence the literal totals in the last column.
+
+    **The bar field is padded with ``▱``, never with spaces.** A monospace
+    fence only guarantees that *ASCII* advances match; ``▰``/``▱`` come from
+    Geometric Shapes and Discord may render them from a fallback font at a
+    different width. Mixing glyphs and spaces in one column therefore lands the
+    centre rule at a different x on rows that pad differently — visible as a
+    kinked axis. Padding with the track glyph keeps every row's bar field the
+    same *glyph* composition, so it renders identically whatever the font does.
+    For the same reason there is no text header inside the fence: an ASCII
+    header could not line up with glyph-padded rows.
     """
-    body = [r for r in rows]
+    body = list(rows)
     span = max(
         (abs(v - t) for _l, v, t in body if v is not None and t > 0),
         default=0.0,
     )
     label_w = max((len(l) for l, _v, _t in body), default=0)
     cells = [fmt(v) for _l, v, _t in body if v is not None]
-    total_w = max((len(c) for c in cells), default=len(total))
+    total_w = max((len(c) for c in cells), default=1)
 
-    # Clamped to the bar width: a header word longer than the bars would push
-    # the rule off the column the rows put it in, and the whole point of this
-    # chart is that the two sides meet on one vertical line.
-    head = (
-        f"{'':{label_w}}  {under[:width]:>{width}}│{over[:width]:<{width}}"
-        f"  {total:>{total_w}}"
-    )
-    out = [head]
+    out = []
     for label, value, target in body:
         if value is None:
+            blank = TRACK * width
             out.append(
-                f"{label:<{label_w}}  {'':{width}}│{'':{width}}  {'—':>{total_w}}"
+                f"{label:<{label_w}}  {blank}│{blank}  {'—':>{total_w}}"
             )
             continue
         delta = value - target if target > 0 else 0.0
         # Any non-zero deviation gets at least one cell, so a day that is over
         # by a little never renders as if it were exactly on target.
         n = 0 if not delta or span <= 0 else max(1, round(abs(delta) / span * width))
-        left = (FILL * n).rjust(width) if delta < 0 else " " * width
-        right = (FILL * n).ljust(width) if delta > 0 else " " * width
+        if delta < 0:
+            left, right = TRACK * (width - n) + FILL * n, TRACK * width
+        elif delta > 0:
+            left, right = TRACK * width, FILL * n + TRACK * (width - n)
+        else:
+            left = right = TRACK * width
         out.append(
             f"{label:<{label_w}}  {left}│{right}  {fmt(value):>{total_w}}"
         )
@@ -886,7 +891,8 @@ def preview_cases() -> list[tuple[str, list]]:
                 ("Sat", 158), ("Sun", 137), ("Mon", 132)]
     pro_card = card(
         f"{PROTEIN} Protein this week",
-        description=diverging([(d, v, 107) for d, v in week_pro], g),
+        description=diverging([(d, v, 107) for d, v in week_pro], g)
+        + "\n" + subtext("left of the line = under your max · right = over"),
         colour=score_ceiling(126, 107),
         footer=f"{STREAK} 35-day logging streak",
     )
@@ -895,7 +901,8 @@ def preview_cases() -> list[tuple[str, list]]:
                 ("Mon", 1755, 1250)]
     cal_card = card(
         f"{FOOD} Calories this week",
-        description=diverging(week_cal, cal),
+        description=diverging(week_cal, cal)
+        + "\n" + subtext("left of the line = under target · right = over"),
         colour=score_target(1901, 1464),
         footer=f"{STREAK} 40-day logging streak",
     )

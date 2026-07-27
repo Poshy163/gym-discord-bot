@@ -15972,7 +15972,10 @@ async def calories_week_cmd(
             logged_days += 1
             target_sum += target_kcal
         rows.append((day_name, total, target_kcal))
-    lines = [ui.diverging(rows, calories.format_kcal)]
+    lines = [
+        ui.diverging(rows, calories.format_kcal),
+        ui.subtext("left of the line = under target · right = over"),
+    ]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         avg_target = target_sum / logged_days
@@ -17320,10 +17323,12 @@ async def protein_week_cmd(
             logged_days += 1
             target_sum += target_g
         rows.append((day_name, total, target_g))
-    # "under"/"over" rather than "under max": the card title and colour already
-    # say this is a ceiling, and a header word wider than the bars would shift
-    # the centre rule off the column the rows draw it on.
-    lines = [ui.diverging(rows, protein_mod.format_grams)]
+    # The legend lives outside the fence — see ui.diverging: an ASCII header
+    # can't line up with glyph-padded bar rows.
+    lines = [
+        ui.diverging(rows, protein_mod.format_grams),
+        ui.subtext("left of the line = under your max · right = over"),
+    ]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         lines.append(

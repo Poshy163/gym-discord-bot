@@ -538,13 +538,41 @@ def _week_rows():
     return [(d, v, MAXG) for d, v in WEEK]
 
 
+def test_diverging_bar_field_is_glyphs_only_never_spaces():
+    """The rule must land at the same *rendered* x on every row, and counting
+    Python characters does not prove that: ``▰``/``▱`` are Geometric Shapes and
+    Discord may draw them from a fallback font at a width that differs from a
+    space. Mixing glyphs and spaces in one column kinks the axis. Padding with
+    the track glyph makes every row's bar field identical in composition, so it
+    renders identically whatever the font does."""
+    rows = _week_rows() + [("Non", None, MAXG), ("Eq", MAXG, MAXG)]
+    out = ui.diverging(rows, g)
+    for line in out.splitlines():
+        if "│" not in line:
+            continue
+        left, right = line.split("│")
+        bar_left = left[left.rindex("  ") + 2:]
+        bar_right = right[: right.index("  ")]
+        assert set(bar_left) <= {ui.FILL, ui.TRACK}, repr(bar_left)
+        assert set(bar_right) <= {ui.FILL, ui.TRACK}, repr(bar_right)
+        assert len(bar_left) == len(bar_right) == 8
+
+
 def test_diverging_centre_rule_is_one_vertical_line():
-    """The whole idea is that the two sides meet on a single column. A header
-    word wider than the bars would push the rule off it."""
-    for kwargs in ({}, {"under": "under max", "over": "over max"}):
-        out = ui.diverging(_week_rows(), g, **kwargs)
-        cols = {ln.index("│") for ln in out.splitlines() if "│" in ln}
-        assert len(cols) == 1, f"{kwargs}: rule at columns {cols}"
+    """Character-index alignment is necessary but not sufficient — see the test
+    above for the rendered-width half of the guarantee."""
+    out = ui.diverging(_week_rows(), g)
+    cols = {ln.index("│") for ln in out.splitlines() if "│" in ln}
+    assert len(cols) == 1, f"rule at columns {cols}"
+
+
+def test_diverging_has_no_text_header_inside_the_fence():
+    """An ASCII header cannot line up with glyph-padded rows, so the legend
+    lives outside the code block."""
+    out = ui.diverging(_week_rows(), g)
+    assert "under" not in out and "over" not in out
+    body = [ln for ln in out.splitlines() if ln not in ("```",)]
+    assert len(body) == len(_week_rows())      # no header row
 
 
 def test_diverging_length_tracks_distance_from_target():
