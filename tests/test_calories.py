@@ -844,3 +844,78 @@ def test_calorie_reminder_prefs_roundtrip(db):
     assert db.calorie_reminder_remove(100) is True
     assert db.calorie_reminder_remove(100) is False
     assert db.calorie_reminder_list() == []
+
+
+# --- saved-food aliases -------------------------------------------------------
+
+def test_food_lookup_falls_back_to_plural_and_singular(db):
+    """"boneless wicked wings" should find the food saved as
+    "boneless wicked wing" without anyone configuring anything."""
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("boneless wicked wing"),
+                        "Boneless Wicked Wing", 114, 9.4)
+    for query in ("boneless wicked wing", "boneless wicked wings"):
+        row = db.calorie_food_get(0, 100, nf(query))
+        assert row is not None, query
+        assert row["display"] == "Boneless Wicked Wing"
+
+    # And the other direction — saved plural, typed singular.
+    db.calorie_food_set(0, 100, nf("oats"), "Oats", 300)
+    assert db.calorie_food_get(0, 100, nf("oat"))["display"] == "Oats"
+
+
+def test_food_alias_resolves_an_arbitrary_name(db):
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("boneless wicked wing"), "BWW", 114)
+    assert db.calorie_food_get(0, 100, nf("bww")) is None
+    db.calorie_food_alias_set(100, nf("bww"), nf("boneless wicked wing"))
+    assert db.calorie_food_get(0, 100, nf("bww"))["display"] == "BWW"
+    assert [tuple(r) for r in db.calorie_food_aliases(100)] == [
+        ("bww", "boneless wicked wing"),
+    ]
+
+
+def test_food_alias_beats_the_plural_guess(db):
+    """An alias is the user's stated intent; the plural swap is a convenience."""
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("wings"), "Wings (plural food)", 200)
+    db.calorie_food_set(0, 100, nf("wing"), "Wing (singular food)", 100)
+    # "wing" is itself a saved food, so an exact hit wins outright.
+    assert db.calorie_food_get(0, 100, nf("wing"))["display"] == "Wing (singular food)"
+    # Point an alias somewhere unrelated and confirm it takes precedence.
+    db.calorie_food_set(0, 100, nf("pizza"), "Pizza", 800)
+    db.calorie_food_alias_set(100, nf("za"), nf("pizza"))
+    assert db.calorie_food_get(0, 100, nf("za"))["display"] == "Pizza"
+
+
+def test_deleting_a_food_clears_its_aliases(db):
+    """An alias pointing at a deleted food would silently stop logging."""
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("pizza"), "Pizza", 800)
+    db.calorie_food_alias_set(100, nf("za"), nf("pizza"))
+    db.calorie_food_remove(0, 100, nf("pizza"))
+    assert db.calorie_food_aliases(100) == []
+    assert db.calorie_food_get(0, 100, nf("za")) is None
+
+
+def test_food_alias_remove_reports_whether_it_existed(db):
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("pizza"), "Pizza", 800)
+    db.calorie_food_alias_set(100, nf("za"), nf("pizza"))
+    assert db.calorie_food_alias_remove(100, nf("za")) is True
+    assert db.calorie_food_alias_remove(100, nf("za")) is False
+
+
+def test_food_aliases_are_per_user(db):
+    from app.calories import normalize_food as nf
+
+    db.calorie_food_set(0, 100, nf("pizza"), "Pizza", 800)
+    db.calorie_food_set(0, 200, nf("pizza"), "Pizza", 800)
+    db.calorie_food_alias_set(100, nf("za"), nf("pizza"))
+    assert db.calorie_food_get(0, 100, nf("za")) is not None
+    assert db.calorie_food_get(0, 200, nf("za")) is None

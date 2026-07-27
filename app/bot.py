@@ -4908,6 +4908,28 @@ async def on_raw_reaction_add(
 # ---------------------------------------------------------------------------
 
 
+def _nothing_logged_embed(
+    target: object, viewer: object, macro: str, *, how: str,
+) -> discord.Embed:
+    """"Nothing logged this week", addressed to whoever is actually reading.
+
+    Looking up your own week gets the how-to; looking up someone else's gets a
+    plain statement about them, because "post an amount in chat" is advice the
+    reader cannot act on for another member.
+    """
+    if int(getattr(target, "id", 0)) == int(getattr(viewer, "id", -1)):
+        return ui.empty(
+            f"You haven't logged any {macro} this week",
+            hint=f"Log some and it'll show up here — {how}.",
+            cmd=f"/{macro} today shows a single day",
+        )
+    return ui.empty(
+        f"{_safe_label(_display_name(target), limit=32)} hasn't logged any "
+        f"{macro} this week",
+        hint="Nothing to chart yet.",
+    )
+
+
 def _no_lifts_embed(name: str) -> discord.Embed:
     """The one empty state six commands were each spelling out for themselves."""
     return ui.empty(
@@ -16236,16 +16258,15 @@ async def calories_week_cmd(
         rows.append((day_name, total, target_kcal))
     if not logged_days:
         # Seven rows of empty track and em dashes is a chart of nothing — say
-        # so instead of drawing it.
+        # so instead of drawing it. Public and third-person when it's someone
+        # else's week: the normal view is public, and "post an amount in chat"
+        # is advice the reader can't act on for another member.
         await interaction.response.send_message(
-            embed=ui.empty(
-                f"Nothing logged this week by "
-                f"{_safe_label(target_user.display_name, limit=32)}",
-                hint="Post an amount in chat — `650`, `650c`, `2700kj` — or "
-                     "use `/calories add`.",
-                cmd="/calories today shows a single day",
+            embed=_nothing_logged_embed(
+                target_user, interaction.user, "calories",
+                how="`650`, `650c`, `2700kj` in chat, or `/calories add`",
             ),
-            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
         return
     lines = [
@@ -17586,13 +17607,11 @@ async def protein_week_cmd(
     # can't line up with glyph-padded bar rows.
     if not logged_days:
         await interaction.response.send_message(
-            embed=ui.empty(
-                f"Nothing logged this week by "
-                f"{_safe_label(target_user.display_name, limit=32)}",
-                hint="Post an amount in chat — `40p` — or use `/protein add`.",
-                cmd="/protein today shows a single day",
+            embed=_nothing_logged_embed(
+                target_user, interaction.user, "protein",
+                how="`40p` in chat, or `/protein add`",
             ),
-            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
         return
     lines = [

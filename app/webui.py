@@ -780,7 +780,10 @@ def build_app(
                 "protein_today": pro_today,
                 "targets": _targets_dict(db, uid),
             },
-            "foods": [_food_dict(r) for r in db.calorie_food_list(gid, uid)],
+            "foods": [
+                _food_dict(r, _alias_map(db, uid))
+                for r in db.calorie_food_list(gid, uid)
+            ],
             "lift_goals": [
                 {
                     "equipment": r["equipment"],
@@ -904,7 +907,10 @@ def build_app(
         if uid is None:
             raise web.HTTPBadRequest(text="?user required")
         rows = db.calorie_food_list(gid, uid)
-        return web.json_response({"foods": [_food_dict(r) for r in rows]})
+        amap = _alias_map(db, uid)
+        return web.json_response(
+            {"foods": [_food_dict(r, amap) for r in rows]}
+        )
 
     async def api_equipment(request: web.Request) -> web.Response:
         _require(request)
@@ -1333,6 +1339,55 @@ def build_app(
         )
         return web.json_response({"ok": True})
 
+    async def api_food_alias_set(request: web.Request) -> web.Response:
+        """Point an alternate name at an existing saved food."""
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            gid = int(body["guild"])
+            uid = int(body["user"])
+            name = str(body["name"]).strip()
+            alias_raw = str(body["alias"]).strip()
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="guild, user, name, alias required")
+        from . import calories as _cal
+        alias = _cal.normalize_food(alias_raw)
+        name = _cal.normalize_food(name)
+        if not alias:
+            raise web.HTTPBadRequest(text="invalid alias")
+        if db.calorie_food_get(gid, uid, name) is None:
+            raise web.HTTPBadRequest(text="no such saved food")
+        if alias == name:
+            raise web.HTTPBadRequest(text="alias matches the food's own name")
+        # A shortcut can only mean one thing, and a saved food outranks an
+        # alias in lookup order — so an alias that shadows another food would
+        # simply never fire.
+        clash = db.calorie_food_get(gid, uid, alias)
+        if clash is not None and clash["name"] == alias:
+            raise web.HTTPBadRequest(
+                text=f"'{alias}' is already a saved food"
+            )
+        db.calorie_food_alias_set(uid, alias, name)
+        return web.json_response({"ok": True, "alias": alias, "name": name})
+
+    async def api_food_alias_delete(request: web.Request) -> web.Response:
+        _require(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid json")
+        try:
+            uid = int(body["user"])
+            alias = str(body["alias"]).strip()
+        except (KeyError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text="user, alias required")
+        from . import calories as _cal
+        removed = db.calorie_food_alias_remove(uid, _cal.normalize_food(alias))
+        return web.json_response({"ok": True, "removed": removed})
+
     async def api_nutrition_targets(request: web.Request) -> web.Response:
         _require(request)
         try:
@@ -1692,6 +1747,8 @@ def build_app(
         web.post("/api/protein/delete", api_protein_delete),
         web.post("/api/foods/set", api_food_set),
         web.post("/api/foods/delete", api_food_delete),
+        web.post("/api/foods/alias/set", api_food_alias_set),
+        web.post("/api/foods/alias/delete", api_food_alias_delete),
         web.post("/api/nutrition/targets", api_nutrition_targets),
         web.post("/api/resync", api_resync),
         web.get("/api/channels", api_channels),
@@ -1760,13 +1817,22 @@ def _role_dict(r) -> dict:
     return out
 
 
-def _food_dict(r) -> dict:
+def _food_dict(r, aliases: dict[str, list[str]] | None = None) -> dict:
     return {
         "name": r["name"],
         "display": r["display"],
         "kcal": r["kcal"],
         "protein_g": r["protein_g"],
+        "aliases": sorted((aliases or {}).get(r["name"], [])),
     }
+
+
+def _alias_map(db, user_id: int) -> dict[str, list[str]]:
+    """``{food name: [alias, ...]}`` for one user, in a single query."""
+    out: dict[str, list[str]] = {}
+    for row in db.calorie_food_aliases(user_id):
+        out.setdefault(row["name"], []).append(row["alias"])
+    return out
 
 
 def _targets_dict(db, user_id: int) -> dict:
@@ -2857,9 +2923,16 @@ async function memberView(uid){
       <div class="box"><h3 style="display:flex;justify-content:space-between">Saved foods
         <a class="link" onclick="foodDialog('${uid}')">+ add</a></h3>
         ${foods.length?`<table><tbody>${foods.map((f,i)=>`<tr>
-          <td><b>${esc(f.display)}</b></td><td>${Math.round(f.kcal)} kcal</td>
+          <td><b>${esc(f.display)}</b>${(f.aliases&&f.aliases.length)?
+            `<div class="faint" style="margin-top:3px;font-size:11px">also: ${
+              f.aliases.map(a=>`<span class="pill">${esc(a)}
+                <a class="link" title="remove this name"
+                   onclick="foodAliasDel('${uid}','${esc(a)}')">×</a></span>`).join(" ")
+            }</div>`:''}</td>
+          <td>${Math.round(f.kcal)} kcal</td>
           <td>${f.protein_g!=null?Math.round(f.protein_g)+' g':'<span class="faint">—</span>'}</td>
           <td><div class="row-actions">
+          <button class="btn sm" onclick="foodAliasAdd('${uid}',${i})">+ name</button>
           <button class="btn sm" onclick="foodEditIdx('${uid}',${i})">edit</button>
           <button class="btn sm danger" onclick="foodDeleteIdx('${uid}',${i})">del</button>
           </div></td></tr>`).join("")}</tbody></table>`:'<div class="faint">No saved foods.</div>'}</div>
@@ -2933,6 +3006,30 @@ async function setTrack(uid,start){
 
 function foodEditIdx(uid,i){foodDialog(uid,currentFoods[i]);}
 function foodDeleteIdx(uid,i){foodDelete(uid,currentFoods[i].name);}
+function foodAliasAdd(uid,i){
+  const f=currentFoods[i];
+  const dlg=document.getElementById("editDlg");
+  dlg.innerHTML=`<h2>Another name for ${esc(f.display)}</h2>
+    <div class="faint" style="margin-bottom:8px">Typing this in chat logs
+      ${esc(f.display)}. Plurals already work automatically — add one here for
+      anything else you call it.</div>
+    <label>Name</label><input id="fa_alias" placeholder="e.g. boneless wicked wings">
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
+    <button class="btn primary" onclick="foodAliasSave('${uid}','${esc(f.name)}')">Add</button></div>`;
+  dlg.showModal();
+}
+async function foodAliasSave(uid,name){
+  const alias=document.getElementById("fa_alias").value.trim();
+  if(!alias){toast("Name required");return;}
+  const r=await post("/api/foods/alias/set",{guild,user:uid,name,alias});
+  document.getElementById("editDlg").close();
+  toast(r&&r.ok?"Added ✓":"Failed");memberView(uid);
+}
+async function foodAliasDel(uid,alias){
+  if(!confirm(`Remove the name "${alias}"?`))return;
+  const r=await post("/api/foods/alias/delete",{guild,user:uid,alias});
+  toast(r&&r.ok?"Removed ✓":"Failed");memberView(uid);
+}
 function foodDialog(uid,f){
   const dlg=document.getElementById("editDlg");f=f||{};
   dlg.innerHTML=`<h2>${f.name?'Edit':'Add'} food</h2>

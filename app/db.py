@@ -379,6 +379,21 @@ CREATE TABLE IF NOT EXISTS calorie_foods (
     PRIMARY KEY (guild_id, user_id, name)
 );
 
+-- Alternate names for a saved food: "boneless wicked wings" → the food saved
+-- as "boneless wicked wing". Per-user and global like the foods themselves, so
+-- an alias set in one server works in every server and in DMs. ``alias`` and
+-- ``name`` are both stored normalized. Deleting or renaming a food clears the
+-- aliases pointing at it, so a shortcut can never resolve to nothing.
+CREATE TABLE IF NOT EXISTS calorie_food_aliases (
+    user_id INTEGER NOT NULL,
+    alias   TEXT    NOT NULL,
+    name    TEXT    NOT NULL,
+    set_at  TEXT    NOT NULL,
+    PRIMARY KEY (user_id, alias)
+);
+CREATE INDEX IF NOT EXISTS idx_calorie_food_aliases_name
+    ON calorie_food_aliases (user_id, name);
+
 -- Saved meals: a named bundle of saved foods ("breakfast" = coffee + oats)
 -- logged in one go. ``items`` is a JSON array of [servings, food_name] pairs
 -- resolved against calorie_foods at log time, so editing a food updates every
@@ -5050,23 +5065,105 @@ class Database:
     ) -> sqlite3.Row | None:
         """A saved food, resolved **per-user** so one set in any server (or via
         DM) is found everywhere. Prefers the current guild's copy, else the most
-        recently saved."""
+        recently saved.
+
+        Falls back to the user's alias table, then to a plural/singular swap, so
+        a food saved as "boneless wicked wing" still answers to "boneless wicked
+        wings" without anyone configuring it.
+        """
         with self._conn() as c:
-            return c.execute(
+            row = c.execute(
                 "SELECT name, display, kcal, protein_g FROM calorie_foods "
                 "WHERE user_id = ? AND name = ? "
                 "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
                 (user_id, name, guild_id),
             ).fetchone()
+            if row is not None:
+                return row
+            for candidate in self._food_name_candidates(c, user_id, name):
+                row = c.execute(
+                    "SELECT name, display, kcal, protein_g FROM calorie_foods "
+                    "WHERE user_id = ? AND name = ? "
+                    "ORDER BY (guild_id = ?) DESC, set_at DESC LIMIT 1",
+                    (user_id, candidate, guild_id),
+                ).fetchone()
+                if row is not None:
+                    return row
+        return None
+
+    @staticmethod
+    def _food_name_candidates(
+        c: sqlite3.Connection, user_id: int, name: str,
+    ) -> list[str]:
+        """Other names to try for *name*, best first.
+
+        An explicit alias always wins over the plural guess — the guess is a
+        convenience, the alias is the user's stated intent.
+        """
+        out: list[str] = []
+        alias = c.execute(
+            "SELECT name FROM calorie_food_aliases "
+            "WHERE user_id = ? AND alias = ?",
+            (user_id, name),
+        ).fetchone()
+        if alias is not None:
+            out.append(alias[0])
+        # Cheap English plural swap, both directions. "wings"→"wing" covers the
+        # common case; "y"→"ies" is deliberately not attempted (too many false
+        # friends for food names).
+        if name.endswith("es") and len(name) > 3:
+            out.append(name[:-2])
+        if name.endswith("s") and not name.endswith("ss") and len(name) > 2:
+            out.append(name[:-1])
+        else:
+            out.append(name + "s")
+        return [n for n in out if n and n != name]
+
+    def calorie_food_alias_set(
+        self, user_id: int, alias: str, name: str,
+    ) -> None:
+        """Point ``alias`` at the saved food ``name`` (both normalized)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO calorie_food_aliases (user_id, alias, name, set_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT(user_id, alias) DO UPDATE SET"
+                " name = excluded.name, set_at = excluded.set_at",
+                (user_id, alias, name, _normalize_iso(None)),
+            )
+
+    def calorie_food_alias_remove(self, user_id: int, alias: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM calorie_food_aliases WHERE user_id = ? AND alias = ?",
+                (user_id, alias),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def calorie_food_aliases(self, user_id: int) -> list[sqlite3.Row]:
+        """Every alias the user has, alphabetical."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT alias, name FROM calorie_food_aliases "
+                "WHERE user_id = ? ORDER BY name, alias",
+                (user_id,),
+            ))
 
     def calorie_food_remove(
         self, guild_id: int, user_id: int, name: str,
     ) -> bool:
         """Remove a saved food for the user **everywhere** (foods are shared
-        across servers, so deletion isn't guild-scoped)."""
+        across servers, so deletion isn't guild-scoped).
+
+        Aliases pointing at it go too — a shortcut that resolves to a food that
+        no longer exists would silently stop logging with nothing to show why.
+        """
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM calorie_foods WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            )
+            c.execute(
+                "DELETE FROM calorie_food_aliases WHERE user_id = ? AND name = ?",
                 (user_id, name),
             )
             return (cur.rowcount or 0) > 0
