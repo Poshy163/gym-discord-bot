@@ -115,7 +115,10 @@ FILE = "📄"
 
 # Bar glyphs. Fixed cell *count*; every row uses the same glyphs so columns
 # hold even though a block glyph is not exactly one ASCII cell wide.
-FILL, TRACK, OVER = "▰", "▱", "█"
+# Exactly two, and they must stay in one glyph family: mixing in a full-height
+# block (█) to mark overshoot put a tower of white above the bar line and made
+# rows different lengths. Overshoot is a number in its own column — see over_by.
+FILL, TRACK = "▰", "▱"
 SPARK = "▁▂▃▄▅▆▇█"
 
 
@@ -210,10 +213,14 @@ def kg(value: float, *, bw: bool = False) -> str:
 
 
 def pct(value: float, total: float, *, decimals: int = 0) -> str:
-    """Percentage of *total*. Unscorable totals render as an em dash."""
+    """Percentage of *total*. Unscorable totals render as an em dash.
+
+    Separated, because a mis-typed entry can put this in four figures and
+    ``1433%`` is harder to read at a glance than ``1,433%``.
+    """
     if total <= 0:
         return "—"
-    return f"{value / total * 100:.{decimals}f}%"
+    return f"{value / total * 100:,.{decimals}f}%"
 
 
 def delta(
@@ -274,24 +281,36 @@ def plural(count: int, singular: str, plural_form: str | None = None) -> str:
 # Graphics
 # ---------------------------------------------------------------------------
 
-def bar(
-    value: float, total: float, *, width: int = 12, overflow: bool = False,
-) -> str:
-    """Fixed-width progress bar, optionally showing overshoot past the end.
+def bar(value: float, total: float, *, width: int = 12) -> str:
+    """Progress bar of exactly ``width`` cells, always.
 
-    The filled region always occupies exactly ``width`` cells so stacked bars
-    line up. With ``overflow=True`` an over-target value appends one ``█`` per
-    10% over (capped at 4) *after* the bar — which is the only way 10-over and
-    2 400-over stop rendering identically.
+    Fixed width is the whole point: these stack in fenced blocks, and a bar
+    that grows when a value goes over target makes every column to its right
+    ragged. Overshoot is carried by :func:`over_by` and by the percentage in
+    :func:`meter`, not by extra cells.
+
+    An earlier version appended ``█`` cells past the end. Two glyph families
+    don't mix — ``█`` is full cell height while ``▰``/``▱`` are short and
+    centred — so the overflow rendered as a tower of white blocks sitting
+    above the bar line. Don't reintroduce it.
     """
     if total <= 0:
         return TRACK * width
-    frac = max(0.0, value / total)
-    filled = min(width, int(round(min(frac, 1.0) * width)))
-    out = FILL * filled + TRACK * (width - filled)
-    if overflow and frac > 1.0:
-        out += OVER * min(4, max(1, int((frac - 1.0) * 10)))
-    return out
+    frac = max(0.0, min(1.0, value / total))
+    filled = min(width, int(round(frac * width)))
+    return FILL * filled + TRACK * (width - filled)
+
+
+def over_by(value: float, limit: float, fmt: Callable[[float], str] | None = None) -> str:
+    """``+34`` when a ceiling is breached, else ``""``.
+
+    The aligned, in-column way to say *how far* over — a bar clamped at full
+    can't, and a bare ``!`` says only that it happened.
+    """
+    if limit <= 0 or value <= limit:
+        return ""
+    excess = value - limit
+    return f"+{fmt(excess)}" if fmt else f"+{excess:,.0f}"
 
 
 def gauge(score: float, *, width: int = 20) -> str:
@@ -353,7 +372,7 @@ def meter(
     """
     scorer = score_ceiling if ceiling else score_target
     colour = scorer(value, target)
-    glyphs = bar(value, target, width=width, overflow=ceiling)
+    glyphs = bar(value, target, width=width)
 
     if target <= 0:
         return f"**{fmt(value)}** logged  `{glyphs}`", colour
@@ -841,10 +860,16 @@ def preview_cases() -> list[tuple[str, list]]:
 
     # --- glyph reference -------------------------------------------------
     ref = card("Glyph reference", colour=BRAND)
-    block(ref, "Bars", "\n".join([
-        f"`{bar(3, 10)}` 30%", f"`{bar(10, 10)}` 100%",
-        f"`{bar(13, 10, overflow=True)}` 130% (overflow)",
-    ]))
+    block(ref, "Bars", table(
+        [
+            ["30%", bar(3, 10), ""],
+            ["100%", bar(10, 10), ""],
+            ["130%", bar(13, 10), over_by(13, 10)],
+            ["1,433%", bar(2580, 180), over_by(2580, 180)],
+        ],
+        align=">",
+        headers=["", "bar", "over"],
+    ))
     block(ref, "Deltas", " · ".join([delta(2.5), delta(-2.5), delta(0)]))
     block(ref, "Sparkline",
           f"`{sparkline([70.3, 70.9, 71.2, 70.8, 71.6, 71.1, 70.4])}` bodyweight")

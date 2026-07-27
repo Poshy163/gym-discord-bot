@@ -4682,6 +4682,65 @@ async def on_raw_reaction_add(
 # ---------------------------------------------------------------------------
 
 
+def _no_lifts_embed(name: str) -> discord.Embed:
+    """The one empty state six commands were each spelling out for themselves."""
+    return ui.empty(
+        f"No lifts logged for {_safe_label(name, limit=32)} yet",
+        hint="Post a session in chat — e.g. `bench press 80kg` — and I'll "
+             "store it automatically. No command needed.",
+        cmd="/log adds one by hand",
+    )
+
+
+def _no_history_embed(equipment: str, name: str) -> discord.Embed:
+    """Empty state for the per-lift views (/history, /progress, /overview).
+
+    Names the lift back, because the usual cause is a spelling the alias table
+    doesn't know — not an absence of training.
+    """
+    eq = _safe_label(equipment)
+    return ui.empty(
+        f"No {eq} history for {_safe_label(name, limit=32)}",
+        hint=f"Either it hasn't been logged yet, or I know it by another "
+             f"name — `/aliases {eq}` shows the spellings I accept.",
+        cmd="/equipment_list shows every lift I track",
+    )
+
+
+def _personal_bests_card(
+    guild_id: int, target: object, rows: "list[sqlite3.Row]",
+) -> discord.Embed:
+    """One member's personal bests as a card.
+
+    Shared by `/stats` and the "Gym stats" context menu, which were two
+    byte-identical copies that differed only in ephemerality. The weights sit
+    in a fenced table because a proportional font gives a ragged right edge on
+    a column of numbers, which is the one thing this card exists to show.
+    """
+    bw = _user_bodyweight(guild_id, int(getattr(target, "id")))
+    table_rows = []
+    for r in rows:
+        eq = r["equipment"]
+        true_suffix = _true_weight_suffix(eq, float(r["best"]), bool(r["bw"]), bw)
+        table_rows.append([
+            eq[:20],
+            _format_weight(r["best"], bool(r["bw"])),
+            true_suffix.strip().removeprefix("(").removesuffix(")"),
+        ])
+    embed = ui.card(
+        f"{ui.CHART} Personal bests",
+        description=ui.table(table_rows, align="<>", max_rows=25),
+        colour=ui.BRAND,
+        member=target,
+        footer=ui.plural(len(rows), "exercise"),
+        timestamp=True,
+    )
+    newest = max((r["set_on"] for r in rows if r["set_on"]), default=None)
+    if newest:
+        ui.block(embed, "Most recent PR", f"{ui.when(newest)}")
+    return embed
+
+
 @bot.tree.command(name="stats", description="Show a user's personal bests.")
 @app_commands.describe(user="The user to look up (defaults to you).")
 async def stats_cmd(
@@ -4694,18 +4753,12 @@ async def stats_cmd(
     rows = db.personal_bests(guild_id, target.id)
     if not rows:
         await interaction.response.send_message(
-            f"No lifts logged for {target.display_name} yet.", ephemeral=True
+            embed=_no_lifts_embed(target.display_name), ephemeral=True,
         )
         return
-
-    lines = [f"**{target.display_name} — personal bests**"]
-    for r in rows:
-        date = _format_date(r["set_on"])
-        lines.append(
-            f"• {r['equipment']}: {_format_weight(r['best'], bool(r['bw']))}"
-            f"  _(set {date})_"
-        )
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message(
+        embed=_personal_bests_card(guild_id, target, rows),
+    )
 
 
 @bot.tree.command(name="progress", description="Show monthly progression on one lift.")
@@ -4727,26 +4780,47 @@ async def progress_cmd(
     rows = db.progress(guild_id, target.id, canon)
     if not rows:
         await interaction.response.send_message(
-            f"No {canon} history for {target.display_name}.", ephemeral=True
+            embed=_no_history_embed(canon, target.display_name), ephemeral=True,
         )
         return
 
-    lines = [f"**{target.display_name} — {canon} by month**"]
+    bests = [float(r["best"]) for r in rows]
+    net = bests[-1] - bests[0]
+    table_rows = []
     prev: float | None = None
     for r in rows:
-        best = r["best"]
-        delta = ""
-        if prev is not None:
-            d = best - prev
-            if d:
-                delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
-        date = _format_date(r["first_seen"])
-        lines.append(
-            f"• {r['month']} (first logged {date}): "
-            f"{_format_weight(best, bool(r['bw']))}{delta}"
-        )
+        best = float(r["best"])
+        table_rows.append([
+            r["month"],
+            _format_weight(best, bool(r["bw"])),
+            (f"{'+' if best > prev else ''}{best - prev:g}"
+             if prev is not None and best != prev else ""),
+        ])
         prev = best
-    await interaction.response.send_message("\n".join(lines))
+
+    embed = ui.card(
+        f"{ui.CHART} {_safe_label(canon)} — by month",
+        # The shape of the trend first, the numbers second. The old form led
+        # with an audit date in parentheses and buried the weight behind it.
+        description=f"`{ui.sparkline(bests)}`\n"
+                    + ui.subtext(
+                        f"{ui.kg(min(bests))} low · {ui.kg(max(bests))} high"
+                    ),
+        colour=ui.score_trend(net),
+        member=target,
+        footer=ui.plural(len(rows), "month"),
+        timestamp=True,
+    )
+    ui.tiles(
+        embed,
+        ("Now", f"**{_format_weight(bests[-1], bool(rows[-1]['bw']))}**"),
+        ("Best", f"**{_format_weight(max(bests), bool(rows[-1]['bw']))}**"),
+        ("Net", ui.delta(net)),
+    )
+    ui.block(embed, "Month by month", ui.table(
+        table_rows, align="<>>", headers=["month", "best", "chg"], max_rows=18,
+    ))
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Top lifters for an equipment.")
@@ -4760,29 +4834,68 @@ async def leaderboard_cmd(
     rows = db.leaderboard(guild_id, canon)
     if not rows:
         await interaction.response.send_message(
-            f"No entries for {canon} yet.", ephemeral=True
+            embed=ui.empty(
+                f"Nobody has logged {_safe_label(canon)} yet",
+                hint=f"Post `{_safe_label(canon)} 60kg` in chat to open the board.",
+                cmd="/equipment_list shows what I know about",
+            ),
+            ephemeral=True,
         )
         return
 
-    lines = [f"**Leaderboard — {canon}**"]
-    medals = ["🥇", "🥈", "🥉"]
     # Pull every lifter's most recent bodyweight in one query so we can show
     # the *true* load on bodyweight-relative lifts (assisted pull-ups, etc.).
     user_ids = [int(r["user_id"]) for r in rows]
     bw_map = db.latest_bodyweights_bulk(guild_id, user_ids)
-    for i, r in enumerate(rows):
-        prefix = medals[i] if i < len(medals) else f"{i + 1}."
-        date = _format_date(r["set_on"])
-        true_suf = _true_weight_suffix(
-            canon, float(r["best"]), bool(r["bw"]),
-            bw_map.get(int(r["user_id"])),
+
+    def _weight(r) -> str:
+        return _format_weight(r["best"], bool(r["bw"]))
+
+    def _true(r) -> str:
+        return _true_weight_suffix(
+            canon, float(r["best"]), bool(r["bw"]), bw_map.get(int(r["user_id"])),
+        ).strip().removeprefix("(").removesuffix(")")
+
+    leader = _ctx_guild(interaction)
+    leader_member = (
+        leader.get_member(int(rows[0]["user_id"])) if leader else None
+    )
+    embed = ui.card(
+        f"{ui.TROPHY} {_safe_label(canon)} leaderboard",
+        colour=ui.BRAND,
+        subject=leader_member,
+        footer=f"{ui.plural(len(rows), 'lifter')} · true load shown where a "
+               "bodyweight is on file",
+        timestamp=True,
+    )
+    # Podium as three tiles, then the rest as one fenced table. The medals stay
+    # out of the fence deliberately: an emoji is not one monospace cell, so
+    # mixing 🥇 with " 4." is what made the old name column jump at rank four.
+    ui.tiles(embed, *[
+        (
+            f"{ui.rank(i)} {_safe_label(r['username'], limit=20)}",
+            f"**{_weight(r)}**"
+            + (f"\n{ui.subtext(_true(r))}" if _true(r) else "")
+            + f"\n{ui.when(r['set_on'])}",
         )
-        lines.append(
-            f"{prefix} {r['username']} — "
-            f"{_format_weight(r['best'], bool(r['bw']))}{true_suf}"
-            f"  _(set {date})_"
-        )
-    await interaction.response.send_message("\n".join(lines))
+        for i, r in enumerate(rows[:3])
+    ])
+    if len(rows) > 3:
+        top = float(rows[0]["best"])
+        ui.block(embed, "The chase", ui.table(
+            [
+                [
+                    ui.rank(i, mono=True),
+                    _safe_label(r["username"], limit=16),
+                    _weight(r),
+                    ui.bar(float(r["best"]), top, width=8),
+                ]
+                for i, r in enumerate(rows[3:], start=3)
+            ],
+            align="<<>",
+            max_rows=22,
+        ))
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -4945,38 +5058,62 @@ async def log_cmd(
         suffix = _target_suffix(interaction.user, target)
         target_bw = _user_bodyweight(guild_id, target.id)
         true_suf = _true_weight_suffix(canon, weight_kg, bodyweight, target_bw)
-        msg = (
-            f"Logged {canon}: {_format_weight(weight_kg, bodyweight)}"
-            f"{true_suf}{suffix}."
-        )
+        backdate = ""
         if date:
             used_local = logged_at.astimezone(DISPLAY_TZ).date()
-            msg += f" _(logged for {used_local.strftime('%Y-%m-%d')})_"
+            backdate = f" · logged for {used_local.strftime('%Y-%m-%d')}"
         is_pr = weight_kg > 0 and (prev is None or weight_kg > prev)
-        if is_pr:
-            if prev is None:
-                msg += "\n🎉 **New PR!** (first entry for this lift)"
-            else:
-                gain = weight_kg - prev
-                msg += (
-                    f"\n🎉 **New PR!** "
-                    f"{_format_weight(prev, bodyweight)} → "
-                    f"{_format_weight(weight_kg, bodyweight)} (+{gain:g}kg)"
-                )
         # Goal hit check — uses the same semantics as auto-parse.
         goal = db.goal_get(guild_id, target.id, canon)
-        if goal and weight_kg >= goal["target_kg"]:
-            msg += (
-                f"\n🎯 **Goal hit!** Target "
-                f"{_format_weight(goal['target_kg'], bool(goal['bw']))} "
-                "reached (goal cleared)."
-            )
+        goal_hit = bool(goal and weight_kg >= goal["target_kg"])
+        if goal_hit:
             db.goal_remove(guild_id, target.id, canon)
-        msg += (
-            "\n-# React ❌ to this response or use `/undo` "
-            "if this was logged by mistake. The logger or target lifter can react."
+
+        undo_note = (
+            "React ❌ or use /undo if this was a mistake — logger or lifter"
         )
-        await interaction.response.send_message(msg)
+        if not (is_pr or goal_hit):
+            # A routine entry is a receipt: cheap, one line, no card. Only the
+            # moments worth celebrating get promoted to an embed.
+            await interaction.response.send_message(
+                f"{ui.OK} Logged **{_safe_label(canon)}** "
+                f"{_format_weight(weight_kg, bodyweight)}{true_suf}{suffix}"
+                f"{backdate}\n{ui.subtext(undo_note)}"
+            )
+        else:
+            # Gold outranks green: clearing a goal you set beats beating a
+            # number you happened to be at.
+            embed = ui.card(
+                f"{ui.GOAL} Goal hit — {_safe_label(canon)}" if goal_hit
+                else f"{ui.PARTY} New PR — {_safe_label(canon)}",
+                colour=ui.GOLD if goal_hit else ui.SUCCESS,
+                member=target,
+                footer=undo_note,
+                timestamp=True,
+            )
+            if prev is None:
+                embed.description = (
+                    f"**{_format_weight(weight_kg, bodyweight)}**{true_suf}\n"
+                    f"{ui.subtext('first entry for this lift')}"
+                )
+            else:
+                embed.description = (
+                    f"`{ui.bar(prev, weight_kg, width=12)}` "
+                    + ui.arrow(
+                        _format_weight(prev, bodyweight),
+                        _format_weight(weight_kg, bodyweight),
+                    )
+                    + f"\n{ui.subtext(ui.delta(weight_kg - prev))}"
+                )
+            if goal_hit:
+                ui.block(
+                    embed, "Target cleared",
+                    f"{_format_weight(goal['target_kg'], bool(goal['bw']))} "
+                    "— goal removed, set the next one with `/goal_set`",
+                )
+            if backdate:
+                ui.block(embed, "Backdated", backdate.lstrip(" ·"))
+            await interaction.response.send_message(embed=embed)
         try:
             sent = await interaction.original_response()
             db.track_reply(
@@ -5017,31 +5154,54 @@ async def history_cmd(
     rows = db.history(guild_id, target.id, canon)
     if not rows:
         await interaction.response.send_message(
-            f"No {canon} history for {target.display_name}.", ephemeral=True
+            embed=_no_history_embed(canon, target.display_name), ephemeral=True,
         )
         return
 
-    lines = [f"**{target.display_name} — {canon} timeline**"]
+    # Five independent quantities per entry — date, weight, reps, change,
+    # estimated 1RM — so they go in real columns rather than a run-on line
+    # built from four optional suffix variables.
+    table_rows = []
     prev: float | None = None
+    has_reps = False
     for r in rows:
-        w = r["weight_kg"]
-        delta = ""
-        if prev is not None:
-            d = w - prev
-            if d:
-                delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
-        # If we captured rep count, show an Epley 1RM estimate alongside the
-        # raw weight — only meaningful for low-rep working sets.
+        w = float(r["weight_kg"])
         reps = r["reps"] if "reps" in r.keys() else None
         one_rm = estimated_one_rep_max(w, reps) if reps else None
-        rm_str = f"  _est. 1RM ≈ {one_rm:g}kg_" if one_rm else ""
-        rep_str = f"  ×{reps}" if reps else ""
-        lines.append(
-            f"• {_format_date(r['logged_at'])}: "
-            f"{_format_weight(w, bool(r['bw']))}{rep_str}{delta}{rm_str}"
-        )
+        if reps:
+            has_reps = True
+        table_rows.append([
+            _format_date(r["logged_at"]),
+            _format_weight(w, bool(r["bw"])),
+            f"x{reps}" if reps else "",
+            (f"{'+' if w > prev else ''}{w - prev:g}"
+             if prev is not None and w != prev else ""),
+            f"{one_rm:g}" if one_rm else "",
+        ])
         prev = w
-    await interaction.response.send_message("\n".join(lines))
+
+    first, last = float(rows[0]["weight_kg"]), float(rows[-1]["weight_kg"])
+    headers = ["date", "weight", "reps", "chg", "e1RM"]
+    if not has_reps:
+        headers = headers[:2] + ["", "chg", ""]
+    embed = ui.card(
+        f"{ui.LIFT} {_safe_label(canon)} — timeline",
+        description=ui.table(
+            table_rows, align="<>><>", headers=headers, max_rows=25,
+        ),
+        colour=ui.score_trend(last - first),
+        member=target,
+        footer=f"{ui.plural(len(rows), 'entry', 'entries')} · most recent last"
+               + ("" if has_reps else " · add `x8` to a post to track e1RM"),
+        timestamp=True,
+    )
+    ui.tiles(
+        embed,
+        ("Latest", f"**{_format_weight(last, bool(rows[-1]['bw']))}**"),
+        ("Best", f"**{_format_weight(max(float(r['weight_kg']) for r in rows), bool(rows[-1]['bw']))}**"),
+        ("Change", ui.delta(last - first)),
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -5107,7 +5267,13 @@ async def machine_cmd(
     rows = db.machine_history(guild_id, canon)
     if not rows:
         await interaction.response.send_message(
-            f"No entries for {canon} yet.", ephemeral=True
+            embed=ui.empty(
+                f"Nothing logged for {_safe_label(canon)} yet",
+                hint=f"Post `{_safe_label(canon)} 60kg` in chat and it starts "
+                     "tracking from there.",
+                cmd="/equipment_list shows every lift I know",
+            ),
+            ephemeral=True,
         )
         return
 
@@ -5148,7 +5314,8 @@ async def machine_cmd(
 async def sync_cmd(interaction: discord.Interaction) -> None:
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
-            "This command is owner-only.", ephemeral=True,
+            embed=ui.denied("Owner only — this manages the bot itself."),
+            ephemeral=True,
         )
         return
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -5411,7 +5578,12 @@ async def cleanup_resurrected_cmd(
 ) -> None:
     if interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
-            "Admins only.", ephemeral=True
+            embed=ui.denied(
+                "Admins only — this rescans and rewrites stored lifts.",
+                allowed="Your own entries are yours: `/undo` removes the last "
+                        "one, `/delete_entry` removes a specific day.",
+            ),
+            ephemeral=True,
         )
         return
 
@@ -5547,7 +5719,12 @@ async def suppress_message_cmd(
 ) -> None:
     if interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
-            "Admins only.", ephemeral=True
+            embed=ui.denied(
+                "Admins only — suppressing a message hides it from every "
+                "member's stats, not just yours.",
+                allowed="React ❌ on my reply to undo something you logged.",
+            ),
+            ephemeral=True,
         )
         return
     if not message_id.isdigit():
@@ -5616,7 +5793,13 @@ async def ctx_suppress_message(
     """Admin: mark a message 'do not import' and remove any lifts it created —
     the /suppress_message action, one tap on the offending message."""
     if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ui.denied(
+                "Admins only — this removes the message's lifts for everyone.",
+                allowed="React ❌ on my reply to undo something you logged.",
+            ),
+            ephemeral=True,
+        )
         return
     guild_id = _ctx_guild_id(interaction)
     removed = db.delete_lifts_for_message_any_user(guild_id, message.id)
@@ -5641,17 +5824,14 @@ async def ctx_gym_stats(
     rows = db.personal_bests(guild_id, member.id)
     if not rows:
         await interaction.response.send_message(
-            f"No lifts logged for {member.display_name} yet.", ephemeral=True,
+            embed=_no_lifts_embed(member.display_name), ephemeral=True,
         )
         return
-    lines = [f"**{member.display_name} — personal bests**"]
-    for r in rows:
-        date = _format_date(r["set_on"])
-        lines.append(
-            f"• {r['equipment']}: {_format_weight(r['best'], bool(r['bw']))}"
-            f"  _(set {date})_"
-        )
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    # Same card as /stats, kept ephemeral: this fires from a right-click on
+    # someone else's message, so it shouldn't post about them in the channel.
+    await interaction.response.send_message(
+        embed=_personal_bests_card(guild_id, member, rows), ephemeral=True,
+    )
 
 
 # Owner-only: download the live SQLite DB. Hard-coded to one user id so a
@@ -5666,7 +5846,10 @@ _DB_DUMP_OWNER_ID = 1072114272064262154
 async def db_dump_cmd(interaction: discord.Interaction) -> None:
     if interaction.user.id != _DB_DUMP_OWNER_ID:
         await interaction.response.send_message(
-            "This command is restricted.", ephemeral=True
+            embed=ui.denied(
+                "Owner only — this exports raw data for the whole server.",
+            ),
+            ephemeral=True,
         )
         return
 
@@ -5750,7 +5933,10 @@ async def chat_dump_cmd(
 ) -> None:
     if interaction.user.id != _DB_DUMP_OWNER_ID:
         await interaction.response.send_message(
-            "This command is restricted.", ephemeral=True
+            embed=ui.denied(
+                "Owner only — this exports raw data for the whole server.",
+            ),
+            ephemeral=True,
         )
         return
 
@@ -5877,7 +6063,11 @@ async def purge_cmd(
     # run is written to the audit log (see db.delete_equipment).
     if interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
-            "Admins only — /purge deletes a lift name for the whole server.",
+            embed=ui.denied(
+                "Admins only — /purge deletes a lift name for the whole server.",
+                allowed="`/undo` removes your last entry; `/delete_entry` "
+                        "removes one of your days.",
+            ),
             ephemeral=True,
         )
         return
@@ -5966,8 +6156,12 @@ async def rename_cmd(
     rewrites_others = user is not None or scope_value == "all"
     if rewrites_others and interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
-            "Admins only — renaming another member's or the whole server's "
-            "rows. You can always rename your own (leave `user`/`scope` unset).",
+            embed=ui.denied(
+                "Admins only — renaming another member's or the whole "
+                "server's rows.",
+                allowed="You can always rename your own — leave `user` and "
+                        "`scope` unset.",
+            ),
             ephemeral=True,
         )
         return
@@ -6062,8 +6256,10 @@ async def delete_entry_cmd(
     # Deleting another member's entries is an admin action; your own is open.
     if target.id != interaction.user.id and interaction.user.id not in ADMIN_USER_IDS:
         await interaction.response.send_message(
-            "Admins only — deleting another member's entries. "
-            "You can always delete your own (leave `user` unset).",
+            embed=ui.denied(
+                "Admins only — deleting another member's entries.",
+                allowed="You can always delete your own — leave `user` unset.",
+            ),
             ephemeral=True,
         )
         return
@@ -6456,7 +6652,7 @@ async def summary_cmd(
     totals = db.user_summary(guild_id, target.id)
     if not totals:
         await interaction.response.send_message(
-            f"No lifts logged for {target.display_name} yet.", ephemeral=True
+            embed=_no_lifts_embed(target.display_name), ephemeral=True,
         )
         return
 
@@ -6465,54 +6661,51 @@ async def summary_cmd(
     gains = db.user_biggest_gains(guild_id, target.id, limit=5)
     streak = _compute_streak_weeks(_local_log_dates(guild_id, target.id))
 
-    embed = discord.Embed(
-        title=f"📋 {target.display_name} — gym summary",
-        colour=EMBED_COLOUR,
+    # The name lives in the author row, so the title drops it rather than
+    # heading the card with it twice.
+    embed = ui.card(
+        f"{ui.CHART} Gym summary",
+        colour=ui.score_streak(streak * 7) if streak else ui.BRAND,
+        member=target,
+        footer=f"training since {_format_date(totals['first_at'])}",
+        timestamp=True,
     )
-    streak_str = ""
-    if streak == 1:
-        streak_str = " · 🔥 **1 week** streak"
-    elif streak > 1:
-        streak_str = f" · 🔥 **{streak} weeks** streak"
-    embed.add_field(
-        name="Totals",
-        value=(
-            f"**{totals['total_lifts']}** lifts · "
-            f"**{totals['unique_equip']}** exercises · "
-            f"**{totals['sessions']}** sessions"
-            f"{streak_str}\n"
-            f"First: {_format_date(totals['first_at'])} · "
-            f"Last: {_format_date(totals['last_at'])}"
-        ),
-        inline=False,
+    # Counters as tiles: Discord packs three inline fields per row, which is
+    # exactly what a row of stats wants. inline=False on all four made the
+    # whole card one narrow column of bullet lists.
+    ui.tiles(
+        embed,
+        ("Lifts", f"**{totals['total_lifts']:,}**"),
+        ("Exercises", f"**{totals['unique_equip']:,}**"),
+        ("Sessions", f"**{totals['sessions']:,}**"),
+    )
+    ui.tiles(
+        embed,
+        ("Streak", f"**{ui.plural(streak, 'week')}** {ui.STREAK}" if streak
+                   else "—"),
+        ("Last lift", ui.when(totals["last_at"])),
+        ("First lift", ui.day(totals["first_at"])),
     )
     if top:
-        lines = [
-            f"• **{r['equipment']}** — "
-            f"{_format_weight(r['best'], bool(r['bw']))}"
-            for r in top
-        ]
-        embed.add_field(
-            name="Heaviest PRs", value="\n".join(lines), inline=False
-        )
+        ui.block(embed, "Heaviest PRs", ui.table(
+            [[_safe_label(r["equipment"], limit=20),
+              _format_weight(r["best"], bool(r["bw"]))] for r in top],
+            align="<>",
+        ))
     if trained:
-        lines = [f"• **{r['equipment']}** — {r['n']}×" for r in trained]
-        embed.add_field(
-            name="Most trained", value="\n".join(lines), inline=False
-        )
+        busiest = max(int(r["n"]) for r in trained)
+        ui.block(embed, "Most trained", ui.table(
+            [[_safe_label(r["equipment"], limit=20), f"{r['n']}x",
+              ui.bar(int(r["n"]), busiest, width=8)] for r in trained],
+            align="<>",
+        ))
     if gains:
-        lines = []
-        for r in gains:
-            sign = "+" if r["delta"] >= 0 else ""
-            lines.append(
-                f"• **{r['equipment']}**: {r['first_w']:g}kg "
-                f"({_format_date(r['first_at'])}) → "
-                f"{r['last_w']:g}kg ({_format_date(r['last_at'])}) "
-                f"{sign}{r['delta']:g}kg"
-            )
-        embed.add_field(
-            name="Biggest gains", value="\n".join(lines), inline=False
-        )
+        ui.block(embed, "Biggest gains", "\n".join(
+            f"**{_safe_label(r['equipment'], limit=24)}** "
+            f"{ui.arrow(ui.kg(r['first_w']), ui.kg(r['last_w']))} "
+            f"{ui.delta(float(r['delta']))}"
+            for r in gains
+        ))
     await interaction.response.send_message(embed=embed)
 
 
@@ -6536,7 +6729,7 @@ async def recent_cmd(
     rows = db.user_recent(_ctx_guild_id(interaction), target.id, lim)
     if not rows:
         await interaction.response.send_message(
-            f"No lifts logged for {target.display_name} yet.", ephemeral=True
+            embed=_no_lifts_embed(target.display_name), ephemeral=True,
         )
         return
     lines = [f"**{target.display_name} — last {len(rows)} entries**"]
@@ -6567,8 +6760,7 @@ async def export_lifts_cmd(
     rows = db.user_all_lifts(guild_id, target.id)
     if not rows:
         await interaction.response.send_message(
-            f"No lifts logged for {_display_name(target)} yet.",
-            ephemeral=True,
+            embed=_no_lifts_embed(_display_name(target)), ephemeral=True,
         )
         return
 
@@ -6746,7 +6938,12 @@ async def streak_cmd(
 
     if not log_dates and attendance is None:
         await respond(
-            f"No training history yet for {target.display_name}.",
+            embed=ui.empty(
+                f"No training history yet for "
+                f"{_safe_label(target.display_name, limit=32)}",
+                hint="Streaks build from logged sessions — post one in chat "
+                     "and the counter starts today.",
+            ),
             ephemeral=True,
         )
         return
@@ -6755,30 +6952,40 @@ async def streak_cmd(
     cur_w, long_w = weekly_streak(log_dates, today) if log_dates else (0, 0)
     if attendance is not None:
         cur_d, long_d = attendance
-        daily_line = (
-            f"• 🏋️ Daily gym attendance: **{cur_d}** "
-            f"day{'s' if cur_d != 1 else ''} in a row (longest **{long_d}**)"
-        )
+        daily_name = "Daily · gym attendance"
+        source_note = "daily streak from Revo check-ins"
     else:
         cur_d, long_d = daily_streak(log_dates, today) if log_dates else (0, 0)
-        suffix = (
-            "" if revo_row is not None
-            else "  ·  *link Revo with `/revo_link` for real gym attendance*"
+        daily_name = "Daily · from logs"
+        source_note = (
+            "daily streak from logged sessions"
+            if revo_row is not None
+            else "link Revo with /revo_link for real gym attendance"
         )
-        daily_line = (
-            f"• Daily (from logs): **{cur_d}** "
-            f"day{'s' if cur_d != 1 else ''} in a row (longest **{long_d}**)"
-            f"{suffix}"
-        )
-    fire = "🔥" if cur_d >= 3 or cur_w >= 3 else ""
-    lines = [
-        f"**{target.display_name} — training streaks** {fire}".rstrip(),
-        f"• Weekly: **{cur_w}** week{'s' if cur_w != 1 else ''} in a row "
-        f"(longest **{long_w}**)",
-        daily_line,
-        f"• Total active days logged: **{len(log_dates)}**",
-    ]
-    await respond("\n".join(lines))
+    # Colour is the intensity signal. The old single 🔥 fired on a bare
+    # `>= 3` threshold, so a 3-day run and a 90-day run looked identical.
+    embed = ui.card(
+        f"{ui.STREAK} Training streaks",
+        colour=ui.score_streak(max(cur_d, cur_w * 7)),
+        member=target,
+        footer=source_note,
+    )
+    recent = {d for d in log_dates}
+    ui.tiles(
+        embed,
+        ("Weekly", f"**{ui.plural(cur_w, 'week')}**\n"
+                   f"{ui.subtext(f'best {long_w}')}"),
+        (daily_name, f"**{ui.plural(cur_d, 'day')}**\n"
+                     f"{ui.subtext(f'best {long_d}')}"),
+        ("Active days", f"**{len(log_dates):,}**"),
+    )
+    ui.block(embed, "Last 14 days", "`{}`\n{}".format(
+        ui.strip([
+            (today - timedelta(days=n)) in recent for n in range(13, -1, -1)
+        ]),
+        ui.subtext("oldest left · today right"),
+    ))
+    await respond(embed=embed)
 
 
 @bot.tree.command(
@@ -6812,8 +7019,12 @@ async def tonnage_cmd(
     total_kg, n = db.total_tonnage(guild_id, target.id, since_iso)
     if n == 0:
         await interaction.response.send_message(
-            f"{target.display_name} hasn't logged anything in the "
-            f"{window_label}.",
+            embed=ui.empty(
+                f"Nothing logged in the {window_label}",
+                hint=f"{_safe_label(target.display_name, limit=32)} has no "
+                     f"entries in this window — try a longer one with "
+                     "`days:`, or `days:0` for all time.",
+            ),
             ephemeral=True,
         )
         return
@@ -6843,28 +7054,42 @@ async def session_cmd(
     day, rows = db.last_session_for_user(guild_id, target.id)
     if not rows or day is None:
         await interaction.response.send_message(
-            f"No sessions logged for {target.display_name} yet.",
+            embed=ui.empty(
+                f"No sessions logged for "
+                f"{_safe_label(target.display_name, limit=32)} yet",
+                hint="Post a session in chat and I'll group it automatically.",
+                cmd="/log adds one by hand",
+            ),
             ephemeral=True,
         )
         return
     target_bw = _user_bodyweight(guild_id, target.id)
     total_kg = sum(float(r["weight_kg"] or 0) for r in rows)
-    lines = [
-        f"**{target.display_name} — last session ({day})**",
-        f"_{len(rows)} entries · {total_kg:g} kg total_",
-        "",
-    ]
+    heaviest = max(rows, key=lambda r: float(r["weight_kg"] or 0))
+    embed = ui.card(
+        f"{ui.LIFT} Last session",
+        description=f"{ui.day(day)} · {ui.when(day)}",
+        colour=ui.BRAND,
+        member=target,
+        footer=ui.plural(len(rows), "entry", "entries"),
+    )
+    ui.tiles(
+        embed,
+        ("Exercises", f"**{len(rows)}**"),
+        ("Total load", f"**{ui.num(total_kg, 'kg')}**"),
+        ("Top lift", f"**{_format_weight(heaviest['weight_kg'], bool(heaviest['bw']))}**"
+                     f"\n{ui.subtext(_safe_label(heaviest['equipment'], limit=18))}"),
+    )
+    table_rows = []
     for r in rows:
-        eq = r["equipment"]
-        w = r["weight_kg"]
-        bw = bool(r["bw"])
-        true_suf = _true_weight_suffix(eq, w, bw, target_bw)
         reps = r["reps"] if "reps" in r.keys() else None
-        rep_str = f" ×{reps}" if reps else ""
-        lines.append(
-            f"• **{eq}**: {_format_weight(w, bw)}{true_suf}{rep_str}"
-        )
-    await interaction.response.send_message("\n".join(lines))
+        table_rows.append([
+            _safe_label(r["equipment"], limit=20),
+            _format_weight(r["weight_kg"], bool(r["bw"])),
+            f"x{reps}" if reps else "",
+        ])
+    ui.block(embed, "Lifts", ui.table(table_rows, align="<>", max_rows=25))
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -7012,7 +7237,7 @@ async def stale_cmd(
 
     if not rows:
         await interaction.response.send_message(
-            f"No lifts logged for {target.display_name} yet.", ephemeral=True
+            embed=_no_lifts_embed(target.display_name), ephemeral=True,
         )
         return
     if not stale_rows:
@@ -7055,7 +7280,11 @@ async def undo_cmd(
     )
     if not rows:
         await interaction.response.send_message(
-            "You don't have any entries to undo.", ephemeral=True
+            embed=ui.empty(
+                "Nothing to undo",
+                hint="You have no lift entries on record in this server.",
+            ),
+            ephemeral=True,
         )
         return
     # Suppress the source posts so a reboot's backfill doesn't re-add them.
@@ -7098,7 +7327,12 @@ async def compare_cmd(
 ) -> None:
     if user.id == interaction.user.id:
         await interaction.response.send_message(
-            "Pick someone other than yourself.", ephemeral=True
+            embed=ui.empty(
+                "Pick someone else to compare against",
+                hint="`/compare` puts two lifters side by side — `/stats` "
+                     "shows your own bests.",
+            ),
+            ephemeral=True,
         )
         return
 
@@ -7114,54 +7348,66 @@ async def compare_cmd(
 
     if not keys or not any(k in a_rows or k in b_rows for k in keys):
         await interaction.response.send_message(
-            "No data to compare.", ephemeral=True
+            embed=ui.empty(
+                "Nothing to compare yet",
+                hint="Neither of you has a personal best on record for that "
+                     "lift.",
+            ),
+            ephemeral=True,
         )
         return
 
-    a_name = interaction.user.display_name
-    b_name = user.display_name
-    lines = [f"**{a_name}** vs **{b_name}**"]
+    a_name = _safe_label(interaction.user.display_name, limit=20)
+    b_name = _safe_label(user.display_name, limit=20)
+    # ASCII markers inside the fence — an emoji is not one monospace cell and
+    # would shear the columns. The 🟢/🔴/⚪ vocabulary stays on the score tiles
+    # outside it. The two "missing data" branches used to drop the marker
+    # entirely, which broke the alignment they were sitting in.
+    table_rows: list[list[str]] = []
     a_wins = b_wins = ties = 0
     for k in keys:
-        ra = a_rows.get(k)
-        rb = b_rows.get(k)
+        ra, rb = a_rows.get(k), b_rows.get(k)
         aw = ra["best"] if ra else None
         bw = rb["best"] if rb else None
         if aw is None and bw is None:
             continue
         if aw is None:
-            lines.append(
-                f"• **{k}** — _{a_name}: —_ vs "
-                f"{_format_weight(bw, bool(rb['bw']))}"
-            )
-            b_wins += 1
-            continue
-        if bw is None:
-            lines.append(
-                f"• **{k}** — {_format_weight(aw, bool(ra['bw']))} vs _{b_name}: —_"
-            )
-            a_wins += 1
-            continue
-        if aw > bw:
-            marker = "🟢"
-            a_wins += 1
+            marker, b_wins = "-", b_wins + 1
+        elif bw is None:
+            marker, a_wins = "+", a_wins + 1
+        elif aw > bw:
+            marker, a_wins = "+", a_wins + 1
         elif bw > aw:
-            marker = "🔴"
-            b_wins += 1
+            marker, b_wins = "-", b_wins + 1
         else:
-            marker = "⚪"
-            ties += 1
-        lines.append(
-            f"{marker} **{k}** — "
-            f"{_format_weight(aw, bool(ra['bw']))} vs "
-            f"{_format_weight(bw, bool(rb['bw']))}"
-        )
+            marker, ties = "=", ties + 1
+        table_rows.append([
+            marker,
+            _safe_label(k, limit=18),
+            _format_weight(aw, bool(ra["bw"])) if ra else "—",
+            _format_weight(bw, bool(rb["bw"])) if rb else "—",
+        ])
 
+    embed = ui.card(
+        f"{ui.TROPHY} {a_name} vs {b_name}",
+        colour=(ui.SUCCESS if a_wins > b_wins
+                else ui.DANGER if b_wins > a_wins else ui.BRAND),
+        subject=user,
+        footer="+ you lead · - they lead · = tied",
+        timestamp=True,
+    )
     if not equipment:
-        lines.append(
-            f"\n**Score:** {a_name} {a_wins} · {b_name} {b_wins} · tied {ties}"
+        ui.tiles(
+            embed,
+            (a_name, f"{ui.UP} **{a_wins}**"),
+            ("Tied", f"{ui.FLAT} **{ties}**"),
+            (b_name, f"{ui.DOWN} **{b_wins}**"),
         )
-    await interaction.response.send_message("\n".join(lines))
+    ui.block(embed, "Lift by lift", ui.table(
+        table_rows, align="<<>>", headers=["", "lift", a_name[:9], b_name[:9]],
+        max_rows=20,
+    ))
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -7568,7 +7814,7 @@ async def overview_cmd(
     rows = db.history(guild_id, target.id, canon, limit=1000)
     if not rows:
         await interaction.response.send_message(
-            f"No {canon} history for {target.display_name}.", ephemeral=True
+            embed=_no_history_embed(canon, target.display_name), ephemeral=True,
         )
         return
 
@@ -7578,58 +7824,53 @@ async def overview_cmd(
     )
     if stats is None:
         await interaction.response.send_message(
-            "Couldn't build an overview — no datable entries.", ephemeral=True
+            embed=ui.empty(
+                "Couldn't build an overview",
+                hint=f"There are {_plural(len(rows), 'entry', 'entries')} for "
+                     f"{_safe_label(canon)}, but none carry a usable date.",
+            ),
+            ephemeral=True,
         )
         return
     bodyweight = any(bool(r["bw"]) for r in rows)
 
-    trend = stats.improvement_kg
-    trend_text = "flat"
-    if trend > 0:
-        trend_text = f"+{trend:g}kg"
-    elif trend < 0:
-        trend_text = f"{trend:g}kg"
-
-    avg_gap = (
-        f"{stats.avg_gap_days:.1f} days"
-        if stats.avg_gap_days is not None else "only one day logged"
+    # Eleven statistics were sharing five prose lines joined by '·'. They split
+    # into a headline gauge (the one score that summarises the rest) and tiles.
+    embed = ui.card(
+        f"{ui.CHART} {_safe_label(canon)} — overview",
+        description=f"`{ui.gauge(stats.consistency_score)}` "
+                    f"**{stats.consistency_score}**/100 consistency",
+        colour=(ui.DANGER if stats.consistency_score < 40
+                else ui.WARNING if stats.consistency_score < 70
+                else ui.SUCCESS),
+        member=target,
+        footer=f"{ui.plural(stats.total_logs, 'log')} over "
+               f"{ui.plural(stats.active_days, 'active day')}",
+        timestamp=True,
     )
-    longest_gap = (
-        f"{stats.longest_gap_days} days"
-        if stats.longest_gap_days is not None else "only one day logged"
+    ui.tiles(
+        embed,
+        ("Latest", f"**{_format_weight(stats.latest_kg, bodyweight)}**\n"
+                   f"{ui.subtext(ui.when(stats.latest_day.isoformat()))}"),
+        ("Best", f"**{_format_weight(stats.best_kg, bodyweight)}**"),
+        ("Change", ui.delta(stats.improvement_kg)),
     )
-    stale = (
-        "today" if stats.days_since_latest == 0
-        else f"{_plural(stats.days_since_latest, 'day')} ago"
+    ui.tiles(
+        embed,
+        ("Week streak", f"**{stats.current_week_streak}**"),
+        ("Active weeks", f"**{stats.active_weeks}**/{stats.total_weeks}"),
+        ("Last 30 days", f"**{ui.plural(stats.logs_last_30_days, 'log')}**"),
     )
-
-    lines = [
-        f"**{target.display_name} — {canon} overview**",
-        (
-            f"Consistency: **{stats.consistency_score}/100** · "
-            f"current streak: **{_plural(stats.current_week_streak, 'week')}**"
-        ),
-        (
-            f"Logged **{stats.total_logs}** times across "
-            f"**{_plural(stats.active_days, 'day')}** and "
-            f"**{stats.active_weeks}/{stats.total_weeks} active weeks**."
-        ),
-        (
-            f"Latest: **{_format_weight(stats.latest_kg, bodyweight)}** "
-            f"({stale}) · best: **{_format_weight(stats.best_kg, bodyweight)}**"
-        ),
-        (
-            f"Change: {_format_weight(stats.first_kg, bodyweight)} "
-            f"({_format_date(stats.first_day.isoformat())}) → "
-            f"{_format_weight(stats.latest_kg, bodyweight)} "
-            f"({_format_date(stats.latest_day.isoformat())}) · **{trend_text}**"
-        ),
-        (
-            f"Spacing: avg gap **{avg_gap}** · longest gap **{longest_gap}** · "
-            f"last 30 days: **{_plural(stats.logs_last_30_days, 'log')}**"
-        ),
-    ]
-    await interaction.response.send_message("\n".join(lines))
+    gap_bits = []
+    if stats.avg_gap_days is not None:
+        gap_bits.append(f"average **{stats.avg_gap_days:.1f} days**")
+    if stats.longest_gap_days is not None:
+        gap_bits.append(f"longest **{ui.plural(stats.longest_gap_days, 'day')}**")
+    ui.block(
+        embed, "Spacing between sessions",
+        " · ".join(gap_bits) or "Only one day logged so far.",
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -8178,6 +8419,31 @@ alias_add_cmd.autocomplete("equipment")(_equipment_autocomplete)
 # fresh session on every cycle.
 _revo_user_clients: dict[int, "revo_client.RevoClient"] = {}
 _revo_clients_lock = __import__("threading").Lock()
+
+
+def _revo_off_embed() -> discord.Embed:
+    """The Revo-is-switched-off gate, in one place.
+
+    Twelve commands each carried their own copy in two different wordings, and
+    four of those pasted the env var name into a message shown to members who
+    have no way to set it. Configuration names belong in the admin field.
+    """
+    return ui.unavailable(
+        "Revo Fitness",
+        why="The gym integration is switched off, so club occupancy, "
+            "check-in streaks and member cards aren't available.",
+        admin_fix="Clear `REVO_DISABLED` and restart the bot.",
+    )
+
+
+def _revo_missing_deps_embed(*, crypto: bool = False) -> discord.Embed:
+    """Revo is enabled but its optional dependencies aren't installed."""
+    packages = "`requests` and `cryptography`" if crypto else "`requests`"
+    return ui.unavailable(
+        "Revo Fitness",
+        why="The gym integration is enabled but can't run on this host yet.",
+        admin_fix=f"Install {packages}, then restart the bot.",
+    )
 
 
 def _client_for_user(row) -> "revo_client.RevoClient":
@@ -8843,13 +9109,12 @@ async def busy_cmd(
     # count, then to a clear "temporarily unavailable" — /busy never hard-errors.
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_perfectgym.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -9016,13 +9281,12 @@ async def revo_clubs_cmd(
     # resolution (public data, shared ok).
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_perfectgym.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -9188,13 +9452,12 @@ async def revo_link_cmd(
     # caller in Discord — only the bot ever sees the arguments.
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install `requests` and `cryptography`.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(crypto=True), ephemeral=True,
         )
         return
 
@@ -9316,7 +9579,7 @@ async def revo_streak_cmd(
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
 
@@ -9379,13 +9642,12 @@ async def revo_streak_cmd(
 async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -9487,13 +9749,12 @@ async def revo_calendar_cmd(
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -9605,13 +9866,12 @@ async def revo_calendar_compare_cmd(
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
     guild = _ctx_guild(interaction)
@@ -9778,7 +10038,7 @@ async def revo_tickets_cmd(
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
 
@@ -9845,13 +10105,12 @@ async def revo_tickets_cmd(
 async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -9941,13 +10200,12 @@ async def revo_summary_cmd(
 ) -> None:
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled.", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_client.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -10106,13 +10364,12 @@ async def revo_card_cmd(interaction: discord.Interaction) -> None:
     #      barcode). The barcode is rendered to a PNG and never logged.
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_perfectgym.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -10221,13 +10478,12 @@ async def seeprofile_cmd(interaction: discord.Interaction) -> None:
     #     raw URL never lands in message history — and it is NEVER logged.
     if REVO_DISABLED:
         await interaction.response.send_message(
-            "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
+            embed=_revo_off_embed(), ephemeral=True,
         )
         return
     if not revo_perfectgym.available():
         await interaction.response.send_message(
-            "Revo client unavailable — install the `requests` package.",
-            ephemeral=True,
+            embed=_revo_missing_deps_embed(), ephemeral=True,
         )
         return
 
@@ -13409,7 +13665,8 @@ async def strava_latest_cmd(
 async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
-            "This command is owner-only.", ephemeral=True,
+            embed=ui.denied("Owner only — this manages the bot itself."),
+            ephemeral=True,
         )
         return
     cfg = _strava_cfg()
@@ -13456,7 +13713,8 @@ async def strava_subscribe_cmd(interaction: discord.Interaction) -> None:
 async def strava_subscription_cmd(interaction: discord.Interaction) -> None:
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
-            "This command is owner-only.", ephemeral=True,
+            embed=ui.denied("Owner only — this manages the bot itself."),
+            ephemeral=True,
         )
         return
     cfg = _strava_cfg()
@@ -13518,7 +13776,8 @@ async def strava_unsubscribe_cmd(
 ) -> None:
     if not _is_owner(interaction.user.id):
         await interaction.response.send_message(
-            "This command is owner-only.", ephemeral=True,
+            embed=ui.denied("Owner only — this manages the bot itself."),
+            ephemeral=True,
         )
         return
     cfg = _strava_cfg()
@@ -13816,11 +14075,17 @@ track_group = app_commands.Group(
 )
 
 
-_PRESENCE_DISABLED_MSG = (
-    "Presence tracking is disabled. Set `ENABLE_PRESENCE_TRACKING=true` and "
-    "enable the **Presence Intent** + **Server Members Intent** toggles in "
-    "the Discord Developer Portal, then restart the bot."
-)
+def _presence_disabled_embed() -> discord.Embed:
+    """Presence tracking gate. The env var and portal toggles are an admin's
+    problem, so they live in the admin field rather than in prose aimed at a
+    member who cannot act on either."""
+    return ui.unavailable(
+        "Presence tracking",
+        why="Nobody's online/offline history is being recorded.",
+        admin_fix="Set `ENABLE_PRESENCE_TRACKING=true`, enable the Presence "
+                  "and Server Members intents in the Discord Developer "
+                  "Portal, then restart the bot.",
+    )
 
 
 @track_group.command(
@@ -13832,7 +14097,7 @@ async def track_start_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if not _is_owner(interaction.user.id):
@@ -13879,7 +14144,7 @@ async def track_stop_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if not _is_owner(interaction.user.id):
@@ -13906,7 +14171,7 @@ async def track_stop_cmd(
 async def track_list_cmd(interaction: discord.Interaction) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if not _is_owner(interaction.user.id):
@@ -14038,7 +14303,7 @@ async def track_schedule_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if days < 1 or days > 90:
@@ -14103,7 +14368,7 @@ async def track_raw_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if days < 1 or days > 90:
@@ -14287,7 +14552,7 @@ async def track_export_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if not _is_owner(interaction.user.id):
@@ -14425,7 +14690,7 @@ async def track_analyze_cmd(
 ) -> None:
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if days < 1 or days > 365:
@@ -14866,7 +15131,7 @@ async def track_now_cmd(
     """
     if not ENABLE_PRESENCE_TRACKING:
         await interaction.response.send_message(
-            _PRESENCE_DISABLED_MSG, ephemeral=True,
+            embed=_presence_disabled_embed(), ephemeral=True,
         )
         return
     if not _is_owner(interaction.user.id):
@@ -14926,10 +15191,12 @@ voice_group = app_commands.Group(
     description="Voice-call time stats (in-call / muted / deafened).",
 )
 
-_VOICE_DISABLED_MSG = (
-    "Voice tracking is disabled. Set `ENABLE_VOICE_TRACKING=true` and restart "
-    "the bot to record voice join/leave/mute/deafen activity."
-)
+def _voice_disabled_embed() -> discord.Embed:
+    return ui.unavailable(
+        "Voice tracking",
+        why="Voice join, leave, mute and deafen activity isn't being recorded.",
+        admin_fix="Set `ENABLE_VOICE_TRACKING=true` and restart the bot.",
+    )
 
 
 def _pct(part: float, whole: float) -> str:
@@ -14951,7 +15218,7 @@ async def voice_stats_cmd(
     days: int = 7,
 ) -> None:
     if not ENABLE_VOICE_TRACKING:
-        await interaction.response.send_message(_VOICE_DISABLED_MSG, ephemeral=True)
+        await interaction.response.send_message(embed=_voice_disabled_embed(), ephemeral=True)
         return
     if days < 1 or days > 90:
         await interaction.response.send_message(
@@ -15070,10 +15337,16 @@ _MAX_TARGET_KCAL = 20_000
 # joke/typo posts like "9999c" bounce instead of poisoning averages and TDEE.
 _MAX_ENTRY_KCAL = 6_000
 
-_CALORIES_NOT_SET_MSG = (
-    "You're not tracking calories yet — run `/calories setup` with your "
-    "daily target first (e.g. `2500` or `8700kj`)."
-)
+def _calories_not_set_embed(name: str | None = None) -> discord.Embed:
+    """Not-tracking-yet state, for yourself or for someone you looked up."""
+    if name is not None:
+        return ui.empty(f"{_safe_label(name, limit=32)} isn't tracking calories")
+    return ui.empty(
+        "You're not tracking calories yet",
+        hint="Set a daily target and I'll count everything you post from "
+             "then on — `2500`, or `8700kj` if your labels are in kilojoules.",
+        cmd="/calories setup <target> to start",
+    )
 
 # What someone types into a `weekend:` option to say "no separate weekend
 # target, just use my normal one".
@@ -15370,7 +15643,7 @@ async def calories_add_cmd(
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
-            _CALORIES_NOT_SET_MSG, ephemeral=True,
+            embed=_calories_not_set_embed(), ephemeral=True,
         )
         return
     logged_at, day_ok = _slash_logged_at(day)
@@ -15446,11 +15719,13 @@ async def calories_today_cmd(
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
-        msg = (
-            _CALORIES_NOT_SET_MSG if target_user == interaction.user
-            else f"{target_user.display_name} isn't tracking calories."
+        await interaction.response.send_message(
+            embed=_calories_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
         )
-        await interaction.response.send_message(msg, ephemeral=True)
         return
     entries = db.calorie_entries_between(
         guild_id, target_user.id, *_today_window(),
@@ -15512,11 +15787,13 @@ async def calories_week_cmd(
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
-        msg = (
-            _CALORIES_NOT_SET_MSG if target_user == interaction.user
-            else f"{target_user.display_name} isn't tracking calories."
+        await interaction.response.send_message(
+            embed=_calories_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
         )
-        await interaction.response.send_message(msg, ephemeral=True)
         return
     _label, start_iso, end_iso = _week_window()
     day_totals = _calorie_week_days(guild_id, target_user.id, start_iso, end_iso)
@@ -15539,7 +15816,7 @@ async def calories_week_cmd(
         target_kcal = day_targets[day].kcal.value or 0.0
         total = day_totals.get(key)
         if total is None:
-            rows.append([day_name, "", "nothing logged"])
+            rows.append([day_name, "", "—", ""])
             continue
         logged_days += 1
         target_sum += target_kcal
@@ -15547,8 +15824,12 @@ async def calories_week_cmd(
             day_name,
             ui.bar(total, target_kcal, width=10),
             calories.format_kcal(total),
+            ui.over_by(total, target_kcal),
         ])
-    lines = [ui.table(rows, align="<<>", max_rows=7)]
+    lines = [ui.table(
+        rows, align="<<>>", headers=["day", "vs target", "total", "over"],
+        max_rows=7,
+    )]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         avg_target = target_sum / logged_days
@@ -15590,7 +15871,11 @@ async def calories_undo_cmd(interaction: discord.Interaction) -> None:
     )
     if row is None:
         await interaction.response.send_message(
-            "No calorie entries to undo.", ephemeral=True,
+            embed=ui.empty(
+                "Nothing to undo",
+                hint="You have no calorie entries on record.",
+            ),
+            ephemeral=True,
         )
         return
     note_part = f" — {row['note']}" if row["note"] else ""
@@ -15621,7 +15906,7 @@ async def calories_edit_cmd(
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
-            _CALORIES_NOT_SET_MSG, ephemeral=True,
+            embed=_calories_not_set_embed(), ephemeral=True,
         )
         return
     parsed = calories.parse_energy(amount)
@@ -15884,11 +16169,13 @@ async def calories_tdee_cmd(
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, target_user.id)
     if goal is None:
-        msg = (
-            _CALORIES_NOT_SET_MSG if target_user == interaction.user
-            else f"{target_user.display_name} isn't tracking calories."
+        await interaction.response.send_message(
+            embed=_calories_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
         )
-        await interaction.response.send_message(msg, ephemeral=True)
         return
 
     now_local = datetime.now(DISPLAY_TZ)
@@ -16142,7 +16429,7 @@ async def calories_estimate_cmd(
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
-            _CALORIES_NOT_SET_MSG, ephemeral=True,
+            embed=_calories_not_set_embed(), ephemeral=True,
         )
         return
     if not gemini_client.available():
@@ -16257,7 +16544,7 @@ async def calories_label_cmd(
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if grams is not None and goal is None:
         await interaction.response.send_message(
-            _CALORIES_NOT_SET_MSG, ephemeral=True,
+            embed=_calories_not_set_embed(), ephemeral=True,
         )
         return
     logged_at, day_ok = _slash_logged_at(day)
@@ -16557,7 +16844,7 @@ async def calories_remind_cmd(
     guild_id = _ctx_guild_id(interaction)
     if db.calorie_goal_get(guild_id, interaction.user.id) is None:
         await interaction.response.send_message(
-            _CALORIES_NOT_SET_MSG, ephemeral=True,
+            embed=_calories_not_set_embed(), ephemeral=True,
         )
         return
     hhmm = _parse_hhmm(time) if time is not None else (20, 0)
@@ -16592,10 +16879,14 @@ protein_group = app_commands.Group(
 _MAX_PROTEIN_TARGET_G = 500
 _MAX_PROTEIN_ENTRY_G = 400
 
-_PROTEIN_NOT_SET_MSG = (
-    "You're not tracking protein yet — run `/protein setup <grams>` with your "
-    "daily max first (e.g. `180`)."
-)
+def _protein_not_set_embed(name: str | None = None) -> discord.Embed:
+    if name is not None:
+        return ui.empty(f"{_safe_label(name, limit=32)} isn't tracking protein")
+    return ui.empty(
+        "You're not tracking protein yet",
+        hint="Set a daily max and I'll flag when you go over it — e.g. `180`.",
+        cmd="/protein setup <grams> to start",
+    )
 
 
 def _protein_week_days(
@@ -16741,7 +17032,7 @@ async def protein_add_cmd(
     goal = db.protein_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
-            _PROTEIN_NOT_SET_MSG, ephemeral=True,
+            embed=_protein_not_set_embed(), ephemeral=True,
         )
         return
     logged_at, day_ok = _slash_logged_at(day)
@@ -16792,11 +17083,13 @@ async def protein_today_cmd(
     guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
     if goal is None:
-        msg = (
-            _PROTEIN_NOT_SET_MSG if target_user == interaction.user
-            else f"{target_user.display_name} isn't tracking protein."
+        await interaction.response.send_message(
+            embed=_protein_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
         )
-        await interaction.response.send_message(msg, ephemeral=True)
         return
     entries = db.protein_entries_between(
         guild_id, target_user.id, *_today_window(),
@@ -16853,11 +17146,13 @@ async def protein_week_cmd(
     guild_id = _ctx_guild_id(interaction)
     goal = db.protein_goal_get(guild_id, target_user.id)
     if goal is None:
-        msg = (
-            _PROTEIN_NOT_SET_MSG if target_user == interaction.user
-            else f"{target_user.display_name} isn't tracking protein."
+        await interaction.response.send_message(
+            embed=_protein_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
         )
-        await interaction.response.send_message(msg, ephemeral=True)
         return
     _label, start_iso, end_iso = _week_window()
     day_totals = _protein_week_days(guild_id, target_user.id, start_iso, end_iso)
@@ -16867,9 +17162,11 @@ async def protein_week_cmd(
     day_targets = targets_mod.resolve_days(
         db.nutrition_target_rows(target_user.id), week,
     )
-    # Same single-fence treatment as /calories week — see the note there. The
-    # over-max marker is an ASCII '!' rather than ⚠️ because an emoji is not one
-    # monospace cell and would shear every column to its right.
+    # Same single-fence treatment as /calories week — see the note there.
+    # Going over the max is the signal this tracker exists for, so the last
+    # column says how far over in grams. A bar clamped at full can't show
+    # magnitude, and growing it past full would make every row a different
+    # length and break the alignment the fence is here to provide.
     rows: list[list[str]] = []
     logged_days = 0
     target_sum = 0.0
@@ -16879,17 +17176,20 @@ async def protein_week_cmd(
         target_g = day_targets[day].protein.value or 0.0
         total = day_totals.get(key)
         if total is None:
-            rows.append([day_name, "", "nothing logged", ""])
+            rows.append([day_name, "", "—", ""])
             continue
         logged_days += 1
         target_sum += target_g
         rows.append([
             day_name,
-            ui.bar(total, target_g, width=10, overflow=True),
+            ui.bar(total, target_g, width=10),
             protein_mod.format_grams(total),
-            "!" if total > target_g else "",
+            ui.over_by(total, target_g),
         ])
-    lines = [ui.table(rows, align="<<>", max_rows=7)]
+    lines = [ui.table(
+        rows, align="<<>>", headers=["day", "vs max", "total", "over"],
+        max_rows=7,
+    )]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         lines.append(
@@ -16929,7 +17229,11 @@ async def protein_undo_cmd(interaction: discord.Interaction) -> None:
     )
     if row is None:
         await interaction.response.send_message(
-            "No protein entries to undo.", ephemeral=True,
+            embed=ui.empty(
+                "Nothing to undo",
+                hint="You have no protein entries on record.",
+            ),
+            ephemeral=True,
         )
         return
     note_part = f" — {row['note']}" if row["note"] else ""
@@ -16960,7 +17264,7 @@ async def protein_edit_cmd(
     goal = db.protein_goal_get(guild_id, interaction.user.id)
     if goal is None:
         await interaction.response.send_message(
-            _PROTEIN_NOT_SET_MSG, ephemeral=True,
+            embed=_protein_not_set_embed(), ephemeral=True,
         )
         return
     amount = protein_mod.parse_protein_amount(grams)

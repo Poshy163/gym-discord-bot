@@ -83,21 +83,37 @@ def test_bar_keeps_a_fixed_cell_count_so_stacked_rows_align():
         assert len(ui.bar(value, 1000, width=10)) == 10
 
 
-def test_bar_shows_overshoot_instead_of_clamping():
-    """The old renderer clamped at 100%, so 10-over and 2400-over drew
-    identically — which is the entire signal a ceiling tracker exists to give."""
-    at_limit = ui.bar(180, 180, width=10, overflow=True)
-    a_bit_over = ui.bar(200, 180, width=10, overflow=True)
-    way_over = ui.bar(500, 180, width=10, overflow=True)
-    assert at_limit != a_bit_over != way_over
-    assert len(way_over) > len(a_bit_over) > len(at_limit)
-    assert way_over.endswith(ui.OVER)
-    # Overflow cells are capped so a typo can't draw a bar off the screen.
-    assert ui.bar(100_000, 180, width=10, overflow=True).count(ui.OVER) == 4
-
-
-def test_bar_without_overflow_never_exceeds_its_width():
+def test_bar_is_always_exactly_width_cells():
+    """Bars stack inside fenced blocks. A bar that grows when a value goes over
+    target makes every column to its right ragged — and an earlier version that
+    appended ``█`` past the end also mixed glyph families, so the overflow
+    rendered as full-height blocks towering over the short ``▰``/``▱`` line."""
+    for value in (0, 90, 180, 200, 500, 100_000):
+        assert len(ui.bar(value, 180, width=10)) == 10
     assert len(ui.bar(9999, 100, width=12)) == 12
+    # Only the two parallelogram glyphs are ever emitted.
+    assert set(ui.bar(500, 180, width=10)) <= {ui.FILL, ui.TRACK}
+
+
+def test_over_by_carries_the_magnitude_a_clamped_bar_cannot():
+    """10-over and 2,400-over must not read identically — that's the whole
+    signal a ceiling tracker gives. The bar can't say it, so this column does."""
+    assert ui.over_by(190, 180) == "+10"
+    assert ui.over_by(2580, 180) == "+2,400"
+    assert ui.over_by(180, 180) == ""      # exactly at the max is not over
+    assert ui.over_by(90, 180) == ""
+    assert ui.over_by(90, 0) == ""         # no ceiling set
+    assert ui.over_by(190, 180, g) == "+10 g"
+
+
+def test_meter_still_distinguishes_a_small_overshoot_from_a_huge_one():
+    """The property the removed overflow cells were carrying, now carried by
+    the percentage and the absolute number instead."""
+    small, _ = ui.meter(190, 180, g, ceiling=True)
+    huge, _ = ui.meter(2580, 180, g, ceiling=True)
+    assert small != huge
+    assert "106%" in small and "1,433%" in huge
+    assert "10 g" in small and "2400 g" in huge
 
 
 def test_bar_with_no_target_is_all_track():
@@ -416,3 +432,94 @@ def test_preview_cases_all_render_inside_discord_limits():
         for item in items:
             if isinstance(item, discord.Embed):
                 assert ui.overflows(item) is None, f"{title}: {ui.overflows(item)}"
+
+
+# ---------------------------------------------------------------------------
+# The card builders in app.bot that can be exercised without an Interaction.
+# Each one is a send that would 400 in production if it overflowed.
+# ---------------------------------------------------------------------------
+
+def _bot():
+    import os
+    os.environ.setdefault("DB_PATH", ":memory:")
+    os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
+    import app.bot as bot
+    return bot
+
+
+def test_shared_empty_and_gate_builders_are_within_limits():
+    bot = _bot()
+    builders = [
+        bot._no_lifts_embed("Poshy"),
+        bot._no_history_embed("incline bench press", "Poshy"),
+        bot._revo_off_embed(),
+        bot._revo_missing_deps_embed(),
+        bot._revo_missing_deps_embed(crypto=True),
+        bot._presence_disabled_embed(),
+        bot._voice_disabled_embed(),
+        bot._calories_not_set_embed(),
+        bot._calories_not_set_embed("Cookie Monster"),
+        bot._protein_not_set_embed(),
+        bot._protein_not_set_embed("Dos"),
+    ]
+    for e in builders:
+        assert ui.overflows(e) is None, f"{e.title}: {ui.overflows(e)}"
+        assert e.colour == ui.NEUTRAL, f"{e.title} should read as absence"
+
+
+def test_gate_embeds_keep_configuration_out_of_member_facing_prose():
+    """Env var names are an admin's lever. A member who sees one can't act on
+    it, so it belongs in the 'For admins' field, never the description."""
+    bot = _bot()
+    for embed, var in (
+        (bot._revo_off_embed(), "REVO_DISABLED"),
+        (bot._presence_disabled_embed(), "ENABLE_PRESENCE_TRACKING"),
+        (bot._voice_disabled_embed(), "ENABLE_VOICE_TRACKING"),
+    ):
+        assert var not in (embed.description or ""), embed.title
+        admin = " ".join(f.value for f in embed.fields if f.name == "For admins")
+        assert var in admin, embed.title
+
+
+def test_no_lifts_embed_escapes_a_hostile_display_name():
+    bot = _bot()
+    e = bot._no_lifts_embed("@everyone **boom**")
+    assert "@everyone" not in e.title
+    assert "**boom**" not in e.title
+
+
+def test_personal_bests_card_survives_a_long_roster():
+    """Jaidyn has 31 distinct exercises; the card must not blow the description
+    budget as that grows."""
+    bot = _bot()
+
+    class _Row(dict):
+        def keys(self):
+            return super().keys()
+
+    rows = [
+        _Row(equipment=f"a rather long exercise name {i}", best=100 + i,
+             bw=0, set_on="2026-07-20T00:00:00+00:00")
+        for i in range(40)
+    ]
+
+    class _M:
+        id = 1
+        display_name = "Jaidyn"
+        display_avatar = type("A", (), {"url": "https://x/y.png"})()
+
+    e = bot._personal_bests_card(0, _M(), rows)
+    assert ui.overflows(e) is None
+
+
+def test_help_sections_each_fit_and_cover_every_category():
+    bot = _bot()
+    sections = bot._help_sections()
+    assert "Overview" in sections
+    for name, embed in sections.items():
+        assert ui.overflows(embed) is None, f"{name}: {ui.overflows(embed)}"
+        # The old two-embed form was 6,440 against a 6,000 message cap; every
+        # paged section should sit far below it with room to grow.
+        assert len(embed) < 2000, f"{name} is {len(embed)}"
+    # Discord's Select maxes out at 25 options.
+    assert len(sections) <= 25
