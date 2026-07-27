@@ -43,7 +43,7 @@ from .aliases import (
 )
 
 from .db import KEEP, Database
-from .graphing import daily_best_points, running_best_values
+from .graphing import daily_best_points, running_best_values, trend_values
 from .message_targeting import strip_leading_user_mention
 from .overview import lift_overview
 from .parser import (
@@ -8127,6 +8127,104 @@ async def overview_cmd(
 # ---------------------------------------------------------------------------
 
 
+# Chart palette. Matches the embed the PNG is attached to — the old cream
+# canvas glared out of a dark card, which is the single loudest thing about
+# the old charts.
+_CHART_BG = "#2b2d31"
+_CHART_INK = "#dbdee1"
+_CHART_MUTED = "#949ba4"
+_CHART_GRID = "#3f4147"
+
+
+def _render_trend_chart(
+    plt, mdates, ticker,
+    xs: list,
+    ys: list[float],
+    trend: list[float],
+    *,
+    title: str,
+    subtitle: str,
+    trend_label: str,
+    trend_colour: str,
+    unit: str = "kg",
+    fmt=lambda v: f"{v:g}kg",
+) -> "io.BytesIO":
+    """Actual readings in thin grey, one bold trend line over the top.
+
+    The readings stay visible so nothing is hidden, but they stop competing:
+    on a noisy series a single spike used to dominate the whole picture and
+    read as the story. Returns a PNG buffer.
+    """
+    fig, ax = plt.subplots(figsize=(8.8, 4.4), dpi=150)
+    fig.patch.set_facecolor(_CHART_BG)
+    ax.set_facecolor(_CHART_BG)
+
+    ax.plot(
+        xs, ys, marker="o", markersize=4.5, markerfacecolor=_CHART_BG,
+        markeredgewidth=1.4, linewidth=1.1, color=_CHART_MUTED, alpha=0.75,
+        label="logged", zorder=2,
+    )
+    ax.plot(
+        xs, trend, linewidth=3.0, color=trend_colour, label=trend_label,
+        zorder=3, solid_capstyle="round",
+    )
+    floor = min(min(ys), min(trend)) - (max(ys) - min(ys) + 1) * 2
+    ax.fill_between(xs, trend, floor, color=trend_colour, alpha=0.09, zorder=1)
+
+    ax.set_title(title, loc="left", fontsize=15, fontweight="bold",
+                 color=_CHART_INK, pad=20)
+    ax.text(0, 1.02, subtitle, transform=ax.transAxes, fontsize=9,
+            color=_CHART_MUTED, va="bottom")
+    ax.set_ylabel(unit, color=_CHART_MUTED)
+
+    ax.grid(axis="y", color=_CHART_GRID, linewidth=0.8, alpha=0.7)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_CHART_GRID)
+    ax.tick_params(colors=_CHART_MUTED, labelsize=9)
+
+    lo, hi = min(ys), max(ys)
+    pad = max(0.8, (hi - lo) * 0.18)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
+
+    if len(xs) > 1:
+        span = max(xs) - min(xs)
+        xpad = timedelta(days=max(1.0, span.days * 0.04))
+        ax.set_xlim(min(xs) - xpad, max(xs) + xpad)
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=7)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        # ConciseDateFormatter parks a "2026-Jul" offset in the corner, which
+        # reads as a stray annotation. The span is already in the subtitle.
+        ax.xaxis.get_offset_text().set_visible(False)
+    else:
+        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+
+    # First and last only — enough to anchor the scale without label spaghetti.
+    for idx, va, dy in ((0, "bottom", 10), (len(xs) - 1, "top", -12)):
+        ax.annotate(
+            fmt(ys[idx]), xy=(xs[idx], ys[idx]), xytext=(0, dy),
+            textcoords="offset points", ha="center", va=va,
+            fontsize=9, fontweight="bold", color=_CHART_INK,
+        )
+
+    legend = ax.legend(loc="best", frameon=False, fontsize=8.5)
+    for text in legend.get_texts():
+        text.set_color(_CHART_MUTED)
+
+    fig.tight_layout(pad=1.1)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 @bot.tree.command(
     name="graph",
     description="Plot a lift's daily-best progress as a PNG chart.",
@@ -8182,87 +8280,22 @@ async def graph_cmd(
     xs = [point.when for point in points]
     ys = [point.weight_kg for point in points]
     running_best = running_best_values(ys)
-
-    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=150)
-    fig.patch.set_facecolor("#f6f3ee")
-    ax.set_facecolor("#fffdfa")
-    primary = "#f26522"
-    best_colour = "#24756f"
-
-    ax.plot(
-        xs, ys,
-        marker="o", markersize=6.5, markerfacecolor="#fffdfa",
-        markeredgewidth=2.0, linewidth=2.4,
-        color=primary, label="Daily best",
-    )
-    if len(xs) > 1:
-        ax.step(
-            xs, running_best, where="post", linewidth=1.8,
-            linestyle=(0, (4, 3)), color=best_colour,
-            label="Best to date",
-        )
-
-    ax.set_title(
-        f"{target.display_name} — {canon}", loc="left",
-        fontsize=14, fontweight="bold", pad=16,
-    )
+    peak = max(ys)
+    net = ys[-1] - ys[0]
     subtitle = (
-        f"{len(rows)} log{'s' if len(rows) != 1 else ''} · "
-        f"{len(points)} day{'s' if len(points) != 1 else ''} · "
-        f"peak {max(ys):g}kg"
+        f"{_plural(len(rows), 'log')} · {_plural(len(points), 'day')} "
+        f"· peak {peak:g}kg"
     )
-    ax.text(
-        0, 1.015, subtitle, transform=ax.transAxes,
-        fontsize=9, color="#6b625a", va="bottom",
+    # For a lift the meaningful trend line is the personal best over time, not
+    # a rolling mean: a heavy day followed by a deload isn't noise to smooth
+    # away, and the number people care about is the best they've hit.
+    buf = _render_trend_chart(
+        plt, mdates, ticker, xs, ys, running_best,
+        title=f"{_display_name(target)} — {canon}",
+        subtitle=subtitle,
+        trend_label="best to date",
+        trend_colour=f"#{ui.score_trend(net).value:06x}",
     )
-    ax.set_ylabel("kg")
-    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
-    ax.grid(axis="y", color="#d9d3cb", linewidth=0.8, alpha=0.85)
-    ax.grid(axis="x", color="#eee9e1", linewidth=0.7, alpha=0.55)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color("#b8afa4")
-    ax.spines["bottom"].set_color("#b8afa4")
-    ax.tick_params(colors="#332f2a", labelsize=9)
-
-    ymin = min(ys)
-    ymax = max(ys)
-    ypad = max(5.0, (ymax - ymin) * 0.18)
-    ax.set_ylim(max(0, ymin - ypad), ymax + ypad)
-
-    label_indexes = (
-        range(len(xs))
-        if len(xs) <= 8
-        else sorted({ys.index(ymax), len(xs) - 1})
-    )
-    for idx in label_indexes:
-        ax.annotate(
-            f"{ys[idx]:g}kg",
-            xy=(xs[idx], ys[idx]), xytext=(0, 9),
-            textcoords="offset points", ha="center", va="bottom",
-            fontsize=8, color="#332f2a",
-        )
-
-    if len(xs) > 1:
-        span = max(xs) - min(xs)
-        pad = timedelta(days=max(1.0, span.days * 0.06))
-        ax.set_xlim(min(xs) - pad, max(xs) + pad)
-        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-        ax.legend(loc="upper left", frameon=False, fontsize=9)
-    else:
-        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
-        ax.xaxis.set_major_locator(mdates.DayLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-
-    fig.autofmt_xdate(rotation=0, ha="center")
-    fig.tight_layout(pad=1.2)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
     fname = f"{canon.replace(' ', '_')}_{target.display_name}.png"
     file = discord.File(buf, filename=fname)
     collapsed_days = sum(1 for point in points if point.entries > 1)
@@ -8415,77 +8448,24 @@ async def bodyweight_graph_cmd(
     xs = sorted(by_day)
     ys = [sum(by_day[d]) / len(by_day[d]) for d in xs]
 
-    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=150)
-    fig.patch.set_facecolor("#f6f3ee")
-    ax.set_facecolor("#fffdfa")
-    primary = "#3b7dd8"
-
-    ax.plot(
-        xs, ys,
-        marker="o", markersize=6.5, markerfacecolor="#fffdfa",
-        markeredgewidth=2.0, linewidth=2.4,
-        color=primary, label="Bodyweight",
-    )
-
-    ax.set_title(
-        f"{target.display_name} — bodyweight", loc="left",
-        fontsize=14, fontweight="bold", pad=16,
-    )
+    # Bodyweight is genuinely noisy — hydration, time of day, what you last
+    # ate all move it a kilo — so the readings recede and a trailing mean
+    # carries the trajectory. Down is the favourable direction here.
+    trend = trend_values(ys)
     delta = ys[-1] - ys[0]
     sign = "+" if delta >= 0 else ""
     subtitle = (
-        f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'} · "
-        f"{len(xs)} day{'s' if len(xs) != 1 else ''} · "
+        f"{_plural(len(rows), 'entry', 'entries')} · "
+        f"{_plural(len(xs), 'day')} · "
         f"{ys[0]:g}kg → {ys[-1]:g}kg ({sign}{delta:g}kg)"
     )
-    ax.text(
-        0, 1.015, subtitle, transform=ax.transAxes,
-        fontsize=9, color="#6b625a", va="bottom",
+    buf = _render_trend_chart(
+        plt, mdates, ticker, xs, ys, trend,
+        title=f"{_display_name(target)} — bodyweight",
+        subtitle=subtitle,
+        trend_label="trend",
+        trend_colour=f"#{ui.score_trend(delta, good='down').value:06x}",
     )
-    ax.set_ylabel("kg")
-    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
-    ax.grid(axis="y", color="#d9d3cb", linewidth=0.8, alpha=0.85)
-    ax.grid(axis="x", color="#eee9e1", linewidth=0.7, alpha=0.55)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color("#b8afa4")
-    ax.spines["bottom"].set_color("#b8afa4")
-    ax.tick_params(colors="#332f2a", labelsize=9)
-
-    ymin, ymax = min(ys), max(ys)
-    ypad = max(1.0, (ymax - ymin) * 0.25)
-    ax.set_ylim(ymin - ypad, ymax + ypad)
-
-    # Annotate first, peak, trough, and latest only — avoids label spaghetti
-    # for users with many weigh-ins.
-    label_idx = sorted({0, len(xs) - 1, ys.index(ymax), ys.index(ymin)})
-    for idx in label_idx:
-        ax.annotate(
-            f"{ys[idx]:g}kg",
-            xy=(xs[idx], ys[idx]), xytext=(0, 9),
-            textcoords="offset points", ha="center", va="bottom",
-            fontsize=8, color="#332f2a",
-        )
-
-    if len(xs) > 1:
-        span = xs[-1] - xs[0]
-        pad = timedelta(days=max(1.0, span.days * 0.06))
-        ax.set_xlim(xs[0] - pad, xs[-1] + pad)
-        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    else:
-        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
-        ax.xaxis.set_major_locator(mdates.DayLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-
-    fig.autofmt_xdate(rotation=0, ha="center")
-    fig.tight_layout(pad=1.2)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
     fname = f"bodyweight_{target.display_name}.png"
     file = discord.File(buf, filename=fname)
     await interaction.followup.send(

@@ -54,3 +54,26 @@ def running_best_values(weights: Iterable[float]) -> list[float]:
         bests.append(current)
     return bests
 
+
+def trend_values(values: Iterable[float], window: int = 3) -> list[float]:
+    """Trailing mean over the last ``window`` points, one output per input.
+
+    Bodyweight is noisy — hydration, time of day and what you last ate move it
+    a kilo either way — so a raw line makes a single bad morning look like the
+    story. Smoothing lets the actual trajectory read while the real readings
+    stay on the chart underneath.
+
+    Trailing rather than centred so the last point reflects only data that
+    existed by then; a centred window would let future weigh-ins bend the line
+    you already saw. The first points average fewer samples rather than being
+    dropped, so the line spans the whole series.
+    """
+    out: list[float] = []
+    seen: list[float] = []
+    span = max(1, int(window))
+    for value in values:
+        seen.append(float(value))
+        chunk = seen[-span:]
+        out.append(sum(chunk) / len(chunk))
+    return out
+
