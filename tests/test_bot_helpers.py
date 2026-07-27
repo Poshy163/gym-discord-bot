@@ -1394,3 +1394,82 @@ def test_new_nutrition_replies_no_longer_use_the_retired_food_icons():
         and "legacy" not in line
     ]
     assert offenders == [], f"retired food icons still emitted: {offenders}"
+
+
+# ---- /busy state boards ------------------------------------------------------
+
+def _occ_list():
+    from app.revo_perfectgym import ClubOccupancy
+    return [
+        ClubOccupancy(name="Marion", suburb="Marion", state="SA", count=133,
+                      capacity=None),
+        ClubOccupancy(name="Modbury", suburb="Modbury", state="SA", count=13,
+                      capacity=None),
+        ClubOccupancy(name="Munno Para", suburb="Munno Para", state="SA",
+                      count=115, capacity=None),
+        ClubOccupancy(name="Cannington", suburb="Cannington", state="WA",
+                      count=200, capacity=None),
+    ]
+
+
+def test_busy_state_embed_ranks_and_scopes_to_one_state():
+    """top_busiest has always accepted a state; nothing exposed it, so the
+    board could only ever be scoped to your own home club's state."""
+    import app.bot as bot
+    from app import ui
+
+    embed = bot._busy_state_embed(_occ_list(), "SA")
+    assert embed.title == "🏋️ Busiest Revo clubs in SA"
+    assert "3 clubs" in embed.description
+    assert "261" in embed.description          # 133 + 13 + 115, SA only
+    body = "\n".join(f.value for f in embed.fields)
+    assert "Cannington" not in body            # WA scoped out
+    # Ranked busiest-first.
+    assert body.index("Marion") < body.index("Munno Para") < body.index("Modbury")
+    assert ui.overflows(embed) is None
+
+
+def test_busy_state_embed_names_the_quietest_club():
+    """The other half of "where should I go?" — a busiest board alone answers
+    the opposite of the question most people are asking."""
+    import app.bot as bot
+
+    embed = bot._busy_state_embed(_occ_list(), "SA")
+    quiet = [f.value for f in embed.fields if f.name == "Quietest right now"]
+    assert quiet and "Modbury" in quiet[0]
+
+
+def test_busy_state_embed_limits_the_board_to_five():
+    import app.bot as bot
+    from app.revo_perfectgym import ClubOccupancy
+
+    many = [
+        ClubOccupancy(name=f"Club {i:02d}", suburb=None, state="SA", count=i,
+                      capacity=None)
+        for i in range(30)
+    ]
+    embed = bot._busy_state_embed(many, "SA")
+    board = [f.value for f in embed.fields if f.name.startswith("Busiest")][0]
+    assert board.count("Club ") == 5
+
+
+def test_busy_state_embed_empty_state_names_the_reporting_ones():
+    import app.bot as bot
+
+    embed = bot._busy_state_embed(_occ_list(), "QLD")
+    assert "No live counts for QLD" in embed.title
+    assert "SA" in embed.description and "WA" in embed.description
+    assert embed.fields == []
+
+
+def test_busiest_board_bars_are_relative_to_the_top_club():
+    """PerfectGym leaves UsersLimit null for almost every club, so a
+    percentage-of-capacity bar would be blank nearly everywhere."""
+    import app.bot as bot
+    from app import ui
+
+    embed = ui.card("t")
+    assert bot._busiest_board_field(embed, _occ_list(), state="SA") is True
+    board = embed.fields[0].value
+    assert ui.FILL * 8 in board            # the busiest club fills its bar
+    assert bot._busiest_board_field(ui.card("t"), [], state="SA") is False

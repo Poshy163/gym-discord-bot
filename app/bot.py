@@ -6577,7 +6577,8 @@ def _help_sections() -> dict[str, discord.Embed]:
     section(
         "Revo Fitness", "🏢 Revo Fitness",
         (
-            "`/busy [club]` — live club occupancy\n"
+            "`/busy [state] [club]` — live occupancy: your home club, a "
+            "state's busiest 5 (`SA`, `WA`, `VIC`, `NSW`), or one named club\n"
             "`/revo_clubs [state] [club]` — every club in a state "
             "(`SA`, `WA`, `VIC`, `NSW`) with live head-counts, or one club + "
             "nearest gyms. No args uses your home state\n"
@@ -8673,17 +8674,95 @@ def _format_busiest_board(
     state: str | None = None,
     limit: int = 5,
 ) -> str:
-    """Render a "🔥 Busiest right now" top-N board (scoped to *state* if given)."""
+    """Render a "Busiest right now" top-N board (scoped to *state* if given)."""
     top = revo_perfectgym.top_busiest(clubs, limit=limit, state=state)
     if not top:
         return ""
     scope = f" in {state}" if state else " nationwide"
-    medals = ("🥇", "🥈", "🥉")
-    lines = [f"🔥 **Busiest right now{scope}**"]
+    lines = [f"{ui.STREAK} **Busiest right now{scope}**"]
     for i, c in enumerate(top):
-        rank = medals[i] if i < len(medals) else f"{i + 1}."
-        lines.append(f"{rank} {c.name} — {c.count}")
+        lines.append(f"{ui.rank(i)} {c.name} — {c.count}")
     return "\n".join(lines)
+
+
+def _busiest_board_field(
+    embed: discord.Embed,
+    clubs: list["revo_perfectgym.ClubOccupancy"],
+    *,
+    state: str | None = None,
+    limit: int = 5,
+) -> bool:
+    """Add the busiest-clubs board to *embed*. Returns False if there's nothing.
+
+    Bars are scaled to the busiest club rather than to capacity: PerfectGym
+    leaves ``UsersLimit`` null for almost every club, so a percentage-of-
+    capacity bar would be blank for nearly all of them. Relative-to-the-top
+    still answers the question people actually ask — where is quiet right now.
+    """
+    top = revo_perfectgym.top_busiest(clubs, limit=limit, state=state)
+    if not top:
+        return False
+    busiest = max(c.count for c in top) or 1
+    ui.block(
+        embed,
+        f"Busiest right now{f' in {state}' if state else ' nationwide'}",
+        ui.table(
+            [
+                [ui.rank(i, mono=True), _safe_label(c.name, limit=18),
+                 str(c.count), ui.bar(c.count, busiest, width=8)]
+                for i, c in enumerate(top)
+            ],
+            align="<<>",
+            max_rows=limit,
+        ),
+    )
+    return True
+
+
+def _quietest_line(
+    clubs: list["revo_perfectgym.ClubOccupancy"], *, state: str | None = None,
+) -> str:
+    """The least busy club in scope — the other half of "where should I go?"."""
+    scoped = [
+        c for c in clubs
+        if not state or (c.state or "").upper() == state.upper()
+    ]
+    if not scoped:
+        return ""
+    quiet = min(scoped, key=lambda c: (c.count, c.name.lower()))
+    return f"**{_safe_label(quiet.name)}** — {quiet.count} in club"
+
+
+def _busy_state_embed(
+    clubs: list["revo_perfectgym.ClubOccupancy"], state: str, *, limit: int = 5,
+) -> discord.Embed:
+    """`/busy state:SA` — the busiest 5 in one state, plus where's quiet.
+
+    ``top_busiest`` has always accepted a state; nothing exposed it, so the
+    board could only ever be scoped to whichever state your home club sits in.
+    """
+    scoped = [c for c in clubs if (c.state or "").upper() == state.upper()]
+    if not scoped:
+        present = sorted({(c.state or "").upper() for c in clubs if c.state})
+        return ui.empty(
+            f"No live counts for {state}",
+            hint="Revo's board is currently reporting "
+                 + (", ".join(present) if present else "no states") + ".",
+        )
+    total = sum(c.count for c in scoped)
+    embed = ui.card(
+        f"{ui.LIFT} Busiest Revo clubs in {state}",
+        description=f"**{total:,}** people across "
+                    f"{ui.plural(len(scoped), 'club')} right now",
+        colour=ui.BRAND,
+        footer="live counts · Revo",
+        timestamp=True,
+    )
+    _busiest_board_field(embed, scoped, state=state, limit=limit)
+    quiet = _quietest_line(scoped, state=state)
+    if quiet:
+        ui.block(embed, "Quietest right now", quiet)
+    return embed
 
 
 def _busy_fav_landing(user_id: int) -> "revo_client.RewardsLanding | None":
@@ -9091,16 +9170,43 @@ def _render_card_barcode(number: str) -> "io.BytesIO | None":
         return None
 
 
+async def _revo_state_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest state codes for /busy and /revo_clubs.
+
+    Prefers the states actually present in the (6h-cached) directory so the list
+    tracks Revo's real footprint; falls back to the curated table when the
+    directory hasn't been fetched yet, since autocomplete must answer within
+    3 seconds and can't afford a cold network round-trip.
+    """
+    try:
+        states = _revo_states_present(revo_perfectgym.cached_club_list())
+    except Exception:  # pragma: no cover - defensive; autocomplete must not raise
+        states = []
+    if not states:
+        states = revo_client.known_states()
+    q = (current or "").strip().lower()
+    matched = [s for s in states if not q or s.lower().startswith(q)]
+    if not matched:  # let a full name like "south australia" match too
+        code = _normalise_state(current)
+        matched = [code] if code in states else []
+    return [app_commands.Choice(name=s, value=s) for s in matched[:25]]
+
+
 @bot.tree.command(
     name="busy",
-    description="Live Revo occupancy: your club + the busiest gyms right now.",
+    description="Live Revo occupancy: your club, a state's top 5, or one club.",
 )
 @app_commands.describe(
     club="Optional club name/suburb. Omit to see your home club + the busiest board.",
+    state="Busiest 5 clubs in a state (SA, WA, VIC, NSW). Defaults to your home state.",
 )
+@app_commands.autocomplete(state=_revo_state_autocomplete)
 async def busy_cmd(
     interaction: discord.Interaction,
     club: str | None = None,
+    state: str | None = None,
 ) -> None:
     # /busy reads Revo's real all-clubs live counter again — the same PerfectGym
     # ClientPortal2 backend the iOS app uses (docs/REVO_PORTAL.md §8). It replaces
@@ -9115,6 +9221,16 @@ async def busy_cmd(
     if not revo_perfectgym.available():
         await interaction.response.send_message(
             embed=_revo_missing_deps_embed(), ephemeral=True,
+        )
+        return
+
+    # Reject an unparseable state before spending a live fetch on it.
+    wanted_state = _normalise_state(state)
+    if state and wanted_state is None:
+        await interaction.response.send_message(
+            f"**{_safe_label(state)}** isn't an Australian state I know. Try "
+            f"one of: {', '.join(revo_client.known_states())}.",
+            ephemeral=True,
         )
         return
 
@@ -9138,27 +9254,46 @@ async def busy_cmd(
         }.get(name.lower())
         return _maps_link(located.lat, located.lng) if located else None
 
-    def _do() -> tuple[str, bool]:
-        """Build the /busy reply text. Returns ``(message, ephemeral)``."""
+    def _do() -> tuple[str | discord.Embed, bool]:
+        """Build the /busy reply. Returns ``(message_or_embed, ephemeral)``."""
         # Shared env account first, then the caller's linked creds (hoisted so
         # /revo_clubs reuses the exact same resolution + TTL cache).
         occ = _perfectgym_occupancy(user_id)
 
         # ---- with a club argument: look that club up in the live board ----
         if club:
+            # A bare state typed into the club box is a natural mistake, and
+            # substring matching would answer "SA" with Salisbury.
+            as_state = _normalise_state(club)
+            if as_state and occ and not revo_perfectgym.find_club(occ, club):
+                return _busy_state_embed(occ, as_state), False
             if occ:
                 match = revo_perfectgym.find_club(occ, club)
                 if match:
-                    line = _format_busy_club_line(match)
-                    # Geo enrichment: attach a maps link when the directory has
-                    # coordinates for this club (best-effort, non-fatal).
-                    link = _busy_maps_link(occ, match.name)
-                    if link:
-                        line += f"\n🗺️ [Open in Google Maps]({link})"
-                    return line, False
+                    embed = ui.card(
+                        f"{ui.LIFT} {_safe_label(match.name)}"
+                        + (f" — {match.state}" if match.state else ""),
+                        description=f"## {match.count} in club right now",
+                        colour=ui.BRAND,
+                        url=_busy_maps_link(occ, match.name),
+                        footer="live count · Revo",
+                        timestamp=True,
+                    )
+                    if match.capacity:
+                        pct = match.count / match.capacity
+                        ui.block(
+                            embed, "Capacity",
+                            f"`{ui.bar(match.count, match.capacity, width=12)}` "
+                            f"{ui.pct(match.count, match.capacity)} of "
+                            f"{match.capacity}",
+                        )
+                    if match.state:
+                        _busiest_board_field(embed, occ, state=match.state)
+                    return embed, False
                 return (
-                    f"Couldn't find a Revo club matching **{club}**. Try the "
-                    "suburb name, or check the Live Member Counter in the Revo app.",
+                    f"Couldn't find a Revo club matching "
+                    f"**{_safe_label(club)}**. Try the suburb name, or "
+                    "`/busy state:` for a whole state's board.",
                     True,
                 )
             # PerfectGym down — degrade to the fav-club web count if it's this club.
@@ -9179,28 +9314,66 @@ async def busy_cmd(
                 True,
             )
 
+        # ---- an explicit state: that state's top 5, nothing personal ----
+        if wanted_state:
+            if occ:
+                return _busy_state_embed(occ, wanted_state), False
+            return (
+                "Revo's live counter is temporarily unavailable. Try again "
+                "shortly, or check the Live Member Counter in the Revo app.",
+                True,
+            )
+
         # ---- no argument: home club count + busiest board ----
         if occ:
             landing = _busy_fav_landing(user_id)
             home_name = landing.fav_club_name if landing else None
             home = revo_perfectgym.find_club(occ, home_name) if home_name else None
-            lines: list[str] = []
-            state: str | None = None
+            home_state: str | None = None
+            embed = ui.card(
+                f"{ui.LIFT} Revo — live occupancy",
+                colour=ui.BRAND,
+                footer="live counts · Revo",
+                timestamp=True,
+            )
             if home:
-                lines.append(_format_busy_club_line(home))
-                state = home.state
+                home_state = home.state
+                embed.description = (
+                    f"**{_safe_label(home.name)}**"
+                    + (f" — {home.state}" if home.state else "")
+                    + f"\n## {home.count} in club right now"
+                )
+                if home.capacity:
+                    ui.block(
+                        embed, "Capacity",
+                        f"`{ui.bar(home.count, home.capacity, width=12)}` "
+                        f"{ui.pct(home.count, home.capacity)} of {home.capacity}",
+                    )
             elif home_name and landing and landing.in_club is not None:
                 # Fav known but somehow absent from the board — show its web count.
-                lines.append(_format_busy_line(landing))
-                state = revo_client.state_for_club(home_name)
-            # Scope the busiest board to the user's state when we know it, else
-            # nationwide. The label makes the scope explicit either way.
-            board = _format_busiest_board(occ, state=state)
-            if board:
-                lines.append(board)
-            if lines:
-                return "\n\n".join(lines), False
-            return "Revo's live counter returned no clubs — try again shortly.", True
+                home_state = revo_client.state_for_club(home_name)
+                embed.description = (
+                    f"**{_safe_label(home_name)}**"
+                    f"\n## {landing.in_club} in club right now"
+                )
+            # Scope the busiest board to the caller's state when we know it,
+            # else nationwide. The field name makes the scope explicit.
+            had_board = _busiest_board_field(embed, occ, state=home_state)
+            quiet = _quietest_line(occ, state=home_state)
+            if quiet:
+                ui.block(embed, "Quietest right now", quiet, inline=False)
+            if not embed.description:
+                if not had_board:
+                    return (
+                        "Revo's live counter returned no clubs — try again "
+                        "shortly.",
+                        True,
+                    )
+                embed.description = (
+                    "You haven't linked a Revo account, so here's the "
+                    "national board. `/revo_link` adds your home club."
+                )
+            return embed, False
 
         # ---- PerfectGym down entirely: degrade to the web fav-club count ----
         landing = _busy_fav_landing(user_id)
@@ -9229,32 +9402,11 @@ async def busy_cmd(
             True,
         )
 
-    message, ephemeral = await bot.loop.run_in_executor(None, _do)
-    await interaction.followup.send(message, ephemeral=ephemeral)
-
-
-async def _revo_state_autocomplete(
-    interaction: discord.Interaction, current: str,
-) -> list[app_commands.Choice[str]]:
-    """Suggest state codes for /revo_clubs.
-
-    Prefers the states actually present in the (6h-cached) directory so the list
-    tracks Revo's real footprint; falls back to the curated table when the
-    directory hasn't been fetched yet, since autocomplete must answer within
-    3 seconds and can't afford a cold network round-trip.
-    """
-    try:
-        states = _revo_states_present(revo_perfectgym.cached_club_list())
-    except Exception:  # pragma: no cover - defensive; autocomplete must not raise
-        states = []
-    if not states:
-        states = revo_client.known_states()
-    q = (current or "").strip().lower()
-    matched = [s for s in states if not q or s.lower().startswith(q)]
-    if not matched:  # let a full name like "south australia" match too
-        code = _normalise_state(current)
-        matched = [code] if code in states else []
-    return [app_commands.Choice(name=s, value=s) for s in matched[:25]]
+    result, ephemeral = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, discord.Embed):
+        await interaction.followup.send(embed=result, ephemeral=ephemeral)
+    else:
+        await interaction.followup.send(result, ephemeral=ephemeral)
 
 
 @bot.tree.command(
