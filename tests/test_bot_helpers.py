@@ -886,6 +886,157 @@ def test_format_revo_clubs_state_list_count_unavailable_when_board_down():
     assert "count unavailable" in out
 
 
+# ---- /revo_clubs state selection ---------------------------------------------
+
+def test_normalise_state_accepts_codes_names_and_punctuation():
+    import app.bot as bot
+
+    for text in ("sa", "SA", " Sa ", "s.a.", "South Australia", "south  australia"):
+        assert bot._normalise_state(text) == "SA", text
+    assert bot._normalise_state("New South Wales") == "NSW"
+    assert bot._normalise_state("victoria") == "VIC"
+    # Territories Revo doesn't operate in still resolve — the caller answers
+    # "no clubs there", which is clearer than "unknown state".
+    assert bot._normalise_state("QLD") == "QLD"
+    assert bot._normalise_state("banana") is None
+    assert bot._normalise_state("") is None
+    assert bot._normalise_state(None) is None
+
+
+def test_revo_states_present_ranks_by_club_count():
+    import app.bot as bot
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.8, 138.6, "SA"),
+        _dir("Marion", "Oaklands Park", -35.0, 138.5, "SA"),
+        _dir("Cannington", "Cannington", -32.0, 115.9, "WA"),
+        _dir("Nowhere", None, None, None, None),  # unknown state is skipped
+    ]
+    assert bot._revo_states_present(directory) == ["SA", "WA"]
+    assert bot._revo_states_present([]) == []
+
+
+def test_revo_clubs_state_embed_scopes_and_totals():
+    import app.bot as bot
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.8, 138.6, "SA"),
+        _dir("Marion", "Oaklands Park", -35.0, 138.5, "SA"),
+        _dir("Cannington", "Cannington", -32.0, 115.9, "WA"),
+    ]
+    occupancy = [_occ("Modbury", 90), _occ("Marion", 40)]
+
+    embed = bot._revo_clubs_state_embed(directory, occupancy, "sa")
+    assert embed.title == "🏋️ Revo clubs in SA"
+    body = "\n".join(f.value for f in embed.fields)
+    assert "**Marion** — Oaklands Park (40 in club now)" in body
+    assert "**Modbury** (90 in club now)" in body
+    assert "Cannington" not in body           # other state scoped out
+    assert "2 clubs" in embed.description
+    assert "130" in embed.description          # live total across the state
+
+
+def test_revo_clubs_state_embed_omits_total_when_board_down():
+    import app.bot as bot
+
+    directory = [_dir("Modbury", "Modbury", -34.8, 138.6, "SA")]
+    embed = bot._revo_clubs_state_embed(directory, [], "SA")
+    # No occupancy at all → report the club count but never a bogus "0 in club".
+    assert embed.description == "1 club"
+    assert "count unavailable" in embed.fields[0].value
+
+
+def test_revo_clubs_state_embed_empty_state_names_the_real_ones():
+    import app.bot as bot
+
+    directory = [_dir("Cannington", "Cannington", -32.0, 115.9, "WA")]
+    embed = bot._revo_clubs_state_embed(directory, [], "QLD")
+    assert embed.fields == []
+    assert "No clubs here yet" in embed.description
+    assert "WA" in embed.description
+
+
+def test_revo_clubs_state_embed_columns_stay_inside_discord_limits():
+    """WA is 37 clubs — as one blob that approaches the 2 000-char message cap,
+    which is why the state list is an embed split into columns."""
+    import app.bot as bot
+
+    directory = [
+        _dir(f"Club {i:02d}", f"Suburb {i:02d}", -32.0, 115.9, "WA")
+        for i in range(37)
+    ]
+    occupancy = [_occ(f"Club {i:02d}", i * 3, state="WA") for i in range(37)]
+    embed = bot._revo_clubs_state_embed(directory, occupancy, "WA")
+
+    assert len(embed.fields) == 3                     # 37 clubs → three columns
+    assert all(f.inline for f in embed.fields)
+    assert len(embed) <= 6000                         # whole-embed cap
+    for f in embed.fields:
+        assert len(f.value) <= bot.EMBED_FIELD_LIMIT  # per-field cap
+    # Every club is present exactly once across the columns.
+    body = "\n".join(f.value for f in embed.fields)
+    assert body.count("• **Club ") == 37
+
+
+def test_revo_state_autocomplete_falls_back_when_directory_is_cold(monkeypatch):
+    """Autocomplete has ~3s and must never trigger a PerfectGym login, so a cold
+    cache degrades to the curated state list instead of blocking."""
+    import asyncio
+    import app.bot as bot
+    from app import revo_client, revo_perfectgym as pg
+
+    monkeypatch.setattr(pg, "cached_club_list", lambda: [])
+
+    async def choices(q):
+        return [c.value for c in await bot._revo_state_autocomplete(None, q)]
+
+    assert asyncio.run(choices("")) == revo_client.known_states()
+    assert asyncio.run(choices("s")) == ["SA"]
+    assert asyncio.run(choices("south australia")) == ["SA"]  # full name matches
+    assert asyncio.run(choices("zz")) == []
+
+
+def test_revo_state_autocomplete_prefers_live_directory(monkeypatch):
+    import asyncio
+    import app.bot as bot
+    from app import revo_perfectgym as pg
+
+    directory = [
+        _dir("Modbury", "Modbury", -34.8, 138.6, "SA"),
+        _dir("Marion", "Oaklands Park", -35.0, 138.5, "SA"),
+        _dir("Cannington", "Cannington", -32.0, 115.9, "WA"),
+    ]
+    monkeypatch.setattr(pg, "cached_club_list", lambda: directory)
+    out = asyncio.run(bot._revo_state_autocomplete(None, ""))
+    assert [c.value for c in out] == ["SA", "WA"]  # busiest state first
+
+
+def test_revo_state_autocomplete_survives_a_broken_cache(monkeypatch):
+    import asyncio
+    import app.bot as bot
+    from app import revo_client, revo_perfectgym as pg
+
+    def boom():
+        raise RuntimeError("cache exploded")
+
+    monkeypatch.setattr(pg, "cached_club_list", boom)
+    out = asyncio.run(bot._revo_state_autocomplete(None, ""))
+    assert [c.value for c in out] == revo_client.known_states()
+
+
+def test_clip_field_trims_on_a_line_break():
+    import app.bot as bot
+
+    text = "\n".join(f"• line {i}" for i in range(400))
+    out = bot._clip_field(text)
+    assert len(out) <= bot.EMBED_FIELD_LIMIT
+    assert out.endswith("…")
+    # Cut on a newline, so the last surviving line is whole rather than sliced.
+    assert out.splitlines()[-2].startswith("• line ")
+    # Short input is returned untouched.
+    assert bot._clip_field("• short") == "• short"
+
+
 def test_format_revo_club_detail_has_address_maps_count_and_nearest():
     import app.bot as bot
     from app import revo_perfectgym as pg
@@ -1203,3 +1354,43 @@ def test_help_text_has_no_retired_nick_commands():
     )
     assert "set_nick" not in help_src
     assert "remove_nick" not in help_src
+
+
+# ---- nutrition reply prefixes (a wire format, not decoration) ----------------
+
+def test_nutrition_reply_prefixes_keep_matching_legacy_replies():
+    """A ❌ reaction finds one of our nutrition replies by its leading glyph, so
+    the ~800 replies already sitting in Discord history must keep matching after
+    the icon vocabulary changed — otherwise undo silently dies on all of them."""
+    import app.bot as bot
+
+    for legacy in ("🍽️", "🥗"):
+        assert legacy in bot._NUTRITION_REPLY_PREFIXES, legacy
+        assert f"{legacy} **+650 cal**".startswith(bot._NUTRITION_REPLY_PREFIXES)
+
+    # ...and the current ones match too.
+    for current in ("🍎 **+650 cal**", "🥩 **+40 g** protein",
+                    "🍎🥩 Logged **650 cal** + **40 g** protein",
+                    "🤖 Estimated **650 cal**"):
+        assert current.startswith(bot._NUTRITION_REPLY_PREFIXES), current
+
+    # A lift reply must NOT match — it has its own undo path.
+    assert not "Added **80kg** to **bench press**".startswith(
+        bot._NUTRITION_REPLY_PREFIXES
+    )
+
+
+def test_new_nutrition_replies_no_longer_use_the_retired_food_icons():
+    """One food icon (🍎). 🍽️/🥗 survive only in the undo prefix tuple and the
+    comments explaining why they must."""
+    import pathlib
+    import app.bot as bot
+
+    src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+    offenders = [
+        line.strip() for line in src.splitlines()
+        if ("🍽️" in line or "🥗" in line)
+        and not line.lstrip().startswith("#")
+        and "legacy" not in line
+    ]
+    assert offenders == [], f"retired food icons still emitted: {offenders}"

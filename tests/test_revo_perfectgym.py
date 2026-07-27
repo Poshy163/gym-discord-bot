@@ -742,3 +742,29 @@ def test_download_photo_requires_requests(monkeypatch):
     monkeypatch.setattr(pg, "requests", None)
     with pytest.raises(pg.PerfectGymUnavailable):
         pg.download_photo(_FAKE_PHOTO_URL)
+
+
+def test_cached_club_list_is_cache_only_and_never_logs_in(monkeypatch):
+    """The autocomplete path must answer inside Discord's ~3s window, so this
+    reader returns [] on a cold cache rather than attempting a login."""
+    import time
+
+    # Cold cache: no client, no network, no exception — just an empty list.
+    monkeypatch.setattr(pg, "_shared_directory", pg._DirectoryCache())
+    monkeypatch.setattr(
+        pg, "shared_client_from_env",
+        lambda: pytest.fail("cached_club_list must not authenticate"),
+    )
+    assert pg.cached_club_list() == []
+
+    # Warm cache: returns exactly what shared_club_list would have.
+    entry = pg.ClubDirEntry(
+        id=1, name="Modbury", address=None, city="Modbury", club_number=None,
+        lat=None, lng=None, opening_date=None, state="SA",
+    )
+    pg._dir_cache_put(time.monotonic(), [entry])
+    assert [e.name for e in pg.cached_club_list()] == ["Modbury"]
+
+    # Expired cache is treated as cold, not stale.
+    monkeypatch.setattr(pg, "CLUB_DIR_TTL_SECONDS", 0)
+    assert pg.cached_club_list() == []

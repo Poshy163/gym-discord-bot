@@ -82,6 +82,7 @@ from . import targets as targets_mod
 from . import strava_client
 from . import strava_web
 from . import tdee as tdee_lib
+from . import ui
 from . import webui
 from . import workerlink
 
@@ -853,6 +854,29 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {word}"
 
 
+# Discord's hard cap on a single embed field's value. Overshooting it doesn't
+# truncate — the whole send fails with a 400 — so anything built from a
+# variable-length list goes through _clip_field().
+EMBED_FIELD_LIMIT = 1024
+
+
+def _clip_field(text: str, *, limit: int = EMBED_FIELD_LIMIT) -> str:
+    """Trim an embed field value to *limit*, cutting on a line break when it can.
+
+    Dropping whole lines beats slicing mid-line, which would leave a half-written
+    club name or an unclosed `**` behind and corrupt the rest of the field.
+    """
+    if len(text) <= limit:
+        return text
+    marker = "\n…"
+    keep = limit - len(marker)
+    cut = text[:keep]
+    nl = cut.rfind("\n")
+    if nl > keep // 2:  # only snap back to a line break if we keep most of it
+        cut = cut[:nl]
+    return cut.rstrip() + marker
+
+
 def _format_lift_lines(
     lifts: list[Lift], limit: int | None = None,
     bodyweight: float | None = None,
@@ -1529,7 +1553,7 @@ async def _reply_calorie_logged(
     suffix = _target_suffix(message.author, target)
     try:
         reply = await message.reply(
-            f"🍽️ **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
+            f"{ui.FOOD} **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
             f"{_backdate_label(logged_at)}\n"
             + _calorie_status_for(target_id, total, logged_at)
             + _streak_suffix(streak)
@@ -1669,7 +1693,7 @@ async def _handle_calorie_food_message(
 
     Always logs the food's calories. If the food was saved with a protein value
     and the user is protein-tracking, the protein is logged too and a combined
-    reply (🥗) is posted so a ❌ removes both entries at once. ``logged_at``
+    reply (🍎🥩) is posted so a ❌ removes both entries at once. ``logged_at``
     backdates both entries (e.g. `coffee yesterday`)."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
@@ -1732,7 +1756,7 @@ async def _handle_calorie_food_message(
         )
         return
 
-    # Combined reply (🥗) — mirrors _handle_combined_nutrition so the shared ❌
+    # Combined reply (🍎🥩) — mirrors _handle_combined_nutrition so the shared ❌
     # undo path removes both the calorie and protein entries via the source id.
     window = _day_window_for(logged_at)
     cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
@@ -1748,7 +1772,7 @@ async def _handle_calorie_food_message(
         pass
     try:
         reply = await message.reply(
-            f"🥗 Logged **{calories.format_kcal(kcal)}** + "
+            f"{ui.FOOD}{ui.PROTEIN} Logged **{calories.format_kcal(kcal)}** + "
             f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}"
             f"{_backdate_label(logged_at)}\n"
             + _calorie_status_line(cal_total, day_targets.kcal.value or 0.0)
@@ -1883,7 +1907,7 @@ async def _handle_calorie_meal_message(
     if logged_protein:
         parts.append(f"**{protein_mod.format_grams(grams)}** protein")
     lines = [
-        f"🥗 Logged {' + '.join(parts)} — {note}{suffix}"
+        f"{ui.FOOD}{ui.PROTEIN} Logged {' + '.join(parts)} — {note}{suffix}"
         f"{_backdate_label(logged_at)}",
         _calorie_status_line(
             cal_total, day_targets.kcal.value or 0.0,
@@ -2074,19 +2098,25 @@ async def _log_ai_estimate(
 def _protein_status_line(
     total: float, ceiling: float, label: str | None = None,
 ) -> str:
-    """Status line for protein vs the daily ceiling. Emphasises going *over*,
-    since the tracker exists to avoid overeating protein."""
-    bar = calories.progress_bar(total, ceiling)
-    remaining = ceiling - total
-    if remaining >= 0:
-        tail = f"**{protein_mod.format_grams(remaining)}** under your max"
-    else:
-        tail = f"⚠️ **{protein_mod.format_grams(-remaining)}** over your max"
-    return (
-        f"`{bar}` {protein_mod.format_grams(total)} / "
-        f"{protein_mod.format_grams(ceiling)} · {tail}"
-        + _target_label_suffix(label)
+    """Protein progress against a daily **ceiling** — staying under is the win.
+
+    The opposite polarity to :func:`_calorie_status_line`, which is exactly why
+    both go through :func:`ui.meter`: the two used one renderer and one colour,
+    so a full bar silently meant "well done" on one card and "stop" on the
+    other, and only the protein one bothered to warn when it was breached.
+    """
+    return _protein_status(total, ceiling, label)[0]
+
+
+def _protein_status(
+    total: float, ceiling: float, label: str | None = None,
+) -> tuple[str, discord.Colour]:
+    """As above, plus the colour an embed built around it should wear."""
+    text, colour = ui.meter(
+        total, ceiling, protein_mod.format_grams,
+        ceiling=True, label="headroom",
     )
+    return text + _target_label_suffix(label), colour
 
 
 async def _handle_protein_message(
@@ -2226,8 +2256,13 @@ async def _handle_combined_nutrition(
                 guild_id, target_id, *window,
             )
             logged.append(f"**{calories.format_kcal(kcal)}**")
+            # Each macro carries its OWN streak. Picking one streak for the
+            # whole reply appended the calorie streak to the protein line
+            # whenever a message logged both, crediting protein with days it
+            # hadn't earned.
             status_lines.append(
                 _calorie_status_line(total, day_targets.kcal.value or 0.0)
+                + _streak_suffix(_calorie_streak(target_id))
             )
             showed_calories = True
         else:
@@ -2249,6 +2284,7 @@ async def _handle_combined_nutrition(
             logged.append(f"**{protein_mod.format_grams(grams)}** protein")
             status_lines.append(
                 _protein_status_line(total, day_targets.protein.value or 0.0)
+                + _streak_suffix(_protein_streak(target_id))
             )
             showed_protein = True
         else:
@@ -2281,19 +2317,15 @@ async def _handle_combined_nutrition(
     except discord.HTTPException:
         pass
     tail = (
-        f"\n*(skipped {', '.join(skipped)})*" if skipped else ""
-    )
-    # Whichever tracker has a live streak (calories first).
-    streak = (
-        _streak_suffix(_calorie_streak(target_id))
-        or _streak_suffix(_protein_streak(target_id))
+        f"\n{ui.subtext(f'skipped {chr(44).join(skipped)}')}" if skipped else ""
     )
     try:
-        # Leading 🥗 marks this as a combined reply; the undo handler removes
-        # every nutrition entry tied to the source message.
+        # Both macro icons mark this as a combined reply; the undo handler
+        # removes every nutrition entry tied to the source message.
         reply = await message.reply(
-            f"🥗 Logged {' + '.join(logged)}{suffix}{_backdate_label(logged_at)}\n"
-            + "\n".join(status_lines) + streak + tail,
+            f"{ui.FOOD}{ui.PROTEIN} Logged {' + '.join(logged)}{suffix}"
+            f"{_backdate_label(logged_at)}\n"
+            + "\n".join(status_lines) + tail,
             mention_author=False,
         )
     except discord.HTTPException:
@@ -2777,7 +2809,7 @@ def _daily_nutrition_lines(
         return []
 
     entries.sort(key=lambda e: e[2], reverse=True)
-    lines = ["\n🍽️ **Nutrition**"]
+    lines = [f"\n{ui.FOOD} **Nutrition**"]
     for name, uid, total, target, streak in entries[:8]:
         tgt = f" / {calories.format_kcal(target)}" if target else ""
         streak_txt = f" 🔥{streak}" if streak >= 2 else ""
@@ -2917,8 +2949,15 @@ async def daily_update() -> None:
     if text is None:
         LOG.info("Daily update skipped for %s: no activity", date_label)
         return
+    # The recap grows with the day's activity — PRs, top lifters, popular
+    # lifts and per-member nutrition all append — so a busy day can pass
+    # Discord's 2 000-char message cap. Unsplit, that 400s into the handler
+    # below and the whole recap is lost silently.
     try:
-        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        for part in ui.chunk(text):
+            await channel.send(
+                part, allowed_mentions=discord.AllowedMentions.none(),
+            )
         LOG.info("Daily update posted to #%s for %s", channel, date_label)
     except discord.HTTPException:
         LOG.exception("Failed to post daily update")
@@ -3323,8 +3362,22 @@ async def _post_weekly_report(
     """Send the gym recap, then calorie + protein check-in embeds if anyone's
     tracking. Shared by the scheduled task and /weekly_report."""
     label, start_iso, end_iso = _week_window()
+    # The gym recap was the only plain-text section among three embeds, and the
+    # only one with no length guard — a busy week could push it past the
+    # 2 000-char message cap and lose the lot. As an embed it gets a 4 096-char
+    # description, and chunking covers the remainder.
     text = _weekly_gym_text(guild_id, label, start_iso, end_iso)
-    await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    head, *rest = text.split("\n", 1)
+    body = rest[0] if rest else ""
+    for i, part in enumerate(ui.chunk(body, ui.DESC_LIMIT)):
+        await channel.send(
+            embed=ui.card(
+                f"{ui.CHART} Weekly gym report — {label}" if i == 0 else None,
+                description=part,
+                colour=ui.BRAND,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     strava_blocks = await _strava_weekly_blocks()
     if strava_blocks:
         strava_embed = discord.Embed(
@@ -4102,10 +4155,10 @@ async def _refresh_calorie_reply(
     label_part = f" — {note}" if note else ""
     suffix = _target_suffix(after.author, target)
     body = (
-        f"🍽️ **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
+        f"{ui.FOOD} **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
         # Today's target, to match the today-scoped total just computed.
         + _calorie_status_for(target_id, total)
-        + "\n✏️ *(updated from an edit)*"
+        + f"\n{ui.subtext(f'{ui.EDIT} updated from an edit')}"
     )
     try:
         await reply_msg.edit(content=body)
@@ -4373,13 +4426,25 @@ def _check_goal_hits(
     return cleared
 
 
+# A ❌ reaction is matched to one of our nutrition replies by its leading glyph,
+# so this tuple is a *wire format*, not decoration: every reply already sitting
+# in Discord's history must keep matching or its undo silently stops working.
+# 🍽️ and 🥗 are retired from new replies (one food icon, 🍎) but stay here
+# permanently for the ~800 replies posted before that change. 🤖 covers the
+# AI-estimate replies (`~...` and /calories estimate).
+_NUTRITION_REPLY_PREFIXES = (
+    ui.FOOD, ui.PROTEIN, ui.AI,   # current
+    "🍽️", "🥗",                   # legacy — do not remove
+)
+
+
 async def _handle_nutrition_reaction_undo(
     payload: discord.RawReactionActionEvent,
 ) -> None:
     """Remove the calorie and/or protein entries a chat message logged when its
     logger/target/admin reacts ❌ on the bot's reply.
 
-    Covers calorie (🍽️), protein (🥩) and combined (🥗) replies. Tracked
+    Covers calorie (🍎), protein (🥩) and combined (🍎🥩) replies. Tracked
     single-calorie replies use their tracking row; the rest (protein, combined,
     legacy) resolve via the reply's referenced source message and remove every
     nutrition entry tied to it.
@@ -4398,9 +4463,7 @@ async def _handle_nutrition_reaction_undo(
     # already-undone ones whose text now starts with "~~").
     if reply_msg.author.id != (bot.user.id if bot.user else 0):
         return
-    # 🤖 covers the AI-estimate replies (`~...` and /calories estimate); the
-    # others are the manual calorie/protein/combined logs.
-    if not reply_msg.content.startswith(("🍽️", "🥩", "🥗", "🤖")):
+    if not reply_msg.content.startswith(_NUTRITION_REPLY_PREFIXES):
         return
 
     guild_id = payload.guild_id or 0
@@ -5048,24 +5111,32 @@ async def machine_cmd(
         )
         return
 
-    lines = [f"**Timeline — {canon}**"]
     # Track each user's previous weight so we can show deltas per person.
+    lines: list[str] = []
     last_by_user: dict[str, float] = {}
     for r in rows:
         user = r["username"]
         w = r["weight_kg"]
-        delta = ""
+        change = ""
         prev = last_by_user.get(user)
-        if prev is not None:
-            d = w - prev
-            if d:
-                delta = f"  ({'+' if d > 0 else ''}{d:g}kg)"
+        if prev is not None and w != prev:
+            change = f"  ({'+' if w > prev else ''}{w - prev:g}kg)"
         last_by_user[user] = w
         lines.append(
-            f"• {_format_date(r['logged_at'])} — **{user}**: "
-            f"{_format_weight(w, bool(r['bw']))}{delta}"
+            f"• {_format_date(r['logged_at'])} — **{_safe_label(user, limit=24)}**: "
+            f"{_format_weight(w, bool(r['bw']))}{change}"
         )
-    await interaction.response.send_message("\n".join(lines))
+    # An embed description holds 4 096 characters against a message's 2 000, and
+    # ui.card clips rather than letting an over-length send 400 — this command
+    # used to build an unbounded string and simply fail on a popular lift.
+    embed = ui.card(
+        f"{ui.LIFT} {_safe_label(canon)} — timeline",
+        description="\n".join(lines),
+        colour=ui.BRAND,
+        footer=f"{ui.plural(len(rows), 'entry', 'entries')} · most recent last",
+        timestamp=True,
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -6147,22 +6218,38 @@ async def swap_weights_cmd(
 # ---------------------------------------------------------------------------
 
 
-@bot.tree.command(name="help", description="Show what this bot can do.")
-async def help_cmd(interaction: discord.Interaction) -> None:
-    embed = discord.Embed(
-        title=f"🏋️ gym-bot v{__version__}",
-        description=(
-            "I read gym posts, parse the lifts, and track progress. Just post "
-            "your gym stats — no command needed — and I'll store them.\n\n"
-            "Example message I understand:\n"
-            "```\nBench press: 80kg\nIncline bench 70\n"
-            "Leg press: 6 plates\nDips: BW+20kg\n```"
-        ),
-        colour=EMBED_COLOUR,
+def _help_sections() -> dict[str, discord.Embed]:
+    """One embed per category, built fresh so the enabled-integration set is
+    always current.
+
+    This is paged rather than sent as two big embeds because Discord caps a
+    *message* at 6 000 characters across all of its embeds. The previous
+    two-embed form measured 6 440 with Strava and Hevy on — i.e. `/help`, the
+    front door, failed outright — and one field was 53 characters from the
+    separate 1 024-per-field cap. Paging removes both ceilings permanently: no
+    single view grows past a few hundred characters however many commands land.
+    """
+    sections: dict[str, discord.Embed] = {}
+
+    def section(key: str, title: str, body: str, *, footer: str | None = None):
+        sections[key] = ui.card(
+            title, description=body, colour=ui.BRAND, footer=footer,
+        )
+
+    section(
+        "Overview",
+        f"{ui.LIFT} gym-bot v{__version__}",
+        "I read gym posts, parse the lifts, and track progress. Just post "
+        "your gym stats — no command needed — and I'll store them.\n\n"
+        "Example message I understand:\n"
+        "```\nBench press: 80kg\nIncline bench 70\n"
+        "Leg press: 6 plates\nDips: BW+20kg\n```\n"
+        "Pick a category below for the full command list.",
+        footer="Weights parsed as kg. Plates assumed 20kg each.",
     )
-    embed.add_field(
-        name="📊 Stats & progress",
-        value=(
+    section(
+        "Stats & progress", f"{ui.CHART} Stats & progress",
+        (
             "`/stats [user]` — personal bests\n"
             "`/summary [user]` — profile overview\n"
             "`/coach [user] [days]` — AI progress report from all your data\n"
@@ -6183,23 +6270,18 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/compare <user> [equipment]` — head-to-head\n"
             "`/serverstats` — server-wide overview"
         ),
-        inline=False,
     )
-    embed.add_field(
-        name="🎯 Goals",
-        value=(
+    section(
+        "Goals", f"{ui.GOAL} Goals",
+        (
             "`/goal_set <equipment> <target_kg> [bodyweight]`\n"
             "`/goals [user]` — progress bars\n"
             "`/goal_remove <equipment>`"
         ),
-        inline=False,
     )
-    # Second embed: nutrition + integrations. Split so neither embed can
-    # brush Discord's 6 000-char per-embed total as features accumulate.
-    embed2 = discord.Embed(colour=EMBED_COLOUR)
-    embed2.add_field(
-        name="🍎 Calories",
-        value=(
+    section(
+        "Calories", f"{ui.FOOD} Calories",
+        (
             "`/calories setup <target>` — set a daily target "
             "(kcal or kJ, e.g. `2500` or `8700kj`)\n"
             "`/calories add <amount> [note]` — log intake "
@@ -6219,11 +6301,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "Tracking is global (all servers + DMs); tracked members get an "
             "AI summary in the Sunday `/weekly_report`"
         ),
-        inline=False,
     )
-    embed2.add_field(
-        name="🧠 Smart food logging",
-        value=(
+    section(
+        "Smart food logging", f"{ui.FOOD} Smart food logging",
+        (
             "`/calories food_set <name> <amount> [protein]` — save a food "
             "shortcut, then log it by typing `coffee` or `2 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
@@ -6239,11 +6320,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/calories tdee [user] [days]` — estimate your real maintenance "
             "calories from your own logs + weigh-ins"
         ),
-        inline=False,
     )
-    embed2.add_field(
-        name="🥩 Protein",
-        value=(
+    section(
+        "Protein", f"{ui.PROTEIN} Protein",
+        (
             "Optional daily-max tracker — flags when you go *over*.\n"
             "`/protein setup <grams>` — set your daily max (e.g. `180`)\n"
             "`/protein add <grams> [note]` — log protein\n"
@@ -6255,11 +6335,10 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/protein undo` — remove it\n"
             "`/protein stop` — stop tracking (history kept)"
         ),
-        inline=False,
     )
-    embed.add_field(
-        name="✏️ Logging & editing",
-        value=(
+    section(
+        "Logging & editing", f"{ui.EDIT} Logging & editing",
+        (
             "`/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry\n"
             "`/bodyweight [weight_kg] [user]` — record your bodyweight so the bot "
             "shows your true load on pull-ups, dips, etc. "
@@ -6280,35 +6359,32 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "Prefix a gym post with `@user` to log it for them: "
             "`@user squat 55kg`"
         ),
-        inline=False,
     )
-    embed.add_field(
-        name="🔎 Discovery",
-        value=(
+    section(
+        "Discovery & maintenance", f"{ui.CHART} Discovery & maintenance",
+        (
             "`/equipment_list` — what the bot knows about\n"
             "`/aliases <equipment>` — spellings I accept\n"
             "`/daily_update [days_ago]` — post a daily recap\n"
             "`/weekly_report` — post the 7-day gym + calorie report\n"
             "`/export [user]` — download lifts as CSV\n"
-            "`/ping` · `/version`"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🛠 Maintenance",
-        value=(
+            "`/server [name]` — pick which server your DM commands read\n"
+            "`/help` — this menu · `/ping` · `/version`\n"
+            "\n"
+            "**Maintenance**\n"
             "`/backfill [limit]` — rescan this channel\n"
             "`/purge <equipment>` — delete all rows for a lift\n"
             "`/alias_add <phrase> <equipment>` — teach a custom name\n"
             "`/alias_remove <phrase>` · `/alias_list`"
         ),
-        inline=False,
     )
-    embed2.add_field(
-        name="🏋️ Revo Fitness",
-        value=(
+    section(
+        "Revo Fitness", "🏢 Revo Fitness",
+        (
             "`/busy [club]` — live club occupancy\n"
-            "`/revo_clubs [club]` — club directory: your state, or one club + nearest gyms\n"
+            "`/revo_clubs [state] [club]` — every club in a state "
+            "(`SA`, `WA`, `VIC`, `NSW`) with live head-counts, or one club + "
+            "nearest gyms. No args uses your home state\n"
             "`/revo_link <email> <password>` — link your account (reply is private)\n"
             "`/help_revo_link` — public explainer for `/revo_link`\n"
             "`/revo_unlink` — remove the link\n"
@@ -6322,23 +6398,22 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "`/revo_card` — privately show YOUR entry barcode (ephemeral, your own card)\n"
             "`/seeprofile` — roster of every linked member's Revo photo + name"
         ),
-        inline=False,
     )
     if not STRAVA_DISABLED:
-        embed2.add_field(
-            name="🏃 Strava",
-            value=(
+        section(
+            "Strava", "🏃 Strava",
+            (
                 "`/strava_link` — link your Strava (workouts auto-post to the feed)\n"
                 "`/strava_status` — check if you're linked\n"
                 "`/strava_latest [member]` — show the most recent activity\n"
                 "`/strava_unlink` — revoke access & remove your tokens"
             ),
-            inline=False,
         )
+        sections["Strava"].colour = ui.STRAVA
     if _hevy_enabled():
-        embed2.add_field(
-            name="🏋️ Hevy",
-            value=(
+        section(
+            "Hevy", "📱 Hevy",
+            (
                 "`/hevy_help` — how it works + how to link\n"
                 "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
                 "`/hevy_recent` — show the most recent workout\n"
@@ -6346,12 +6421,24 @@ async def help_cmd(interaction: discord.Interaction) -> None:
                 "`/hevy_status` — check if you're linked\n"
                 "`/hevy_unlink` — remove your stored API key"
             ),
-            inline=False,
         )
-    embed2.set_footer(text="Weights parsed as kg. Plates assumed 20kg each.")
-    await interaction.response.send_message(
-        embeds=[embed, embed2], ephemeral=True,
+        sections["Hevy"].colour = ui.HEVY
+    return sections
+
+
+@bot.tree.command(name="help", description="Show what this bot can do.")
+async def help_cmd(interaction: discord.Interaction) -> None:
+    sections = _help_sections()
+    view = ui.Sections(
+        sections, owner_id=interaction.user.id, placeholder="Browse commands…",
     )
+    await interaction.response.send_message(
+        embed=sections["Overview"], view=view, ephemeral=True,
+    )
+    # Held so on_timeout can grey the dropdown out instead of leaving a control
+    # that looks live and silently does nothing.
+    with contextlib.suppress(discord.HTTPException):
+        view._message = await interaction.original_response()
 
 
 @bot.tree.command(
@@ -8476,16 +8563,66 @@ def _find_dir_entry(
     return None
 
 
-def _format_revo_clubs_state_list(
+# Spellings we accept for an Australian state, mapped to the code the club
+# directory uses. Keyed by what a member might realistically type into the
+# `state` option — full names, the dotted form, and the two territories that
+# Revo doesn't operate in yet (so they get "no clubs there" rather than a
+# confusing "unknown state"). Extend alongside _CLUB_NAMES_BY_STATE.
+_REVO_STATE_ALIASES: dict[str, str] = {
+    "sa": "SA", "s.a.": "SA", "south australia": "SA", "southaustralia": "SA",
+    "wa": "WA", "w.a.": "WA", "western australia": "WA",
+    "westernaustralia": "WA",
+    "vic": "VIC", "v.i.c.": "VIC", "victoria": "VIC",
+    "nsw": "NSW", "n.s.w.": "NSW", "new south wales": "NSW",
+    "newsouthwales": "NSW",
+    "qld": "QLD", "queensland": "QLD",
+    "tas": "TAS", "tasmania": "TAS",
+    "nt": "NT", "northern territory": "NT",
+    "act": "ACT", "australian capital territory": "ACT",
+}
+
+
+def _normalise_state(text: str | None) -> str | None:
+    """Map free-form state text to a directory state code, or None.
+
+    Accepts the code itself, the full state name, and the dotted form, all
+    case- and space-insensitively — so `sa`, `SA`, `S.A.` and
+    `South Australia` all resolve to ``"SA"``.
+    """
+    key = " ".join((text or "").strip().lower().split())
+    if not key:
+        return None
+    return _REVO_STATE_ALIASES.get(key)
+
+
+def _revo_states_present(
+    directory: list["revo_perfectgym.ClubDirEntry"],
+) -> list[str]:
+    """State codes that actually have clubs in *directory*, club-count desc.
+
+    Driven by live directory data rather than the curated name→state table, so
+    a state that Revo opens in shows up in autocomplete the moment its first
+    club appears in the portal.
+    """
+    counts: dict[str, int] = {}
+    for e in directory:
+        st = (e.state or "").upper()
+        if st:
+            counts[st] = counts.get(st, 0) + 1
+    return sorted(counts, key=lambda s: (-counts[s], s))
+
+
+def _revo_clubs_state_lines(
     directory: list["revo_perfectgym.ClubDirEntry"],
     occupancy: list["revo_perfectgym.ClubOccupancy"],
     state: str,
-) -> str:
-    """Render "Name — Suburb (X in club now)" for every club in *state*.
+) -> tuple[str, list[str], int | None]:
+    """``(state_code, one line per club, total people in state)``.
 
     Joins the public directory to the live occupancy board *by name*, so each club
     shows its current head-count when the board is up (and "count unavailable" when
-    it isn't). Alphabetical for a stable, scannable list.
+    it isn't). Alphabetical for a stable, scannable list. The total is None when
+    the board is down for every club, so callers can omit it rather than print 0.
     """
     st = state.strip().upper()
     occ_by_name = {c.name.lower(): c for c in occupancy}
@@ -8493,19 +8630,73 @@ def _format_revo_clubs_state_list(
         (e for e in directory if (e.state or "").upper() == st),
         key=lambda e: e.name.lower(),
     )
-    lines = [f"🏋️ **Revo clubs in {st}**"]
-    if not entries:
-        lines.append("_No clubs found for this state._")
-        return "\n".join(lines)
+    lines: list[str] = []
+    total: int | None = None
     for e in entries:
         occ = occ_by_name.get(e.name.lower())
         suburb = e.city or (occ.suburb if occ else None)
         count_txt = f"{occ.count} in club now" if occ is not None else "count unavailable"
+        if occ is not None:
+            total = (total or 0) + occ.count
         if suburb and suburb.lower() != e.name.lower():
             lines.append(f"• **{e.name}** — {suburb} ({count_txt})")
         else:
             lines.append(f"• **{e.name}** ({count_txt})")
-    return "\n".join(lines)
+    return st, lines, total
+
+
+def _format_revo_clubs_state_list(
+    directory: list["revo_perfectgym.ClubDirEntry"],
+    occupancy: list["revo_perfectgym.ClubOccupancy"],
+    state: str,
+) -> str:
+    """Plain-text rendering of :func:`_revo_clubs_state_lines` (DM/fallback path)."""
+    st, lines, _total = _revo_clubs_state_lines(directory, occupancy, state)
+    if not lines:
+        return f"🏋️ **Revo clubs in {st}**\n_No clubs found for this state._"
+    return "\n".join([f"🏋️ **Revo clubs in {st}**", *lines])
+
+
+def _revo_clubs_state_embed(
+    directory: list["revo_perfectgym.ClubDirEntry"],
+    occupancy: list["revo_perfectgym.ClubOccupancy"],
+    state: str,
+) -> discord.Embed:
+    """The state directory as an embed, split into columns when it's long.
+
+    WA alone is 37 clubs — as one text blob that is ~1.6k characters and one
+    bad suburb name away from Discord's 2 000-char message cap. Splitting into
+    up to three inline fields keeps every chunk far below the 1 024-char field
+    limit and reads as a directory instead of a wall.
+    """
+    st, lines, total = _revo_clubs_state_lines(directory, occupancy, state)
+    embed = discord.Embed(title=f"🏋️ Revo clubs in {st}", colour=EMBED_COLOUR)
+    if not lines:
+        embed.colour = discord.Colour(0x99AAB5)
+        embed.description = (
+            "No clubs here yet. Revo currently operates in "
+            f"{', '.join(_revo_states_present(directory)) or 'no listed states'}."
+        )
+        return embed
+
+    summary = _plural(len(lines), "club")
+    if total is not None:
+        summary += f" · **{total}** in club right now"
+    embed.description = summary
+
+    # One column up to 12 clubs, then two, then three — so a small state stays a
+    # single readable list and a big one doesn't become a scroll.
+    columns = 1 if len(lines) <= 12 else (2 if len(lines) <= 24 else 3)
+    size = -(-len(lines) // columns)  # ceil, so the last column is the short one
+    for i in range(0, len(lines), size):
+        chunk = lines[i:i + size]
+        embed.add_field(
+            name="​", value=_clip_field("\n".join(chunk)), inline=columns > 1,
+        )
+    embed.set_footer(
+        text="/revo_clubs club:<name> for one club's address, map & nearest gyms",
+    )
+    return embed
 
 
 def _format_revo_club_detail(
@@ -8777,24 +8968,52 @@ async def busy_cmd(
     await interaction.followup.send(message, ephemeral=ephemeral)
 
 
+async def _revo_state_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest state codes for /revo_clubs.
+
+    Prefers the states actually present in the (6h-cached) directory so the list
+    tracks Revo's real footprint; falls back to the curated table when the
+    directory hasn't been fetched yet, since autocomplete must answer within
+    3 seconds and can't afford a cold network round-trip.
+    """
+    try:
+        states = _revo_states_present(revo_perfectgym.cached_club_list())
+    except Exception:  # pragma: no cover - defensive; autocomplete must not raise
+        states = []
+    if not states:
+        states = revo_client.known_states()
+    q = (current or "").strip().lower()
+    matched = [s for s in states if not q or s.lower().startswith(q)]
+    if not matched:  # let a full name like "south australia" match too
+        code = _normalise_state(current)
+        matched = [code] if code in states else []
+    return [app_commands.Choice(name=s, value=s) for s in matched[:25]]
+
+
 @bot.tree.command(
     name="revo_clubs",
-    description="Revo club directory: clubs in your state, or one club's details + nearest gyms.",
+    description="Revo club directory: clubs by state, or one club's details + nearest gyms.",
 )
 @app_commands.describe(
-    club="Optional club name. Omit to list every club in your home state.",
+    club="Optional club name. Omit to list a whole state.",
+    state="List every club in a state (SA, WA, VIC, NSW). Defaults to your home state.",
 )
+@app_commands.autocomplete(state=_revo_state_autocomplete)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def revo_clubs_cmd(
     interaction: discord.Interaction,
     club: str | None = None,
+    state: str | None = None,
 ) -> None:
     # Public club directory (Geo/GetClubList) — no PII — joined to the live
-    # occupancy board so each club shows its current head-count. No arg lists the
-    # caller's home state; a club name shows that club's address, a Google-Maps
-    # link, state, live count and the nearest 3 other clubs. Mirrors /busy's
-    # gating + shared-vs-linked credential resolution (public data, shared ok).
+    # occupancy board so each club shows its current head-count. `state` lists a
+    # whole state; a club name shows that club's address, a Google-Maps link,
+    # state, live count and the nearest 3 other clubs; neither falls back to the
+    # caller's home state. Mirrors /busy's gating + shared-vs-linked credential
+    # resolution (public data, shared ok).
     if REVO_DISABLED:
         await interaction.response.send_message(
             "Revo integration is disabled (REVO_DISABLED=1).", ephemeral=True,
@@ -8807,10 +9026,20 @@ async def revo_clubs_cmd(
         )
         return
 
+    # Reject an unparseable state before spending a directory fetch on it.
+    wanted_state = _normalise_state(state)
+    if state and wanted_state is None:
+        await interaction.response.send_message(
+            f"**{_safe_label(state)}** isn't an Australian state I know. Try "
+            f"one of: {', '.join(revo_client.known_states())}.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer(thinking=True)
     user_id = interaction.user.id
 
-    def _do() -> tuple[str, bool]:
+    def _do() -> tuple[str | discord.Embed, bool]:
         directory = _perfectgym_directory(user_id)
         if not directory:
             return (
@@ -8822,31 +9051,51 @@ async def revo_clubs_cmd(
 
         # ---- a named club: detail card + nearest 3 ----
         if club:
-            entry = _find_dir_entry(directory, club)
+            # A bare state in the club box is a natural mistake ("/revo_clubs
+            # club:SA") and substring matching would silently answer it with
+            # e.g. Salisbury, so resolve it as a state first.
+            as_state = _normalise_state(club)
+            if as_state and _find_dir_entry(directory, club) is None:
+                return _revo_clubs_state_embed(directory, occupancy, as_state), False
+            pool = directory
+            if wanted_state:  # both given → search within that state
+                pool = [e for e in directory if (e.state or "").upper() == wanted_state]
+            entry = _find_dir_entry(pool, club)
             if entry is None:
+                where = f" in {wanted_state}" if wanted_state else ""
                 return (
-                    f"Couldn't find a Revo club matching **{club}**. Try the "
-                    "suburb name, or omit it to list your state's clubs.",
+                    f"Couldn't find a Revo club matching "
+                    f"**{_safe_label(club)}**{where}. Try the suburb name, or "
+                    "use `state:` to list a whole state.",
                     True,
                 )
             nearest = revo_perfectgym.nearest_clubs(directory, entry.name, limit=3)
             return _format_revo_club_detail(entry, occupancy, nearest), False
 
+        # ---- an explicit state ----
+        if wanted_state:
+            return _revo_clubs_state_embed(directory, occupancy, wanted_state), False
+
         # ---- no arg: every club in the caller's home state ----
         landing = _busy_fav_landing(user_id)
         home_name = landing.fav_club_name if landing else None
-        state = revo_client.state_for_club(home_name) if home_name else None
-        if not state:
+        home_state = revo_client.state_for_club(home_name) if home_name else None
+        if not home_state:
+            available = ", ".join(_revo_states_present(directory)) or "SA, WA, VIC, NSW"
             return (
-                "Couldn't work out your home state. Name a club instead — e.g. "
-                "`/revo_clubs club:Modbury` — or link your account with "
+                "Couldn't work out your home state. Pick one with "
+                f"`/revo_clubs state:` ({available}), name a club with "
+                "`/revo_clubs club:Modbury`, or link your account with "
                 "`/revo_link` so I know your home club.",
                 True,
             )
-        return _format_revo_clubs_state_list(directory, occupancy, state), False
+        return _revo_clubs_state_embed(directory, occupancy, home_state), False
 
-    message, ephemeral = await bot.loop.run_in_executor(None, _do)
-    await interaction.followup.send(message, ephemeral=ephemeral)
+    result, ephemeral = await bot.loop.run_in_executor(None, _do)
+    if isinstance(result, discord.Embed):
+        await interaction.followup.send(embed=result, ephemeral=ephemeral)
+    else:
+        await interaction.followup.send(result, ephemeral=ephemeral)
 
 
 @bot.tree.command(
@@ -10605,7 +10854,10 @@ async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
 # the resolved values into this process's environment.
 
 STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
-HEVY_COLOUR = discord.Colour.from_str("#1d2330")  # Hevy's dark brand tone
+# Hevy's own dark brand tone (#1d2330) sits at roughly 1.1:1 contrast against
+# Discord's dark background (#313338) — an invisible rail on what is, by volume,
+# the most-posted embed in the bot. Their brand blue reads in both themes.
+HEVY_COLOUR = ui.HEVY
 
 # aiohttp AppRunner handle, set in setup_hook so a future shutdown path could
 # clean it up.
@@ -14289,7 +14541,7 @@ _COACH_SYSTEM = (
     "**⚠️ Lagging**\n"
     "• Overhead press flat at 50kg for 5 weeks.\n"
     "• No pulling logged — rows/pull-ups missing vs all that pressing.\n"
-    "**🍽️ Nutrition**\n"
+    "**🍎 Nutrition**\n"
     "• Protein only logged 3/30 days — too sparse to judge; worth tracking.\n"
     "**🎯 Next steps**\n"
     "• Add a weekly row variation, target 60kg×8.\n"
@@ -14877,17 +15129,16 @@ def _target_label_suffix(label: str | None) -> str:
 def _calorie_status_line(
     total: float, target: float, label: str | None = None,
 ) -> str:
-    bar = calories.progress_bar(total, target)
-    remaining = target - total
-    if remaining >= 0:
-        tail = f"**{calories.format_kcal(remaining)}** left today"
-    else:
-        tail = f"**{calories.format_kcal(-remaining)}** over target"
-    return (
-        f"`{bar}` {calories.format_kcal(total)} / "
-        f"{calories.format_kcal(target)} · {tail}"
-        + _target_label_suffix(label)
-    )
+    """Calorie progress against a daily **target** — reaching it is the win."""
+    return _calorie_status(total, target, label)[0]
+
+
+def _calorie_status(
+    total: float, target: float, label: str | None = None,
+) -> tuple[str, discord.Colour]:
+    """As above, plus the colour an embed built around it should wear."""
+    text, colour = ui.meter(total, target, calories.format_kcal)
+    return text + _target_label_suffix(label), colour
 
 
 def _reply_targets(
@@ -15171,7 +15422,7 @@ async def calories_add_cmd(
     # Skip the note suffix when it just repeats the food name we already show.
     note_part = f" — {note}" if note and note != logged_label else ""
     await interaction.response.send_message(
-        f"🍽️ Logged **{logged_label}**{converted}{note_part}"
+        f"{ui.FOOD} Logged **{logged_label}**{converted}{note_part}"
         f"{_backdate_label(logged_at)}\n"
         + _calorie_status_for(interaction.user.id, total, logged_at)
         + _streak_suffix(_calorie_streak(interaction.user.id))
@@ -15205,29 +15456,40 @@ async def calories_today_cmd(
         guild_id, target_user.id, *_today_window(),
     )
     total = sum(float(r["kcal"]) for r in entries)
-    lines = [
-        _calorie_status_line(
-            total, float(goal["daily_target_kcal"]), goal["label"],
+    status, colour = _calorie_status(
+        total, float(goal["daily_target_kcal"]), goal["label"],
+    )
+    streak = _calorie_streak(target_user.id)
+    embed = ui.card(
+        f"{ui.FOOD} Calories today",
+        description=status,
+        colour=colour,
+        member=target_user,
+        footer=(
+            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
+            if streak >= 2 else None
         ),
-    ]
+    )
     if entries:
-        lines.append("")
+        # The day's entries as one fence so the times and amounts line up. The
+        # heaviest logger here averages 11 entries a day and peaks at 17, so
+        # this list is routinely long enough for alignment to matter.
+        rows = []
         for r in entries:
             dt = datetime.fromisoformat(r["logged_at"])
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            when = dt.astimezone(DISPLAY_TZ).strftime("%H:%M")
-            note_part = f" — {r['note']}" if r["note"] else ""
-            lines.append(
-                f"`{when}` {calories.format_kcal(float(r['kcal']))}{note_part}"
-            )
+            rows.append([
+                dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
+                calories.format_kcal(float(r["kcal"])),
+                _safe_label(r["note"] or "", limit=24) if r["note"] else "",
+            ])
+        ui.block(
+            embed, ui.plural(len(entries), "entry", "entries"),
+            ui.table(rows, align="<>", max_rows=20),
+        )
     else:
-        lines.append("\nNothing logged yet today.")
-    embed = discord.Embed(
-        title=f"🍎 Calories today — {target_user.display_name}",
-        description="\n".join(lines),
-        colour=EMBED_COLOUR,
-    )
+        ui.block(embed, "Entries", "Nothing logged yet today.")
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -15265,7 +15527,10 @@ async def calories_week_cmd(
     day_targets = targets_mod.resolve_days(
         db.nutrition_target_rows(target_user.id), week,
     )
-    lines = []
+    # One fenced block, not a bar-per-line: two adjacent inline-code spans don't
+    # line up (Discord puts a proportional gap between them), so the day column
+    # and the bars only stay in register inside a single monospace fence.
+    rows: list[list[str]] = []
     logged_days = 0
     target_sum = 0.0
     for day in week:
@@ -15274,19 +15539,21 @@ async def calories_week_cmd(
         target_kcal = day_targets[day].kcal.value or 0.0
         total = day_totals.get(key)
         if total is None:
-            lines.append(f"`{day_name}` — nothing logged")
+            rows.append([day_name, "", "nothing logged"])
             continue
         logged_days += 1
         target_sum += target_kcal
-        bar = calories.progress_bar(total, target_kcal)
-        lines.append(
-            f"`{day_name}` `{bar}` {calories.format_kcal(total)}"
-        )
+        rows.append([
+            day_name,
+            ui.bar(total, target_kcal, width=10),
+            calories.format_kcal(total),
+        ])
+    lines = [ui.table(rows, align="<<>", max_rows=7)]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         avg_target = target_sum / logged_days
         lines.append(
-            f"\nAvg on logged days: **{calories.format_kcal(avg)}** vs "
+            f"Avg on logged days: **{calories.format_kcal(avg)}** vs "
             f"target {calories.format_kcal(avg_target)}"
         )
         lines.extend(_band_breakdown_lines(
@@ -15294,12 +15561,18 @@ async def calories_week_cmd(
             targets_mod.MACRO_KCAL,
         ))
     streak = _calorie_streak(target_user.id)
-    if streak >= 2:
-        lines.append(f"🔥 **{streak} day** logging streak")
-    embed = discord.Embed(
-        title=f"🍎 Calories this week — {target_user.display_name}",
+    embed = ui.card(
+        f"{ui.FOOD} Calories this week",
         description="\n".join(lines),
-        colour=EMBED_COLOUR,
+        colour=ui.score_target(
+            sum(day_totals.values()) / logged_days if logged_days else 0.0,
+            target_sum / logged_days if logged_days else 0.0,
+        ),
+        member=target_user,
+        footer=(
+            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
+            if streak >= 2 else None
+        ),
     )
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
@@ -16092,7 +16365,7 @@ async def calories_label_cmd(
     if logged_protein:
         parts.append(f"**{protein_mod.format_grams(pro_grams)}** protein")
     lines.append(
-        f"\n🍽️ Logged {' + '.join(parts)} for **{grams:g} g**"
+        f"\n{ui.FOOD} Logged {' + '.join(parts)} for **{grams:g} g**"
         f"{_backdate_label(logged_at)}"
     )
     lines.append(_calorie_status_line(
@@ -16171,7 +16444,7 @@ async def calories_meal_set_cmd(
         (f"{n}× " if n > 1 else "") + row["display"] for n, row in resolved
     )
     await interaction.response.send_message(
-        f"🥗 Saved meal **{name.strip()}** = {pieces} ({macro} right now — "
+        f"{ui.OK} Saved meal **{name.strip()}** = {pieces} ({macro} right now — "
         f"it re-reads the foods each time you log it).\n"
         f"Log it by typing `{norm}` in chat."
     )
@@ -16216,7 +16489,7 @@ async def calories_meal_list_cmd(interaction: discord.Interaction) -> None:
             line += f" ⚠️ {missing} deleted food(s)"
         lines.append(line)
     embed = discord.Embed(
-        title="🥗 Your saved meals",
+        title=f"{ui.FOOD} Your saved meals",
         description="\n".join(lines)[:4000],
         colour=EMBED_COLOUR,
     )
@@ -16529,29 +16802,37 @@ async def protein_today_cmd(
         guild_id, target_user.id, *_today_window(),
     )
     total = sum(float(r["grams"]) for r in entries)
-    lines = [
-        _protein_status_line(
-            total, float(goal["daily_target_g"]), goal["label"],
+    status, colour = _protein_status(
+        total, float(goal["daily_target_g"]), goal["label"],
+    )
+    streak = _protein_streak(target_user.id)
+    embed = ui.card(
+        f"{ui.PROTEIN} Protein today",
+        description=status,
+        colour=colour,
+        member=target_user,
+        footer=(
+            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
+            if streak >= 2 else None
         ),
-    ]
+    )
     if entries:
-        lines.append("")
+        rows = []
         for r in entries:
             dt = datetime.fromisoformat(r["logged_at"])
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            when = dt.astimezone(DISPLAY_TZ).strftime("%H:%M")
-            note_part = f" — {r['note']}" if r["note"] else ""
-            lines.append(
-                f"`{when}` {protein_mod.format_grams(float(r['grams']))}{note_part}"
-            )
+            rows.append([
+                dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
+                protein_mod.format_grams(float(r["grams"])),
+                _safe_label(r["note"] or "", limit=24) if r["note"] else "",
+            ])
+        ui.block(
+            embed, ui.plural(len(entries), "entry", "entries"),
+            ui.table(rows, align="<>", max_rows=20),
+        )
     else:
-        lines.append("\nNothing logged yet today.")
-    embed = discord.Embed(
-        title=f"🥩 Protein today — {target_user.display_name}",
-        description="\n".join(lines),
-        colour=EMBED_COLOUR,
-    )
+        ui.block(embed, "Entries", "Nothing logged yet today.")
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -16586,7 +16867,10 @@ async def protein_week_cmd(
     day_targets = targets_mod.resolve_days(
         db.nutrition_target_rows(target_user.id), week,
     )
-    lines = []
+    # Same single-fence treatment as /calories week — see the note there. The
+    # over-max marker is an ASCII '!' rather than ⚠️ because an emoji is not one
+    # monospace cell and would shear every column to its right.
+    rows: list[list[str]] = []
     logged_days = 0
     target_sum = 0.0
     for day in week:
@@ -16595,19 +16879,21 @@ async def protein_week_cmd(
         target_g = day_targets[day].protein.value or 0.0
         total = day_totals.get(key)
         if total is None:
-            lines.append(f"`{day_name}` — nothing logged")
+            rows.append([day_name, "", "nothing logged", ""])
             continue
         logged_days += 1
         target_sum += target_g
-        bar = calories.progress_bar(total, target_g)
-        over = " ⚠️" if total > target_g else ""
-        lines.append(
-            f"`{day_name}` `{bar}` {protein_mod.format_grams(total)}{over}"
-        )
+        rows.append([
+            day_name,
+            ui.bar(total, target_g, width=10, overflow=True),
+            protein_mod.format_grams(total),
+            "!" if total > target_g else "",
+        ])
+    lines = [ui.table(rows, align="<<>", max_rows=7)]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         lines.append(
-            f"\nAvg on logged days: **{protein_mod.format_grams(avg)}** vs "
+            f"Avg on logged days: **{protein_mod.format_grams(avg)}** vs "
             f"max {protein_mod.format_grams(target_sum / logged_days)}"
         )
         lines.extend(_band_breakdown_lines(
@@ -16615,12 +16901,18 @@ async def protein_week_cmd(
             targets_mod.MACRO_PROTEIN, noun="max",
         ))
     streak = _protein_streak(target_user.id)
-    if streak >= 2:
-        lines.append(f"🔥 **{streak} day** logging streak")
-    embed = discord.Embed(
-        title=f"🥩 Protein this week — {target_user.display_name}",
+    embed = ui.card(
+        f"{ui.PROTEIN} Protein this week",
         description="\n".join(lines),
-        colour=EMBED_COLOUR,
+        colour=ui.score_ceiling(
+            sum(day_totals.values()) / logged_days if logged_days else 0.0,
+            target_sum / logged_days if logged_days else 0.0,
+        ),
+        member=target_user,
+        footer=(
+            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
+            if streak >= 2 else None
+        ),
     )
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),

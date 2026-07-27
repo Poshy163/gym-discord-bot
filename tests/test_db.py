@@ -10,7 +10,7 @@ think they "won" the deletion).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -626,3 +626,54 @@ def test_nickname_owner_case_insensitive_and_absent(db):
     assert db.nickname_owner("  josh  ") == 4242  # case- + whitespace-insensitive
     assert db.nickname_owner("Joshua") is None  # not a prefix match, exact name only
     assert db.nickname_owner("Sean") is None
+
+
+# --- timeline windows: newest N, displayed oldest-first --------------------
+
+def test_history_returns_the_newest_entries_not_the_oldest(db):
+    """``ORDER BY logged_at LIMIT n`` silently returned the *oldest* n. A lifter
+    with 71 entries on one exercise saw a timeline that stopped months back and
+    never included today's — for a command whose whole job is recency."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(40):
+        _add(db, 1, 100, "bench press", 50 + i, msg_id=i + 1,
+             logged_at=base + timedelta(days=i))
+
+    rows = db.history(1, 100, "bench press", limit=10)
+    assert len(rows) == 10
+    weights = [r["weight_kg"] for r in rows]
+    # The last ten sessions (89..50+39), not the first ten.
+    assert weights == [80.0, 81.0, 82.0, 83.0, 84.0, 85.0, 86.0, 87.0, 88.0, 89.0]
+    # Still ascending, so the per-row deltas the caller computes read forwards.
+    assert weights == sorted(weights)
+
+
+def test_machine_history_returns_the_newest_entries_not_the_oldest(db):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(40):
+        _add(db, 1, 100 + (i % 3), "leg press", 100 + i, msg_id=i + 1,
+             logged_at=base + timedelta(days=i))
+
+    rows = db.machine_history(1, "leg press", limit=10)
+    assert len(rows) == 10
+    weights = [r["weight_kg"] for r in rows]
+    assert weights == sorted(weights)              # ascending for display
+    assert weights[-1] == 139.0                    # includes the most recent
+    assert weights[0] == 130.0                     # excludes the ancient ones
+
+
+def test_machine_history_default_limit_fits_a_discord_message(db):
+    """50 rows of the rendered line measured 2 052 chars against a 2 000-char
+    message cap, so /machine on the most-logged exercise failed to send."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(80):
+        _add(db, 1, 100, "incline bench press", 60 + i, msg_id=i + 1,
+             logged_at=base + timedelta(days=i))
+
+    rows = db.machine_history(1, "incline bench press")
+    assert len(rows) == 30
+    rendered = "\n".join(
+        f"• {r['logged_at'][:10]} — **{r['username']}**: {r['weight_kg']:g}kg  (+1kg)"
+        for r in rows
+    )
+    assert len(rendered) < 2000

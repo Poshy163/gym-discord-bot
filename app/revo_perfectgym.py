@@ -994,3 +994,14 @@ def club_list_with_client(client: PerfectGymClient) -> list[ClubDirEntry]:
     entries = client.get_club_list()
     _dir_cache_put(now, entries)
     return entries
+
+
+def cached_club_list() -> list[ClubDirEntry]:
+    """The directory **only if it's already cached** — never logs in, never blocks.
+
+    For callers on a hard latency budget that must degrade instead of wait:
+    Discord gives an autocomplete handler ~3 seconds, and a cold PerfectGym
+    login round-trip blows through that. Returns ``[]`` on a cold cache so the
+    caller can fall back to a static list.
+    """
+    return _dir_cache_get(time.monotonic()) or []

@@ -1,0 +1,67 @@
+<!doctype html><meta charset='utf-8'><title>gym-bot UI preview</title><style>
+:root{--bg:#313338;--card:#2b2d31;--txt:#dbdee1;--mut:#949ba4;--acc:#f26522;
+--code:#1e1f22;--line:#3f4147}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+font-family:"gg sans","Noto Sans",Helvetica,Arial,sans-serif;font-size:16px;
+line-height:1.375}
+.wrap{max-width:900px;margin:0 auto;padding:32px 16px 96px}
+h1.page{font-size:22px;margin:0 0 4px;color:#fff}
+p.lede{color:var(--mut);margin:0 0 32px;font-size:14px}
+.case{margin:0 0 40px;border-top:1px solid var(--line);padding-top:20px}
+.case > h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;
+color:var(--mut);margin:0 0 12px;font-weight:700}
+.msg{display:flex;gap:16px;padding:6px 0}
+.avatar{width:40px;height:40px;border-radius:50%;flex:0 0 40px;
+background:var(--acc);display:flex;align-items:center;justify-content:center;
+font-size:18px}
+.body{min-width:0;flex:1}
+.head{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+.name{color:#fff;font-weight:500;font-size:15px}
+.bot{background:#5865f2;color:#fff;font-size:10px;font-weight:600;
+padding:1px 4px;border-radius:3px;text-transform:uppercase;
+position:relative;top:-1px}
+.time{color:var(--mut);font-size:12px}
+.embed{border-left:4px solid var(--acc);background:var(--card);
+border-radius:4px;max-width:520px;padding:8px 16px 16px 12px;
+display:grid;grid-template-columns:1fr auto;gap:16px;margin-top:2px}
+.embed-inner{min-width:0}
+.author{display:flex;align-items:center;gap:8px;margin-top:8px;
+font-size:14px;font-weight:600;color:#fff}
+.author-icon{width:24px;height:24px;border-radius:50%}
+.title{margin-top:8px;font-size:16px;font-weight:700;color:#fff}
+.desc{margin-top:8px;font-size:14px;color:var(--txt);white-space:normal}
+.fields{margin-top:8px;display:flex;flex-direction:column;gap:8px}
+.inline-row{display:flex;gap:8px}
+.field.inline{min-width:0}
+.fname{font-size:14px;font-weight:700;color:#fff;margin-bottom:2px}
+.fval{font-size:14px;color:var(--txt)}
+.thumb{width:80px;height:80px;border-radius:50%;object-fit:cover;
+align-self:start;margin-top:8px}
+.embed-image{margin-top:16px;max-width:100%;border-radius:4px;display:block}
+.footer{max-width:520px;background:var(--card);border-left:4px solid var(--acc);
+margin-top:-16px;padding:0 12px 12px;border-radius:0 0 4px 4px;
+font-size:12px;color:var(--mut)}
+code.inline{background:var(--code);padding:.1em .3em;border-radius:3px;
+font-family:Consolas,"Courier New",monospace;font-size:.85em;
+white-space:pre}
+pre{background:var(--code);border:1px solid #2b2d31;border-radius:4px;
+padding:8px;font-family:Consolas,monospace;font-size:.85em;overflow-x:auto;
+margin:6px 0;white-space:pre}
+.subtext{color:var(--mut);font-size:.8em}
+.quote{border-left:4px solid var(--line);padding-left:8px;display:inline-block}
+.h1{font-size:1.5em;font-weight:700;color:#fff;margin:8px 0 2px}
+.h2{font-size:1.25em;font-weight:700;color:#fff;margin:8px 0 2px}
+.h3{font-size:1em;font-weight:700;color:#fff;margin:8px 0 2px}
+.plain{font-size:15px;white-space:normal}
+.budget{font-size:11px;color:var(--mut);font-family:Consolas,monospace;
+display:inline-block;margin-top:6px}
+.budget.over{color:#ed4245;font-weight:700}
+.buttons{display:flex;gap:8px;margin-top:8px;max-width:520px}
+.btn{background:#4e5058;color:#fff;font-size:14px;font-weight:500;
+padding:8px 16px;border-radius:3px}
+.btn.primary{background:#5865f2}
+.btn.success{background:#248046}
+</style><div class="wrap"><h1 class="page">gym-bot — Discord UI preview</h1><p class="lede">Rendered from the real helpers in <code class='inline'>app/ui.py</code>. Character budgets are checked against Discord's limits.</p><div class="case"><h2>Shared meter — target vs ceiling</h2><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#e67e22"><div class="embed-inner"><div class="title">🍎 Calories — climbing</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>47%</b>  <code class="inline">▰▰▰▰▰▰▰▱▱▱▱▱▱▱</code><br><span class="subtext">1,180 cal / 2,500 cal · <b>1,320 cal</b> left today</span></div></div></div></div></div><span class="budget ok">103/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#57f287"><div class="embed-inner"><div class="title">🍎 Calories — on target</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>95%</b>  <code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰▰▱</code><br><span class="subtext">2,380 cal / 2,500 cal · <b>120 cal</b> left today</span></div></div></div></div></div><span class="budget ok">102/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#e67e22"><div class="embed-inner"><div class="title">🍎 Calories — over</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>130%</b>  <code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰▰▰</code><br><span class="subtext">3,260 cal / 2,500 cal · ⚠️ <b>760 cal</b> over target</span></div></div></div></div></div><span class="budget ok">102/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#57f287"><div class="embed-inner"><div class="title">🥩 Protein — comfortable</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>53%</b>  <code class="inline">▰▰▰▰▰▰▰▱▱▱▱▱▱▱</code><br><span class="subtext">96 g / 180 g · <b>84 g</b> headroom</span></div></div></div></div></div><span class="budget ok">89/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#e67e22"><div class="embed-inner"><div class="title">🥩 Protein — close to max</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>93%</b>  <code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰▰▱</code><br><span class="subtext">168 g / 180 g · <b>12 g</b> headroom</span></div></div></div></div></div><span class="budget ok">91/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#ed4245"><div class="embed-inner"><div class="title">🥩 Protein — over max</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>119%</b>  <code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰▰▰█</code><br><span class="subtext">214 g / 180 g · ⚠️ <b>34 g</b> over your max</span></div></div></div></div></div><span class="budget ok">97/6000 chars</span></div></div></div><div class="case"><h2>Calorie receipt (the most-rendered output)</h2><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#57f287"><div class="embed-inner"><div class="title">🍎 Logged</div><div class="desc"><b>+650 cal</b> · banh mi</div><div class="fields"><div class="field"><div class="fname">Today</div><div class="fval"><b>74%</b>  <code class="inline">▰▰▰▰▰▰▰▰▰▰▱▱▱▱</code><br><span class="subtext">1,850 cal / 2,500 cal · <b>650 cal</b> left today</span></div></div></div></div></div><div class="footer">🔥 40-day streak · ❌ to undo • 27/07/2026 12:56</div><span class="budget ok">137/6000 chars</span></div></div></div><div class="case"><h2>Leaderboard — podium tiles + monospace chase</h2><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#f26522"><div class="embed-inner"><div class="title">🏆 incline bench press leaderboard</div><div class="fields"><div class="inline-row"><div class="field inline" style="flex-basis:33.3333%"><div class="fname">🥇 Jaidyn</div><div class="fval"><b>92.5kg</b><br>&lt;t:1784684428:R&gt;</div></div><div class="field inline" style="flex-basis:33.3333%"><div class="fname">🥈 Poshy</div><div class="fval"><b>85kg</b><br>&lt;t:1784684428:R&gt;</div></div><div class="field inline" style="flex-basis:33.3333%"><div class="fname">🥉 musk</div><div class="fval"><b>80kg</b><br>&lt;t:1784684428:R&gt;</div></div></div><div class="field"><div class="fname">The chase</div><div class="fval"><pre> 4.  Cookie Monster  72.5kg  ▰▰▰▰▰▰▱▱
+ 5.  Dos               70kg  ▰▰▰▰▰▰▱▱
+ 6.  Dumbaay           65kg  ▰▰▰▰▰▰▱▱</pre></div></div></div></div></div><div class="footer">6 lifters · true load shown where known • 27/07/2026 12:56</div><span class="budget ok">300/6000 chars</span></div></div></div><div class="case"><h2>Empty, denied, unavailable, error</h2><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#99aab5"><div class="embed-inner"><div class="title">📭 No lifts logged for Dumbaay yet</div><div class="desc">Post your session in chat — e.g. <code class="inline">bench 80kg</code> — and I&#x27;ll store it.</div></div></div><div class="footer">/log adds one manually</div><span class="budget ok">121/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#99aab5"><div class="embed-inner"><div class="title">🔒 Admins only — /purge deletes a lift name for the whole server.</div><div class="desc">You can remove your own entries with /undo.</div></div></div><span class="budget ok">107/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#99aab5"><div class="embed-inner"><div class="title">🔒 Revo Fitness is switched off</div><div class="desc">Nobody has connected a Revo account yet.</div><div class="fields"><div class="field"><div class="fname">For admins</div><div class="fval">Set the Revo credentials in the dashboard.</div></div></div></div></div><span class="budget ok">122/6000 chars</span></div></div><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#ed4245"><div class="embed-inner"><div class="title">❌ Couldn&#x27;t reach Strava</div><div class="desc">Strava didn&#x27;t answer in time.</div><div class="fields"><div class="field"><div class="fname">Try this</div><div class="fval">Try again in a minute.</div></div></div></div></div><div class="footer">strava · 504</div><span class="budget ok">94/6000 chars</span></div></div></div><div class="case"><h2>Glyph reference</h2><div class="msg"><div class="avatar">🏋️</div><div class="body"><div class="head"><span class="name">gym-bot</span><span class="bot">bot</span><span class="time">Today at 19:42</span></div><div class="embed" style="border-color:#f26522"><div class="embed-inner"><div class="title">Glyph reference</div><div class="fields"><div class="field"><div class="fname">Bars</div><div class="fval"><code class="inline">▰▰▰▰▱▱▱▱▱▱▱▱</code> 30%<br><code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰</code> 100%<br><code class="inline">▰▰▰▰▰▰▰▰▰▰▰▰███</code> 130% (overflow)</div></div><div class="field"><div class="fname">Deltas</div><div class="fval">🟢 +2.5kg · 🔴 -2.5kg · ⚪ no change</div></div><div class="field"><div class="fname">Sparkline</div><div class="fval"><code class="inline">▁▄▆▄█▅▂</code> bodyweight</div></div><div class="field"><div class="fname">Streak strip</div><div class="fval"><code class="inline">▰▰▰▰▰▰▰▰▰▱▰▰▰▰</code> 14 days</div></div></div></div></div><span class="budget ok">195/6000 chars</span></div></div></div></div>

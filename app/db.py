@@ -1719,15 +1719,23 @@ class Database:
     def history(
         self, guild_id: int, user_id: int, equipment: str, limit: int = 25
     ) -> list[sqlite3.Row]:
-        """Chronological per-entry history for one user/equipment."""
+        """Chronological per-entry history for one user/equipment.
+
+        The LIMIT takes the **most recent** rows, then flips them back into
+        ascending order for display. Selecting ascending and limiting returned
+        the *oldest* N instead, so a lifter with 71 entries on one exercise saw
+        a "timeline" that stopped eight months ago and never showed today's.
+        """
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT weight_kg, bodyweight_add AS bw, logged_at, reps
-                FROM lifts
-                WHERE guild_id = ? AND user_id = ? AND equipment = ?
-                ORDER BY logged_at
-                LIMIT ?
+                SELECT * FROM (
+                    SELECT weight_kg, bodyweight_add AS bw, logged_at, reps
+                    FROM lifts
+                    WHERE guild_id = ? AND user_id = ? AND equipment = ?
+                    ORDER BY logged_at DESC
+                    LIMIT ?
+                ) ORDER BY logged_at
                 """,
                 (guild_id, user_id, equipment, limit),
             ))
@@ -1799,17 +1807,26 @@ class Database:
             return day, rows
 
     def machine_history(
-        self, guild_id: int, equipment: str, limit: int = 50
+        self, guild_id: int, equipment: str, limit: int = 30
     ) -> list[sqlite3.Row]:
-        """Chronological timeline of all users' entries on one equipment."""
+        """Chronological timeline of all users' entries on one equipment.
+
+        Most-recent-N then re-sorted ascending, for the same reason as
+        :meth:`history`. The limit is 30 rather than 50 because 50 rows of
+        ``date — **name**: weight (+delta)`` measured 2 052 characters on real
+        data — past Discord's 2 000-char message cap, so ``/machine`` on the
+        most-logged exercise failed to send at all.
+        """
         with self._conn() as c:
             return list(c.execute(
                 """
-                SELECT username, weight_kg, bodyweight_add AS bw, logged_at
-                FROM lifts
-                WHERE guild_id = ? AND equipment = ?
-                ORDER BY logged_at
-                LIMIT ?
+                SELECT * FROM (
+                    SELECT username, weight_kg, bodyweight_add AS bw, logged_at
+                    FROM lifts
+                    WHERE guild_id = ? AND equipment = ?
+                    ORDER BY logged_at DESC
+                    LIMIT ?
+                ) ORDER BY logged_at
                 """,
                 (guild_id, equipment, limit),
             ))
