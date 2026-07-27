@@ -181,20 +181,30 @@ def _log_failure(mdl: str, exc: GeminiError) -> None:
     )
 
 
-def _thinking_budget_for(mdl: str, requested: int | None) -> int:
-    """Effective ``thinkingBudget`` for ``mdl``.
+def _thinking_budget_for(mdl: str, requested: int | None) -> int | None:
+    """Effective ``thinkingBudget`` for ``mdl``, or None to omit the field.
 
     On Gemini 2.5 the "thinking" pass spends tokens from the same
     ``maxOutputTokens`` allowance as the answer, so an uncapped thinking pass on
-    a tight cap can truncate or empty the reply. We therefore always pin a
-    budget: the caller's explicit ``requested`` value wins; otherwise thinking
-    is turned OFF (0) on flash/flash-lite, which accept a zero, and pinned to
-    128 — gemini-2.5-pro's minimum — on every other model, since pro can't
-    disable thinking and rejects a 0.
+    a tight cap can truncate or empty the reply — hence pinning a budget at all.
+    The caller's explicit ``requested`` value always wins.
+
+    Otherwise the rule is deliberately narrow: only the 2.x flash line is known
+    to accept a zero. Later families reject it — Gemini 3 can't disable
+    thinking, so ``gemini-3.6-flash`` answered a plain "Request contains an
+    invalid argument" and every AI feature broke. A bare ``"flash" in name``
+    test cannot keep up with model releases, so anything unrecognised omits the
+    field and takes the server default; :func:`_call_model` drops it and
+    retries anyway if a 400 says otherwise.
     """
     if requested is not None:
         return requested
-    return 0 if "flash" in mdl.lower() else 128
+    name = mdl.lower()
+    if name.startswith(("gemini-1.", "gemini-2.")) and "flash" in name:
+        return 0          # known to accept "thinking off"
+    if name.startswith("gemini-2.") :
+        return 128        # 2.5-pro can't disable it; 128 is its minimum
+    return None           # unknown family — let the server decide
 
 
 def _call_model(
@@ -223,9 +233,9 @@ def _call_model(
     # devour a tight token cap and truncate (or empty) the reply — which then
     # looks like a malformed response downstream. Always pin a budget so that
     # can't happen on any model, flash or not (see _thinking_budget_for).
-    gen_config["thinkingConfig"] = {
-        "thinkingBudget": _thinking_budget_for(mdl, thinking_budget)
-    }
+    budget = _thinking_budget_for(mdl, thinking_budget)
+    if budget is not None:
+        gen_config["thinkingConfig"] = {"thinkingBudget": budget}
     # Image parts go first so the text prompt reads as a question *about* the
     # attached image(s) — the ordering Google's own docs use for vision.
     parts: list[dict] = [
@@ -245,6 +255,36 @@ def _call_model(
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
+    try:
+        return _post_with_retries(url, body, key, mdl, timeout, retries)
+    except GeminiError as exc:
+        # A 400 while we're pinning a thinking budget is overwhelmingly likely
+        # to BE that field: model families disagree about whether thinking can
+        # be capped or switched off, and Google's reply is just "Request
+        # contains an invalid argument" with no field name. Dropping it and
+        # trying once more costs one request and self-heals across future model
+        # releases, which a name-matching table cannot.
+        if (
+            exc.status_code == 400
+            and "thinkingConfig" in body.get("generationConfig", {})
+            # A rejected key is also a 400 here, and it will fail identically
+            # without the field — so don't spend a second request proving it.
+            and "api key" not in str(exc).lower()
+        ):
+            LOG.warning(
+                "Gemini rejected thinkingConfig on %s (%s) — retrying without "
+                "it. Model probably can't cap or disable thinking.",
+                mdl, exc,
+            )
+            body["generationConfig"].pop("thinkingConfig", None)
+            return _post_with_retries(url, body, key, mdl, timeout, retries)
+        raise
+
+
+def _post_with_retries(
+    url: str, body: dict, key: str, mdl: str, timeout: int, retries: int,
+) -> str:
+    """POST ``body``, retrying transient failures; return text or raise."""
     last_exc: GeminiError | None = None
     for attempt in range(retries + 1):
         try:

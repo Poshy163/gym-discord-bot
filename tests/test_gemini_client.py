@@ -126,13 +126,61 @@ def test_generate_503_exhausts_retries(monkeypatch):
 
 
 def test_generate_400_not_retried(monkeypatch):
+    """A client error must not go through the transient-retry loop. With no
+    thinkingConfig in play (an explicit budget of None omits it) that means
+    exactly one request."""
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     fake = _FakeRequests([_err(400, "INVALID_ARGUMENT", "bad request")])
     monkeypatch.setattr(gemini_client, "requests", fake)
     with pytest.raises(gemini_client.GeminiError) as ei:
-        gemini_client.generate("hi", retries=2)
+        gemini_client.generate("hi", retries=2, thinking_budget=None,
+                               model="gemini-9.9-unknown")
     assert ei.value.status_code == 400 and ei.value.retryable is False
     assert fake.calls == 1  # no retry on a client error
+
+
+def test_generate_400_drops_thinking_config_and_retries_once(monkeypatch):
+    """Model families disagree about whether thinking can be capped, and
+    Google answers a bad budget with a bare "invalid argument" naming no field.
+    gemini-3.6-flash rejected thinkingBudget=0 and took every AI feature down,
+    so a 400 while we're pinning that field earns exactly one retry without
+    it."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([
+        _err(400, "INVALID_ARGUMENT", "Request contains an invalid argument."),
+        _ok("recovered"),
+    ])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    assert gemini_client.generate(
+        "hi", retries=0, model="gemini-2.5-flash",
+    ) == "recovered"
+    assert fake.calls == 2
+    assert "thinkingConfig" not in fake.last_json["generationConfig"]
+
+
+def test_generate_400_reduction_retry_happens_at_most_once(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([
+        _err(400, "INVALID_ARGUMENT", "Request contains an invalid argument."),
+        _err(400, "INVALID_ARGUMENT", "Request contains an invalid argument."),
+    ])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError):
+        gemini_client.generate("hi", retries=0, model="gemini-2.5-flash")
+    assert fake.calls == 2  # not an infinite reduction loop
+
+
+def test_generate_400_on_a_bad_key_skips_the_reduction_retry(monkeypatch):
+    """A rejected key fails identically without thinkingConfig, so spending a
+    second request to prove it is pure waste."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = _FakeRequests([
+        _err(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key."),
+    ])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+    with pytest.raises(gemini_client.GeminiError):
+        gemini_client.generate("hi", retries=0, model="gemini-2.5-flash")
+    assert fake.calls == 1
 
 
 def test_generate_retries_transport_error(monkeypatch):
@@ -250,11 +298,14 @@ def test_generate_no_backup_fallback_on_client_error(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
     monkeypatch.setenv("BACKUP_GEMINI_MODEL", "gemini-2.5-flash-lite")
-    # A 400 is the caller's fault — the backup must NOT be tried.
+    # A 400 is a client error — the backup model must NOT be tried. Use an
+    # explicit budget of None so no thinkingConfig is sent and the
+    # drop-and-retry path can't add a request here.
     fake = _FakeRequests([_err(400, "INVALID_ARGUMENT"), _ok("unused")])
     monkeypatch.setattr(gemini_client, "requests", fake)
     with pytest.raises(gemini_client.GeminiError):
-        gemini_client.generate("hi", retries=0)
+        gemini_client.generate("hi", retries=0, thinking_budget=None,
+                               model="gemini-9.9-unknown")
     assert fake.calls == 1
 
 
