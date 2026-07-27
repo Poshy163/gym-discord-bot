@@ -1646,3 +1646,71 @@ def test_every_calorie_entry_path_guards_the_rounds_to_zero_case():
     src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
     guarded = src.count("_rounds_to_zero_kcal(kcal)")
     assert guarded == 5, f"expected 5 guarded paths, found {guarded}"
+
+
+# ---- the ❌ gate must survive the move to embeds ------------------------------
+
+class _FakeEmbed:
+    def __init__(self, title):
+        self.title = title
+
+
+class _FakeReply:
+    def __init__(self, content="", embeds=()):
+        self.content = content
+        self.embeds = list(embeds)
+
+
+def test_is_nutrition_reply_matches_embed_cards():
+    """The chat replies are cards now. An embed-only message has an EMPTY
+    content, so the old content-only test would have stopped matching every new
+    reply — and ❌ would have quietly done nothing on all of them."""
+    import app.bot as bot
+
+    for title in ("🍎 +650 cal", "🥩 +40 g protein", "🤖 Estimated large coffee"):
+        assert bot._is_nutrition_reply(_FakeReply(embeds=[_FakeEmbed(title)]))
+
+
+def test_is_nutrition_reply_still_matches_plain_text_history():
+    """~800 plain-text replies predate the cards and must stay undoable."""
+    import app.bot as bot
+
+    for content in ("🍽️ **+650 cal**", "🥗 Logged **650 cal**", "🍎 Logged x"):
+        assert bot._is_nutrition_reply(_FakeReply(content=content))
+
+
+def test_is_nutrition_reply_ignores_everything_else():
+    import app.bot as bot
+
+    assert not bot._is_nutrition_reply(_FakeReply(content="Added **80kg**"))
+    assert not bot._is_nutrition_reply(_FakeReply())
+    assert not bot._is_nutrition_reply(
+        _FakeReply(embeds=[_FakeEmbed("🏋️ Last session")])
+    )
+    assert not bot._is_nutrition_reply(_FakeReply(embeds=[_FakeEmbed(None)]))
+
+
+def test_log_card_title_carries_a_prefix_the_gate_accepts():
+    """The card's own title is what the gate reads, so the two can't drift."""
+    import app.bot as bot
+    from app import ui
+
+    for icon in (ui.FOOD, ui.PROTEIN, ui.AI):
+        card = bot._log_card(icon, "+650 cal", "status", ui.SUCCESS)
+        assert bot._is_nutrition_reply(_FakeReply(embeds=[card]))
+        assert ui.overflows(card) is None
+
+
+def test_log_card_footer_always_advertises_the_reaction():
+    import app.bot as bot
+    from app import ui
+
+    plain = bot._log_card(ui.FOOD, "+650 cal", "s", ui.SUCCESS)
+    streaked = bot._log_card(ui.FOOD, "+650 cal", "s", ui.SUCCESS, streak=37)
+    assert "❌" in plain.footer.text
+    assert "❌" in streaked.footer.text
+    assert "37-day streak" in streaked.footer.text
+    # A day-one streak isn't a streak worth announcing.
+    assert "streak" not in bot._log_card(
+        ui.FOOD, "x", "s", ui.SUCCESS, streak=1,
+    ).footer.text

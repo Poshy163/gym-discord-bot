@@ -1516,6 +1516,45 @@ class StreakReminderView(discord.ui.View):
         )
 
 
+def _log_card(
+    icon: str,
+    headline: str,
+    status: str,
+    colour: discord.Colour,
+    *,
+    author: object | None = None,
+    streak: int = 0,
+    banner: str = "",
+    note: str | None = None,
+) -> discord.Embed:
+    """The shared card for "I logged this" confirmations.
+
+    One shape for every nutrition write — chat posts, slash commands, AI
+    estimates — so the highest-frequency output in the bot stops looking like
+    three different features. ``headline`` is what was added, ``status`` the
+    two-tier meter for the day so far.
+
+    The title carries the domain icon because the ❌ handler identifies our
+    replies by that leading glyph (see :func:`_is_nutrition_reply`).
+    """
+    embed = ui.card(
+        f"{icon} {headline}",
+        description=status,
+        colour=colour,
+        member=author,
+        footer=(
+            f"{ui.STREAK} {streak}-day streak · react ❌ to remove"
+            if streak >= 2 else "react ❌ to remove"
+        ),
+        timestamp=True,
+    )
+    if note:
+        ui.block(embed, "Note", note)
+    if banner:
+        ui.block(embed, f"{ui.PARTY} Milestone", banner.strip().lstrip("🎉 *"))
+    return embed
+
+
 async def _reply_calorie_logged(
     message: discord.Message, target: object, goal: sqlite3.Row,
     added_kcal: float, label: str | None, *, entry_id: int = 0,
@@ -1549,15 +1588,18 @@ async def _reply_calorie_logged(
     view: discord.ui.View | None = None
     if banner and streak <= 30 and db.calorie_reminder_get(target_id) is None:
         view = StreakReminderView(target_id)
-    label_part = f" — {label}" if label else ""
     suffix = _target_suffix(message.author, target)
+    status, colour = _calorie_status_pair(target_id, total, logged_at)
     try:
         reply = await message.reply(
-            f"{ui.FOOD} **+{calories.format_kcal(added_kcal)}**{label_part}{suffix}"
-            f"{_backdate_label(logged_at)}\n"
-            + _calorie_status_for(target_id, total, logged_at)
-            + _streak_suffix(streak)
-            + banner,
+            embed=_log_card(
+                ui.FOOD,
+                f"+{calories.format_kcal(added_kcal)}"
+                f"{suffix}{_backdate_label(logged_at)}",
+                status, colour,
+                author=target, streak=streak, banner=banner,
+                note=_safe_label(label, limit=64) if label else None,
+            ),
             mention_author=False,
             view=view,
         )
@@ -1619,7 +1661,7 @@ async def _handle_calorie_message(
 
     Mirrors `/calories add`: the target must have run `/calories setup`
     first, and the per-entry typo cap applies. Replies with a ✅ reaction and
-    the running total; `/calories undo` reverses it. ``logged_at`` backdates the
+    the running total; a ❌ on that reply reverses it. ``logged_at`` backdates the
     entry (e.g. `650kcal yesterday`) — None files it under the message time.
     """
     guild_id = _msg_guild_id(message)
@@ -1959,10 +2001,11 @@ _MAX_AI_ESTIMATE_KCAL = 5_000
 
 
 async def _attach_undo(
-    interaction: discord.Interaction,
+    interaction: discord.Interaction | None,
     *,
     calorie_id: int = 0,
     protein_id: int = 0,
+    message: "discord.Message | None" = None,
 ) -> None:
     """Link freshly-written nutrition rows to this reply and add the ❌.
 
@@ -1976,10 +2019,17 @@ async def _attach_undo(
     """
     if not (calorie_id or protein_id):
         return
-    try:
-        msg = await interaction.original_response()
-    except discord.HTTPException:
-        return
+    # A followup's handle is the object `followup.send` returned —
+    # `original_response()` would hand back the deferred first response
+    # instead, and the reaction would land on the wrong message.
+    msg = message
+    if msg is None:
+        if interaction is None:
+            return
+        try:
+            msg = await interaction.original_response()
+        except discord.HTTPException:
+            return
     try:
         if calorie_id:
             db.set_calorie_message_id(calorie_id, msg.id)
@@ -2268,13 +2318,16 @@ async def _reply_protein_logged(
         "protein", streak, first_today=(logged_at is None and _n == 1),
     )
     suffix = _target_suffix(message.author, target)
+    status, colour = _protein_status_pair(target_id, total, logged_at)
     try:
         reply = await message.reply(
-            f"🥩 **+{protein_mod.format_grams(grams)}** protein{suffix}"
-            f"{_backdate_label(logged_at)}\n"
-            + _protein_status_for(target_id, total, logged_at)
-            + _streak_suffix(streak)
-            + banner,
+            embed=_log_card(
+                ui.PROTEIN,
+                f"+{protein_mod.format_grams(grams)} protein"
+                f"{suffix}{_backdate_label(logged_at)}",
+                status, colour,
+                author=target, streak=streak, banner=banner,
+            ),
             mention_author=False,
         )
     except discord.HTTPException:
@@ -4226,16 +4279,16 @@ async def _refresh_calorie_reply(
     guild_id = after.guild.id if after.guild else 0
     target_id = int(getattr(target, "id"))
     total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
-    label_part = f" — {note}" if note else ""
     suffix = _target_suffix(after.author, target)
-    body = (
-        f"{ui.FOOD} **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
-        # Today's target, to match the today-scoped total just computed.
-        + _calorie_status_for(target_id, total)
-        + f"\n{ui.subtext(f'{ui.EDIT} updated from an edit')}"
+    # Today's target, to match the today-scoped total just computed.
+    status, colour = _calorie_status_pair(target_id, total)
+    embed = _log_card(
+        ui.FOOD, f"+{calories.format_kcal(kcal)}{suffix}", status, colour,
+        author=target, note=_safe_label(note, limit=64) if note else None,
     )
+    embed.set_footer(text=f"{ui.EDIT} updated from an edit · react ❌ to remove")
     try:
-        await reply_msg.edit(content=body)
+        await reply_msg.edit(content=None, embed=embed)
     except discord.HTTPException:
         pass
 
@@ -4265,15 +4318,15 @@ async def _revive_calorie_reply(
     guild_id = after.guild.id if after.guild else 0
     target_id = int(getattr(target, "id"))
     total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
-    label_part = f" — {note}" if note else ""
     suffix = _target_suffix(after.author, target)
-    body = (
-        f"{ui.FOOD} **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
-        + _calorie_status_for(target_id, total)
-        + f"\n{ui.subtext(f'{ui.EDIT} updated from an edit')}"
+    status, colour = _calorie_status_pair(target_id, total)
+    embed = _log_card(
+        ui.FOOD, f"+{calories.format_kcal(kcal)}{suffix}", status, colour,
+        author=target, note=_safe_label(note, limit=64) if note else None,
     )
+    embed.set_footer(text=f"{ui.EDIT} updated from an edit · react ❌ to remove")
     try:
-        await reply_msg.edit(content=body)
+        await reply_msg.edit(content=None, embed=embed)
     except discord.HTTPException:
         return False
     # Re-arm the ❌ against the *new* entry id — the tracked row still names the
@@ -4331,9 +4384,15 @@ async def _handle_calorie_edit(
                 rm = await after.channel.fetch_message(
                     int(crec["reply_message_id"])
                 )
-                await rm.edit(
-                    content=f"{ui.UNDO} Entry removed (message edited)."
-                )
+                # Replace the card rather than the content — the reply is an
+                # embed now, and setting content alone would leave the old
+                # figures sitting underneath, still coloured as if live.
+                await rm.edit(content=None, embed=ui.card(
+                    f"{ui.FOOD} Entry removed",
+                    description="The message that logged this was edited, so "
+                                "the entry went with it.",
+                    colour=ui.NEUTRAL,
+                ))
                 await rm.clear_reaction("❌")
             except discord.HTTPException:
                 pass
@@ -4580,6 +4639,23 @@ _NUTRITION_REPLY_PREFIXES = (
 )
 
 
+def _is_nutrition_reply(msg: "discord.Message") -> bool:
+    """True when *msg* is one of our nutrition confirmations.
+
+    Checks the embed title as well as the content: the chat replies are cards
+    now, and an embed-only message has an EMPTY ``content``, so a
+    content-only test would silently stop matching every new reply — and ❌
+    would quietly do nothing on all of them. Plain-text replies (the ones
+    already in history, and the slash-command ones) still match on content.
+    """
+    if msg.content.startswith(_NUTRITION_REPLY_PREFIXES):
+        return True
+    for embed in msg.embeds or ():
+        if (embed.title or "").startswith(_NUTRITION_REPLY_PREFIXES):
+            return True
+    return False
+
+
 async def _handle_nutrition_reaction_undo(
     payload: discord.RawReactionActionEvent,
 ) -> None:
@@ -4605,7 +4681,7 @@ async def _handle_nutrition_reaction_undo(
     # already-undone ones whose text now starts with "~~").
     if reply_msg.author.id != (bot.user.id if bot.user else 0):
         return
-    if not reply_msg.content.startswith(_NUTRITION_REPLY_PREFIXES):
+    if not _is_nutrition_reply(reply_msg):
         return
 
     guild_id = payload.guild_id or 0
@@ -4683,13 +4759,21 @@ async def _handle_nutrition_reaction_undo(
     else:
         note = "↩️ Nothing to undo (already removed)."
     # Strike through the original log so the edited message clearly reads as
-    # "removed", then append the confirmation note.
-    struck = "\n".join(
-        f"~~{line}~~" if line.strip() else line
-        for line in reply_msg.content.split("\n")
-    )
+    # "removed", then append the confirmation note. An embed reply is greyed
+    # and restated instead — striking markdown inside a card leaves the tiles
+    # and colour looking live, which reads as though nothing happened.
     try:
-        await reply_msg.edit(content=f"{struck}\n\n{note}")
+        if reply_msg.embeds:
+            old = reply_msg.embeds[0]
+            await reply_msg.edit(embed=ui.card(
+                old.title, description=note, colour=ui.NEUTRAL,
+            ))
+        else:
+            struck = "\n".join(
+                f"~~{line}~~" if line.strip() else line
+                for line in reply_msg.content.split("\n")
+            )
+            await reply_msg.edit(content=f"{struck}\n\n{note}")
     except discord.HTTPException:
         pass
     # Clear the ❌ affordance now that it's done (best-effort).
@@ -6631,7 +6715,7 @@ def _help_sections() -> dict[str, discord.Embed]:
             "Backdate with `yesterday` / `monday` / `3 days ago`\n"
             "`/calories today [user]` · `/calories week [user]`\n"
             "`/calories edit <amount>` — fix your last entry · "
-            "`/calories undo` — remove it (or react ❌ on my reply)\n"
+            "React ❌ on my reply to remove that entry\n"
             "`/calories leaderboard` — longest 🔥 logging streak\n"
             "`/calories remind [time]` — evening DM if you haven't logged\n"
             "`/calories export [user]` — CSVs of calories/protein/bodyweight\n"
@@ -6670,7 +6754,7 @@ def _help_sections() -> dict[str, discord.Embed]:
             "Log both at once: `500c and 40p` (or `0.7x1640kj and 0.7x43p`)\n"
             "`/protein today [user]` · `/protein week [user]`\n"
             "`/protein edit <grams>` — fix your last entry · "
-            "`/protein undo` — remove it\n"
+            "React ❌ on my reply to remove that entry\n"
             "`/protein stop` — stop tracking (history kept)"
         ),
     )
@@ -15779,6 +15863,28 @@ def _reply_label(
     return None
 
 
+def _calorie_status_pair(
+    user_id: int, total: float, logged_at: datetime | None = None,
+) -> tuple[str, discord.Colour]:
+    """:func:`_calorie_status_for` plus the colour a card around it should wear."""
+    resolved = _reply_targets(user_id, logged_at)
+    return _calorie_status(
+        total, resolved.kcal.value or 0.0,
+        resolved.label_for(targets_mod.MACRO_KCAL),
+    )
+
+
+def _protein_status_pair(
+    user_id: int, total: float, logged_at: datetime | None = None,
+) -> tuple[str, discord.Colour]:
+    """:func:`_protein_status_for` plus its card colour."""
+    resolved = _reply_targets(user_id, logged_at)
+    return _protein_status(
+        total, resolved.protein.value or 0.0,
+        resolved.label_for(targets_mod.MACRO_PROTEIN),
+    )
+
+
 def _calorie_status_for(
     user_id: int, total: float, logged_at: datetime | None = None,
 ) -> str:
@@ -16128,6 +16234,20 @@ async def calories_week_cmd(
             logged_days += 1
             target_sum += target_kcal
         rows.append((day_name, total, target_kcal))
+    if not logged_days:
+        # Seven rows of empty track and em dashes is a chart of nothing — say
+        # so instead of drawing it.
+        await interaction.response.send_message(
+            embed=ui.empty(
+                f"Nothing logged this week by "
+                f"{_safe_label(target_user.display_name, limit=32)}",
+                hint="Post an amount in chat — `650`, `650c`, `2700kj` — or "
+                     "use `/calories add`.",
+                cmd="/calories today shows a single day",
+            ),
+            ephemeral=True,
+        )
+        return
     lines = [
         ui.diverging(rows, calories.format_kcal),
         ui.subtext("left of the line = under target · right = over"),
@@ -16160,37 +16280,6 @@ async def calories_week_cmd(
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-@calories_group.command(
-    name="undo",
-    description="Remove your most recent calorie entry.",
-)
-async def calories_undo_cmd(interaction: discord.Interaction) -> None:
-    guild_id = _ctx_guild_id(interaction)
-    row = db.calorie_pop_last(
-        guild_id, interaction.user.id, actor_id=interaction.user.id,
-    )
-    if row is None:
-        await interaction.response.send_message(
-            embed=ui.empty(
-                "Nothing to undo",
-                hint="You have no calorie entries on record.",
-            ),
-            ephemeral=True,
-        )
-        return
-    note_part = f" — {row['note']}" if row["note"] else ""
-    goal = db.calorie_goal_get(guild_id, interaction.user.id)
-    lines = [
-        f"↩️ Removed **{calories.format_kcal(float(row['kcal']))}**{note_part}",
-    ]
-    if goal is not None:
-        total, _n = db.calorie_total_between(
-            guild_id, interaction.user.id, *_today_window(),
-        )
-        lines.append(_calorie_status_for(interaction.user.id, total))
-    await interaction.response.send_message("\n".join(lines))
 
 
 @calories_group.command(
@@ -16905,7 +16994,9 @@ async def calories_label_cmd(
     if kj100 is None and kcal100 is not None:
         kj100 = calories.kcal_to_kj(kcal100)
     name = info.name or "that label"
-    lines = [f"🏷️ **{name}** — per 100 g:"]
+    # Leads with the food icon, not a label glyph: the ❌ handler only acts on
+    # replies whose first character is in _NUTRITION_REPLY_PREFIXES.
+    lines = [f"{ui.FOOD} **{name}** — per 100 g:"]
     if kj100 is not None:
         lines.append(f"• Energy: **{kj100:,.0f} kJ** ({kcal100:,.0f} cal)")
     if info.protein_per_100g is not None:
@@ -16933,7 +17024,7 @@ async def calories_label_cmd(
         )
         return
     note = f"{name} ({grams:g} g, label)" if info.name else f"label ({grams:g} g)"
-    db.calorie_add(
+    cal_id = db.calorie_add(
         guild_id, interaction.user.id, _display_name(interaction.user), kcal,
         note=note, raw=f"label {grams:g}g", logged_at=logged_at,
     )
@@ -16943,8 +17034,9 @@ async def calories_label_cmd(
         if info.protein_per_100g is not None else 0.0
     )
     logged_protein = False
+    pro_id = 0
     if pro_goal is not None and 0 < pro_grams <= _MAX_PROTEIN_ENTRY_G:
-        db.protein_add(
+        pro_id = db.protein_add(
             guild_id, interaction.user.id, _display_name(interaction.user),
             pro_grams, note=note, raw=f"label {grams:g}g", logged_at=logged_at,
         )
@@ -16975,10 +17067,13 @@ async def calories_label_cmd(
                 pro_total, day_targets.protein.value or 0.0, day_label,
             )
         )
-    lines.append(
-        "*Read by AI — `/calories undo` if it misread the label.*"
+    lines.append(ui.subtext(
+        "Read by AI — react ❌ to remove if it misread the label."
+    ))
+    msg = await interaction.followup.send("\n".join(lines))
+    await _attach_undo(
+        None, calorie_id=cal_id, protein_id=pro_id, message=msg,
     )
-    await interaction.followup.send("\n".join(lines))
 
 
 @calories_group.command(
@@ -17489,6 +17584,17 @@ async def protein_week_cmd(
         rows.append((day_name, total, target_g))
     # The legend lives outside the fence — see ui.diverging: an ASCII header
     # can't line up with glyph-padded bar rows.
+    if not logged_days:
+        await interaction.response.send_message(
+            embed=ui.empty(
+                f"Nothing logged this week by "
+                f"{_safe_label(target_user.display_name, limit=32)}",
+                hint="Post an amount in chat — `40p` — or use `/protein add`.",
+                cmd="/protein today shows a single day",
+            ),
+            ephemeral=True,
+        )
+        return
     lines = [
         ui.diverging(rows, protein_mod.format_grams),
         ui.subtext("left of the line = under your max · right = over"),
@@ -17520,37 +17626,6 @@ async def protein_week_cmd(
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-@protein_group.command(
-    name="undo", description="Remove your most recent protein entry.",
-)
-async def protein_undo_cmd(interaction: discord.Interaction) -> None:
-    guild_id = _ctx_guild_id(interaction)
-    row = db.protein_pop_last(
-        guild_id, interaction.user.id, actor_id=interaction.user.id,
-    )
-    if row is None:
-        await interaction.response.send_message(
-            embed=ui.empty(
-                "Nothing to undo",
-                hint="You have no protein entries on record.",
-            ),
-            ephemeral=True,
-        )
-        return
-    note_part = f" — {row['note']}" if row["note"] else ""
-    goal = db.protein_goal_get(guild_id, interaction.user.id)
-    lines = [
-        f"↩️ Removed **{protein_mod.format_grams(float(row['grams']))}** "
-        f"protein{note_part}",
-    ]
-    if goal is not None:
-        total, _n = db.protein_total_between(
-            guild_id, interaction.user.id, *_today_window(),
-        )
-        lines.append(_protein_status_for(interaction.user.id, total))
-    await interaction.response.send_message("\n".join(lines))
 
 
 @protein_group.command(

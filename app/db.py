@@ -4423,7 +4423,7 @@ class Database:
         """Delete the user's most recent intake entry and return it.
 
         Global: undoes the latest entry across **every** server (one shared
-        diary), so `/calories undo` works regardless of where it was logged.
+        diary), so a pop works regardless of where it was logged.
         ``guild_id`` is kept for the audit record but not used to scope the
         lookup."""
         with self._conn() as c:

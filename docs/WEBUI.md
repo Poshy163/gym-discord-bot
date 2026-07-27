@@ -39,7 +39,7 @@ by the bot from gateway events and by the dashboard on every edit. It covers:
   startup backfill settles so re-imports don't flood it:
   - **logs** — lifts, calories, protein logged through normal bot use;
   - **reverts/undos** — when the bot removes an entry (the ❌ reaction undo,
-    `/undo`, `/calories undo`, `/protein undo`), recorded with *who* triggered
+    `/undo`, an edit that removed the amount), recorded with *who* triggered
     it;
   - **goals** — lift goals set/removed, calorie & protein targets set, and
     tracking turned off;

@@ -133,9 +133,11 @@ Calories:
 - `/calories leaderboard` — ranks the server's trackers by current logging
   streak.
 - `/calories edit <amount> [note]` — fix the amount of your most recent entry.
-- `/calories undo` — remove your most recent entry. To remove a *specific*
-  entry instead, react ❌ on the bot's `🍽️ +N cal` reply for it (the logger,
-  the target, or an admin can do this).
+- **Remove an entry:** react ❌ on the bot's `🍎 +N cal` reply for it (the
+  logger, the target, or an admin can do this). Every way of logging —
+  chat posts, saved foods and meals, `/calories add`, `/calories estimate`,
+  `/calories label` — gets that reaction, so it removes exactly the entry you
+  point at rather than whichever happened to be most recent.
 - **Edit to fix:** editing the original chat message updates the stored entry —
   e.g. correcting `1730c` to `1730kj` recomputes the calories; deleting the
   amount removes it.
@@ -191,8 +193,8 @@ A lightweight, separate tracker for keeping protein **under** a daily ceiling
 - `/protein today [user]` · `/protein week [user]` — totals vs your max (with
   your 🔥 logging streak).
 - `/protein edit <grams> [note]` — fix the amount of your most recent entry.
-- `/protein undo` — remove your most recent entry, or react ❌ on the bot's
-  reply to remove that specific one (the logger, the target, or an admin).
+- **Remove an entry:** react ❌ on the bot's reply for it (the logger, the
+  target, or an admin).
 - `/protein stop` — stop tracking (history kept; `setup` re-enables).
 
 **Log both at once:** a message with both amounts — e.g. `500c and 40p` (also
