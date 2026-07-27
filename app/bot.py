@@ -15956,10 +15956,11 @@ async def calories_week_cmd(
     day_targets = targets_mod.resolve_days(
         db.nutrition_target_rows(target_user.id), week,
     )
-    # One fenced block, not a bar-per-line: two adjacent inline-code spans don't
-    # line up (Discord puts a proportional gap between them), so the day column
-    # and the bars only stay in register inside a single monospace fence.
-    rows: list[list[str]] = []
+    # A diverging chart, not a progress bar: scored against a daily target,
+    # most days end up over, and a progress bar pins full for all of them —
+    # going flat exactly where the week is most interesting. Bar length is the
+    # distance from target, so the outlier day is the longest bar.
+    rows: list[tuple[str, float | None, float]] = []
     logged_days = 0
     target_sum = 0.0
     for day in week:
@@ -15967,21 +15968,11 @@ async def calories_week_cmd(
         day_name = _WEEKDAY_NAMES[day.weekday()][:3]
         target_kcal = day_targets[day].kcal.value or 0.0
         total = day_totals.get(key)
-        if total is None:
-            rows.append([day_name, "", "—", ""])
-            continue
-        logged_days += 1
-        target_sum += target_kcal
-        rows.append([
-            day_name,
-            ui.bar(total, target_kcal, width=10),
-            calories.format_kcal(total),
-            ui.over_by(total, target_kcal),
-        ])
-    lines = [ui.table(
-        rows, align="<<>>", headers=["day", "vs target", "total", "over"],
-        max_rows=7,
-    )]
+        if total is not None:
+            logged_days += 1
+            target_sum += target_kcal
+        rows.append((day_name, total, target_kcal))
+    lines = [ui.diverging(rows, calories.format_kcal)]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         avg_target = target_sum / logged_days
@@ -17314,12 +17305,10 @@ async def protein_week_cmd(
     day_targets = targets_mod.resolve_days(
         db.nutrition_target_rows(target_user.id), week,
     )
-    # Same single-fence treatment as /calories week — see the note there.
-    # Going over the max is the signal this tracker exists for, so the last
-    # column says how far over in grams. A bar clamped at full can't show
-    # magnitude, and growing it past full would make every row a different
-    # length and break the alignment the fence is here to provide.
-    rows: list[list[str]] = []
+    # Same diverging chart as /calories week — see the note there. It matters
+    # more here: this tracker exists to catch going *over*, and a clamped
+    # progress bar drew a 5 g overshoot and an 86 g one identically.
+    rows: list[tuple[str, float | None, float]] = []
     logged_days = 0
     target_sum = 0.0
     for day in week:
@@ -17327,21 +17316,14 @@ async def protein_week_cmd(
         day_name = _WEEKDAY_NAMES[day.weekday()][:3]
         target_g = day_targets[day].protein.value or 0.0
         total = day_totals.get(key)
-        if total is None:
-            rows.append([day_name, "", "—", ""])
-            continue
-        logged_days += 1
-        target_sum += target_g
-        rows.append([
-            day_name,
-            ui.bar(total, target_g, width=10),
-            protein_mod.format_grams(total),
-            ui.over_by(total, target_g),
-        ])
-    lines = [ui.table(
-        rows, align="<<>>", headers=["day", "vs max", "total", "over"],
-        max_rows=7,
-    )]
+        if total is not None:
+            logged_days += 1
+            target_sum += target_g
+        rows.append((day_name, total, target_g))
+    # "under"/"over" rather than "under max": the card title and colour already
+    # say this is a ceiling, and a header word wider than the bars would shift
+    # the centre rule off the column the rows draw it on.
+    lines = [ui.diverging(rows, protein_mod.format_grams)]
     if logged_days:
         avg = sum(day_totals.values()) / logged_days
         lines.append(

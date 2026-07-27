@@ -318,6 +318,65 @@ def gauge(score: float, *, width: int = 20) -> str:
     return bar(score, 100, width=width)
 
 
+def diverging(
+    rows: "Sequence[tuple[str, float | None, float]]",
+    fmt: Callable[[float], str],
+    *,
+    width: int = 8,
+    under: str = "under",
+    over: str = "over",
+    total: str = "total",
+) -> str:
+    """A fenced chart of *deviation from target*, growing both ways from a rule.
+
+    ``rows`` is ``(label, value, target)`` per row; a ``value`` of None means
+    nothing was logged that day.
+
+    A plain progress bar is the wrong form for a week of days scored against a
+    target: once most days are over, every bar pins full and the chart goes
+    flat exactly when it should be loudest. Here the bar length is |value -
+    target|, so the outlier day is the longest bar and an on-target day is
+    almost nothing.
+
+    Bars are scaled to the **largest deviation in this set**, which makes the
+    shape maximally readable within one card but not comparable between cards —
+    hence the literal totals in the last column.
+    """
+    body = [r for r in rows]
+    span = max(
+        (abs(v - t) for _l, v, t in body if v is not None and t > 0),
+        default=0.0,
+    )
+    label_w = max((len(l) for l, _v, _t in body), default=0)
+    cells = [fmt(v) for _l, v, _t in body if v is not None]
+    total_w = max((len(c) for c in cells), default=len(total))
+
+    # Clamped to the bar width: a header word longer than the bars would push
+    # the rule off the column the rows put it in, and the whole point of this
+    # chart is that the two sides meet on one vertical line.
+    head = (
+        f"{'':{label_w}}  {under[:width]:>{width}}│{over[:width]:<{width}}"
+        f"  {total:>{total_w}}"
+    )
+    out = [head]
+    for label, value, target in body:
+        if value is None:
+            out.append(
+                f"{label:<{label_w}}  {'':{width}}│{'':{width}}  {'—':>{total_w}}"
+            )
+            continue
+        delta = value - target if target > 0 else 0.0
+        # Any non-zero deviation gets at least one cell, so a day that is over
+        # by a little never renders as if it were exactly on target.
+        n = 0 if not delta or span <= 0 else max(1, round(abs(delta) / span * width))
+        left = (FILL * n).rjust(width) if delta < 0 else " " * width
+        right = (FILL * n).ljust(width) if delta > 0 else " " * width
+        out.append(
+            f"{label:<{label_w}}  {left}│{right}  {fmt(value):>{total_w}}"
+        )
+    return "```\n" + "\n".join(out) + "\n```"
+
+
 def sparkline(values: Sequence[float], *, width: int | None = None) -> str:
     """Eight-level spark. Downsamples by mean so long series still fit."""
     vals = [float(v) for v in values]
@@ -821,6 +880,29 @@ def preview_cases() -> list[tuple[str, list]]:
         block(e, "Today", text)
         samples.append(e)
     cases.append(("Shared meter — target vs ceiling", samples))
+
+    # --- the weekly diverging chart --------------------------------------
+    week_pro = [("Tue", 56), ("Wed", 93), ("Thu", 112), ("Fri", 193),
+                ("Sat", 158), ("Sun", 137), ("Mon", 132)]
+    pro_card = card(
+        f"{PROTEIN} Protein this week",
+        description=diverging([(d, v, 107) for d, v in week_pro], g),
+        colour=score_ceiling(126, 107),
+        footer=f"{STREAK} 35-day logging streak",
+    )
+    week_cal = [("Tue", 1763, 1250), ("Wed", 1286, 1250), ("Thu", 1251, 1250),
+                ("Fri", 2012, 1250), ("Sat", 3392, 2000), ("Sun", 1845, 2000),
+                ("Mon", 1755, 1250)]
+    cal_card = card(
+        f"{FOOD} Calories this week",
+        description=diverging(week_cal, cal),
+        colour=score_target(1901, 1464),
+        footer=f"{STREAK} 40-day logging streak",
+    )
+    cases.append((
+        "Weekly view — bar length is distance from target, not progress to it",
+        [pro_card, cal_card],
+    ))
 
     # --- receipt ---------------------------------------------------------
     text, colour = meter(1850, 2500, cal)

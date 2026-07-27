@@ -523,3 +523,83 @@ def test_help_sections_each_fit_and_cover_every_category():
         assert len(embed) < 2000, f"{name} is {len(embed)}"
     # Discord's Select maxes out at 25 options.
     assert len(sections) <= 25
+
+
+# ---------------------------------------------------------------------------
+# diverging — the weekly chart
+# ---------------------------------------------------------------------------
+
+WEEK = [("Tue", 56), ("Wed", 93), ("Thu", 112), ("Fri", 193),
+        ("Sat", 158), ("Sun", 137), ("Mon", 132)]
+MAXG = 107
+
+
+def _week_rows():
+    return [(d, v, MAXG) for d, v in WEEK]
+
+
+def test_diverging_centre_rule_is_one_vertical_line():
+    """The whole idea is that the two sides meet on a single column. A header
+    word wider than the bars would push the rule off it."""
+    for kwargs in ({}, {"under": "under max", "over": "over max"}):
+        out = ui.diverging(_week_rows(), g, **kwargs)
+        cols = {ln.index("│") for ln in out.splitlines() if "│" in ln}
+        assert len(cols) == 1, f"{kwargs}: rule at columns {cols}"
+
+
+def test_diverging_length_tracks_distance_from_target():
+    """A progress bar pins full once most days are over — going flat exactly
+    where the week is most interesting. Here the outlier is the longest bar."""
+    out = ui.diverging(_week_rows(), g)
+    by_day = {
+        ln.split()[0]: ln for ln in out.splitlines()
+        if ln.split() and ln.split()[0] in dict(WEEK)
+    }
+    fri = by_day["Fri"].count(ui.FILL)     # +86, the worst day
+    sat = by_day["Sat"].count(ui.FILL)     # +51
+    thu = by_day["Thu"].count(ui.FILL)     # +5
+    assert fri > sat > thu >= 1
+    # Under-target days draw on the left of the rule, over-target on the right.
+    tue = by_day["Tue"]
+    assert tue.index(ui.FILL) < tue.index("│")
+    assert by_day["Fri"].index(ui.FILL) > by_day["Fri"].index("│")
+
+
+def test_diverging_gives_a_small_overshoot_at_least_one_cell():
+    """Thu is +5 against a span of 86 — rounding would erase it, and 'a bit
+    over' must not render as 'exactly on target'."""
+    out = ui.diverging(_week_rows(), g)
+    thu = [ln for ln in out.splitlines() if ln.startswith("Thu")][0]
+    assert ui.FILL in thu
+
+
+def test_diverging_exactly_on_target_draws_nothing():
+    out = ui.diverging([("Tue", 107, 107)], g)
+    row = [ln for ln in out.splitlines() if ln.startswith("Tue")][0]
+    assert ui.FILL not in row
+    assert "107 g" in row
+
+
+def test_diverging_handles_unlogged_days_and_absent_targets():
+    out = ui.diverging(
+        [("Tue", 56, 107), ("Wed", None, 107), ("Thu", 90, 0)], g,
+    )
+    wed = [ln for ln in out.splitlines() if ln.startswith("Wed")][0]
+    assert "—" in wed and ui.FILL not in wed
+    # No target set is unscorable, so no bar — but the total still shows.
+    thu = [ln for ln in out.splitlines() if ln.startswith("Thu")][0]
+    assert ui.FILL not in thu and "90 g" in thu
+
+
+def test_diverging_is_fenced_and_survives_an_all_zero_week():
+    out = ui.diverging([("Tue", 0, 0), ("Wed", 0, 0)], g)
+    assert out.startswith("```\n") and out.endswith("\n```")
+    assert ui.FILL not in out          # nothing to deviate from
+
+
+def test_diverging_columns_line_up_with_mixed_number_widths():
+    out = ui.diverging(
+        [("Tue", 1763, 1250), ("Sat", 3392, 2000), ("Sun", 1845, 2000)], cal,
+    )
+    rows = [ln for ln in out.splitlines() if "│" in ln][1:]
+    assert len({len(ln) for ln in rows}) == 1   # every row the same width
