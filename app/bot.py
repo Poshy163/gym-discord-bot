@@ -1947,9 +1947,30 @@ async def _handle_calorie_meal_message(
 _MAX_AI_ESTIMATE_KCAL = 5_000
 
 
-async def _ai_estimate_meal(description: str) -> ai_food.MealEstimate | str:
-    """Run the Gemini meal-estimate prompt off-thread. Returns the estimate or
-    a short user-facing error string."""
+def _estimate_failed(reason: str) -> str:
+    """Prefix a failed-estimate reason without doubling the leading icon.
+
+    ``gemini_client.friendly_message`` already opens with 🤖, so the old
+    f-string rendered "🤖 Couldn't estimate that: 🤖 The AI ...". Parse errors
+    come back without one, hence the check rather than a blanket strip.
+    """
+    reason = (reason or "").strip()
+    if reason.startswith(ui.AI):
+        return f"{ui.AI} Couldn't estimate that — {reason[len(ui.AI):].lstrip()}"
+    return f"{ui.AI} Couldn't estimate that: {reason}"
+
+
+async def _ai_estimate_meal(
+    description: str,
+) -> "ai_food.MealEstimate | str | gemini_client.GeminiError":
+    """Run the Gemini meal-estimate prompt off-thread.
+
+    Returns the estimate, a short user-facing error string (the reply came back
+    but couldn't be parsed), or the :class:`GeminiError` itself when the call
+    failed. Handing back the exception rather than flattening it to prose lets
+    the slash-command path show admins what Google actually said — a rejected
+    key and a garbled reply need very different fixes.
+    """
     try:
         raw = await asyncio.to_thread(
             gemini_client.generate,
@@ -1965,7 +1986,7 @@ async def _ai_estimate_meal(description: str) -> ai_food.MealEstimate | str:
             response_mime_type="application/json",
         )
     except gemini_client.GeminiError as exc:
-        return gemini_client.friendly_message(exc)
+        return exc
     result = ai_food.parse_estimate(raw)
     if isinstance(result, str):
         # Couldn't turn the reply into an estimate — log the raw reply so any
@@ -1994,10 +2015,14 @@ async def _handle_estimate_message(
     except discord.HTTPException:
         pass
     result = await _ai_estimate_meal(description)
-    if isinstance(result, str):
+    if isinstance(result, (str, gemini_client.GeminiError)):
+        reason = (
+            gemini_client.friendly_message(result)
+            if isinstance(result, gemini_client.GeminiError) else result
+        )
         try:
             await message.reply(
-                f"🤖 Couldn't estimate that: {result}", mention_author=False,
+                _estimate_failed(reason), mention_author=False,
             )
         except discord.HTTPException:
             pass
@@ -14797,19 +14822,31 @@ def _ai_error_embed(exc: gemini_client.GeminiError) -> discord.Embed:
     distinct from a "just retry" blip.
     """
     config_problem = (
-        getattr(exc, "status_code", None) in (401, 403)
+        getattr(exc, "status_code", None) in (400, 401, 403, 404)
         or (getattr(exc, "status", None) or "").upper()
-        in ("UNAUTHENTICATED", "PERMISSION_DENIED")
+        in ("UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT",
+            "NOT_FOUND")
         or "configured" in gemini_client.friendly_message(exc)
     )
-    colour = discord.Colour.red() if config_problem else discord.Colour.orange()
-    embed = discord.Embed(
-        title="🤖 AI unavailable",
+    embed = ui.card(
+        f"{ui.AI} AI unavailable",
         description=gemini_client.friendly_message(exc),
-        colour=colour,
+        colour=ui.DANGER if config_problem else ui.WARNING,
+        footer=(
+            "This is usually temporary — give it a moment."
+            if getattr(exc, "retryable", False) else None
+        ),
     )
-    if getattr(exc, "retryable", False):
-        embed.set_footer(text="This is usually temporary — give it a moment.")
+    # A misconfiguration is nobody's fault but the operator's, and only they can
+    # fix it — so give them Google's own wording instead of making them go
+    # trawling container logs for it.
+    if config_problem:
+        ui.block(
+            embed, "For admins",
+            f"`{_safe_label(str(exc), limit=300)}`\n"
+            f"model `{gemini_client.model_name()}` · "
+            f"check the Gemini settings in the dashboard",
+        )
     return embed
 
 
@@ -16589,8 +16626,14 @@ async def calories_estimate_cmd(
         return
     await interaction.response.defer(thinking=True)
     result = await _ai_estimate_meal(description.strip())
+    if isinstance(result, gemini_client.GeminiError):
+        # The card carries Google's own wording in a "For admins" field when
+        # the fault is configuration, so the owner doesn't have to go digging
+        # through container logs to find out the key was rejected.
+        await interaction.followup.send(embed=_ai_error_embed(result))
+        return
     if isinstance(result, str):
-        await interaction.followup.send(f"🤖 Couldn't estimate that: {result}")
+        await interaction.followup.send(_estimate_failed(result))
         return
     if not (0 < result.kcal <= _MAX_AI_ESTIMATE_KCAL):
         await interaction.followup.send(

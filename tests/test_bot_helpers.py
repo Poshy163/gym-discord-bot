@@ -1473,3 +1473,54 @@ def test_busiest_board_bars_are_relative_to_the_top_club():
     board = embed.fields[0].value
     assert ui.FILL * 8 in board            # the busiest club fills its bar
     assert bot._busiest_board_field(ui.card("t"), [], state="SA") is False
+
+
+# ---- AI failure copy ---------------------------------------------------------
+
+def test_estimate_failed_does_not_double_the_robot_icon():
+    """friendly_message already opens with 🤖, so the old f-string rendered
+    "🤖 Couldn't estimate that: 🤖 The AI ..." — which is what the user saw."""
+    import app.bot as bot
+    from app import gemini_client
+
+    friendly = gemini_client.friendly_message(
+        gemini_client.GeminiError("x", status_code=400, status="INVALID_ARGUMENT")
+    )
+    out = bot._estimate_failed(friendly)
+    assert out.count("🤖") == 1, out
+    assert out.startswith("🤖 Couldn't estimate that")
+
+    # A parse failure arrives without an icon and still reads correctly.
+    plain = bot._estimate_failed("that didn't look like food")
+    assert plain == "🤖 Couldn't estimate that: that didn't look like food"
+
+
+def test_ai_error_embed_gives_admins_googles_wording_on_a_config_fault():
+    """A rejected key is 400 INVALID_ARGUMENT. Only the operator can fix it, so
+    the card carries the real message instead of making them read logs."""
+    import app.bot as bot
+    from app import gemini_client, ui
+
+    exc = gemini_client.GeminiError(
+        "API key not valid. Please pass a valid API key.",
+        status_code=400, status="INVALID_ARGUMENT",
+    )
+    embed = bot._ai_error_embed(exc)
+    assert embed.colour == ui.DANGER          # config fault, not a blip
+    admin = [f.value for f in embed.fields if f.name == "For admins"]
+    assert admin and "API key not valid" in admin[0]
+    assert ui.overflows(embed) is None
+
+
+def test_ai_error_embed_stays_amber_and_terse_for_a_transient_blip():
+    import app.bot as bot
+    from app import gemini_client, ui
+
+    exc = gemini_client.GeminiError(
+        "The model is overloaded.", status_code=503, status="UNAVAILABLE",
+        retryable=True,
+    )
+    embed = bot._ai_error_embed(exc)
+    assert embed.colour == ui.WARNING
+    assert not [f for f in embed.fields if f.name == "For admins"]
+    assert "temporary" in embed.footer.text

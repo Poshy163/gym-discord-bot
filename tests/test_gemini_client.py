@@ -336,3 +336,84 @@ def test_friendly_message_maps_max_tokens():
         gemini_client.GeminiError("cut off", status="MAX_TOKENS")
     ).lower()
     assert "cut off" in msg and "try again" in msg
+
+
+# --- diagnosability: the operator must be able to see what actually failed ---
+
+def test_failure_is_logged_with_googles_own_wording(monkeypatch, caplog):
+    """Every call site swaps a GeminiError for short friendly copy and drops
+    the exception, so without a log here the real diagnosis never surfaces and
+    the operator sees only "the AI couldn't process that request"."""
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MAX_RETRIES", "0")
+    monkeypatch.setattr(gemini_client, "MAX_RETRIES", 0)
+    fake = _FakeRequests([
+        _err(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key."),
+    ])
+    monkeypatch.setattr(gemini_client, "requests", fake)
+
+    with caplog.at_level("WARNING", logger="gymbot.gemini"):
+        with pytest.raises(gemini_client.GeminiError):
+            gemini_client.generate("hi")
+
+    logged = caplog.text
+    assert "API key not valid" in logged      # Google's message, verbatim
+    assert "INVALID_ARGUMENT" in logged
+    assert "400" in logged
+
+
+def test_failure_log_never_contains_the_api_key(monkeypatch, caplog):
+    """The key rides in the query string, never the body — and must never end
+    up in a log line either."""
+    secret = "AIzaSuperSecret12345"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.setattr(gemini_client, "MAX_RETRIES", 0)
+    monkeypatch.setattr(
+        gemini_client, "requests",
+        _FakeRequests([_err(403, "PERMISSION_DENIED", "nope")]),
+    )
+    with caplog.at_level("INFO", logger="gymbot.gemini"):
+        with pytest.raises(gemini_client.GeminiError):
+            gemini_client.generate("hi")
+    assert secret not in caplog.text
+
+
+def test_friendly_message_distinguishes_a_rejected_key_from_a_bad_request():
+    """Google reports a rejected key as 400 INVALID_ARGUMENT, not 401, so the
+    old blanket "couldn't process that request" sent operators hunting for a
+    bad prompt when the fault was configuration."""
+    rejected = gemini_client.GeminiError(
+        "API key not valid. Please pass a valid API key.",
+        status_code=400, status="INVALID_ARGUMENT",
+    )
+    other = gemini_client.GeminiError(
+        "Unknown name 'thinkingConfig'", status_code=400,
+        status="INVALID_ARGUMENT",
+    )
+    assert "API key was rejected" in gemini_client.friendly_message(rejected)
+    assert "API key was rejected" not in gemini_client.friendly_message(other)
+    assert "configuration problem" in gemini_client.friendly_message(other)
+
+
+def test_friendly_message_names_a_retired_model():
+    exc = gemini_client.GeminiError(
+        "models/gemini-2.5-flash is not found for API version v1beta",
+        status_code=404, status="NOT_FOUND",
+    )
+    assert "doesn't exist" in gemini_client.friendly_message(exc)
+
+
+def test_every_friendly_message_leads_with_the_ai_icon():
+    """The callers prefix their own context, so a message that dropped the icon
+    (or carried two) would render inconsistently."""
+    for exc in (
+        gemini_client.GeminiError("x", status_code=503, status="UNAVAILABLE"),
+        gemini_client.GeminiError("x", status_code=429),
+        gemini_client.GeminiError("x", status_code=400, status="INVALID_ARGUMENT"),
+        gemini_client.GeminiError("x", status_code=404),
+        gemini_client.GeminiError("GEMINI_API_KEY is not set."),
+        gemini_client.GeminiError("something else entirely"),
+    ):
+        msg = gemini_client.friendly_message(exc)
+        assert msg.startswith("🤖 "), msg
+        assert msg.count("🤖") == 1, msg

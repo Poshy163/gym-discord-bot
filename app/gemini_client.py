@@ -151,13 +151,34 @@ def generate(
             # A config/auth/client error (400/401/403) won't be fixed by a
             # different model, so don't waste the fallback on it.
             if not exc.retryable:
+                _log_failure(mdl, exc)
                 raise
             if i + 1 < len(models):
                 LOG.info(
                     "Gemini model %s unavailable (%s); falling back to %s",
                     mdl, exc.status or exc.status_code or "?", models[i + 1],
                 )
-    raise last_exc or GeminiError("Gemini request failed.")  # pragma: no cover
+    if last_exc is not None:
+        _log_failure(models[-1], last_exc)
+        raise last_exc
+    raise GeminiError("Gemini request failed.")  # pragma: no cover
+
+
+def _log_failure(mdl: str, exc: GeminiError) -> None:
+    """Record what Google actually said before the caller swaps it for friendly
+    copy.
+
+    Every call site turns a :class:`GeminiError` into a short user-facing line
+    and drops the exception, so without this the real diagnosis — a rejected
+    key, a retired model, a malformed field — never reaches the logs and the
+    operator sees only "the AI couldn't process that request". The API key
+    travels in the query string, never in the message body, so nothing secret
+    is logged here.
+    """
+    LOG.warning(
+        "Gemini request failed on %s: status=%s code=%s retryable=%s — %s",
+        mdl, exc.status or "?", exc.status_code or "?", exc.retryable, exc,
+    )
 
 
 def _thinking_budget_for(mdl: str, requested: int | None) -> int:
@@ -352,8 +373,25 @@ def friendly_message(exc: GeminiError) -> str:
             "🤖 The AI isn't set up correctly (API key/permissions). "
             "Let the bot owner know."
         )
+    if code == 404 or status == "NOT_FOUND":
+        return (
+            "🤖 The configured AI model doesn't exist (it may have been "
+            "retired). Let the bot owner know."
+        )
     if code == 400 or status == "INVALID_ARGUMENT":
-        return "🤖 The AI couldn't process that request."
+        # Google reports a rejected key as 400 INVALID_ARGUMENT, not 401 — so
+        # the generic "couldn't process that request" sent operators hunting
+        # for a bad prompt when the actual fault was configuration.
+        detail = str(exc).lower()
+        if "api key" in detail or "api_key" in detail:
+            return (
+                "🤖 The AI's API key was rejected. Let the bot owner know — "
+                "it needs replacing in the dashboard."
+            )
+        return (
+            "🤖 The AI rejected that request. If it keeps happening, let the "
+            "bot owner know — it's a configuration problem, not your input."
+        )
     if status == "MAX_TOKENS":
         return "🤖 The AI's answer got cut off before it finished. Please try again."
     msg = str(exc).lower()
