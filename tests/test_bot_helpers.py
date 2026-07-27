@@ -1524,3 +1524,125 @@ def test_ai_error_embed_stays_amber_and_terse_for_a_transient_blip():
     assert embed.colour == ui.WARNING
     assert not [f for f in embed.fields if f.name == "For admins"]
     assert "temporary" in embed.footer.text
+
+
+# ---- ❌ as the universal removal affordance ----------------------------------
+
+def test_slash_nutrition_replies_match_the_undo_prefix_gate():
+    """A ❌ only does anything if the reply's leading glyph is in the gate. The
+    /calories add and /protein add replies are new entrants to that path, so
+    pin them."""
+    import app.bot as bot
+
+    for reply in (
+        "🍎 Logged **banh mi** = 500 cal",          # /calories add
+        "🥩 Logged **40 g** protein",                # /protein add
+        "🤖 Estimated **large coffee** ≈ 5 cal",     # /calories estimate
+    ):
+        assert reply.startswith(bot._NUTRITION_REPLY_PREFIXES), reply
+
+
+def test_attach_undo_links_rows_to_the_reply_and_adds_the_reaction():
+    """The reaction handler resolves a slash reply by the reply's OWN id — a
+    followup has no reference to a source post — so the rows must carry that id
+    before ❌ can find them."""
+    import app.bot as bot
+
+    calls = {"cal": None, "pro": None, "reaction": None}
+
+    class _Msg:
+        id = 4242
+
+        async def add_reaction(self, emoji):
+            calls["reaction"] = emoji
+
+    class _Interaction:
+        async def original_response(self):
+            return _Msg()
+
+    monkey = {
+        "set_calorie_message_id": lambda cid, mid: calls.__setitem__("cal", (cid, mid)),
+        "set_protein_message_id": lambda pid, mid: calls.__setitem__("pro", (pid, mid)),
+    }
+    real = {k: getattr(bot.db, k) for k in monkey}
+    try:
+        for k, v in monkey.items():
+            setattr(bot.db, k, v)
+        asyncio.run(bot._attach_undo(_Interaction(), calorie_id=7, protein_id=9))
+    finally:
+        for k, v in real.items():
+            setattr(bot.db, k, v)
+
+    assert calls["cal"] == (7, 4242)
+    assert calls["pro"] == (9, 4242)
+    assert calls["reaction"] == "❌"
+
+
+def test_attach_undo_is_a_no_op_without_any_rows():
+    """Nothing was written, so there's nothing to offer removing."""
+    import app.bot as bot
+
+    class _Interaction:
+        async def original_response(self):
+            raise AssertionError("must not fetch the reply when nothing was logged")
+
+    asyncio.run(bot._attach_undo(_Interaction()))
+
+
+def test_attach_undo_survives_a_failed_reply_fetch():
+    """The entry is already saved — a failure here costs the affordance, never
+    the log."""
+    import app.bot as bot
+
+    class _Interaction:
+        async def original_response(self):
+            raise discord.HTTPException(MagicMock(status=404), "gone")
+
+    asyncio.run(bot._attach_undo(_Interaction(), calorie_id=1))
+
+
+def test_ai_estimate_footer_offers_only_the_reaction():
+    """/calories undo pops the most recent calorie row and would leave an AI
+    estimate's paired protein row behind; ❌ removes both, so it's the only
+    removal path the card advertises."""
+    import pathlib
+    import app.bot as bot
+
+    src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+    for line in src.splitlines():
+        if "AI estimate —" in line:
+            assert "❌" in line
+            assert "/calories undo" not in line, line
+
+
+# ---- sub-1-kcal entries -------------------------------------------------------
+
+def test_rounds_to_zero_kcal_catches_amounts_that_display_as_nothing():
+    """`1kj` is 0.239 kcal — it clears a `> 0` guard, gets stored, and then
+    renders as "🍎 +0 cal", an entry claiming to be nothing."""
+    import app.bot as bot
+    from app import calories
+
+    for text in ("1kj", "2kj", "0.5kj"):
+        kcal = calories.parse_chat_message(text)[0]
+        assert calories.format_kcal(kcal) == "0 cal"     # what the user saw
+        assert bot._rounds_to_zero_kcal(kcal), text      # now rejected
+
+    # A real entry, and the boundary, both survive.
+    assert not bot._rounds_to_zero_kcal(calories.parse_chat_message("1c")[0])
+    assert not bot._rounds_to_zero_kcal(0.5)
+    assert not bot._rounds_to_zero_kcal(650)
+    # Zero and negatives are the existing guard's job, not this one.
+    assert not bot._rounds_to_zero_kcal(0)
+    assert not bot._rounds_to_zero_kcal(-5)
+
+
+def test_every_calorie_entry_path_guards_the_rounds_to_zero_case():
+    """Five call sites decide whether to store an amount; a guard missing from
+    any one of them puts a "+0 cal" entry back in the database."""
+    import pathlib
+    import app.bot as bot
+
+    src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+    guarded = src.count("_rounds_to_zero_kcal(kcal)")
+    assert guarded == 5, f"expected 5 guarded paths, found {guarded}"

@@ -1593,6 +1593,17 @@ _ZERO_PROTEIN_QUIPS = (
 )
 
 
+def _rounds_to_zero_kcal(kcal: float) -> bool:
+    """True when an amount is positive but displays as ``0 cal``.
+
+    ``1kj`` is 0.239 kcal: it clears a ``> 0`` guard, gets stored, and then
+    renders as "🍎 +0 cal" — an entry that claims to be nothing. Anything under
+    half a calorie is a typo or a unit mix-up, never a meal, so it's treated the
+    same as a literal zero.
+    """
+    return 0 < kcal < 0.5
+
+
 def _zero_quip(kind: str) -> str:
     """Random cheeky reply for a logged value of exactly zero."""
     pool = _ZERO_PROTEIN_QUIPS if kind == "protein" else _ZERO_CALORIE_QUIPS
@@ -1625,7 +1636,7 @@ async def _handle_calorie_message(
         except discord.HTTPException:
             pass
         return
-    if kcal <= 0:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal):
         try:
             await message.reply(_zero_quip("calories"), mention_author=False)
         except discord.HTTPException:
@@ -1698,7 +1709,7 @@ async def _handle_calorie_food_message(
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     kcal = float(food_row["kcal"]) * servings
-    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
         try:
             await message.reply(
                 f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — skipped.",
@@ -1853,7 +1864,7 @@ async def _handle_calorie_meal_message(
     if goal is None:  # pragma: no cover - _match_calorie_meal already checked
         return
     kcal, grams = _meal_totals(items)
-    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
         try:
             await message.reply(
                 f"**{display}** adds up to {calories.format_kcal(kcal)} — "
@@ -1945,6 +1956,42 @@ async def _handle_calorie_meal_message(
 # marked in the note; a stricter per-entry cap than typed amounts keeps a
 # hallucinated number from wrecking a day's stats.
 _MAX_AI_ESTIMATE_KCAL = 5_000
+
+
+async def _attach_undo(
+    interaction: discord.Interaction,
+    *,
+    calorie_id: int = 0,
+    protein_id: int = 0,
+) -> None:
+    """Link freshly-written nutrition rows to this reply and add the ❌.
+
+    ``_handle_nutrition_reaction_undo`` resolves a slash-command reply by the
+    reply's *own* message id — a followup has no ``reference`` pointing at a
+    source post — so the rows have to carry that id before the reaction can
+    find them. The id isn't known until after the insert, hence the backfill.
+
+    Best-effort throughout: the entry is already saved, so a failure here costs
+    the one-tap affordance, never the log.
+    """
+    if not (calorie_id or protein_id):
+        return
+    try:
+        msg = await interaction.original_response()
+    except discord.HTTPException:
+        return
+    try:
+        if calorie_id:
+            db.set_calorie_message_id(calorie_id, msg.id)
+        if protein_id:
+            db.set_protein_message_id(protein_id, msg.id)
+    except Exception:  # pragma: no cover - defensive; never fail a logged entry
+        LOG.exception("Failed to link nutrition entry to reply %s", msg.id)
+        return
+    try:
+        await msg.add_reaction("❌")
+    except discord.HTTPException:
+        pass
 
 
 def _estimate_failed(reason: str) -> str:
@@ -2105,7 +2152,9 @@ async def _log_ai_estimate(
                 pro_total, day_targets.protein.value or 0.0, day_label,
             )
         )
-    lines.append("*AI estimate — ❌ to remove, `/calories edit` to correct.*")
+    lines.append(ui.subtext(
+        "AI estimate — react ❌ to remove, `/calories edit` to correct."
+    ))
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
@@ -3531,7 +3580,7 @@ def _backfill_calorie_entry(msg: discord.Message, target: object, content: str) 
     if hit is None:
         return False
     kcal, _unit, note = hit
-    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
         return False
     guild_id = msg.guild.id if msg.guild else 0
     target_id = int(getattr(target, "id"))
@@ -4191,6 +4240,55 @@ async def _refresh_calorie_reply(
         pass
 
 
+async def _revive_calorie_reply(
+    after: discord.Message, target: object, goal: sqlite3.Row,
+    kcal: float, note: str | None, *, entry_id: int,
+) -> bool:
+    """Re-point this message's existing reply at a newly re-created entry.
+
+    Returns False when there's no reply to reuse, so the caller posts a fresh
+    one. Used when an edit removed the entry and a later edit brought it back:
+    the reply is still on screen reading "Entry removed", so it should become
+    the new confirmation rather than gaining a sibling.
+    """
+    crec = db.get_calorie_reply_by_original(after.id)
+    if crec is None:
+        return False
+    reply_id = int(crec["reply_message_id"])
+    try:
+        reply_msg = await after.channel.fetch_message(reply_id)
+    except discord.HTTPException:
+        # Reply deleted — drop the stale row so it can't strand a future edit.
+        db.delete_calorie_reply(reply_id)
+        return False
+
+    guild_id = after.guild.id if after.guild else 0
+    target_id = int(getattr(target, "id"))
+    total, _n = db.calorie_total_between(guild_id, target_id, *_today_window())
+    label_part = f" — {note}" if note else ""
+    suffix = _target_suffix(after.author, target)
+    body = (
+        f"{ui.FOOD} **+{calories.format_kcal(kcal)}**{label_part}{suffix}\n"
+        + _calorie_status_for(target_id, total)
+        + f"\n{ui.subtext(f'{ui.EDIT} updated from an edit')}"
+    )
+    try:
+        await reply_msg.edit(content=body)
+    except discord.HTTPException:
+        return False
+    # Re-arm the ❌ against the *new* entry id — the tracked row still names the
+    # deleted one, so without this the reaction would find nothing to remove.
+    db.delete_calorie_reply(reply_id)
+    db.track_calorie_reply(
+        reply_id, guild_id, after.author.id, target_id, entry_id, after.id,
+    )
+    try:
+        await reply_msg.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+    return True
+
+
 async def _handle_calorie_edit(
     after: discord.Message, target: object, content: str,
 ) -> bool:
@@ -4224,12 +4322,18 @@ async def _handle_calorie_edit(
         )
         crec = db.get_calorie_reply_by_original(after.id)
         if crec is not None:
-            db.delete_calorie_reply(int(crec["reply_message_id"]))
+            # The tracking row stays. It's the only link back to this reply,
+            # and editing the message again — to a valid amount — needs to find
+            # it rather than post a second reply beneath the first. The entry it
+            # points at is gone, which the ❌ handler already copes with: the
+            # delete returns nothing and it says "already removed".
             try:
                 rm = await after.channel.fetch_message(
                     int(crec["reply_message_id"])
                 )
-                await rm.edit(content="↩️ Entry removed (message edited).")
+                await rm.edit(
+                    content=f"{ui.UNDO} Entry removed (message edited)."
+                )
                 await rm.clear_reaction("❌")
             except discord.HTTPException:
                 pass
@@ -4242,7 +4346,7 @@ async def _handle_calorie_edit(
     kcal, _unit, note = new_hit  # type: ignore[misc]
     if goal is None:
         return existing is not None  # can't log without a target
-    if kcal <= 0 or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
         return True  # ignore implausible edits
 
     if existing is None:
@@ -4253,6 +4357,19 @@ async def _handle_calorie_edit(
             actor_id=after.author.id,
             actor_name=_display_name(after.author),
         )
+        # Reuse the reply we already posted for this message if it's still
+        # around. Editing through an unparseable value and back — `1kj` → `2k`
+        # → `2kj` — lands here with the first reply sitting right above,
+        # already reading "Entry removed"; posting a second one leaves two bot
+        # messages for one post, only one of them true.
+        if await _revive_calorie_reply(
+            after, target, goal, kcal, note, entry_id=entry_id,
+        ):
+            try:
+                await after.add_reaction("✏️")
+            except discord.HTTPException:
+                pass
+            return True
         await _reply_calorie_logged(
             after, target, goal, kcal, note, entry_id=entry_id,
         )
@@ -15874,7 +15991,7 @@ async def calories_add_cmd(
             ephemeral=True,
         )
         return
-    db.calorie_add(
+    cal_id = db.calorie_add(
         guild_id, interaction.user.id, _display_name(interaction.user),
         kcal, note=note, raw=amount.strip(), logged_at=logged_at,
     )
@@ -15888,7 +16005,9 @@ async def calories_add_cmd(
         f"{_backdate_label(logged_at)}\n"
         + _calorie_status_for(interaction.user.id, total, logged_at)
         + _streak_suffix(_calorie_streak(interaction.user.id))
+        + "\n" + ui.subtext("react ❌ to remove")
     )
+    await _attach_undo(interaction, calorie_id=cal_id)
 
 
 @calories_group.command(
@@ -16685,10 +16804,9 @@ async def calories_estimate_cmd(
                 pro_total, day_targets.protein.value or 0.0, day_label,
             )
         )
-    lines.append(
-        "*AI estimate — ❌ or `/calories undo` to remove, "
-        "`/calories edit` to correct.*"
-    )
+    lines.append(ui.subtext(
+        "AI estimate — react ❌ to remove, `/calories edit` to correct."
+    ))
     msg = await interaction.followup.send("\n".join(lines))
     # Link the entries to this reply so a ❌ reaction (from the logger or an
     # admin) removes them, then add the affordance. The followup id isn't known
@@ -17241,7 +17359,7 @@ async def protein_add_cmd(
             ephemeral=True,
         )
         return
-    db.protein_add(
+    pro_id = db.protein_add(
         guild_id, interaction.user.id, _display_name(interaction.user),
         amount, note=note, raw=grams.strip(), logged_at=logged_at,
     )
@@ -17250,11 +17368,14 @@ async def protein_add_cmd(
     )
     note_part = f" — {note}" if note else ""
     await interaction.response.send_message(
-        f"🥩 Logged **{protein_mod.format_grams(amount)}** protein{note_part}"
+        f"{ui.PROTEIN} Logged **{protein_mod.format_grams(amount)}** "
+        f"protein{note_part}"
         f"{_backdate_label(logged_at)}\n"
         + _protein_status_for(interaction.user.id, total, logged_at)
         + _streak_suffix(_protein_streak(interaction.user.id))
+        + "\n" + ui.subtext("react ❌ to remove")
     )
+    await _attach_undo(interaction, protein_id=pro_id)
 
 
 @protein_group.command(
