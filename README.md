@@ -125,7 +125,8 @@ Calories:
   an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and
   combined posts; the reply notes the day it landed on. The slash commands take
   it too: `/calories add 650 day:yesterday`, `/protein add 40 day:monday`.
-- `/calories today [user]` — today's entries and total vs today's target.
+- `/today [user]` — today's entries and totals vs today's targets, calories and
+  protein together in one card (whichever of the two you track).
 - `/calories week [user]` — per-day totals for the last 7 days (with your 🔥
   logging streak). Each day is measured against the target that was live on
   that day; with weekday/weekend targets the footer also breaks out weekday and
@@ -190,8 +191,8 @@ A lightweight, separate tracker for keeping protein **under** a daily ceiling
   bot reacts ✅ and replies with your running total vs your max (with a ⚠️ once
   you're over). An explicit `p`/`protein` marker is required, so a bare number
   or a `40kg` lift is never mistaken for protein.
-- `/protein today [user]` · `/protein week [user]` — totals vs your max (with
-  your 🔥 logging streak).
+- `/today [user]` · `/protein week [user]` — totals vs your max (with your 🔥
+  logging streak). `/today` covers calories and protein in a single card.
 - `/protein edit <grams> [note]` — fix the amount of your most recent entry.
 - **Remove an entry:** react ❌ on the bot's reply for it (the logger, the
   target, or an admin).

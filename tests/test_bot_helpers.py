@@ -1714,3 +1714,106 @@ def test_log_card_footer_always_advertises_the_reaction():
     assert "streak" not in bot._log_card(
         ui.FOOD, "x", "s", ui.SUCCESS, streak=1,
     ).footer.text
+
+
+# ---- /today — the merged calories+protein day card ---------------------------
+# It replaced /calories today and /protein today. The merge introduced two ways
+# to be wrong that neither single-macro command could be, so both are guarded
+# here: scoring a card that shows two macros at once, and rendering a macro the
+# member doesn't track.
+
+_CAL_GOAL = {"daily_target_kcal": 2500.0, "label": None, "split": False}
+_PRO_GOAL = {"daily_target_g": 180.0, "label": None, "split": False}
+
+
+def _run_today(monkeypatch, *, cal_goal, pro_goal, cal=(), pro=()):
+    """Invoke /today against stubbed goals and entries; return the sent kwargs."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_deny_channel_outsider", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot.db, "calorie_goal_get", lambda g, u, day=None: cal_goal)
+    monkeypatch.setattr(bot.db, "protein_goal_get", lambda g, u, day=None: pro_goal)
+    monkeypatch.setattr(bot.db, "calorie_entries_between", lambda g, u, a, z: list(cal))
+    monkeypatch.setattr(bot.db, "protein_entries_between", lambda g, u, a, z: list(pro))
+    monkeypatch.setattr(bot, "_calorie_streak", lambda u: 5)
+    monkeypatch.setattr(bot, "_protein_streak", lambda u: 3)
+
+    interaction = MagicMock()
+    interaction.user.id = 4242
+    interaction.guild_id = 7
+    interaction.response.send_message = AsyncMock()
+    asyncio.run(bot.today_cmd.callback(interaction, None))
+    return interaction.response.send_message.call_args.kwargs
+
+
+def _entry(key, value, note="x"):
+    return {"logged_at": "2026-06-28T02:00:00+00:00", key: value, "note": note}
+
+
+def test_today_refuses_privately_when_nothing_is_tracked(monkeypatch):
+    """Neither macro on: one combined empty state, ephemeral. Falling back to
+    either per-macro embed would tell a would-be protein tracker to set
+    calories."""
+    kwargs = _run_today(monkeypatch, cal_goal=None, pro_goal=None)
+
+    assert kwargs["ephemeral"] is True
+    assert "calories or protein" in kwargs["embed"].title
+
+
+def test_today_card_takes_the_more_alarming_of_the_two_colours(monkeypatch):
+    """The merge's headline risk: calories on target (SUCCESS) next to a
+    breached protein ceiling (DANGER) must not paint the card green on the exact
+    day the ceiling tracker exists to catch."""
+    from app import ui
+
+    kwargs = _run_today(
+        monkeypatch, cal_goal=_CAL_GOAL, pro_goal=_PRO_GOAL,
+        cal=[_entry("kcal", 2400.0)], pro=[_entry("grams", 260.0)],
+    )
+
+    assert kwargs["embed"].colour == ui.DANGER
+
+
+def test_today_omits_the_macro_that_is_not_tracked(monkeypatch):
+    """Protein-only trackers get a protein card, not a half-empty one reading
+    '0 cal / 0 cal' — and the title wears their macro's icon, not the apple."""
+    from app import ui
+
+    embed = _run_today(
+        monkeypatch, cal_goal=None, pro_goal=_PRO_GOAL,
+        pro=[_entry("grams", 45.0)],
+    )["embed"]
+
+    assert embed.title.startswith(ui.PROTEIN)
+    assert not any(ui.FOOD in f.name for f in embed.fields)
+    assert [f.name for f in embed.fields] == [
+        f"{ui.PROTEIN} Protein", f"{ui.PROTEIN} Entries",
+    ]
+
+
+def test_today_names_each_streak_only_when_both_macros_are_on(monkeypatch):
+    """Two independent streaks in one footer need labels; one doesn't, and keeps
+    the wording the single-macro cards used."""
+    both = _run_today(
+        monkeypatch, cal_goal=_CAL_GOAL, pro_goal=_PRO_GOAL,
+    )["embed"]
+    assert "calorie streak" in both.footer.text
+    assert "protein streak" in both.footer.text
+
+    one = _run_today(monkeypatch, cal_goal=_CAL_GOAL, pro_goal=None)["embed"]
+    assert one.footer.text == "🔥 5 days logging streak"
+
+
+def test_today_survives_a_heavy_day_on_both_macros(monkeypatch):
+    """Meter and entry list sit in separate fields precisely so a long day can't
+    breach the 1024-char field limit and get clipped mid-fence."""
+    from app import ui
+
+    embed = _run_today(
+        monkeypatch, cal_goal=_CAL_GOAL, pro_goal=_PRO_GOAL,
+        cal=[_entry("kcal", 1234.0, "a fairly long note here")] * 30,
+        pro=[_entry("grams", 44.0, "another longish note x")] * 30,
+    )["embed"]
+
+    assert ui.overflows(embed) is None

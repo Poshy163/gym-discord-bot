@@ -4921,7 +4921,7 @@ def _nothing_logged_embed(
         return ui.empty(
             f"You haven't logged any {macro} this week",
             hint=f"Log some and it'll show up here — {how}.",
-            cmd=f"/{macro} today shows a single day",
+            cmd="/today shows a single day",
         )
     return ui.empty(
         f"{_safe_label(_display_name(target), limit=32)} hasn't logged any "
@@ -6735,7 +6735,8 @@ def _help_sections() -> dict[str, discord.Embed]:
             "Label maths: `0.7x1640kj` = 0.7 × 1640 kJ (per-100g label, ate "
             "70g) — same idea for protein: `0.7x43p`\n"
             "Backdate with `yesterday` / `monday` / `3 days ago`\n"
-            "`/calories today [user]` · `/calories week [user]`\n"
+            "`/today [user]` — today's calories *and* protein in one card · "
+            "`/calories week [user]`\n"
             "`/calories edit <amount>` — fix your last entry · "
             "React ❌ on my reply to remove that entry\n"
             "`/calories leaderboard` — longest 🔥 logging streak\n"
@@ -6774,7 +6775,8 @@ def _help_sections() -> dict[str, discord.Embed]:
             "Or just type `40p` / `40g protein` in chat\n"
             "Label maths: `0.7x43p` logs 0.7 × 43 g (per-100g label, ate 70g)\n"
             "Log both at once: `500c and 40p` (or `0.7x1640kj and 0.7x43p`)\n"
-            "`/protein today [user]` · `/protein week [user]`\n"
+            "`/today [user]` — today's protein *and* calories in one card · "
+            "`/protein week [user]`\n"
             "`/protein edit <grams>` — fix your last entry · "
             "React ❌ on my reply to remove that entry\n"
             "`/protein stop` — stop tracking (history kept)"
@@ -15975,7 +15977,7 @@ async def calories_setup_cmd(
     await interaction.response.send_message(
         f"{head}\n"
         "Log what you eat with `/calories add` (kcal or kJ — I'll convert), "
-        "check in with `/calories today`, and you'll be included in the "
+        "check in with `/today`, and you'll be included in the "
         "Sunday weekly report."
     )
 
@@ -16044,7 +16046,7 @@ async def calories_targets_cmd(
 )
 @app_commands.describe(
     amount='Energy ("650", "650c", "2700kj") or a saved food ("coffee", "2 coffee").',
-    note="What it was (optional, shows in /calories today).",
+    note="What it was (optional, shows in /today).",
     day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
 async def calories_add_cmd(
@@ -16116,74 +16118,6 @@ async def calories_add_cmd(
         + "\n" + ui.subtext("react ❌ to remove")
     )
     await _attach_undo(interaction, calorie_id=cal_id)
-
-
-@calories_group.command(
-    name="today",
-    description="Show today's calorie intake vs the daily target.",
-)
-@app_commands.describe(user="The member to look up (defaults to you).")
-async def calories_today_cmd(
-    interaction: discord.Interaction,
-    user: discord.Member | None = None,
-) -> None:
-    target_user = user or interaction.user
-    if await _deny_invisible_target(interaction, target_user):
-        return
-    if await _deny_channel_outsider(interaction, target_user):
-        return
-    guild_id = _ctx_guild_id(interaction)
-    goal = db.calorie_goal_get(guild_id, target_user.id)
-    if goal is None:
-        await interaction.response.send_message(
-            embed=_calories_not_set_embed(
-                None if target_user == interaction.user
-                else target_user.display_name
-            ),
-            ephemeral=True,
-        )
-        return
-    entries = db.calorie_entries_between(
-        guild_id, target_user.id, *_today_window(),
-    )
-    total = sum(float(r["kcal"]) for r in entries)
-    status, colour = _calorie_status(
-        total, float(goal["daily_target_kcal"]), goal["label"],
-    )
-    streak = _calorie_streak(target_user.id)
-    embed = ui.card(
-        f"{ui.FOOD} Calories today",
-        description=status,
-        colour=colour,
-        member=target_user,
-        footer=(
-            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
-            if streak >= 2 else None
-        ),
-    )
-    if entries:
-        # The day's entries as one fence so the times and amounts line up. The
-        # heaviest logger here averages 11 entries a day and peaks at 17, so
-        # this list is routinely long enough for alignment to matter.
-        rows = []
-        for r in entries:
-            dt = datetime.fromisoformat(r["logged_at"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            rows.append([
-                dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
-                calories.format_kcal(float(r["kcal"])),
-                _safe_label(r["note"] or "", limit=24) if r["note"] else "",
-            ])
-        ui.block(
-            embed, ui.plural(len(entries), "entry", "entries"),
-            ui.table(rows, align="<>", max_rows=20),
-        )
-    else:
-        ui.block(embed, "Entries", "Nothing logged yet today.")
-    await interaction.response.send_message(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-    )
 
 
 @calories_group.command(
@@ -17415,7 +17349,7 @@ async def protein_setup_cmd(
     await interaction.response.send_message(
         f"{head}{unlink_note}\n"
         "Log it with `/protein add <grams>` or just type `40p` in chat, and "
-        "check in with `/protein today`. I'll flag when you go over."
+        "check in with `/today`. I'll flag when you go over."
     )
 
 
@@ -17424,7 +17358,7 @@ async def protein_setup_cmd(
 )
 @app_commands.describe(
     grams='Grams of protein, e.g. "40".',
-    note="What it was (optional, shows in /protein today).",
+    note="What it was (optional, shows in /today).",
     day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
 async def protein_add_cmd(
@@ -17472,69 +17406,6 @@ async def protein_add_cmd(
         + "\n" + ui.subtext("react ❌ to remove")
     )
     await _attach_undo(interaction, protein_id=pro_id)
-
-
-@protein_group.command(
-    name="today", description="Show today's protein vs your daily max.",
-)
-@app_commands.describe(user="The member to look up (defaults to you).")
-async def protein_today_cmd(
-    interaction: discord.Interaction, user: discord.Member | None = None,
-) -> None:
-    target_user = user or interaction.user
-    if await _deny_invisible_target(interaction, target_user):
-        return
-    if await _deny_channel_outsider(interaction, target_user):
-        return
-    guild_id = _ctx_guild_id(interaction)
-    goal = db.protein_goal_get(guild_id, target_user.id)
-    if goal is None:
-        await interaction.response.send_message(
-            embed=_protein_not_set_embed(
-                None if target_user == interaction.user
-                else target_user.display_name
-            ),
-            ephemeral=True,
-        )
-        return
-    entries = db.protein_entries_between(
-        guild_id, target_user.id, *_today_window(),
-    )
-    total = sum(float(r["grams"]) for r in entries)
-    status, colour = _protein_status(
-        total, float(goal["daily_target_g"]), goal["label"],
-    )
-    streak = _protein_streak(target_user.id)
-    embed = ui.card(
-        f"{ui.PROTEIN} Protein today",
-        description=status,
-        colour=colour,
-        member=target_user,
-        footer=(
-            f"{ui.STREAK} {ui.plural(streak, 'day')} logging streak"
-            if streak >= 2 else None
-        ),
-    )
-    if entries:
-        rows = []
-        for r in entries:
-            dt = datetime.fromisoformat(r["logged_at"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            rows.append([
-                dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
-                protein_mod.format_grams(float(r["grams"])),
-                _safe_label(r["note"] or "", limit=24) if r["note"] else "",
-            ])
-        ui.block(
-            embed, ui.plural(len(entries), "entry", "entries"),
-            ui.table(rows, align="<>", max_rows=20),
-        )
-    else:
-        ui.block(embed, "Entries", "Nothing logged yet today.")
-    await interaction.response.send_message(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
-    )
 
 
 @protein_group.command(
@@ -17698,6 +17569,168 @@ async def protein_stop_cmd(interaction: discord.Interaction) -> None:
 
 
 bot.tree.add_command(protein_group)
+
+
+# ---------------------------------------------------------------------------
+# /today — the day's nutrition, both macros, one card
+# ---------------------------------------------------------------------------
+# Top-level rather than under either group because it belongs to neither.
+# "How's my day going?" is one question, and answering it used to mean running
+# /calories today *and* /protein today and reading two cards side by side —
+# after first guessing which group the answer lived under. Defined below both
+# groups so every per-macro helper it borrows is already in scope.
+
+#: Severity order for a card that scores more than one macro at once. The day
+#: is only as good as its worst macro, so a breached protein ceiling (DANGER)
+#: has to outrank calories sitting neatly on target (SUCCESS) — otherwise the
+#: rail goes green on the exact day the tracker exists to catch.
+_STATUS_SEVERITY = (ui.SUCCESS, ui.BRAND, ui.WARNING, ui.DANGER)
+
+
+def _worst_colour(colours: Sequence[discord.Colour]) -> discord.Colour:
+    """The most alarming colour in ``colours`` — see :data:`_STATUS_SEVERITY`.
+
+    An unranked colour sorts lowest rather than raising: a new scorer colour
+    should quietly not win the card, not break the command.
+    """
+    return max(
+        colours,
+        key=lambda c: _STATUS_SEVERITY.index(c) if c in _STATUS_SEVERITY else 0,
+        default=ui.BRAND,
+    )
+
+
+def _nutrition_not_set_embed(name: str | None = None) -> discord.Embed:
+    """Neither macro tracked. Neither per-macro not-set embed can serve here:
+    picking one would tell a would-be protein tracker to set calories."""
+    if name is not None:
+        return ui.empty(f"{_safe_label(name, limit=32)} isn't tracking nutrition")
+    return ui.empty(
+        "You're not tracking calories or protein yet",
+        hint="Set a daily calorie target, a daily protein max, or both — "
+             "`/today` then scores the day against whichever you keep.",
+        cmd="/calories setup <target> · /protein setup <grams>",
+    )
+
+
+def _today_entry_table(entries: Sequence[sqlite3.Row], column: str, fmt) -> str:
+    """The day's entries as one fence so times and amounts line up. The heaviest
+    logger here averages 11 entries a day and peaks at 17, so this list is
+    routinely long enough for alignment to matter.
+
+    One fence per macro, never a merged one: the amounts are in different units,
+    so a shared table would need a unit column on every row.
+    """
+    rows = []
+    for r in entries:
+        dt = datetime.fromisoformat(r["logged_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        rows.append([
+            dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
+            fmt(float(r[column])),
+            _safe_label(r["note"] or "", limit=24) if r["note"] else "",
+        ])
+    return ui.table(rows, align="<>", max_rows=20)
+
+
+@bot.tree.command(
+    name="today",
+    description="Today's calories and protein against your daily targets.",
+)
+@app_commands.describe(user="The member to look up (defaults to you).")
+async def today_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+) -> None:
+    target_user = user or interaction.user
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
+    cal_goal = db.calorie_goal_get(guild_id, target_user.id)
+    pro_goal = db.protein_goal_get(guild_id, target_user.id)
+    if cal_goal is None and pro_goal is None:
+        await interaction.response.send_message(
+            embed=_nutrition_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
+        )
+        return
+
+    start_iso, end_iso = _today_window()
+    # One section per macro the member actually keeps. An untracked macro
+    # contributes nothing at all — a half-card reading "0 g / 0 g" looks like a
+    # broken tracker rather than an optional feature left switched off, and
+    # protein being off is the common case.
+    sections: list[tuple[str, str, str, str]] = []
+    colours: list[discord.Colour] = []
+    streaks: list[tuple[str, int]] = []
+
+    if cal_goal is not None:
+        entries = db.calorie_entries_between(
+            guild_id, target_user.id, start_iso, end_iso,
+        )
+        total = sum(float(r["kcal"]) for r in entries)
+        status, colour = _calorie_status(
+            total, float(cal_goal["daily_target_kcal"]), cal_goal["label"],
+        )
+        colours.append(colour)
+        sections.append((
+            ui.FOOD, "Calories", status,
+            _today_entry_table(entries, "kcal", calories.format_kcal),
+        ))
+        streaks.append(("calorie", _calorie_streak(target_user.id)))
+
+    if pro_goal is not None:
+        entries = db.protein_entries_between(
+            guild_id, target_user.id, start_iso, end_iso,
+        )
+        total = sum(float(r["grams"]) for r in entries)
+        status, colour = _protein_status(
+            total, float(pro_goal["daily_target_g"]), pro_goal["label"],
+        )
+        colours.append(colour)
+        sections.append((
+            ui.PROTEIN, "Protein", status,
+            _today_entry_table(entries, "grams", protein_mod.format_grams),
+        ))
+        streaks.append(("protein", _protein_streak(target_user.id)))
+
+    # The two streaks are independent — calories logged every day and protein
+    # logged sporadically is a normal pattern — so they're named whenever both
+    # macros are on. One macro keeps the older unqualified wording.
+    named = len(streaks) > 1
+    footer = " · ".join(
+        f"{ui.STREAK} {ui.plural(n, 'day')} "
+        f"{name if named else 'logging'} streak"
+        for name, n in streaks if n >= 2
+    )
+    embed = ui.card(
+        # The apple is the nutrition headline, but a protein-only tracker
+        # shouldn't be handed a card titled with a food they aren't counting.
+        f"{sections[0][0]} Today",
+        colour=_worst_colour(colours),
+        member=target_user,
+        footer=footer or None,
+    )
+    for icon, heading, status, entry_table in sections:
+        ui.block(embed, f"{icon} {heading}", status)
+        # Meter and entries stay in separate fields: together they can pass the
+        # 1024-char field limit, and ui.fit would then clip mid-fence and leave
+        # an unclosed ``` that eats the rest of the card. The icon repeats on
+        # the entries heading because with both macros on, four stacked fields
+        # make "Entries" alone ambiguous about which list it belongs to.
+        ui.block(
+            embed, f"{icon} Entries",
+            entry_table or "Nothing logged yet today.",
+        )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 # Exit codes the supervisor reads to explain a stopped bot in plain English
