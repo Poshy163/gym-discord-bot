@@ -1820,3 +1820,308 @@ def test_today_survives_a_heavy_day_on_both_macros(monkeypatch):
     )["embed"]
 
     assert ui.overflows(embed) is None
+
+
+# ---- /estimate: one AI entry point for words and photos ----------------------
+#
+# /calories estimate and /calories label used to split this job by input type,
+# which asked people to know in advance which kind of photo they were about to
+# take. The merged command routes on what the model saw instead, so the tests
+# that matter are the routing ones.
+
+class _FakeAttachment:
+    def __init__(self, content_type="image/jpeg", size=1024, filename="food.jpg"):
+        self.content_type = content_type
+        self.size = size
+        self.filename = filename
+
+    async def read(self):
+        return b"\xff\xd8\xff"
+
+
+def test_caption_serving_g_reuses_the_text_scale_token():
+    """`~110g` with a photo means the same thing as `110g` after a label's
+    numbers — one way to say a serving, not two."""
+    import app.bot as bot
+
+    assert bot._caption_serving_g("110g") == pytest.approx(110.0)
+    assert bot._caption_serving_g("110 g") == pytest.approx(110.0)
+    assert bot._caption_serving_g("x1.1") == pytest.approx(110.0)
+    # No serving stated → nothing to scale by.
+    assert bot._caption_serving_g("chicken and rice") is None
+    assert bot._caption_serving_g("") is None
+    # A caption that contradicts itself is refused, not guessed at.
+    assert bot._caption_serving_g("110g 120g") is None
+
+
+def test_photo_problem_gates_what_reaches_the_vision_model():
+    import app.bot as bot
+
+    assert bot._photo_problem(_FakeAttachment()) is None
+    assert bot._photo_problem(_FakeAttachment(content_type="video/mp4"))
+    assert bot._photo_problem(_FakeAttachment(size=11 * 1024 * 1024))
+    # _first_photo skips the unusable ones rather than failing the message.
+    pick = bot._first_photo([
+        _FakeAttachment(content_type="application/pdf"),
+        _FakeAttachment(filename="ok.png", content_type="image/png"),
+    ])
+    assert pick is not None and pick.filename == "ok.png"
+    assert bot._first_photo([]) is None
+    assert bot._first_photo([_FakeAttachment(content_type="text/plain")]) is None
+
+
+def test_label_howto_hands_back_a_line_you_can_retype():
+    """A transcription is worth keeping even when we can't log it yet, and the
+    scale token means the answer is one line for any weight rather than a sum."""
+    import app.bot as bot
+    from app.ai_food import LabelInfo
+
+    line = bot._label_howto(LabelInfo(
+        kj_per_100g=895.0, kcal_per_100g=None, protein_per_100g=14.7,
+        serving_g=110.0, name="Peanut butter",
+    ))
+    assert "`895kj 14.7p 110g`" in line
+    # No stated serving → a worked example, still valid syntax.
+    line = bot._label_howto(LabelInfo(
+        kj_per_100g=895.0, kcal_per_100g=None, protein_per_100g=None,
+        serving_g=None, name=None,
+    ))
+    assert "`895kj 110g`" in line
+    # Nothing to log against at all.
+    assert bot._label_howto(LabelInfo(None, None, 20.0, None, None)) is None
+
+
+def _stub_store(monkeypatch):
+    """Replace the storage helper with a recorder — these tests are about which
+    branch runs, not the DB writes, which _store_ai_nutrition owns."""
+    import app.bot as bot
+
+    seen = {}
+
+    def _fake(guild_id, target, kcal, protein_g, **kw):
+        seen.update(kcal=kcal, protein_g=protein_g, **kw)
+        return 11, 22, ["**X cal**", "**Y g** protein"], ["meter"]
+
+    monkeypatch.setattr(bot, "_store_ai_nutrition", _fake)
+    return seen
+
+
+def test_photo_label_outcome_transcribes_without_a_serving(monkeypatch):
+    """Most panel photos arrive before you've said how much you ate. That's the
+    normal outcome, not a failure — read it back and hand over the line."""
+    import app.bot as bot
+    from app.ai_food import LabelInfo
+
+    seen = _stub_store(monkeypatch)
+    info = LabelInfo(895.0, None, 14.7, 110.0, "Peanut butter")
+    lines, cal_id, pro_id = bot._photo_label_outcome(
+        7, MagicMock(id=1), info, serving_g=None, logged_at=None, raw="photo",
+    )
+
+    assert (cal_id, pro_id) == (0, 0)   # nothing stored
+    assert not seen
+    body = "\n".join(lines)
+    assert "per 100 g" in body
+    assert "`895kj 14.7p 110g`" in body
+
+
+def test_photo_label_outcome_logs_once_a_serving_is_known(monkeypatch):
+    import app.bot as bot
+    from app.ai_food import LabelInfo
+
+    seen = _stub_store(monkeypatch)
+    info = LabelInfo(895.0, None, 14.7, None, "Peanut butter")
+    lines, cal_id, pro_id = bot._photo_label_outcome(
+        7, MagicMock(id=1), info, serving_g=110.0, logged_at=None, raw="photo",
+    )
+
+    assert (cal_id, pro_id) == (11, 22)
+    # 895 kJ/100 g at 110 g = 984.5 kJ = 235 cal; protein scales with it.
+    assert seen["kcal"] == pytest.approx(895.0 * 1.1 / 4.184)
+    assert seen["protein_g"] == pytest.approx(14.7 * 1.1)
+    assert "110 g" in seen["note"]
+    assert "for **110 g**" in "\n".join(lines)
+
+
+def test_photo_label_outcome_refuses_an_implausible_serving(monkeypatch):
+    """The per-entry cap applies to a scaled label exactly as to a typed one —
+    a misread panel shouldn't bank 40,000 cal."""
+    import app.bot as bot
+    from app.ai_food import LabelInfo
+
+    _stub_store(monkeypatch)
+    lines, cal_id, pro_id = bot._photo_label_outcome(
+        7, MagicMock(id=1), LabelInfo(9999.0, None, 14.7, None, "x"),
+        serving_g=2000.0, logged_at=None, raw="photo",
+    )
+    assert (cal_id, pro_id) == (0, 0)
+    assert "nothing was stored" in "\n".join(lines)
+
+
+def _run_estimate(monkeypatch, *, ai_result, **kwargs):
+    """Invoke /estimate with the AI stubbed; return the interaction mock."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "calorie_goal_get", lambda g, u, day=None: _CAL_GOAL)
+    monkeypatch.setattr(bot.gemini_client, "available", lambda: True)
+    monkeypatch.setattr(bot, "_ai_read_photo", AsyncMock(return_value=ai_result))
+    monkeypatch.setattr(bot, "_ai_estimate_meal", AsyncMock(return_value=ai_result))
+    monkeypatch.setattr(bot, "_attach_undo", AsyncMock())
+
+    interaction = MagicMock()
+    interaction.user.id = 4242
+    interaction.guild_id = 7
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    asyncio.run(bot.estimate_cmd.callback(interaction, **kwargs))
+    return interaction
+
+
+def test_estimate_needs_something_to_go_on(monkeypatch):
+    interaction = _run_estimate(monkeypatch, ai_result=None)
+    kwargs = interaction.response.send_message.call_args.kwargs
+    assert kwargs["ephemeral"] is True
+    interaction.followup.send.assert_not_awaited()
+
+
+def test_estimate_logs_a_photo_of_food(monkeypatch):
+    """A plate goes straight in — the model already sized the portion."""
+    import app.bot as bot
+    from app.ai_food import MealEstimate
+
+    seen = _stub_store(monkeypatch)
+    interaction = _run_estimate(
+        monkeypatch,
+        ai_result=MealEstimate(
+            kcal=780.0, protein_g=46.0, name="chicken parmi", confidence="medium",
+        ),
+        photo=_FakeAttachment(),
+    )
+    body = interaction.followup.send.call_args.args[0]
+    assert "chicken parmi" in body
+    assert "confidence: medium" in body
+    assert seen["kcal"] == 780.0
+    assert bot._attach_undo.call_args.kwargs["calorie_id"] == 11
+    assert bot._attach_undo.call_args.kwargs["protein_id"] == 22
+
+
+def test_estimate_routes_a_panel_photo_to_the_label_path(monkeypatch):
+    """Same command, same photo slot — the model decides which it was, so a
+    packet is transcribed rather than guessed at."""
+    from app.ai_food import LabelInfo
+
+    _stub_store(monkeypatch)
+    interaction = _run_estimate(
+        monkeypatch,
+        ai_result=LabelInfo(895.0, None, 14.7, 110.0, "Peanut butter"),
+        photo=_FakeAttachment(),
+    )
+    body = interaction.followup.send.call_args.args[0]
+    assert "per 100 g" in body
+    assert "Estimated" not in body   # a transcription, not a guess
+
+
+def test_estimate_rejects_a_non_photo_attachment(monkeypatch):
+    interaction = _run_estimate(
+        monkeypatch, ai_result=None,
+        photo=_FakeAttachment(content_type="video/mp4"),
+    )
+    assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+    interaction.followup.send.assert_not_awaited()
+
+
+def _chat_message(content, attachments=()):
+    message = MagicMock()
+    message.content = content
+    message.attachments = list(attachments)
+    message.id = 555
+    message.author.id = 4242
+    message.channel.typing = AsyncMock()
+    message.reply = AsyncMock()
+    message.add_reaction = AsyncMock()
+    return message
+
+
+def _run_chat_estimate(monkeypatch, message, description, *, ai_result):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_msg_guild_id", lambda m: 7)
+    monkeypatch.setattr(bot.db, "calorie_goal_get", lambda g, u, day=None: _CAL_GOAL)
+    monkeypatch.setattr(bot.gemini_client, "available", lambda: True)
+    monkeypatch.setattr(bot, "_ai_read_photo", AsyncMock(return_value=ai_result))
+    monkeypatch.setattr(bot, "_ai_estimate_meal", AsyncMock(return_value=ai_result))
+    target = MagicMock()
+    target.id = 4242
+    return asyncio.run(
+        bot._handle_estimate_message(message, target, description)
+    )
+
+
+def test_chat_tilde_takes_a_photo_with_no_words(monkeypatch):
+    """`~` plus a picture is a complete request — the photo IS the description,
+    so the old three-character floor can't apply when one is attached."""
+    import app.bot as bot
+    from app.ai_food import MealEstimate
+
+    _stub_store(monkeypatch)
+    message = _chat_message("~", [_FakeAttachment()])
+    handled = _run_chat_estimate(
+        monkeypatch, message, "",
+        ai_result=MealEstimate(
+            kcal=780.0, protein_g=46.0, name="parmi", confidence="high",
+        ),
+    )
+
+    assert handled is True
+    bot._ai_read_photo.assert_awaited()          # vision, not the text prompt
+    bot._ai_estimate_meal.assert_not_awaited()
+    assert "parmi" in message.reply.call_args.args[0]
+
+
+def test_chat_tilde_with_no_photo_still_needs_words(monkeypatch):
+    """A bare `~` and nothing else falls through to the other parsers rather
+    than burning a Gemini call on an empty description."""
+    import app.bot as bot
+
+    message = _chat_message("~")
+    handled = _run_chat_estimate(monkeypatch, message, "", ai_result=None)
+
+    assert handled is False
+    bot._ai_read_photo.assert_not_awaited()
+    bot._ai_estimate_meal.assert_not_awaited()
+    message.reply.assert_not_awaited()
+
+
+def test_chat_photo_of_a_panel_logs_at_the_caption_serving(monkeypatch):
+    """`~110g` with a packet photo closes the loop in one message: transcribe
+    the panel, then scale it by the serving the caption already stated."""
+    from app.ai_food import LabelInfo
+
+    seen = _stub_store(monkeypatch)
+    message = _chat_message("~110g", [_FakeAttachment()])
+    handled = _run_chat_estimate(
+        monkeypatch, message, "110g",
+        ai_result=LabelInfo(895.0, None, 14.7, None, "Peanut butter"),
+    )
+
+    assert handled is True
+    assert seen["kcal"] == pytest.approx(895.0 * 1.1 / 4.184)
+    body = message.reply.call_args.args[0]
+    assert "for **110 g**" in body
+    message.add_reaction.assert_not_awaited()   # the ❌ goes on the reply
+
+
+def test_chat_photo_of_a_panel_without_a_serving_only_reads_it(monkeypatch):
+    from app.ai_food import LabelInfo
+
+    seen = _stub_store(monkeypatch)
+    message = _chat_message("~", [_FakeAttachment()])
+    handled = _run_chat_estimate(
+        monkeypatch, message, "",
+        ai_result=LabelInfo(895.0, None, 14.7, 110.0, "Peanut butter"),
+    )
+
+    assert handled is True
+    assert not seen                              # nothing logged
+    assert "`895kj 14.7p 110g`" in message.reply.call_args.args[0]

@@ -1,11 +1,16 @@
 """Prompts + response parsing for the AI nutrition features.
 
-Two features share this module:
+One command, ``/estimate``, and its chat shorthand ``~``. Both take a
+description, a photo, or both, and both come back with calories + protein.
+Two prompts sit behind that:
 
-* **Meal estimates** (``/calories estimate`` or a chat message starting with
-  ``~``): describe a meal in words, Gemini guesses calories + protein.
-* **Label reading** (``/calories label``): photograph a nutrition information
-  panel, Gemini transcribes the per-100g values.
+* :data:`ESTIMATE_SYSTEM` — words in, estimate out ("large big mac meal").
+* :data:`PHOTO_SYSTEM` — a photo in. The photo is either a nutrition
+  information panel or the food itself, and the *model* decides which rather
+  than the person holding the camera: a panel is transcribed per 100 g, a
+  plate is estimated for the portion shown. Asking someone to pick the right
+  command before they know what the photo will turn out to be is a question
+  nobody has the answer to, so :func:`parse_photo` tags the reply instead.
 
 The Gemini calls themselves live in the bot layer (they need asyncio + the
 shared client); everything here is pure so the prompt contracts and the
@@ -33,18 +38,30 @@ ESTIMATE_SYSTEM = (
     '{"error": "<short reason>"}.'
 )
 
-# System prompt for nutrition-panel photos. The panel prints per-100g and
-# per-serving columns; we want per-100g (it composes with the bot's
-# multiplier syntax) plus the stated serving size when readable.
-LABEL_SYSTEM = (
-    "You read Australian nutrition information panels from photos. Extract "
-    "the per-100g column. Reply with ONLY a JSON object, no markdown fences: "
-    '{"kj_per_100g": <number or null>, "kcal_per_100g": <number or null>, '
-    '"protein_per_100g": <number or null>, "serving_g": <number or null>, '
-    '"name": "<product name if visible, else null>"}. '
+# System prompt for food photos, of either kind. The `kind` field is what
+# lets one command serve both: a packet gets transcribed (per-100g, which
+# composes with the scale-token syntax), a plate gets estimated for what's
+# actually in shot. Panels win when both are visible — a transcription beats
+# a guess whenever it's available.
+PHOTO_SYSTEM = (
+    "You read food photos for an Australian fitness Discord bot. The photo is "
+    "either a nutrition information panel or the food itself. Decide which, "
+    "and reply with ONLY a JSON object, no markdown fences.\n"
+    "If a nutrition information panel is legible anywhere in the photo, "
+    "transcribe its per-100g column and prefer that over estimating: "
+    '{"kind": "label", "kj_per_100g": <number or null>, '
+    '"kcal_per_100g": <number or null>, "protein_per_100g": <number or null>, '
+    '"serving_g": <number or null>, "name": "<product name if visible, else '
+    'null>"}. '
     "Energy on Australian panels is kilojoules — put that in kj_per_100g and "
-    "only fill kcal_per_100g when the label itself prints kcal/Cal. If the "
-    "image does not show a readable nutrition panel, reply "
+    "only fill kcal_per_100g when the label itself prints kcal/Cal.\n"
+    "Otherwise estimate the food you can see, for the WHOLE portion shown: "
+    '{"kind": "meal", "kcal": <number>, "protein_g": <number or null>, '
+    '"name": "<short cleaned-up name>", "confidence": "high|medium|low"}. '
+    "kcal is kilocalories, not kJ. Use Australian portion sizes and menu "
+    "items. Judge the portion from the plate, packet, hand or cutlery in "
+    "shot, and say low confidence when there's nothing to judge scale by.\n"
+    "If the photo shows neither food nor a nutrition panel, reply "
     '{"error": "<short reason>"}.'
 )
 
@@ -165,15 +182,8 @@ def _num(v: object) -> float | None:
     return None
 
 
-def parse_estimate(text: str) -> MealEstimate | str:
-    """Parse a meal-estimate reply. Returns a :class:`MealEstimate`, or a
-    short human-readable error string when the model declined / the reply is
-    unusable (callers show it directly)."""
-    data = _extract_json(text)
-    if data is None:
-        return "the AI reply wasn't in the expected format"
-    if data.get("error"):
-        return str(data["error"])[:200]
+def _meal_from(data: dict) -> MealEstimate | str:
+    """Build a :class:`MealEstimate` from a parsed reply dict, or an error."""
     kcal = _num(data.get("kcal"))
     if kcal is None or kcal <= 0:
         return "the AI couldn't put a number on that"
@@ -189,14 +199,8 @@ def parse_estimate(text: str) -> MealEstimate | str:
     )
 
 
-def parse_label(text: str) -> LabelInfo | str:
-    """Parse a label-photo reply. Returns :class:`LabelInfo` or a short
-    human-readable error string."""
-    data = _extract_json(text)
-    if data is None:
-        return "the AI reply wasn't in the expected format"
-    if data.get("error"):
-        return str(data["error"])[:200]
+def _label_from(data: dict) -> LabelInfo | str:
+    """Build a :class:`LabelInfo` from a parsed reply dict, or an error."""
     info = LabelInfo(
         kj_per_100g=_num(data.get("kj_per_100g")),
         kcal_per_100g=_num(data.get("kcal_per_100g")),
@@ -213,3 +217,45 @@ def parse_label(text: str) -> LabelInfo | str:
     if not info.has_energy and info.protein_per_100g is None:
         return "couldn't read any energy or protein values off that label"
     return info
+
+
+def parse_estimate(text: str) -> MealEstimate | str:
+    """Parse a meal-estimate reply. Returns a :class:`MealEstimate`, or a
+    short human-readable error string when the model declined / the reply is
+    unusable (callers show it directly)."""
+    data = _extract_json(text)
+    if data is None:
+        return "the AI reply wasn't in the expected format"
+    if data.get("error"):
+        return str(data["error"])[:200]
+    return _meal_from(data)
+
+
+def parse_photo(text: str) -> MealEstimate | LabelInfo | str:
+    """Parse a photo reply into whichever shape the model chose.
+
+    A :class:`LabelInfo` means it found a nutrition panel and transcribed it
+    (per 100 g, so it still needs a serving weight before anything is logged);
+    a :class:`MealEstimate` means it looked at food and guessed the portion in
+    shot. A string is a short human-readable error.
+
+    ``kind`` is what the prompt asks for, but a model that drops the tag still
+    gives itself away by which fields it filled — and getting that wrong would
+    log a per-100g figure as if it were a whole meal, so the fallback checks
+    the fields rather than defaulting to either shape.
+    """
+    data = _extract_json(text)
+    if data is None:
+        return "the AI reply wasn't in the expected format"
+    if data.get("error"):
+        return str(data["error"])[:200]
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind == "label":
+        return _label_from(data)
+    if kind == "meal":
+        return _meal_from(data)
+    per_100g = any(
+        data.get(k) is not None
+        for k in ("kj_per_100g", "kcal_per_100g", "protein_per_100g")
+    )
+    return _label_from(data) if per_100g else _meal_from(data)

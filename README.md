@@ -136,9 +136,9 @@ Calories:
 - `/calories edit <amount> [note]` — fix the amount of your most recent entry.
 - **Remove an entry:** react ❌ on the bot's `🍎 +N cal` reply for it (the
   logger, the target, or an admin can do this). Every way of logging —
-  chat posts, saved foods and meals, `/calories add`, `/calories estimate`,
-  `/calories label` — gets that reaction, so it removes exactly the entry you
-  point at rather than whichever happened to be most recent.
+  chat posts, saved foods and meals, `/calories add`, `/estimate` — gets that
+  reaction, so it removes exactly the entry you point at rather than whichever
+  happened to be most recent.
 - **Edit to fix:** editing the original chat message updates the stored entry —
   e.g. correcting `1730c` to `1730kj` recomputes the calories; deleting the
   amount removes it.
@@ -215,6 +215,22 @@ rather than picking one. The older per-number prefix (`1.1x895kj`) still works.
 parses used to vanish in silence. Now, if a post was clearly meant to be a food
 log but couldn't be read, the bot reacts ❓ and says what went wrong. Ordinary
 chat that happens to mention food is never nagged.
+
+**Ask the AI:** `/estimate` takes a description, a photo, or both, and logs
+calories *and* protein from whichever it gets.
+
+- `/estimate description: large Big Mac meal` — words in, estimate out.
+- `/estimate photo: <your dinner>` — it looks at the plate and guesses the
+  portion in shot.
+- `/estimate photo: <a packet's nutrition panel> grams: 110` — it transcribes
+  the per-100 g column and logs your 110 g. Leave `grams` off and it just reads
+  the panel back with the one line to post when you know your serving.
+
+You don't tell it which kind of photo you're sending; it works that out, and
+prefers transcribing a panel over guessing whenever one is legible. In chat the
+same thing is `~` — `~large big mac meal`, or a bare `~` with a photo attached
+(`~110g` with a panel photo logs it at that serving). Every estimate carries the
+usual ❌ to remove it, and `/calories edit` corrects the amount.
 
 Logging & editing:
 

@@ -77,6 +77,7 @@ from . import protein as protein_mod
 from . import revo_client
 from . import revo_netpulse
 from . import revo_perfectgym
+from . import scaling
 from . import secretbox
 from . import targets as targets_mod
 from . import strava_client
@@ -2072,6 +2073,74 @@ def _estimate_failed(reason: str) -> str:
     return f"{ui.AI} Couldn't estimate that: {reason}"
 
 
+def _store_ai_nutrition(
+    guild_id: int, target: object, kcal: float, protein_g: float, *,
+    note: str, raw: str, logged_at: datetime | None = None,
+    message_id: int = 0, actor: object | None = None,
+) -> tuple[int, int, list[str], list[str]]:
+    """Store an AI-derived calorie (+ protein) entry pair and meter both.
+
+    Returns ``(calorie_id, protein_id, amount_parts, status_lines)``. Callers
+    write their own headline around ``amount_parts`` — a guessed plate and a
+    transcribed packet say different things — but the storing, the "only log
+    protein you're actually tracking" rule and the two meters are identical,
+    and used to be copied out once per surface.
+
+    ``protein_id`` is 0 when protein wasn't logged, which is the flag callers
+    need for :func:`_attach_undo`. ``actor`` is the person who *posted*, when
+    that differs from the person being logged for.
+    """
+    target_id = int(getattr(target, "id"))
+    by_proxy = (
+        {} if actor is None
+        else {"actor_id": int(getattr(actor, "id")),
+              "actor_name": _display_name(actor)}
+    )
+    cal_id = db.calorie_add(
+        guild_id, target_id, _display_name(target), kcal,
+        note=note, raw=raw, logged_at=logged_at, message_id=message_id,
+        **by_proxy,
+    )
+    pro_goal = db.protein_goal_get(guild_id, target_id)
+    logged_protein = (
+        pro_goal is not None and 0 < protein_g <= _MAX_PROTEIN_ENTRY_G
+    )
+    pro_id = 0
+    if logged_protein:
+        try:
+            pro_id = db.protein_add(
+                guild_id, target_id, _display_name(target), protein_g,
+                note=note, raw=raw, logged_at=logged_at,
+                message_id=message_id, **by_proxy,
+            )
+        except Exception:
+            # The calories are already banked; losing the protein row costs
+            # half the entry, not the whole log.
+            LOG.exception("Failed to store AI protein for user %s", target_id)
+            logged_protein = False
+
+    window = _day_window_for(logged_at)
+    total, _n = db.calorie_total_between(guild_id, target_id, *window)
+    day_targets = _reply_targets(target_id, logged_at)
+    # One "Using Weekend Targets" note for the reply, hung off the last meter.
+    day_label = _reply_label(day_targets, calories=True, protein=logged_protein)
+    parts = [f"**{calories.format_kcal(kcal)}**"]
+    status = [
+        _calorie_status_line(
+            total, day_targets.kcal.value or 0.0,
+            None if logged_protein else day_label,
+        )
+        + _streak_suffix(_calorie_streak(target_id))
+    ]
+    if logged_protein:
+        parts.append(f"**{protein_mod.format_grams(protein_g)}** protein")
+        pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
+        status.append(_protein_status_line(
+            pro_total, day_targets.protein.value or 0.0, day_label,
+        ))
+    return cal_id, pro_id, parts, status
+
+
 async def _ai_estimate_meal(
     description: str,
 ) -> "ai_food.MealEstimate | str | gemini_client.GeminiError":
@@ -2107,26 +2176,112 @@ async def _ai_estimate_meal(
     return result
 
 
+# Attachment guardrails for photo estimates. Discord caps most uploads well
+# under this anyway; the cap protects the Gemini request from camera raws.
+_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+_PHOTO_MIME_OK = ("image/png", "image/jpeg", "image/webp", "image/heic")
+
+
+def _photo_problem(att: discord.Attachment) -> str | None:
+    """Why *att* can't be sent to the vision model, or None when it can."""
+    mime = (att.content_type or "").split(";")[0].strip().lower()
+    if mime not in _PHOTO_MIME_OK:
+        return (
+            "That doesn't look like a photo — attach a PNG/JPEG/WebP image of "
+            "the food, or of its nutrition panel."
+        )
+    if att.size > _PHOTO_MAX_BYTES:
+        return "That image is over 10 MB — crop it to the food and retry."
+    return None
+
+
+def _first_photo(
+    attachments: "list[discord.Attachment]",
+) -> "discord.Attachment | None":
+    """The first attachment that looks like a usable photo, or None."""
+    for att in attachments or ():
+        if _photo_problem(att) is None:
+            return att
+    return None
+
+
+async def _ai_read_photo(
+    mime: str, blob: bytes, description: str | None = None,
+) -> "ai_food.MealEstimate | ai_food.LabelInfo | str | gemini_client.GeminiError":
+    """Run the Gemini photo prompt off-thread.
+
+    Same contract as :func:`_ai_estimate_meal`, with one extra outcome: a
+    :class:`ai_food.LabelInfo` when the photo turned out to be a nutrition
+    panel rather than a plate of food. ``description`` is whatever the person
+    typed alongside the photo — it goes in as context ("this is two serves"),
+    not as a separate estimate.
+    """
+    prompt = "Read this food photo."
+    if description:
+        prompt += f" The person adds: {description}"
+    try:
+        raw = await asyncio.to_thread(
+            gemini_client.generate,
+            prompt,
+            system=ai_food.PHOTO_SYSTEM,
+            # Low: a panel in shot is a transcription job, and the estimating
+            # branch wants a consistent answer rather than an imaginative one.
+            temperature=0.1,
+            # Headroom for the thinking pass on models that can't turn it off
+            # (see _ai_estimate_meal) — else the JSON truncates mid-object.
+            max_output_tokens=768,
+            response_mime_type="application/json",
+            images=[(mime, blob)],
+        )
+    except gemini_client.GeminiError as exc:
+        return exc
+    result = ai_food.parse_photo(raw)
+    if isinstance(result, str):
+        LOG.warning("AI photo parse failed (%s); raw reply: %r", result, raw[:500])
+    return result
+
+
 async def _handle_estimate_message(
     message: discord.Message, target: object, description: str,
     *, logged_at: datetime | None = None,
 ) -> bool:
     """Chat AI estimate: `~large big mac meal` → Gemini guesses kcal/protein
-    and logs them. Returns True when the message was consumed (logged or a
-    reply was sent), False to fall through to the other parsers (user not
-    tracking, or AI not configured)."""
+    and logs them. Attach a photo and `~` alone is enough — the picture is the
+    description. Returns True when the message was consumed (logged or a reply
+    was sent), False to fall through to the other parsers (user not tracking,
+    or AI not configured)."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     goal = db.calorie_goal_get(guild_id, target_id)
     if goal is None or not gemini_client.available():
         return False
+    photo = _first_photo(getattr(message, "attachments", None) or [])
+    if photo is None and len(description) < 3:
+        return False  # a bare "~" with nothing to go on isn't an estimate
     # Best-effort typing indicator while the AI thinks — never let a missing
     # permission on it kill the actual estimate.
     try:
         await message.channel.typing()
     except discord.HTTPException:
         pass
-    result = await _ai_estimate_meal(description)
+
+    if photo is not None:
+        try:
+            blob = await photo.read()
+        except discord.HTTPException:
+            try:
+                await message.reply(
+                    f"{ui.AI} Couldn't download that photo — try re-posting it.",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+            return True
+        mime = (photo.content_type or "").split(";")[0].strip().lower()
+        result = await _ai_read_photo(mime, blob, description or None)
+    else:
+        result = await _ai_estimate_meal(description)
+
     if isinstance(result, (str, gemini_client.GeminiError)):
         reason = (
             gemini_client.friendly_message(result)
@@ -2139,8 +2294,147 @@ async def _handle_estimate_message(
         except discord.HTTPException:
             pass
         return True
+    if isinstance(result, ai_food.LabelInfo):
+        # The photo was a packet, not a plate. A panel is per 100 g, so it
+        # needs a serving before anything can be logged — the caption can
+        # carry one (`~110g`), and otherwise the reply hands back a line to
+        # post, since a transcription is worth keeping even unlogged.
+        await _log_photo_label(
+            message, target, result,
+            serving_g=_caption_serving_g(description), logged_at=logged_at,
+        )
+        return True
     await _log_ai_estimate(message, target, goal, result, logged_at=logged_at)
     return True
+
+
+def _caption_serving_g(description: str) -> float | None:
+    """Grams stated in a photo caption (`~110g`, `~x1.1`), or None.
+
+    Reuses the text logger's scale token so there's exactly one way to say
+    "110 g of this" whether you're typing the label values or photographing
+    them.
+    """
+    if not description:
+        return None
+    split_result = scaling.split(description)
+    if split_result is None or split_result[1] is None:
+        return None
+    return split_result[1].factor * 100.0
+
+
+def _label_readout(info: "ai_food.LabelInfo") -> tuple[list[str], float | None]:
+    """The per-100g readout for a transcribed panel, plus its kcal per 100 g.
+
+    Leads with the food icon, not a label glyph: the ❌ handler only acts on
+    replies whose first character is in ``_NUTRITION_REPLY_PREFIXES``.
+    """
+    kj100, kcal100 = info.kj_per_100g, info.kcal_per_100g
+    if kcal100 is None and kj100 is not None:
+        kcal100 = calories.kj_to_kcal(kj100)
+    if kj100 is None and kcal100 is not None:
+        kj100 = calories.kcal_to_kj(kcal100)
+    lines = [f"{ui.FOOD} **{info.name or 'that label'}** — per 100 g:"]
+    if kj100 is not None:
+        lines.append(f"• Energy: **{kj100:,.0f} kJ** ({kcal100:,.0f} cal)")
+    if info.protein_per_100g is not None:
+        lines.append(f"• Protein: **{info.protein_per_100g:g} g**")
+    if info.serving_g:
+        lines.append(f"• Stated serving: {info.serving_g:g} g")
+    return lines, kcal100
+
+
+def _label_howto(info: "ai_food.LabelInfo") -> str | None:
+    """The single line to post to log a transcribed panel at your own serving.
+
+    A transcription is worth handing back even when we can't log it yet, and
+    the scale-token syntax means the answer is one line the person can retype
+    for any weight rather than a sum they have to do.
+    """
+    kj100 = info.kj_per_100g
+    if kj100 is None and info.kcal_per_100g is not None:
+        kj100 = calories.kcal_to_kj(info.kcal_per_100g)
+    if kj100 is None:
+        return None
+    amounts = f"{kj100:.0f}kj"
+    if info.protein_per_100g is not None:
+        amounts += f" {info.protein_per_100g:g}p"
+    serving = f"{info.serving_g:g}" if info.serving_g else "110"
+    return (
+        f"\nTo log it, post the values and what you ate — `{amounts} {serving}g`."
+    )
+
+
+def _photo_label_outcome(
+    guild_id: int, target: object, info: "ai_food.LabelInfo", *,
+    serving_g: float | None, logged_at: datetime | None, raw: str,
+    message_id: int = 0, actor: object | None = None,
+) -> tuple[list[str], int, int]:
+    """Render a panel photo, logging it too when a serving weight is known.
+
+    Returns ``(lines, calorie_id, protein_id)``; the ids are 0 when nothing was
+    stored, which is the normal outcome — most panel photos arrive before the
+    person has said how much they ate. Shared by ``/estimate`` and the chat
+    ``~`` path so a packet reads the same either way.
+    """
+    lines, kcal100 = _label_readout(info)
+    if serving_g is None or kcal100 is None:
+        howto = _label_howto(info)
+        if howto:
+            lines.append(howto)
+        lines.append(ui.subtext("Read by AI — double-check against the label."))
+        return lines, 0, 0
+
+    scale = float(serving_g) / 100.0
+    kcal = kcal100 * scale
+    if not (0 < kcal <= _MAX_ENTRY_KCAL):
+        lines.append(
+            f"\nThat works out to {calories.format_kcal(kcal)} — outside what "
+            "I'll log in one entry, so nothing was stored."
+        )
+        return lines, 0, 0
+    protein_g = (
+        info.protein_per_100g * scale
+        if info.protein_per_100g is not None else 0.0
+    )
+    name = info.name or "label"
+    cal_id, pro_id, parts, status = _store_ai_nutrition(
+        guild_id, target, kcal, protein_g,
+        note=f"{name} ({serving_g:g} g, label)", raw=raw,
+        logged_at=logged_at, message_id=message_id, actor=actor,
+    )
+    lines.append(
+        f"\n{ui.FOOD} Logged {' + '.join(parts)} for **{serving_g:g} g**"
+        f"{_backdate_label(logged_at)}"
+    )
+    lines.extend(status)
+    lines.append(ui.subtext(
+        "Read by AI — react ❌ to remove if it misread the label."
+    ))
+    return lines, cal_id, pro_id
+
+
+async def _log_photo_label(
+    message: discord.Message, target: object, info: "ai_food.LabelInfo", *,
+    serving_g: float | None = None, logged_at: datetime | None = None,
+) -> None:
+    """Chat-side panel photo: post the readout and log it when a serving was
+    given in the caption."""
+    lines, cal_id, pro_id = _photo_label_outcome(
+        _msg_guild_id(message), target, info,
+        serving_g=serving_g, logged_at=logged_at,
+        raw=message.content.strip()[:80], message_id=message.id,
+        actor=message.author,
+    )
+    try:
+        reply = await message.reply("\n".join(lines), mention_author=False)
+    except discord.HTTPException:
+        return
+    if cal_id or pro_id:
+        try:
+            await reply.add_reaction("❌")
+        except discord.HTTPException:
+            pass
 
 
 async def _log_ai_estimate(
@@ -2149,9 +2443,8 @@ async def _log_ai_estimate(
 ) -> None:
     """Store an AI meal estimate (calories + protein when tracked) and post
     the combined reply with the ❌-undo affordance. Chat (`~`) path only —
-    `/calories estimate` has its own interaction-based reply."""
+    `/estimate` has its own interaction-based reply."""
     guild_id = _msg_guild_id(message)
-    target_id = int(getattr(target, "id"))
     if not (0 < est.kcal <= _MAX_AI_ESTIMATE_KCAL):
         try:
             await message.reply(
@@ -2163,63 +2456,25 @@ async def _log_ai_estimate(
             pass
         return
     label = est.name or "AI estimate"
-    note = f"{label} (AI estimate)"
-    raw = message.content.strip()[:80]
     try:
-        db.calorie_add(
-            guild_id, target_id, _display_name(target), est.kcal,
-            note=note, raw=raw, logged_at=logged_at, message_id=message.id,
-            actor_id=message.author.id,
-            actor_name=_display_name(message.author),
+        _cal_id, _pro_id, parts, status = _store_ai_nutrition(
+            guild_id, target, est.kcal, est.protein_g or 0.0,
+            note=f"{label} (AI estimate)", raw=message.content.strip()[:80],
+            logged_at=logged_at, message_id=message.id, actor=message.author,
         )
     except Exception:
-        LOG.exception("Failed to store AI estimate for user %s", target_id)
+        LOG.exception(
+            "Failed to store AI estimate for user %s", getattr(target, "id", "?"),
+        )
         return
-    pro_goal = db.protein_goal_get(guild_id, target_id)
-    grams = est.protein_g or 0.0
-    logged_protein = False
-    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
-        try:
-            db.protein_add(
-                guild_id, target_id, _display_name(target), grams,
-                note=note, raw=raw, logged_at=logged_at, message_id=message.id,
-                actor_id=message.author.id,
-                actor_name=_display_name(message.author),
-            )
-            logged_protein = True
-        except Exception:
-            LOG.exception("Failed to store AI protein for user %s", target_id)
-
-    window = _day_window_for(logged_at)
-    cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
-    day_targets = _reply_targets(target_id, logged_at)
-    day_label = _reply_label(
-        day_targets, calories=True, protein=logged_protein,
-    )
     suffix = _target_suffix(message.author, target)
     conf = f" · confidence: {est.confidence}" if est.confidence else ""
-    parts = [f"**{calories.format_kcal(est.kcal)}**"]
-    if logged_protein:
-        parts.append(f"**{protein_mod.format_grams(grams)}** protein")
     lines = [
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}{suffix}"
         f"{_backdate_label(logged_at)}",
-        _calorie_status_line(
-            cal_total, day_targets.kcal.value or 0.0,
-            None if logged_protein else day_label,
-        )
-        + _streak_suffix(_calorie_streak(target_id)),
+        *status,
+        ui.subtext("AI estimate — react ❌ to remove, `/calories edit` to correct."),
     ]
-    if logged_protein:
-        pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
-        lines.append(
-            _protein_status_line(
-                pro_total, day_targets.protein.value or 0.0, day_label,
-            )
-        )
-    lines.append(ui.subtext(
-        "AI estimate — react ❌ to remove, `/calories edit` to correct."
-    ))
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
@@ -4050,15 +4305,15 @@ async def on_message(message: discord.Message) -> None:
     )
 
     # AI meal estimate: `~large big mac meal` asks Gemini to guess calories
-    # and protein, then logs them. The `~` prefix is an explicit opt-in per
-    # message (a double `~~` is Discord strikethrough, not an estimate), and
-    # the handler falls through silently when the user isn't calorie-tracking
-    # or AI isn't configured.
-    if (
-        nut_content.startswith("~")
-        and not nut_content.startswith("~~")
-        and len(nut_content.lstrip("~ ")) >= 3
-    ):
+    # and protein, then logs them. Attach a photo and a bare `~` is enough —
+    # the picture is the description, and a caption on top is extra context.
+    # The `~` prefix is an explicit opt-in per message (a double `~~` is
+    # Discord strikethrough, not an estimate), which is what keeps progress
+    # pics and whiteboard shots out of the vision model. The handler falls
+    # through silently when the user isn't calorie-tracking or AI isn't
+    # configured; the length floor now lives with it, since it depends on
+    # whether there's a photo to fall back on.
+    if nut_content.startswith("~") and not nut_content.startswith("~~"):
         handled = await _handle_estimate_message(
             message, target, nut_content.lstrip("~ ").strip(),
             logged_at=nut_dt,
@@ -4690,7 +4945,7 @@ def _check_goal_hits(
 # in Discord's history must keep matching or its undo silently stops working.
 # 🍽️ and 🥗 are retired from new replies (one food icon, 🍎) but stay here
 # permanently for the ~800 replies posted before that change. 🤖 covers the
-# AI-estimate replies (`~...` and /calories estimate).
+# AI-estimate replies (`~...` and /estimate).
 _NUTRITION_REPLY_PREFIXES = (
     ui.FOOD, ui.PROTEIN, ui.AI,   # current
     "🍽️", "🥗",                   # legacy — do not remove
@@ -4765,7 +5020,7 @@ async def _handle_nutrition_reaction_undo(
     else:
         # Protein / combined / legacy: resolve via the referenced message and
         # remove every nutrition entry it created. Chat replies point back to
-        # the source message; a slash-command followup (/calories estimate) has
+        # the source message; a slash-command followup (/estimate) has
         # no reference, so fall back to the reply's own id — its entries are
         # linked directly to it.
         ref = reply_msg.reference
@@ -6816,10 +7071,10 @@ def _help_sections() -> dict[str, discord.Embed]:
             "`/calories meal_list` · `/calories meal_remove <name>`\n"
             "`/calories food_lookup <query> [save]` — per-100g values from "
             "Open Food Facts (name or barcode)\n"
-            "`/calories estimate <description>` — AI-guess calories + protein "
-            "for a described meal, or type `~large big mac meal` in chat\n"
-            "`/calories label <image> [grams]` — read a nutrition-panel "
-            "photo; give grams to log it directly\n"
+            "`/estimate [description] [photo]` — AI-guess calories + protein "
+            "from words, a photo of the food, or a photo of its nutrition "
+            "panel; or type `~large big mac meal` in chat, or `~` with a "
+            "photo attached (`~110g` logs a panel at that serving)\n"
             "`/calories tdee [user] [days]` — estimate your real maintenance "
             "calories from your own logs + weigh-ins"
         ),
@@ -16800,17 +17055,37 @@ async def calories_food_lookup_cmd(
     )
 
 
-@calories_group.command(
+@bot.tree.command(
     name="estimate",
-    description="AI-estimate calories + protein for a described meal and log it.",
+    description="AI-estimate calories + protein from words or a photo, and log it.",
 )
 @app_commands.describe(
-    description="What you ate, e.g. 'large Big Mac meal' or '2 slices pepperoni pizza'.",
+    description="What you ate, e.g. 'large Big Mac meal'. Optional when you attach a photo.",
+    photo="A photo of the food, or of its nutrition panel.",
+    grams="For a nutrition-panel photo: how many grams you ate.",
     day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
-async def calories_estimate_cmd(
-    interaction: discord.Interaction, description: str, day: str | None = None,
+async def estimate_cmd(
+    interaction: discord.Interaction,
+    description: str | None = None,
+    photo: discord.Attachment | None = None,
+    grams: app_commands.Range[float, 1, 2000] | None = None,
+    day: str | None = None,
 ) -> None:
+    """One AI entry point for both macros, from either words or a picture.
+
+    This replaced `/calories estimate` and `/calories label`, which split the
+    same job by input type and made you know in advance which one your photo
+    would turn out to be — a packet's panel and a plate of food are the same
+    question ("what did I just eat?") and now take the same command. The photo
+    branch lets the model decide which it's looking at.
+    """
+    if description is None and photo is None:
+        await interaction.response.send_message(
+            "Describe what you ate, attach a photo of it, or both — e.g. "
+            "`/estimate description: large Big Mac meal`.", ephemeral=True,
+        )
+        return
     guild_id = _ctx_guild_id(interaction)
     goal = db.calorie_goal_get(guild_id, interaction.user.id)
     if goal is None:
@@ -16827,8 +17102,27 @@ async def calories_estimate_cmd(
     if not day_ok:
         await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
         return
+    if photo is not None:
+        problem = _photo_problem(photo)
+        if problem is not None:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+
     await interaction.response.defer(thinking=True)
-    result = await _ai_estimate_meal(description.strip())
+    described = (description or "").strip()
+    if photo is not None:
+        try:
+            blob = await photo.read()
+        except discord.HTTPException:
+            await interaction.followup.send("Couldn't download that attachment.")
+            return
+        mime = (photo.content_type or "").split(";")[0].strip().lower()
+        result = await _ai_read_photo(mime, blob, described or None)
+        raw = f"photo {photo.filename}"[:80]
+    else:
+        result = await _ai_estimate_meal(described)
+        raw = described[:80]
+
     if isinstance(result, gemini_client.GeminiError):
         # The card carries Google's own wording in a "For admins" field when
         # the fault is configuration, so the owner doesn't have to go digging
@@ -16838,241 +17132,43 @@ async def calories_estimate_cmd(
     if isinstance(result, str):
         await interaction.followup.send(_estimate_failed(result))
         return
+
+    if isinstance(result, ai_food.LabelInfo):
+        # The photo was a packet. Per-100g values need a serving before they
+        # mean anything, so `grams:` logs it and its absence just transcribes.
+        lines, cal_id, pro_id = _photo_label_outcome(
+            guild_id, interaction.user, result,
+            serving_g=grams, logged_at=logged_at, raw=raw,
+        )
+        msg = await interaction.followup.send("\n".join(lines))
+        await _attach_undo(
+            None, calorie_id=cal_id, protein_id=pro_id, message=msg,
+        )
+        return
+
     if not (0 < result.kcal <= _MAX_AI_ESTIMATE_KCAL):
         await interaction.followup.send(
             f"🤖 The AI guessed {calories.format_kcal(result.kcal)} — outside "
             "what I'll auto-log. Log it manually if it's real."
         )
         return
-    label = result.name or description.strip()[:60]
-    note = f"{label} (AI estimate)"
-    cal_id = db.calorie_add(
-        guild_id, interaction.user.id, _display_name(interaction.user),
-        result.kcal, note=note, raw=description.strip()[:80],
-        logged_at=logged_at,
-    )
-    pro_goal = db.protein_goal_get(guild_id, interaction.user.id)
-    grams = result.protein_g or 0.0
-    logged_protein = False
-    pro_id = 0
-    if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
-        pro_id = db.protein_add(
-            guild_id, interaction.user.id, _display_name(interaction.user),
-            grams, note=note, raw=description.strip()[:80], logged_at=logged_at,
-        )
-        logged_protein = True
-    window = _day_window_for(logged_at)
-    total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
-    day_targets = _reply_targets(interaction.user.id, logged_at)
-    day_label = _reply_label(
-        day_targets, calories=True, protein=logged_protein,
+    label = result.name or described[:60] or "AI estimate"
+    cal_id, pro_id, parts, status = _store_ai_nutrition(
+        guild_id, interaction.user, result.kcal, result.protein_g or 0.0,
+        note=f"{label} (AI estimate)", raw=raw, logged_at=logged_at,
     )
     conf = f" · confidence: {result.confidence}" if result.confidence else ""
-    parts = [f"**{calories.format_kcal(result.kcal)}**"]
-    if logged_protein:
-        parts.append(f"**{protein_mod.format_grams(grams)}** protein")
     lines = [
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}"
         f"{_backdate_label(logged_at)}",
-        _calorie_status_line(
-            total, day_targets.kcal.value or 0.0,
-            None if logged_protein else day_label,
-        ),
+        *status,
+        ui.subtext("AI estimate — react ❌ to remove, `/calories edit` to correct."),
     ]
-    if logged_protein:
-        pro_total, _ = db.protein_total_between(
-            guild_id, interaction.user.id, *window,
-        )
-        lines.append(
-            _protein_status_line(
-                pro_total, day_targets.protein.value or 0.0, day_label,
-            )
-        )
-    lines.append(ui.subtext(
-        "AI estimate — react ❌ to remove, `/calories edit` to correct."
-    ))
     msg = await interaction.followup.send("\n".join(lines))
-    # Link the entries to this reply so a ❌ reaction (from the logger or an
-    # admin) removes them, then add the affordance. The followup id isn't known
-    # until after the insert, so we backfill message_id here.
-    if cal_id:
-        db.set_calorie_message_id(cal_id, msg.id)
-    if logged_protein and pro_id:
-        db.set_protein_message_id(pro_id, msg.id)
-    try:
-        await msg.add_reaction("❌")
-    except discord.HTTPException:
-        pass
-
-
-# Attachment guardrails for /calories label. Discord caps most uploads well
-# under this anyway; the cap protects the Gemini request from huge camera raws.
-_LABEL_MAX_BYTES = 10 * 1024 * 1024
-_LABEL_MIME_OK = ("image/png", "image/jpeg", "image/webp", "image/heic")
-
-
-@calories_group.command(
-    name="label",
-    description="Read a nutrition-panel photo; give grams eaten to log it.",
-)
-@app_commands.describe(
-    image="A photo of the nutrition information panel.",
-    grams="How many grams you ate — leave blank to just read the label.",
-    day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
-)
-async def calories_label_cmd(
-    interaction: discord.Interaction,
-    image: discord.Attachment,
-    grams: app_commands.Range[float, 1, 2000] | None = None,
-    day: str | None = None,
-) -> None:
-    if not gemini_client.available():
-        await interaction.response.send_message(
-            "🤖 AI features aren't configured on this bot.", ephemeral=True,
-        )
-        return
-    guild_id = _ctx_guild_id(interaction)
-    goal = db.calorie_goal_get(guild_id, interaction.user.id)
-    if grams is not None and goal is None:
-        await interaction.response.send_message(
-            embed=_calories_not_set_embed(), ephemeral=True,
-        )
-        return
-    logged_at, day_ok = _slash_logged_at(day)
-    if not day_ok:
-        await interaction.response.send_message(_BAD_DAY_MSG, ephemeral=True)
-        return
-    mime = (image.content_type or "").split(";")[0].strip().lower()
-    if mime not in _LABEL_MIME_OK:
-        await interaction.response.send_message(
-            "That doesn't look like a photo — attach a PNG/JPEG/WebP image "
-            "of the nutrition panel.", ephemeral=True,
-        )
-        return
-    if image.size > _LABEL_MAX_BYTES:
-        await interaction.response.send_message(
-            "That image is over 10 MB — crop it to just the panel and retry.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(thinking=True)
-    try:
-        blob = await image.read()
-    except discord.HTTPException:
-        await interaction.followup.send("Couldn't download that attachment.")
-        return
-    try:
-        raw = await asyncio.to_thread(
-            gemini_client.generate,
-            "Read the nutrition information panel in this photo.",
-            system=ai_food.LABEL_SYSTEM,
-            temperature=0.1,           # transcription, not creativity
-            # Headroom for the thinking pass on models that can't turn it off
-            # (see _ai_estimate_meal) — else the transcription JSON truncates.
-            max_output_tokens=768,
-            response_mime_type="application/json",
-            images=[(mime, blob)],
-        )
-    except gemini_client.GeminiError as exc:
-        await interaction.followup.send(gemini_client.friendly_message(exc))
-        return
-    info = ai_food.parse_label(raw)
-    if isinstance(info, str):
-        await interaction.followup.send(f"🤖 {info} — try a straighter photo.")
-        return
-
-    kj100 = info.kj_per_100g
-    kcal100 = info.kcal_per_100g
-    if kcal100 is None and kj100 is not None:
-        kcal100 = calories.kj_to_kcal(kj100)
-    if kj100 is None and kcal100 is not None:
-        kj100 = calories.kcal_to_kj(kcal100)
-    name = info.name or "that label"
-    # Leads with the food icon, not a label glyph: the ❌ handler only acts on
-    # replies whose first character is in _NUTRITION_REPLY_PREFIXES.
-    lines = [f"{ui.FOOD} **{name}** — per 100 g:"]
-    if kj100 is not None:
-        lines.append(f"• Energy: **{kj100:,.0f} kJ** ({kcal100:,.0f} cal)")
-    if info.protein_per_100g is not None:
-        lines.append(f"• Protein: **{info.protein_per_100g:g} g**")
-    if info.serving_g:
-        lines.append(f"• Stated serving: {info.serving_g:g} g")
-
-    if grams is None or kcal100 is None:
-        if kj100 is not None:
-            amounts = f"{kj100:.0f}kj"
-            if info.protein_per_100g is not None:
-                amounts += f" {info.protein_per_100g:g}p"
-            serving = f"{info.serving_g:g}" if info.serving_g else "60"
-            lines.append(
-                f"\nTo log it: re-run with `grams:`, or just post the values "
-                f"and what you ate — `{amounts} {serving}g`."
-            )
-        lines.append("\n*Read by AI — double-check against the label.*")
-        await interaction.followup.send("\n".join(lines))
-        return
-
-    scale = float(grams) / 100.0
-    kcal = kcal100 * scale
-    if not (0 < kcal <= _MAX_ENTRY_KCAL):
-        await interaction.followup.send(
-            "\n".join(lines)
-            + f"\n\nThat works out to {calories.format_kcal(kcal)} — outside "
-            "what I'll log in one entry, so nothing was stored."
-        )
-        return
-    note = f"{name} ({grams:g} g, label)" if info.name else f"label ({grams:g} g)"
-    cal_id = db.calorie_add(
-        guild_id, interaction.user.id, _display_name(interaction.user), kcal,
-        note=note, raw=f"label {grams:g}g", logged_at=logged_at,
-    )
-    pro_goal = db.protein_goal_get(guild_id, interaction.user.id)
-    pro_grams = (
-        info.protein_per_100g * scale
-        if info.protein_per_100g is not None else 0.0
-    )
-    logged_protein = False
-    pro_id = 0
-    if pro_goal is not None and 0 < pro_grams <= _MAX_PROTEIN_ENTRY_G:
-        pro_id = db.protein_add(
-            guild_id, interaction.user.id, _display_name(interaction.user),
-            pro_grams, note=note, raw=f"label {grams:g}g", logged_at=logged_at,
-        )
-        logged_protein = True
-    window = _day_window_for(logged_at)
-    total, _n = db.calorie_total_between(guild_id, interaction.user.id, *window)
-    day_targets = _reply_targets(interaction.user.id, logged_at)
-    day_label = _reply_label(
-        day_targets, calories=True, protein=logged_protein,
-    )
-    parts = [f"**{calories.format_kcal(kcal)}**"]
-    if logged_protein:
-        parts.append(f"**{protein_mod.format_grams(pro_grams)}** protein")
-    lines.append(
-        f"\n{ui.FOOD} Logged {' + '.join(parts)} for **{grams:g} g**"
-        f"{_backdate_label(logged_at)}"
-    )
-    lines.append(_calorie_status_line(
-        total, day_targets.kcal.value or 0.0,
-        None if logged_protein else day_label,
-    ))
-    if logged_protein:
-        pro_total, _ = db.protein_total_between(
-            guild_id, interaction.user.id, *window,
-        )
-        lines.append(
-            _protein_status_line(
-                pro_total, day_targets.protein.value or 0.0, day_label,
-            )
-        )
-    lines.append(ui.subtext(
-        "Read by AI — react ❌ to remove if it misread the label."
-    ))
-    msg = await interaction.followup.send("\n".join(lines))
-    await _attach_undo(
-        None, calorie_id=cal_id, protein_id=pro_id, message=msg,
-    )
+    # The entries were inserted without a message_id — a followup's id isn't
+    # known until it's sent — so link them now, which is what lets a ❌ on this
+    # reply find them.
+    await _attach_undo(None, calorie_id=cal_id, protein_id=pro_id, message=msg)
 
 
 @calories_group.command(

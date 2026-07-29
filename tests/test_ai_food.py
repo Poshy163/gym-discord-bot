@@ -5,7 +5,7 @@ from app.ai_food import (
     LabelInfo,
     MealEstimate,
     parse_estimate,
-    parse_label,
+    parse_photo,
     repair_unterminated_json,
 )
 
@@ -74,8 +74,8 @@ def test_parse_estimate_missing_closing_brace():
     assert est.confidence == "high"
 
 
-def test_parse_label_missing_closing_brace():
-    info = parse_label(
+def test_parse_photo_missing_closing_brace():
+    info = parse_photo(
         '{"kj_per_100g": 1640, "protein_per_100g": 43, "name": "Whey"'
     )
     assert isinstance(info, LabelInfo)
@@ -103,11 +103,15 @@ def test_parse_estimate_string_numbers_and_negative_protein():
     assert est.protein_g is None  # negative → dropped
 
 
-# ---- parse_label ------------------------------------------------------------
+# ---- parse_photo ------------------------------------------------------------
+#
+# One photo prompt serves both a packet and a plate, so the parser has to route
+# on what came back. Getting that wrong logs a per-100g figure as if it were a
+# whole meal, which is why the tag and the field-shape fallback are both pinned.
 
-def test_parse_label_australian_panel():
-    info = parse_label(
-        '{"kj_per_100g": 1640, "kcal_per_100g": null, '
+def test_parse_photo_routes_on_the_kind_tag():
+    info = parse_photo(
+        '{"kind": "label", "kj_per_100g": 1640, "kcal_per_100g": null, '
         '"protein_per_100g": 43, "serving_g": 30, "name": "Whey blend"}'
     )
     assert isinstance(info, LabelInfo)
@@ -118,23 +122,49 @@ def test_parse_label_australian_panel():
     assert info.name == "Whey blend"
     assert info.has_energy
 
+    est = parse_photo(
+        '{"kind": "meal", "kcal": 780, "protein_g": 46, '
+        '"name": "chicken parmi and chips", "confidence": "medium"}'
+    )
+    assert isinstance(est, MealEstimate)
+    assert est.kcal == 780.0
+    assert est.protein_g == 46.0
+    assert est.confidence == "medium"
 
-def test_parse_label_error_and_garbage():
-    assert isinstance(parse_label('{"error": "blurry photo"}'), str)
-    assert isinstance(parse_label("no json here"), str)
-    # All-null values → nothing usable.
+
+def test_parse_photo_infers_the_shape_when_the_tag_is_missing():
+    # A model that drops `kind` still gives itself away by which fields it
+    # filled — per-100g keys mean a panel, a bare kcal means a plate.
     assert isinstance(
-        parse_label(
-            '{"kj_per_100g": null, "kcal_per_100g": null, '
+        parse_photo('{"kj_per_100g": 1640, "protein_per_100g": 43}'), LabelInfo,
+    )
+    assert isinstance(
+        parse_photo('{"kcal": 780, "protein_g": 46, "name": "parmi"}'),
+        MealEstimate,
+    )
+    # An unrecognised tag falls back to the same field check, not to a guess.
+    assert isinstance(
+        parse_photo('{"kind": "packet", "kj_per_100g": 900}'), LabelInfo,
+    )
+
+
+def test_parse_photo_error_and_garbage():
+    assert isinstance(parse_photo('{"error": "blurry photo"}'), str)
+    assert isinstance(parse_photo("no json here"), str)
+    # All-null values → nothing usable either way.
+    assert isinstance(
+        parse_photo(
+            '{"kind": "label", "kj_per_100g": null, "kcal_per_100g": null, '
             '"protein_per_100g": null, "serving_g": null, "name": null}'
         ),
         str,
     )
+    assert isinstance(parse_photo('{"kind": "meal", "kcal": null}'), str)
 
 
-def test_parse_label_negative_values_dropped():
-    info = parse_label(
-        '{"kj_per_100g": -100, "kcal_per_100g": null, '
+def test_parse_photo_negative_values_dropped():
+    info = parse_photo(
+        '{"kind": "label", "kj_per_100g": -100, "kcal_per_100g": null, '
         '"protein_per_100g": 20, "serving_g": null, "name": null}'
     )
     assert isinstance(info, LabelInfo)
@@ -143,9 +173,10 @@ def test_parse_label_negative_values_dropped():
     assert not info.has_energy
 
 
-def test_parse_label_protein_only_is_usable():
-    info = parse_label(
-        '{"kj_per_100g": null, "protein_per_100g": 25.5, "name": "tuna"}'
+def test_parse_photo_protein_only_is_usable():
+    info = parse_photo(
+        '{"kind": "label", "kj_per_100g": null, "protein_per_100g": 25.5, '
+        '"name": "tuna"}'
     )
     assert isinstance(info, LabelInfo)
     assert info.protein_per_100g == 25.5
