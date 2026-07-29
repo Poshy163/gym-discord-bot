@@ -2489,3 +2489,136 @@ def test_catchup_covers_every_channel_when_none_are_listed(monkeypatch):
 
     picked = bot._catchup_channels()
     assert picked == [readable]     # the one it can actually read
+
+
+# ---- the catch-up summary message -------------------------------------------
+#
+# ✅ marks on individual posts say *that* something landed. The summary says
+# *what*, so nobody has to open /today and compare it against what they
+# remember typing.
+
+def _person(bot, name, **amounts):
+    p = bot._CaughtUpPerson(name)
+    p.add(**amounts)
+    return p
+
+
+@pytest.mark.parametrize("delta,expected", [
+    (timedelta(seconds=20), "1m"),      # rounds up: "0m offline" reads as a bug
+    (timedelta(minutes=7), "7m"),
+    (timedelta(minutes=59), "59m"),
+    (timedelta(hours=2), "2h"),         # a whole number of hours drops the 0m
+    (timedelta(hours=2, minutes=14), "2h 14m"),
+    (timedelta(days=1, hours=3), "1d 3h"),
+    (timedelta(days=9), "9d"),
+])
+def test_format_downtime_trims_to_the_units_that_matter(delta, expected):
+    import app.bot as bot
+
+    assert bot._format_downtime(delta) == expected
+
+
+def test_caught_up_person_lists_only_what_happened():
+    import app.bot as bot
+
+    assert _person(bot, "Josh", kcal=526.0).summary() == "**526 cal**"
+    assert _person(bot, "Josh", grams=40.0).summary() == "**40 g** protein"
+    assert _person(bot, "Josh", lifts=3).summary() == "**3 lifts**"
+    assert _person(bot, "Josh", lifts=1).summary() == "**1 lift**"
+    both = _person(bot, "Josh", kcal=526.0, grams=40.0).summary()
+    assert both == "**526 cal** + **40 g** protein"
+    assert _person(bot, "Josh").summary() == ""
+
+
+def test_catchup_summary_names_who_got_what():
+    import app.bot as bot
+
+    result = bot._CatchUpResult(
+        scanned=120, posts_with_lifts=1, lifts=3, suppressed=0, entries=4,
+        people={
+            1: _person(bot, "Josh", kcal=526.0, grams=40.0),
+            2: _person(bot, "Dos", kcal=350.0),
+            3: _person(bot, "Sean", lifts=3),
+        },
+    )
+    body = bot._catchup_summary(result, "2h 14m")
+
+    assert "after 2h 14m offline" in body
+    assert "imported 5 posts I missed" in body      # 4 nutrition + 1 lift post
+    assert "**Josh** — **526 cal** + **40 g** protein" in body
+    assert "**Sean** — **3 lifts**" in body
+    assert "/today" in body
+
+
+def test_catchup_summary_survives_an_unknown_downtime():
+    """No last-online marker (first boot, wiped DB) — say nothing about how
+    long rather than inventing a duration."""
+    import app.bot as bot
+
+    body = bot._catchup_summary(
+        bot._CatchUpResult(10, 0, 0, 0, 1, {1: _person(bot, "Josh", kcal=350.0)}),
+        None,
+    )
+    assert body.startswith("🍎🥩 Caught up — imported 1 post I missed:")
+
+
+def test_catchup_summary_counts_the_tail_instead_of_listing_it():
+    """A long outage across a busy server must not post a wall of names."""
+    import app.bot as bot
+
+    people = {
+        i: _person(bot, f"Lifter{i}", kcal=float(100 + i))
+        for i in range(bot._CATCHUP_NAMES_SHOWN + 3)
+    }
+    body = bot._catchup_summary(
+        bot._CatchUpResult(200, 0, 0, 0, len(people), people), "3h",
+    )
+
+    assert body.count("• **") == bot._CATCHUP_NAMES_SHOWN
+    assert "…and 3 others" in body
+
+
+def test_catch_up_result_knows_when_nothing_happened():
+    """A quiet redeploy has to stay silent — otherwise every deploy posts."""
+    import app.bot as bot
+
+    assert not bot._CatchUpResult(500, 0, 0, 4, 0, {}).anything
+    assert bot._CatchUpResult(500, 0, 0, 0, 1, {}).anything
+    assert bot._CatchUpResult(500, 1, 2, 0, 0, {}).anything
+
+
+def test_backfill_channel_tallies_each_person_separately(monkeypatch):
+    """The summary is only as good as the tally, and a channel scan sees posts
+    from everyone."""
+    import app.bot as bot
+
+    _tracking_everything(monkeypatch, bot)
+    monkeypatch.setattr(bot.db, "is_message_suppressed", lambda g, m: False)
+    monkeypatch.setattr(bot, "_custom_alias_map", lambda g: {})
+    monkeypatch.setattr(bot, "_resolve_nickname_target", AsyncMock(return_value=(None, None)))
+
+    posts = [("350 c", 1, "Josh"), ("40p", 2, "Josh"), ("500c", 3, "Dos")]
+
+    def _target(msg):
+        member = MagicMock()
+        member.id = msg.author.id
+        member.display_name = dict(zip([1, 2], ["Josh", "Josh"])).get(msg.id, "Dos")
+        return member, msg.content
+
+    monkeypatch.setattr(bot, "_message_lift_target", _target)
+
+    class _Chan:
+        def history(self, **kwargs):
+            async def _gen():
+                for text, mid, _name in posts:
+                    m = _backfill_msg(text, mid=mid, author_id=1 if mid < 3 else 2)
+                    yield m
+            return _gen()
+
+    result = asyncio.run(bot._backfill_channel(_Chan(), 100))
+
+    assert result.entries == 3
+    assert set(result.people) == {1, 2}
+    assert result.people[1].kcal == pytest.approx(350.0)
+    assert result.people[1].grams == pytest.approx(40.0)
+    assert result.people[2].kcal == pytest.approx(500.0)

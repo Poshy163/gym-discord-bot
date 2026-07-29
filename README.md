@@ -118,12 +118,19 @@ Calories:
   `/calories add` instead. `@user 650kcal` logs it for someone else.
 - **Offline catch-up:** when the bot restarts it scans forward from the last
   moment it was known to be running and imports anything it missed — calories,
-  protein and combined posts alike — reacting ✅ on each one so you can see it
-  landed. Entries are deduped per message and dated to the original post, so a
-  restart never double-counts and a backdated log still lands on its own day.
-  A first boot (or one after a wiped database) reaches back 14 days rather than
-  through the whole channel. `/backfill [limit]` does the same on demand for
-  the last N messages of one channel.
+  protein and combined posts alike — reacting ✅ on each one, then posting a
+  summary of what landed and for whom:
+
+  > 🍎🥩 Caught up after 2h 14m offline — imported 5 posts I missed:
+  > • **Josh** — **526 cal** + **40 g** protein
+  > • **Dos** — **350 cal**
+
+  A restart that missed nothing says nothing, so a quiet redeploy is silent.
+  Entries are deduped per message and dated to the original post, so a restart
+  never double-counts and a backdated log still lands on its own day. A first
+  boot (or one after a wiped database) reaches back 14 days rather than through
+  the whole channel. `/backfill [limit]` does the same on demand for the last N
+  messages of one channel, reporting back privately to whoever ran it.
 - **Backdating:** add a day to a chat log to file it under that day —
   `650kcal yesterday`, `200c monday`, `coffee yesterday`, `40p 3 days ago`, or
   an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and

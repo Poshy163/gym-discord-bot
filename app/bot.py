@@ -3989,7 +3989,7 @@ async def weekly_report_cmd(interaction: discord.Interaction) -> None:
 
 def _backfill_nutrition_entry(
     msg: discord.Message, target: object, content: str,
-) -> bool:
+) -> tuple[float, float]:
     """Store any nutrition log in ``content`` that isn't recorded already.
 
     Covers the same three chat forms the live path does — calories, protein,
@@ -3997,8 +3997,11 @@ def _backfill_nutrition_entry(
     to make a restart silently drop every protein log posted while the bot was
     down. Deduped by message id and dated to the message, so re-scans are free.
 
-    Returns True if anything new was inserted. The live path is
-    :func:`_handle_calorie_message` and friends.
+    Returns the ``(kcal, protein_g)`` actually stored — zeroes when nothing
+    was, which is the common case. The amounts come back rather than a bare
+    flag so the catch-up can report what it added instead of only how many
+    posts it touched. The live path is :func:`_handle_calorie_message` and
+    friends.
     """
     hint_dt, parse_content = _split_date_hint(
         content, msg.created_at.astimezone(DISPLAY_TZ),
@@ -4014,7 +4017,7 @@ def _backfill_nutrition_entry(
         else:
             both = nutrition.parse_combined(parse_content)
             if both is None:
-                return False
+                return 0.0, 0.0
             kcal, grams = both
 
     guild_id = msg.guild.id if msg.guild else 0
@@ -4022,7 +4025,7 @@ def _backfill_nutrition_entry(
     logged_at = hint_dt or msg.created_at.astimezone(timezone.utc)
     raw = msg.content.strip()[:80]
     note = nutrition.chat_scale_note(parse_content)
-    inserted = False
+    added_kcal = added_grams = 0.0
 
     # Each macro is stored only if the person tracks it and the amount clears
     # the same typo guards the live path applies — a backfill must not become a
@@ -4036,7 +4039,7 @@ def _backfill_nutrition_entry(
                 guild_id, target_id, _display_name(target), kcal,
                 note=note, raw=raw, logged_at=logged_at, message_id=msg.id,
             ):
-                inserted = True
+                added_kcal = kcal
         except Exception:
             LOG.exception(
                 "Backfill: failed to store calorie entry for %s", target_id,
@@ -4050,18 +4053,88 @@ def _backfill_nutrition_entry(
                 guild_id, target_id, _display_name(target), grams,
                 note=note, raw=raw, logged_at=logged_at, message_id=msg.id,
             ):
-                inserted = True
+                added_grams = grams
         except Exception:
             LOG.exception(
                 "Backfill: failed to store protein entry for %s", target_id,
             )
-    return inserted
+    return added_kcal, added_grams
+
+
+class _CaughtUpPerson:
+    """What one member's catch-up added, for the summary line."""
+
+    __slots__ = ("grams", "kcal", "lifts", "name")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.kcal = 0.0
+        self.grams = 0.0
+        self.lifts = 0
+
+    def add(self, *, kcal: float = 0.0, grams: float = 0.0, lifts: int = 0) -> None:
+        self.kcal += kcal
+        self.grams += grams
+        self.lifts += lifts
+
+    def summary(self) -> str:
+        """"526 cal + 40 g protein + 3 lifts" — only the parts that happened."""
+        bits = []
+        if self.kcal:
+            bits.append(f"**{calories.format_kcal(self.kcal)}**")
+        if self.grams:
+            bits.append(f"**{protein_mod.format_grams(self.grams)}** protein")
+        if self.lifts:
+            bits.append(f"**{ui.plural(self.lifts, 'lift')}**")
+        return " + ".join(bits)
+
+
+class _CatchUpResult(NamedTuple):
+    """What one channel scan found. ``people`` keys are member ids."""
+
+    scanned: int
+    posts_with_lifts: int
+    lifts: int
+    suppressed: int
+    entries: int
+    people: dict[int, _CaughtUpPerson]
+
+    @property
+    def anything(self) -> bool:
+        return bool(self.lifts or self.entries)
+
+
+def _tally(
+    people: dict[int, _CaughtUpPerson], target: object,
+) -> _CaughtUpPerson:
+    """The running tally for ``target``, created on first sight."""
+    target_id = int(getattr(target, "id", 0) or 0)
+    person = people.get(target_id)
+    if person is None:
+        person = people[target_id] = _CaughtUpPerson(_display_name(target))
+    return person
+
+
+def _format_downtime(delta: timedelta) -> str:
+    """A rough "2h 14m" for how long the bot was away.
+
+    Rounded and units-trimmed on purpose: the point is "you were gone a while",
+    not a stopwatch reading.
+    """
+    minutes = max(1, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h" if not minutes else f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d" if not hours else f"{days}d {hours}h"
 
 
 async def _backfill_channel(
     channel: discord.abc.Messageable, limit: int | None,
     *, since: datetime | None = None, react: bool = False,
-) -> tuple[int, int, int, int, int]:
+) -> "_CatchUpResult":
     """Scan a channel's history and store any detected lifts or nutrition logs.
 
     ``since`` scans forward from that moment — how the startup catch-up asks
@@ -4073,13 +4146,12 @@ async def _backfill_channel(
     as "start at the channel's first ever message", so a busy channel spent
     every boot re-reading its opening 1,000 posts and never reached today's.
 
-    Returns (messages_scanned, messages_with_lifts, lifts_inserted,
-    skipped_suppressed, nutrition_entries_inserted). Lifts dedupe on
-    (message_id, equipment); nutrition entries dedupe on message_id — so
-    re-runs are safe. ``react`` adds the ✅ the live path would have added,
-    so a catch-up is visible in the channel rather than silent.
+    Lifts dedupe on (message_id, equipment); nutrition entries dedupe on
+    message_id — so re-runs are safe. ``react`` adds the ✅ the live path would
+    have added, so a catch-up is visible in the channel rather than silent.
     """
     scanned = matched = inserted = skipped = cal_inserted = 0
+    people: dict[int, _CaughtUpPerson] = {}
     history = (
         channel.history(limit=limit, after=since, oldest_first=True)
         if since is not None
@@ -4106,8 +4178,10 @@ async def _backfill_channel(
                 target, content = nick_target, nick_content
         # Nutrition logs ("650kcal", "200c", "40p", "@user 2700kj") never
         # contain a lift, so check them first and move on when one matches.
-        if _backfill_nutrition_entry(msg, target, content):
+        added_kcal, added_grams = _backfill_nutrition_entry(msg, target, content)
+        if added_kcal or added_grams:
             cal_inserted += 1
+            _tally(people, target).add(kcal=added_kcal, grams=added_grams)
             if react:
                 try:
                     await msg.add_reaction("✅")
@@ -4129,7 +4203,8 @@ async def _backfill_channel(
         if n:
             matched += 1
             inserted += n
-    return scanned, matched, inserted, skipped, cal_inserted
+            _tally(people, target).add(lifts=n)
+    return _CatchUpResult(scanned, matched, inserted, skipped, cal_inserted, people)
 
 
 # When the bot was last known to be running. Written every few minutes, and
@@ -4200,44 +4275,93 @@ def _catchup_channels() -> list[discord.abc.Messageable]:
     return out
 
 
+# How many people to name individually before the summary gives up and counts
+# them, so a long outage across a busy server can't post a wall of text.
+_CATCHUP_NAMES_SHOWN = 8
+
+
+def _catchup_summary(result: "_CatchUpResult", downtime: str | None) -> str:
+    """The "here's what I missed" message for one channel.
+
+    ✅ marks on the individual posts say *that* something landed; this says
+    *what*, in one place, without anyone having to open /today and compare it
+    against what they remember typing.
+    """
+    away = f" after {downtime} offline" if downtime else ""
+    posts = ui.plural(result.entries + result.posts_with_lifts, "post")
+    lines = [f"{ui.FOOD}{ui.PROTEIN} Caught up{away} — imported {posts} I missed:"]
+    ranked = sorted(
+        result.people.values(),
+        key=lambda p: (p.kcal + p.grams * 10 + p.lifts * 100),
+        reverse=True,
+    )
+    for person in ranked[:_CATCHUP_NAMES_SHOWN]:
+        body = person.summary()
+        if body:
+            lines.append(f"• **{_safe_label(person.name, limit=32)}** — {body}")
+    extra = len(ranked) - _CATCHUP_NAMES_SHOWN
+    if extra > 0:
+        lines.append(f"• …and {ui.plural(extra, 'other')}")
+    lines.append(ui.subtext(
+        "Each post above is marked ✅. Check the day with `/today`, or fix an "
+        "amount with `/calories edit` · `/protein edit`."
+    ))
+    return "\n".join(lines)
+
+
 async def _run_startup_backfill() -> None:
     """Catch up on everything posted while the bot was down.
 
     Scans forward from the last heartbeat rather than over a fixed slice of
     history, which makes a quiet restart nearly free and a long outage still
-    complete. Newly imported logs get the ✅ they'd have got live, so the
-    catch-up is visible instead of silent.
+    complete. Newly imported logs get the ✅ they'd have got live, and each
+    channel that gained anything gets a summary saying what landed — a restart
+    shouldn't leave people wondering whether their logs made it.
     """
     since = _catchup_since()
+    last_online = _parse_iso(db.meta_get(_LAST_ONLINE_KEY))
+    downtime = (
+        _format_downtime(datetime.now(timezone.utc) - last_online)
+        if last_online is not None else None
+    )
     limit = BACKFILL_LIMIT if BACKFILL_LIMIT > 0 else None
     channels = _catchup_channels()
     LOG.info(
         "Catch-up: scanning %d channel(s) for anything since %s",
         len(channels), since.isoformat(timespec="seconds"),
     )
-    totals = [0, 0, 0]
+    scanned_total = lifts_total = entries_total = 0
     for channel in channels:
         try:
-            scanned, matched, inserted, skipped, cal_inserted = (
-                await _backfill_channel(channel, limit, since=since, react=True)
+            result = await _backfill_channel(
+                channel, limit, since=since, react=True,
             )
         except discord.Forbidden:
             continue
         except discord.HTTPException:
             LOG.warning("Catch-up: HTTP error scanning #%s", channel)
             continue
-        if inserted or cal_inserted:
-            LOG.info(
-                "Catch-up for #%s: scanned=%d, new_lifts=%d, "
-                "new_nutrition=%d, skipped_suppressed=%d",
-                channel, scanned, inserted, cal_inserted, skipped,
+        scanned_total += result.scanned
+        lifts_total += result.lifts
+        entries_total += result.entries
+        if not result.anything:
+            continue  # a quiet restart says nothing at all
+        LOG.info(
+            "Catch-up for #%s: scanned=%d, new_lifts=%d, new_nutrition=%d, "
+            "skipped_suppressed=%d",
+            channel, result.scanned, result.lifts, result.entries,
+            result.suppressed,
+        )
+        try:
+            await channel.send(
+                _catchup_summary(result, downtime),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
-        totals[0] += scanned
-        totals[1] += inserted
-        totals[2] += cal_inserted
+        except discord.HTTPException:
+            LOG.warning("Catch-up: couldn't post the summary in #%s", channel)
     LOG.info(
         "Catch-up done: scanned=%d, new_lifts=%d, new_nutrition=%d",
-        *totals,
+        scanned_total, lifts_total, entries_total,
     )
     db.meta_set(_LAST_ONLINE_KEY, datetime.now(timezone.utc).isoformat())
     # History import is done — from here on, data mutations are live user
@@ -6488,9 +6612,7 @@ async def backfill_cmd(
     try:
         # No `since`, so this walks back from the newest message — "rescan the
         # last N" is what someone typing a limit means.
-        scanned, matched, inserted, skipped, cal_inserted = (
-            await _backfill_channel(interaction.channel, lim, react=True)
-        )
+        result = await _backfill_channel(interaction.channel, lim, react=True)
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to read this channel's history.",
@@ -6498,14 +6620,16 @@ async def backfill_cmd(
         )
         return
     cal_part = (
-        f", {cal_inserted} new nutrition entries" if cal_inserted else ""
+        f", {result.entries} new nutrition entries" if result.entries else ""
     )
     await interaction.followup.send(
-        f"Backfill complete — scanned {scanned} messages, "
-        f"{matched} had lifts, {inserted} new lifts stored, "
-        f"{skipped} skipped (suppressed){cal_part}.",
+        f"Backfill complete — scanned {result.scanned} messages, "
+        f"{result.posts_with_lifts} had lifts, {result.lifts} new lifts "
+        f"stored, {result.suppressed} skipped (suppressed){cal_part}.",
         ephemeral=True,
     )
+    # A manual rescan already reports back to whoever ran it, so it doesn't
+    # also announce itself to the channel.
 
 
 # Marker text the reaction-undo handler appends to the bot's reply when it
