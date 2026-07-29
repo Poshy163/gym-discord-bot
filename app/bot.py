@@ -17773,10 +17773,10 @@ async def today_cmd(
         f"{name if named else 'logging'} streak"
         for name, n in streaks if n >= 2
     )
+    # No card title: Discord already shows "used /today" above the reply, so a
+    # "🍎 Today" headline just says it again and pushes the actual figures down.
+    # The first section heading (🍎 Calories) carries the card instead.
     embed = ui.card(
-        # The apple is the nutrition headline, but a protein-only tracker
-        # shouldn't be handed a card titled with a food they aren't counting.
-        f"{sections[0][0]} Today",
         colour=_worst_colour(colours),
         member=target_user,
         footer=footer or None,

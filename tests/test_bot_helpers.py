@@ -1777,7 +1777,8 @@ def test_today_card_takes_the_more_alarming_of_the_two_colours(monkeypatch):
 
 def test_today_omits_the_macro_that_is_not_tracked(monkeypatch):
     """Protein-only trackers get a protein card, not a half-empty one reading
-    '0 cal / 0 cal' — and the title wears their macro's icon, not the apple."""
+    '0 cal / 0 cal' — and no apple anywhere on it, for a food they aren't
+    counting."""
     from app import ui
 
     embed = _run_today(
@@ -1785,7 +1786,9 @@ def test_today_omits_the_macro_that_is_not_tracked(monkeypatch):
         pro=[_entry("grams", 45.0)],
     )["embed"]
 
-    assert embed.title.startswith(ui.PROTEIN)
+    # No title at all: Discord's own "used /today" line already names the
+    # command, so the first section heading leads the card.
+    assert not embed.title
     assert not any(ui.FOOD in f.name for f in embed.fields)
     assert [f.name for f in embed.fields] == [
         f"{ui.PROTEIN} Protein", f"{ui.PROTEIN} Entries",
