@@ -28,6 +28,7 @@ from calendar import monthrange
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import discord
 from discord import app_commands
@@ -913,6 +914,21 @@ def _format_date(iso: str | None) -> str:
     return dt.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d")
 
 
+def _parse_iso(iso: str | None) -> datetime | None:
+    """A stored ISO timestamp as a tz-aware datetime, or None if unparseable.
+
+    Older rows were written without an offset, so a naive value is read as UTC
+    — the same assumption every other reader here makes.
+    """
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
 def _format_local_day_age(iso: str) -> tuple[str, int]:
     try:
         dt = datetime.fromisoformat(iso)
@@ -1517,6 +1533,28 @@ class StreakReminderView(discord.ui.View):
         )
 
 
+def _remember_reply(
+    reply: "discord.Message", target_id: int, *,
+    calorie_id: int = 0, protein_id: int = 0,
+    headline: str | None = None, footnote: str | None = None,
+) -> None:
+    """Record a posted nutrition reply so its totals can be corrected later.
+
+    Best-effort and deliberately silent: a reply that can't be remembered just
+    won't be restated, which is exactly the behaviour every reply had before.
+    """
+    if not (calorie_id or protein_id):
+        return
+    try:
+        db.track_nutrition_reply(
+            reply.id, int(getattr(reply.channel, "id", 0) or 0), target_id,
+            calorie_id=calorie_id, protein_id=protein_id,
+            headline=headline, footnote=footnote,
+        )
+    except Exception:  # pragma: no cover - defensive; never fail a logged entry
+        LOG.exception("Couldn't remember nutrition reply %s", reply.id)
+
+
 def _log_card(
     icon: str,
     headline: str,
@@ -1612,6 +1650,7 @@ async def _reply_calorie_logged(
         db.track_calorie_reply(
             reply.id, guild_id, message.author.id, target_id, entry_id, message.id,
         )
+        _remember_reply(reply, target_id, calorie_id=entry_id)
         try:
             await reply.add_reaction("❌")
         except discord.HTTPException:
@@ -2365,17 +2404,32 @@ def _label_howto(info: "ai_food.LabelInfo") -> str | None:
     )
 
 
+class _PhotoLabelReply(NamedTuple):
+    """A rendered panel-photo reply, split where its meters sit.
+
+    ``headline`` is the transcription plus the "logged N g" line and
+    ``footnote`` the closing subtext — everything either side of the meters,
+    kept apart so a later change to the day can swap the middle without
+    re-transcribing the packet.
+    """
+
+    lines: list[str]
+    calorie_id: int
+    protein_id: int
+    headline: str
+    footnote: str | None
+
+
 def _photo_label_outcome(
     guild_id: int, target: object, info: "ai_food.LabelInfo", *,
     serving_g: float | None, logged_at: datetime | None, raw: str,
     message_id: int = 0, actor: object | None = None,
-) -> tuple[list[str], int, int]:
+) -> _PhotoLabelReply:
     """Render a panel photo, logging it too when a serving weight is known.
 
-    Returns ``(lines, calorie_id, protein_id)``; the ids are 0 when nothing was
-    stored, which is the normal outcome — most panel photos arrive before the
-    person has said how much they ate. Shared by ``/estimate`` and the chat
-    ``~`` path so a packet reads the same either way.
+    The ids are 0 when nothing was stored, which is the normal outcome — most
+    panel photos arrive before the person has said how much they ate. Shared by
+    ``/estimate`` and the chat ``~`` path so a packet reads the same either way.
     """
     lines, kcal100 = _label_readout(info)
     if serving_g is None or kcal100 is None:
@@ -2383,7 +2437,7 @@ def _photo_label_outcome(
         if howto:
             lines.append(howto)
         lines.append(ui.subtext("Read by AI — double-check against the label."))
-        return lines, 0, 0
+        return _PhotoLabelReply(lines, 0, 0, "\n".join(lines), None)
 
     scale = float(serving_g) / 100.0
     kcal = kcal100 * scale
@@ -2392,7 +2446,7 @@ def _photo_label_outcome(
             f"\nThat works out to {calories.format_kcal(kcal)} — outside what "
             "I'll log in one entry, so nothing was stored."
         )
-        return lines, 0, 0
+        return _PhotoLabelReply(lines, 0, 0, "\n".join(lines), None)
     protein_g = (
         info.protein_per_100g * scale
         if info.protein_per_100g is not None else 0.0
@@ -2407,11 +2461,13 @@ def _photo_label_outcome(
         f"\n{ui.FOOD} Logged {' + '.join(parts)} for **{serving_g:g} g**"
         f"{_backdate_label(logged_at)}"
     )
-    lines.extend(status)
-    lines.append(ui.subtext(
+    headline = "\n".join(lines)
+    footnote = ui.subtext(
         "Read by AI — react ❌ to remove if it misread the label."
-    ))
-    return lines, cal_id, pro_id
+    )
+    lines.extend(status)
+    lines.append(footnote)
+    return _PhotoLabelReply(lines, cal_id, pro_id, headline, footnote)
 
 
 async def _log_photo_label(
@@ -2420,17 +2476,22 @@ async def _log_photo_label(
 ) -> None:
     """Chat-side panel photo: post the readout and log it when a serving was
     given in the caption."""
-    lines, cal_id, pro_id = _photo_label_outcome(
+    out = _photo_label_outcome(
         _msg_guild_id(message), target, info,
         serving_g=serving_g, logged_at=logged_at,
         raw=message.content.strip()[:80], message_id=message.id,
         actor=message.author,
     )
     try:
-        reply = await message.reply("\n".join(lines), mention_author=False)
+        reply = await message.reply("\n".join(out.lines), mention_author=False)
     except discord.HTTPException:
         return
-    if cal_id or pro_id:
+    if out.calorie_id or out.protein_id:
+        _remember_reply(
+            reply, int(getattr(target, "id")), calorie_id=out.calorie_id,
+            protein_id=out.protein_id, headline=out.headline,
+            footnote=out.footnote,
+        )
         try:
             await reply.add_reaction("❌")
         except discord.HTTPException:
@@ -2469,20 +2530,27 @@ async def _log_ai_estimate(
         return
     suffix = _target_suffix(message.author, target)
     conf = f" · confidence: {est.confidence}" if est.confidence else ""
-    lines = [
+    headline = (
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}{suffix}"
-        f"{_backdate_label(logged_at)}",
-        *status,
-        ui.subtext("AI estimate — react ❌ to remove, `/calories edit` to correct."),
-    ]
+        f"{_backdate_label(logged_at)}"
+    )
+    footnote = ui.subtext(
+        "AI estimate — react ❌ to remove, `/calories edit` to correct."
+    )
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
     try:
-        reply = await message.reply("\n".join(lines), mention_author=False)
+        reply = await message.reply(
+            "\n".join([headline, *status, footnote]), mention_author=False,
+        )
     except discord.HTTPException:
         return
+    _remember_reply(
+        reply, int(getattr(target, "id")), calorie_id=_cal_id,
+        protein_id=_pro_id, headline=headline, footnote=footnote,
+    )
     try:
         await reply.add_reaction("❌")
     except discord.HTTPException:
@@ -2553,7 +2621,7 @@ async def _handle_protein_message(
             pass
         return
     try:
-        db.protein_add(
+        entry_id = db.protein_add(
             guild_id, target_id, _display_name(target), grams,
             raw=message.content.strip()[:80],
             logged_at=logged_at, message_id=message.id,
@@ -2566,12 +2634,14 @@ async def _handle_protein_message(
     LOG.info("Stored %.0fg protein for %s in #%s", grams, target, message.channel)
     await _reply_protein_logged(
         message, target, goal, grams, logged_at=logged_at, note=note,
+        entry_id=entry_id,
     )
 
 
 async def _reply_protein_logged(
     message: discord.Message, target: object, goal: sqlite3.Row, grams: float,
     *, logged_at: datetime | None = None, note: str | None = None,
+    entry_id: int = 0,
 ) -> None:
     """React ✅ and reply with what was added + that day's running total vs max.
 
@@ -2607,6 +2677,7 @@ async def _reply_protein_logged(
         )
     except discord.HTTPException:
         return
+    _remember_reply(reply, target_id, protein_id=entry_id)
     # ❌ affordance — the legacy undo path resolves the entry via this reply's
     # reference, so no tracking row is needed.
     try:
@@ -2644,13 +2715,14 @@ async def _handle_combined_nutrition(
     logged: list[str] = []      # "**500 cal**", "**40 g** protein"
     status_lines: list[str] = []
     skipped: list[str] = []
+    cal_id = pro_id = 0
 
     window = _day_window_for(logged_at)
     day_targets = _reply_targets(target_id, logged_at)
     showed_calories = showed_protein = False
     if cal_goal is not None:
         if 0 < kcal <= _MAX_ENTRY_KCAL:
-            db.calorie_add(
+            cal_id = db.calorie_add(
                 guild_id, target_id, _display_name(target), kcal,
                 raw=raw, logged_at=logged_at, message_id=message.id,
                 actor_id=message.author.id,
@@ -2676,7 +2748,7 @@ async def _handle_combined_nutrition(
 
     if pro_goal is not None:
         if 0 < grams <= _MAX_PROTEIN_ENTRY_G:
-            db.protein_add(
+            pro_id = db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 raw=raw, logged_at=logged_at, message_id=message.id,
                 actor_id=message.author.id,
@@ -2725,17 +2797,26 @@ async def _handle_combined_nutrition(
     )
     if basis:
         tail = f"\n{ui.subtext(basis)}{tail}"
+    # Split out so the same headline and tail can be reused verbatim when an
+    # earlier entry changes and this reply's meters have to be recomputed —
+    # re-deriving them would lose who it was logged for and any backdating.
+    headline = (
+        f"{ui.FOOD}{ui.PROTEIN} Logged {' + '.join(logged)}{suffix}"
+        f"{_backdate_label(logged_at)}"
+    )
     try:
         # Both macro icons mark this as a combined reply; the undo handler
         # removes every nutrition entry tied to the source message.
         reply = await message.reply(
-            f"{ui.FOOD}{ui.PROTEIN} Logged {' + '.join(logged)}{suffix}"
-            f"{_backdate_label(logged_at)}\n"
-            + "\n".join(status_lines) + tail,
+            headline + "\n" + "\n".join(status_lines) + tail,
             mention_author=False,
         )
     except discord.HTTPException:
         return
+    _remember_reply(
+        reply, target_id, calorie_id=cal_id, protein_id=pro_id,
+        headline=headline, footnote=tail.lstrip("\n") or None,
+    )
     try:
         await reply.add_reaction("❌")
     except discord.HTTPException:
@@ -4573,6 +4654,173 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
+# A day of logs is a handful of messages; this caps the blast radius if a
+# backfill or a bulk delete ever points at one. Anything past it is left alone
+# and logged, rather than quietly editing a hundred messages.
+_MAX_RESTATED_REPLIES = 25
+_RESTATED_NOTE = "totals corrected after an earlier entry changed"
+
+
+def _restated_status_lines(
+    target_id: int, *, cal_total: float | None, pro_total: float | None,
+    logged_at: datetime | None,
+) -> list[str]:
+    """The meter block for a reply, recomputed as at its own entry."""
+    day_targets = _reply_targets(target_id, logged_at)
+    day_label = _reply_label(
+        day_targets, calories=cal_total is not None, protein=pro_total is not None,
+    )
+    lines: list[str] = []
+    if cal_total is not None:
+        lines.append(
+            _calorie_status_line(
+                cal_total, day_targets.kcal.value or 0.0,
+                None if pro_total is not None else day_label,
+            )
+            + _streak_suffix(_calorie_streak(target_id))
+        )
+    if pro_total is not None:
+        lines.append(_protein_status_line(
+            pro_total, day_targets.protein.value or 0.0, day_label,
+        ))
+    return lines
+
+
+def _running_totals(rows: "list[sqlite3.Row]", column: str) -> dict[int, float]:
+    """Map each entry id to the day's total *as at* that entry.
+
+    That's what a confirmation card showed when it was posted, so it's what
+    has to be recomputed to correct one. Rows arrive oldest-first.
+    """
+    out: dict[int, float] = {}
+    running = 0.0
+    for row in rows:
+        running += float(row[column])
+        out[int(row["id"])] = running
+    return out
+
+
+async def _restate_day_replies(
+    target: object, *, logged_at: datetime | None = None, guild_id: int = 0,
+) -> int:
+    """Correct the running totals on this day's other nutrition replies.
+
+    Each confirmation shows the day's total at the moment it was posted, so
+    removing or editing an entry leaves every *later* card overstating the day
+    by the amount that just went away — and those cards stay on screen,
+    disagreeing with `/today` and with each other. The one the user acted on
+    is already struck through by the caller; this fixes the rest.
+
+    Best-effort throughout: the data is already correct, so a failure here
+    costs an out-of-date message, never an entry. Returns how many replies were
+    actually edited, for the log.
+    """
+    target_id = int(getattr(target, "id", 0) or 0)
+    if not target_id:
+        return 0
+    window = _day_window_for(logged_at)
+    try:
+        rows = db.nutrition_replies_for_day(target_id, *window)
+    except Exception:
+        LOG.exception("Couldn't list nutrition replies for user %s", target_id)
+        return 0
+    if not rows:
+        return 0
+    if len(rows) > _MAX_RESTATED_REPLIES:
+        LOG.warning(
+            "Restating only the %d most recent of %d replies for user %s",
+            _MAX_RESTATED_REPLIES, len(rows), target_id,
+        )
+        rows = rows[-_MAX_RESTATED_REPLIES:]
+
+    cal_running = _running_totals(
+        db.calorie_entries_between(guild_id, target_id, *window), "kcal",
+    )
+    pro_running = _running_totals(
+        db.protein_entries_between(guild_id, target_id, *window), "grams",
+    )
+
+    edited = 0
+    for row in rows:
+        # A macro whose entry is gone drops off the card rather than showing a
+        # stale meter — the other one is still true and still worth showing.
+        cal_total = cal_running.get(int(row["calorie_id"] or 0))
+        pro_total = pro_running.get(int(row["protein_id"] or 0))
+        if cal_total is None and pro_total is None:
+            continue
+        if await _restate_one_reply(
+            row, target, cal_total=cal_total, pro_total=pro_total,
+            logged_at=logged_at,
+        ):
+            edited += 1
+    if edited:
+        LOG.info("Restated %d nutrition replies for user %s", edited, target_id)
+    return edited
+
+
+async def _restate_one_reply(
+    row: "sqlite3.Row", target: object, *, cal_total: float | None,
+    pro_total: float | None, logged_at: datetime | None,
+) -> bool:
+    """Rewrite one reply's meters in place. True when it was actually edited."""
+    reply_id = int(row["reply_message_id"])
+    channel = bot.get_channel(int(row["channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(row["channel_id"]))
+        except discord.HTTPException:
+            return False
+    try:
+        msg = await channel.fetch_message(reply_id)
+    except discord.NotFound:
+        # Deleted by hand — drop the row so it can't be retried every time.
+        db.forget_nutrition_reply(reply_id)
+        return False
+    except discord.HTTPException:
+        return False
+    # An already-undone reply reads as struck-through/greyed; rewriting its
+    # meters would make a removed entry look live again.
+    if msg.content.lstrip().startswith("~~"):
+        db.forget_nutrition_reply(reply_id)
+        return False
+
+    target_id = int(getattr(target, "id"))
+    try:
+        if msg.embeds:
+            old = msg.embeds[0]
+            if cal_total is not None:
+                status, colour = _calorie_status_pair(
+                    target_id, cal_total, logged_at,
+                )
+            else:
+                status, colour = _protein_status_pair(
+                    target_id, pro_total or 0.0, logged_at,
+                )
+            # Rebuild from the live embed so the title, note field, author and
+            # milestone banner survive — only the meter and its colour move.
+            embed = old.copy()
+            embed.description = status
+            embed.colour = colour
+            embed.set_footer(text=f"{ui.EDIT} {_RESTATED_NOTE} · react ❌ to remove")
+            await msg.edit(embed=embed)
+        else:
+            headline = row["headline"]
+            if not headline:
+                return False  # posted before the render cache existed
+            status = _restated_status_lines(
+                target_id, cal_total=cal_total, pro_total=pro_total,
+                logged_at=logged_at,
+            )
+            body = [headline, *status]
+            if row["footnote"]:
+                body.append(row["footnote"])
+            body.append(ui.subtext(f"{ui.EDIT} {_RESTATED_NOTE}"))
+            await msg.edit(content="\n".join(body))
+    except discord.HTTPException:
+        return False
+    return True
+
+
 async def _refresh_calorie_reply(
     after: discord.Message, target: object, goal: sqlite3.Row,
     kcal: float, note: str | None,
@@ -4680,7 +4928,7 @@ async def _handle_calorie_edit(
 
     # Edited the calorie text away → remove the entry + tidy the reply.
     if existing is not None and new_hit is None:
-        db.delete_calorie_entry(
+        removed = db.delete_calorie_entry(
             guild_id, int(existing["user_id"]), int(existing["id"]),
         )
         crec = db.get_calorie_reply_by_original(after.id)
@@ -4710,6 +4958,14 @@ async def _handle_calorie_edit(
             await after.add_reaction("✏️")
         except discord.HTTPException:
             pass
+        if crec is not None:
+            # The reply now reads "Entry removed", so it must not be restated.
+            db.forget_nutrition_reply(int(crec["reply_message_id"]))
+        if removed is not None:
+            await _restate_day_replies(
+                target, logged_at=_parse_iso(removed["logged_at"]),
+                guild_id=guild_id,
+            )
         return True
 
     kcal, _unit, note = new_hit  # type: ignore[misc]
@@ -4760,6 +5016,12 @@ async def _handle_calorie_edit(
             await after.add_reaction("✏️")
         except discord.HTTPException:
             pass
+        # Correcting `1730c` to `1730kj` moves the day's total by ~1,300 cal,
+        # so every confirmation posted after this one is now wrong too.
+        await _restate_day_replies(
+            target, logged_at=_parse_iso(existing["logged_at"]),
+            guild_id=guild_id,
+        )
     return True
 
 
@@ -5000,6 +5262,7 @@ async def _handle_nutrition_reaction_undo(
     guild_id = payload.guild_id or 0
     logger_id: int | None = None
     removed_bits: list[str] = []
+    removed_at: datetime | None = None    # the day whose later cards go stale
 
     crec = db.get_calorie_reply(payload.message_id)
     if crec is not None:
@@ -5017,6 +5280,7 @@ async def _handle_nutrition_reaction_undo(
         )
         if r is not None:
             removed_bits.append(calories.format_kcal(float(r["kcal"])))
+            removed_at = _parse_iso(r["logged_at"])
     else:
         # Protein / combined / legacy: resolve via the referenced message and
         # remove every nutrition entry it created. Chat replies point back to
@@ -5045,6 +5309,7 @@ async def _handle_nutrition_reaction_undo(
             )
             if r is not None:
                 removed_bits.append(calories.format_kcal(float(r["kcal"])))
+                removed_at = _parse_iso(r["logged_at"])
         if pro_entry is not None:
             r = db.delete_protein_entry(
                 guild_id, target_user_id, int(pro_entry["id"]),
@@ -5054,6 +5319,7 @@ async def _handle_nutrition_reaction_undo(
                 removed_bits.append(
                     f"{protein_mod.format_grams(float(r['grams']))} protein"
                 )
+                removed_at = removed_at or _parse_iso(r["logged_at"])
 
     # Suppress the source message so a restart backfill won't re-import it.
     if original_id is not None:
@@ -5097,6 +5363,17 @@ async def _handle_nutrition_reaction_undo(
             await reply_msg.remove_reaction("❌", bot.user)  # type: ignore[arg-type]
         except discord.HTTPException:
             pass
+    # This reply is now struck through, so it can't be restated later.
+    db.forget_nutrition_reply(payload.message_id)
+    # Every *later* confirmation from the same day was printed with this entry
+    # still in the total, so each one now overstates the day by the amount just
+    # removed. Correct them rather than leaving a trail of numbers that
+    # disagree with /today and with each other.
+    if removed_bits:
+        await _restate_day_replies(
+            discord.Object(id=target_user_id),
+            logged_at=removed_at, guild_id=guild_id,
+        )
     # Drop the ✅ on the user's original message so the visual state matches.
     if original_id:
         try:
@@ -16581,6 +16858,12 @@ async def calories_edit_cmd(
         f"**{calories.format_kcal(kcal)}**{converted}\n"
         + _calorie_status_for(interaction.user.id, total)
     )
+    # The edited entry is the most recent one, so anything posted after it in
+    # the same day was printed against the old figure.
+    await _restate_day_replies(
+        interaction.user, logged_at=_parse_iso(old["logged_at"]),
+        guild_id=guild_id,
+    )
 
 
 @calories_group.command(
@@ -17136,13 +17419,19 @@ async def estimate_cmd(
     if isinstance(result, ai_food.LabelInfo):
         # The photo was a packet. Per-100g values need a serving before they
         # mean anything, so `grams:` logs it and its absence just transcribes.
-        lines, cal_id, pro_id = _photo_label_outcome(
+        out = _photo_label_outcome(
             guild_id, interaction.user, result,
             serving_g=grams, logged_at=logged_at, raw=raw,
         )
-        msg = await interaction.followup.send("\n".join(lines))
+        msg = await interaction.followup.send("\n".join(out.lines))
+        _remember_reply(
+            msg, interaction.user.id, calorie_id=out.calorie_id,
+            protein_id=out.protein_id, headline=out.headline,
+            footnote=out.footnote,
+        )
         await _attach_undo(
-            None, calorie_id=cal_id, protein_id=pro_id, message=msg,
+            None, calorie_id=out.calorie_id, protein_id=out.protein_id,
+            message=msg,
         )
         return
 
@@ -17158,13 +17447,20 @@ async def estimate_cmd(
         note=f"{label} (AI estimate)", raw=raw, logged_at=logged_at,
     )
     conf = f" · confidence: {result.confidence}" if result.confidence else ""
-    lines = [
+    headline = (
         f"🤖 Estimated **{label}** ≈ {' + '.join(parts)}{conf}"
-        f"{_backdate_label(logged_at)}",
-        *status,
-        ui.subtext("AI estimate — react ❌ to remove, `/calories edit` to correct."),
-    ]
-    msg = await interaction.followup.send("\n".join(lines))
+        f"{_backdate_label(logged_at)}"
+    )
+    footnote = ui.subtext(
+        "AI estimate — react ❌ to remove, `/calories edit` to correct."
+    )
+    msg = await interaction.followup.send(
+        "\n".join([headline, *status, footnote])
+    )
+    _remember_reply(
+        msg, interaction.user.id, calorie_id=cal_id, protein_id=pro_id,
+        headline=headline, footnote=footnote,
+    )
     # The entries were inserted without a message_id — a followup's id isn't
     # known until it's sent — so link them now, which is what lets a ❌ on this
     # reply find them.
@@ -17705,6 +18001,10 @@ async def protein_edit_cmd(
         f"**{protein_mod.format_grams(float(old['grams']))}** → "
         f"**{protein_mod.format_grams(amount)}** protein\n"
         + _protein_status_for(interaction.user.id, total)
+    )
+    await _restate_day_replies(
+        interaction.user, logged_at=_parse_iso(old["logged_at"]),
+        guild_id=guild_id,
     )
 
 

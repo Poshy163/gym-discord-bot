@@ -1914,13 +1914,13 @@ def test_photo_label_outcome_transcribes_without_a_serving(monkeypatch):
 
     seen = _stub_store(monkeypatch)
     info = LabelInfo(895.0, None, 14.7, 110.0, "Peanut butter")
-    lines, cal_id, pro_id = bot._photo_label_outcome(
+    out = bot._photo_label_outcome(
         7, MagicMock(id=1), info, serving_g=None, logged_at=None, raw="photo",
     )
 
-    assert (cal_id, pro_id) == (0, 0)   # nothing stored
+    assert (out.calorie_id, out.protein_id) == (0, 0)   # nothing stored
     assert not seen
-    body = "\n".join(lines)
+    body = "\n".join(out.lines)
     assert "per 100 g" in body
     assert "`895kj 14.7p 110g`" in body
 
@@ -1931,16 +1931,20 @@ def test_photo_label_outcome_logs_once_a_serving_is_known(monkeypatch):
 
     seen = _stub_store(monkeypatch)
     info = LabelInfo(895.0, None, 14.7, None, "Peanut butter")
-    lines, cal_id, pro_id = bot._photo_label_outcome(
+    out = bot._photo_label_outcome(
         7, MagicMock(id=1), info, serving_g=110.0, logged_at=None, raw="photo",
     )
 
-    assert (cal_id, pro_id) == (11, 22)
+    assert (out.calorie_id, out.protein_id) == (11, 22)
     # 895 kJ/100 g at 110 g = 984.5 kJ = 235 cal; protein scales with it.
     assert seen["kcal"] == pytest.approx(895.0 * 1.1 / 4.184)
     assert seen["protein_g"] == pytest.approx(14.7 * 1.1)
     assert "110 g" in seen["note"]
-    assert "for **110 g**" in "\n".join(lines)
+    assert "for **110 g**" in "\n".join(out.lines)
+    # The meters sit between headline and footnote, so a later change can swap
+    # just the middle without re-transcribing the packet.
+    assert "for **110 g**" in out.headline
+    assert out.footnote and out.footnote.startswith("-#")
 
 
 def test_photo_label_outcome_refuses_an_implausible_serving(monkeypatch):
@@ -1950,12 +1954,12 @@ def test_photo_label_outcome_refuses_an_implausible_serving(monkeypatch):
     from app.ai_food import LabelInfo
 
     _stub_store(monkeypatch)
-    lines, cal_id, pro_id = bot._photo_label_outcome(
+    out = bot._photo_label_outcome(
         7, MagicMock(id=1), LabelInfo(9999.0, None, 14.7, None, "x"),
         serving_g=2000.0, logged_at=None, raw="photo",
     )
-    assert (cal_id, pro_id) == (0, 0)
-    assert "nothing was stored" in "\n".join(lines)
+    assert (out.calorie_id, out.protein_id) == (0, 0)
+    assert "nothing was stored" in "\n".join(out.lines)
 
 
 def _run_estimate(monkeypatch, *, ai_result, **kwargs):
@@ -2125,3 +2129,207 @@ def test_chat_photo_of_a_panel_without_a_serving_only_reads_it(monkeypatch):
     assert handled is True
     assert not seen                              # nothing logged
     assert "`895kj 14.7p 110g`" in message.reply.call_args.args[0]
+
+
+# ---- restating a day's other replies after an entry changes ------------------
+#
+# Each confirmation prints the day's total *as at that entry*, so removing or
+# editing one silently falsifies every card posted after it — they stay on
+# screen disagreeing with /today and with each other. These pin the recompute
+# and the guards that stop it rewriting things it shouldn't.
+
+def test_running_totals_are_cumulative_not_the_day_total():
+    """The point of the whole feature: a card shows the total *at its own
+    entry*, not the day's final figure, so restating means re-accumulating."""
+    import app.bot as bot
+
+    rows = [
+        {"id": 1, "kcal": 500.0},
+        {"id": 2, "kcal": 214.0},
+        {"id": 3, "kcal": 235.0},
+    ]
+    assert bot._running_totals(rows, "kcal") == {1: 500.0, 2: 714.0, 3: 949.0}
+    assert bot._running_totals([], "kcal") == {}
+
+
+class _FakeChannel:
+    def __init__(self, messages):
+        self._messages = messages
+
+    async def fetch_message(self, mid):
+        msg = self._messages.get(mid)
+        if msg is None:
+            raise discord.NotFound(MagicMock(status=404), "gone")
+        return msg
+
+
+class _FakeReply:
+    def __init__(self, content="", embeds=()):
+        self.content = content
+        self.embeds = list(embeds)
+        self.edited = None
+
+    async def edit(self, **kwargs):
+        self.edited = kwargs
+
+
+def _restate_harness(monkeypatch, *, rows, messages, cal=(), pro=()):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "nutrition_replies_for_day", lambda u, a, z: list(rows))
+    monkeypatch.setattr(bot.db, "calorie_entries_between", lambda g, u, a, z: list(cal))
+    monkeypatch.setattr(bot.db, "protein_entries_between", lambda g, u, a, z: list(pro))
+    # The meters resolve their targets through _reply_targets, not the raw
+    # goal rows, so that's what has to be stubbed for a card to score at all.
+    from app import targets as targets_mod
+
+    resolved = targets_mod.Resolved(
+        day=date(2026, 6, 28),
+        kcal=targets_mod.MacroTarget(value=1250.0),
+        protein=targets_mod.MacroTarget(value=106.0),
+    )
+    monkeypatch.setattr(bot, "_reply_targets", lambda u, at=None: resolved)
+    monkeypatch.setattr(bot, "_calorie_streak", lambda u: 5)
+    monkeypatch.setattr(bot, "_protein_streak", lambda u: 3)
+    monkeypatch.setattr(bot, "get_channel", lambda cid: _FakeChannel(messages), raising=False)
+    monkeypatch.setattr(bot.bot, "get_channel", lambda cid: _FakeChannel(messages))
+    return bot
+
+
+def _render_row(reply_id, *, calorie_id=0, protein_id=0, headline="H", footnote=None):
+    return {
+        "reply_message_id": reply_id, "channel_id": 55, "target_user_id": 4242,
+        "calorie_id": calorie_id, "protein_id": protein_id,
+        "headline": headline, "footnote": footnote,
+    }
+
+
+def test_restate_rewrites_a_later_text_reply_with_the_corrected_total(monkeypatch):
+    """The reported bug: remove a 214 cal entry logged at 5pm and the 9pm card
+    still claims the higher running total it was printed with."""
+    reply = _FakeReply(content="OLD BODY")
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9002, calorie_id=2, protein_id=2,
+                          headline="🍎🥩 Logged **235 cal**", footnote="-# note")],
+        messages={9002: reply},
+        # The 214 cal entry is already gone, so the running total is just 235.
+        cal=[{"id": 2, "kcal": 235.0}],
+        pro=[{"id": 2, "grams": 16.0}],
+    )
+
+    edited = asyncio.run(bot._restate_day_replies(MagicMock(id=4242)))
+
+    assert edited == 1
+    body = reply.edited["content"]
+    assert body.startswith("🍎🥩 Logged **235 cal**")   # headline preserved
+    assert "-# note" in body                            # footnote preserved
+    assert "235 cal / 1,250 cal" in body                # meter recomputed
+    assert "totals corrected" in body
+
+
+def test_restate_rewrites_a_card_reply_without_losing_its_fields(monkeypatch):
+    """Card replies carry the note and author in embed fields; only the meter
+    and its colour should move."""
+    from app import ui
+
+    embed = ui.card("🍎 +235 cal", description="STALE METER", colour=ui.SUCCESS)
+    ui.block(embed, "Note", "110 g of the per-100 g values")
+    reply = _FakeReply(embeds=[embed])
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9003, calorie_id=2)],
+        messages={9003: reply},
+        cal=[{"id": 2, "kcal": 235.0}],
+    )
+
+    assert asyncio.run(bot._restate_day_replies(MagicMock(id=4242))) == 1
+    new = reply.edited["embed"]
+    assert new.title == "🍎 +235 cal"
+    assert [f.name for f in new.fields] == ["Note"]
+    assert "STALE METER" not in (new.description or "")
+    assert "235 cal / 1,250 cal" in new.description
+
+
+def test_restate_leaves_an_already_undone_reply_struck_through(monkeypatch):
+    """A reply that's been ❌'d reads as struck-through. Rewriting its meters
+    would make a removed entry look live again."""
+    forgotten = []
+    reply = _FakeReply(content="~~🍎🥩 Logged **214 cal**~~\n\n↩️ Removed")
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9001, calorie_id=1)],
+        messages={9001: reply},
+        cal=[{"id": 1, "kcal": 214.0}],
+    )
+    monkeypatch.setattr(bot.db, "forget_nutrition_reply", forgotten.append)
+
+    assert asyncio.run(bot._restate_day_replies(MagicMock(id=4242))) == 0
+    assert reply.edited is None
+    assert forgotten == [9001]
+
+
+def test_restate_forgets_a_reply_that_was_deleted_by_hand(monkeypatch):
+    forgotten = []
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9004, calorie_id=1)],
+        messages={},                       # fetch_message raises NotFound
+        cal=[{"id": 1, "kcal": 214.0}],
+    )
+    monkeypatch.setattr(bot.db, "forget_nutrition_reply", forgotten.append)
+
+    assert asyncio.run(bot._restate_day_replies(MagicMock(id=4242))) == 0
+    assert forgotten == [9004]
+
+
+def test_restate_skips_a_reply_whose_entries_are_all_gone(monkeypatch):
+    """Nothing left to meter — and the undo path has already struck that one
+    through, so touching it would undo the strike."""
+    reply = _FakeReply(content="body")
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9005, calorie_id=99)],   # id 99 isn't in the day
+        messages={9005: reply},
+        cal=[{"id": 1, "kcal": 214.0}],
+    )
+
+    assert asyncio.run(bot._restate_day_replies(MagicMock(id=4242))) == 0
+    assert reply.edited is None
+
+
+def test_restate_will_not_rewrite_a_pre_cache_text_reply(monkeypatch):
+    """Replies posted before the render cache existed have no headline, so
+    they're left alone rather than rebuilt into something they never said."""
+    reply = _FakeReply(content="body")
+    bot = _restate_harness(
+        monkeypatch,
+        rows=[_render_row(9006, calorie_id=1, headline=None)],
+        messages={9006: reply},
+        cal=[{"id": 1, "kcal": 214.0}],
+    )
+
+    assert asyncio.run(bot._restate_day_replies(MagicMock(id=4242))) == 0
+    assert reply.edited is None
+
+
+def test_restate_caps_how_many_messages_it_will_edit(monkeypatch):
+    """A backfill or bulk delete must not turn into a hundred message edits."""
+    import app.bot as bot
+
+    n = bot._MAX_RESTATED_REPLIES + 10
+    replies = {9000 + i: _FakeReply(content="body") for i in range(n)}
+    rows = [
+        _render_row(9000 + i, calorie_id=i + 1, headline="🍎 Logged")
+        for i in range(n)
+    ]
+    _restate_harness(
+        monkeypatch, rows=rows, messages=replies,
+        cal=[{"id": i + 1, "kcal": 10.0} for i in range(n)],
+    )
+
+    edited = asyncio.run(bot._restate_day_replies(MagicMock(id=4242)))
+    assert edited == bot._MAX_RESTATED_REPLIES
+    # It keeps the most recent ones — those are the ones still on screen.
+    assert replies[9000].edited is None
+    assert replies[9000 + n - 1].edited is not None

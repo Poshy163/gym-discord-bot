@@ -493,6 +493,31 @@ CREATE TABLE IF NOT EXISTS calorie_reply_tracking (
     created_at          TEXT    NOT NULL
 );
 
+-- Enough about each posted nutrition reply to re-render its running totals
+-- later. Every confirmation shows the day's total *as at that entry*, so
+-- removing or editing an earlier entry silently falsifies every card posted
+-- after it — they stay on screen contradicting /today and each other.
+--
+-- Deliberately a separate table from calorie_reply_tracking above: that one
+-- decides what a ❌ deletes, and nothing about restating a total should be
+-- able to reach the code that removes someone's data. ``headline`` and
+-- ``footnote`` are the rendered top and bottom of a text reply, kept so the
+-- middle can be replaced without re-deriving the parts that didn't change
+-- (who it was logged for, whether it was backdated). Card replies carry their
+-- own title and leave both NULL.
+CREATE TABLE IF NOT EXISTS nutrition_reply_render (
+    reply_message_id INTEGER PRIMARY KEY,
+    channel_id       INTEGER NOT NULL,
+    target_user_id   INTEGER NOT NULL,
+    calorie_id       INTEGER NOT NULL DEFAULT 0,
+    protein_id       INTEGER NOT NULL DEFAULT 0,
+    headline         TEXT,
+    footnote         TEXT,
+    created_at       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nutrition_reply_render_user
+    ON nutrition_reply_render (target_user_id);
+
 -- Linked Strava accounts (see app/strava_client.py). access/refresh tokens are
 -- Fernet-encrypted — the plaintext is never persisted. ``expires_at`` is epoch
 -- seconds (Strava's own) so the refresh path can tell when the access token is
@@ -4469,12 +4494,13 @@ class Database:
     ) -> sqlite3.Row | None:
         """Overwrite the user's most recent calorie entry's amount (global).
 
-        Returns the *old* row (id, kcal, note) so the caller can show the change,
-        or None when there's nothing to edit. A new ``note`` replaces the old;
-        ``None`` keeps it."""
+        Returns the *old* row (id, kcal, note, logged_at) so the caller can show
+        the change and know which day it landed on, or None when there's nothing
+        to edit. A new ``note`` replaces the old; ``None`` keeps it."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, kcal, note FROM calorie_entries WHERE user_id = ? "
+                "SELECT id, kcal, note, logged_at FROM calorie_entries "
+                "WHERE user_id = ? "
                 "ORDER BY logged_at DESC, id DESC LIMIT 1",
                 (user_id,),
             ).fetchone()
@@ -4517,6 +4543,72 @@ class Database:
                 ),
             )
 
+    def track_nutrition_reply(
+        self,
+        reply_message_id: int,
+        channel_id: int,
+        target_user_id: int,
+        *,
+        calorie_id: int = 0,
+        protein_id: int = 0,
+        headline: str | None = None,
+        footnote: str | None = None,
+    ) -> None:
+        """Remember enough about a posted nutrition reply to restate it.
+
+        Called for every confirmation the bot posts — card or text, chat or
+        slash — so that when an earlier entry changes, the later replies can
+        have their running totals corrected instead of being left wrong.
+        """
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO nutrition_reply_render
+                    (reply_message_id, channel_id, target_user_id, calorie_id,
+                     protein_id, headline, footnote, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reply_message_id, channel_id, target_user_id,
+                    int(calorie_id or 0), int(protein_id or 0),
+                    headline, footnote, _normalize_iso(None),
+                ),
+            )
+
+    def forget_nutrition_reply(self, reply_message_id: int) -> None:
+        """Drop a render row — the reply is gone, or has been struck through."""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM nutrition_reply_render WHERE reply_message_id = ?",
+                (reply_message_id,),
+            )
+
+    def nutrition_replies_for_day(
+        self, target_user_id: int, start_iso: str, end_iso: str,
+    ) -> list[sqlite3.Row]:
+        """Tracked replies whose entry falls in [start_iso, end_iso), oldest
+        first — the messages an earlier change to that day makes stale.
+
+        A reply whose entries have *both* been deleted drops out on its own:
+        the join finds no timestamp, so it fails the range test. That's the
+        behaviour we want, since the undo path has already struck that one
+        through and restating it would undo the strike.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT r.*, COALESCE(ce.logged_at, pe.logged_at) AS entry_at
+                FROM nutrition_reply_render r
+                LEFT JOIN calorie_entries ce ON ce.id = r.calorie_id
+                LEFT JOIN protein_entries pe ON pe.id = r.protein_id
+                WHERE r.target_user_id = ?
+                  AND COALESCE(ce.logged_at, pe.logged_at) >= ?
+                  AND COALESCE(ce.logged_at, pe.logged_at) <  ?
+                ORDER BY entry_at ASC, r.reply_message_id ASC
+                """,
+                (target_user_id, start_iso, end_iso),
+            ))
+
     def get_calorie_reply(self, reply_message_id: int) -> sqlite3.Row | None:
         with self._conn() as c:
             return c.execute(
@@ -4547,7 +4639,7 @@ class Database:
         under; a non-zero ``guild_id`` still scopes strictly as before."""
         with self._conn() as c:
             return c.execute(
-                "SELECT id, user_id, kcal, note FROM calorie_entries "
+                "SELECT id, user_id, kcal, note, logged_at FROM calorie_entries "
                 "WHERE message_id = ? AND (? = 0 OR guild_id = ?)",
                 (message_id, guild_id, guild_id),
             ).fetchone()
@@ -4582,10 +4674,12 @@ class Database:
         *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete one intake entry by id, scoped to (guild, user) for safety.
-        Returns the deleted row (kcal/note) or None if it was already gone."""
+        Returns the deleted row (kcal/note/logged_at) or None if it was already
+        gone. ``logged_at`` comes back so the caller knows which day's other
+        confirmations now show a stale running total."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, kcal, note FROM calorie_entries "
+                "SELECT id, kcal, note, logged_at FROM calorie_entries "
                 "WHERE id = ? AND guild_id = ? AND user_id = ?",
                 (calorie_id, guild_id, target_user_id),
             ).fetchone()
@@ -4896,10 +4990,12 @@ class Database:
         username: str | None = None,
     ) -> sqlite3.Row | None:
         """Overwrite the user's most recent protein entry's amount (global).
-        Returns the *old* row or None when there's nothing to edit."""
+        Returns the *old* row (incl. ``logged_at``, so the caller knows which
+        day to restate) or None when there's nothing to edit."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, grams, note FROM protein_entries WHERE user_id = ? "
+                "SELECT id, grams, note, logged_at FROM protein_entries "
+                "WHERE user_id = ? "
                 "ORDER BY logged_at DESC, id DESC LIMIT 1",
                 (user_id,),
             ).fetchone()
@@ -4970,10 +5066,11 @@ class Database:
         *, actor_id: int | None = None, actor_name: str | None = None,
     ) -> sqlite3.Row | None:
         """Delete one protein entry by id, scoped to (guild, user). Returns the
-        deleted row or None if already gone."""
+        deleted row (incl. ``logged_at``, so the caller can restate that day's
+        other confirmations) or None if already gone."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, grams, note FROM protein_entries "
+                "SELECT id, grams, note, logged_at FROM protein_entries "
                 "WHERE id = ? AND guild_id = ? AND user_id = ?",
                 (protein_id, guild_id, target_user_id),
             ).fetchone()

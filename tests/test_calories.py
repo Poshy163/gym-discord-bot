@@ -966,3 +966,78 @@ def test_food_aliases_are_per_user(db):
     db.calorie_food_alias_set(100, nf("za"), nf("pizza"))
     assert db.calorie_food_get(0, 100, nf("za")) is not None
     assert db.calorie_food_get(0, 200, nf("za")) is None
+
+
+# The query is a plain range filter, so a wide window exercises the join,
+# ordering and scoping without importing the bot module for its day maths
+# (day bucketing has its own tests).
+_ALL_TIME = ("1970-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00")
+
+
+# ---- the nutrition-reply render cache ---------------------------------------
+#
+# Deliberately a separate table from calorie_reply_tracking: that one decides
+# what a ❌ deletes, and nothing about restating a total should be able to reach
+# the code that removes someone's data.
+
+def test_nutrition_reply_render_lists_a_day_oldest_first(db):
+    c1 = db.calorie_add(1, 100, "alice", 500)
+    p1 = db.protein_add(1, 100, "alice", 40)
+    c2 = db.calorie_add(1, 100, "alice", 214)
+    db.track_nutrition_reply(
+        9001, 55, 100, calorie_id=c1, protein_id=p1,
+        headline="🍎🥩 Logged", footnote="-# note",
+    )
+    db.track_nutrition_reply(9002, 55, 100, calorie_id=c2, headline="🍎 Logged")
+
+    rows = db.nutrition_replies_for_day(100, *_ALL_TIME)
+    assert [r["reply_message_id"] for r in rows] == [9001, 9002]
+    first = rows[0]
+    assert (first["calorie_id"], first["protein_id"]) == (c1, p1)
+    assert first["headline"] == "🍎🥩 Logged"
+    assert first["footnote"] == "-# note"
+    assert first["channel_id"] == 55
+
+
+def test_nutrition_reply_render_drops_a_reply_whose_entries_are_gone(db):
+    c1 = db.calorie_add(1, 100, "alice", 500)
+    p1 = db.protein_add(1, 100, "alice", 40)
+    c2 = db.calorie_add(1, 100, "alice", 214)
+    db.track_nutrition_reply(9001, 55, 100, calorie_id=c1, protein_id=p1)
+    db.track_nutrition_reply(9002, 55, 100, calorie_id=c2)
+
+    # Undoing the first entry pair takes its own reply out of the list — the
+    # undo path has already struck that one through, and restating it would
+    # undo the strike. The later reply stays, because it's the stale one.
+    db.delete_calorie_entry(1, 100, c1)
+    db.delete_protein_entry(1, 100, p1)
+    rows = db.nutrition_replies_for_day(100, *_ALL_TIME)
+    assert [r["reply_message_id"] for r in rows] == [9002]
+
+    db.forget_nutrition_reply(9002)
+    assert db.nutrition_replies_for_day(100, *_ALL_TIME) == []
+
+
+def test_nutrition_reply_render_is_scoped_to_one_person(db):
+    mine = db.calorie_add(1, 100, "alice", 500)
+    theirs = db.calorie_add(1, 200, "bob", 500)
+    db.track_nutrition_reply(9001, 55, 100, calorie_id=mine)
+    db.track_nutrition_reply(9002, 55, 200, calorie_id=theirs)
+
+    rows = db.nutrition_replies_for_day(100, *_ALL_TIME)
+    assert [r["reply_message_id"] for r in rows] == [9001]
+
+
+def test_delete_and_edit_hand_back_the_day_they_touched(db):
+    """Restating needs to know *which* day went stale, and a backdated entry
+    isn't today's — so the mutating calls return logged_at."""
+    cid = db.calorie_add(1, 100, "alice", 500)
+    pid = db.protein_add(1, 100, "alice", 40)
+
+    old = db.calorie_update_last(1, 100, 600, username="alice")
+    assert old["logged_at"]
+    old = db.protein_update_last(1, 100, 50, username="alice")
+    assert old["logged_at"]
+
+    assert db.delete_calorie_entry(1, 100, cid)["logged_at"]
+    assert db.delete_protein_entry(1, 100, pid)["logged_at"]

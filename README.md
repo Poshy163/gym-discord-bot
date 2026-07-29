@@ -142,6 +142,13 @@ Calories:
 - **Edit to fix:** editing the original chat message updates the stored entry —
   e.g. correcting `1730c` to `1730kj` recomputes the calories; deleting the
   amount removes it.
+- **The rest of the day catches up.** Each confirmation shows the day's total
+  *as at that entry*, so removing or editing something from a few messages back
+  used to leave every later card overstating the day by the amount that just
+  went away — still on screen, still contradicting `/today`. Now those cards are
+  rewritten with the corrected running totals and marked ✏️. Replies posted
+  before this shipped have nothing recorded to rebuild them from, so they're
+  left as they are.
 - **Streaks:** log on consecutive days and the bot shows a 🔥 streak on replies
   and in `/calories week`; it stays alive until a whole day passes unlogged.
 - `/calories stop` — stop tracking (history is kept; `setup` re-enables).
