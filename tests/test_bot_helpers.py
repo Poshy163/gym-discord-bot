@@ -2333,3 +2333,159 @@ def test_restate_caps_how_many_messages_it_will_edit(monkeypatch):
     # It keeps the most recent ones — those are the ones still on screen.
     assert replies[9000].edited is None
     assert replies[9000 + n - 1].edited is not None
+
+
+# ---- catching up on what was posted while the bot was down -------------------
+#
+# Three separate faults made a restart lose logs, and each one alone was enough
+# to make the catch-up useless, so each gets its own test.
+
+def _backfill_msg(text, mid=500, author_id=4242, guild_id=1):
+    msg = MagicMock()
+    msg.content = text
+    msg.id = mid
+    msg.author.bot = False
+    msg.author.id = author_id
+    msg.guild.id = guild_id
+    msg.created_at = datetime(2026, 7, 29, 9, 0, tzinfo=timezone.utc)
+    return msg
+
+
+def _tracking_everything(monkeypatch, bot, *, cal=True, pro=True):
+    stored = {"cal": [], "pro": []}
+    monkeypatch.setattr(
+        bot.db, "calorie_goal_get", lambda g, u, day=None: _CAL_GOAL if cal else None,
+    )
+    monkeypatch.setattr(
+        bot.db, "protein_goal_get", lambda g, u, day=None: _PRO_GOAL if pro else None,
+    )
+    monkeypatch.setattr(
+        bot.db, "calorie_add",
+        lambda *a, **kw: (stored["cal"].append((a, kw)), len(stored["cal"]))[1],
+    )
+    monkeypatch.setattr(
+        bot.db, "protein_add",
+        lambda *a, **kw: (stored["pro"].append((a, kw)), len(stored["pro"]))[1],
+    )
+    return stored
+
+
+@pytest.mark.parametrize("text,cals,pros", [
+    ("350 c", 1, 0),
+    ("2 x 88 c", 1, 0),          # scale token — 2 c x 88
+    ("40p", 0, 1),               # protein alone used to be dropped entirely
+    ("40g protein", 0, 1),
+    ("500c and 40p", 1, 1),      # so did the combined form
+    ("895kj 14.7p 110g", 1, 1),
+    ("HELLO?", 0, 0),
+    ("just chatting", 0, 0),
+])
+def test_backfill_covers_every_chat_form_the_live_path_does(
+    monkeypatch, text, cals, pros,
+):
+    """The bug: the catch-up only ran calories.parse_chat_message, so a restart
+    silently swallowed every protein and combined log posted while it was
+    down."""
+    import app.bot as bot
+
+    stored = _tracking_everything(monkeypatch, bot)
+    target = MagicMock(id=4242)
+
+    bot._backfill_nutrition_entry(_backfill_msg(text), target, text)
+
+    assert len(stored["cal"]) == cals
+    assert len(stored["pro"]) == pros
+
+
+def test_backfill_respects_the_typo_caps_and_what_is_tracked(monkeypatch):
+    """A catch-up must not be a side door around the guards the live path
+    applies."""
+    import app.bot as bot
+
+    stored = _tracking_everything(monkeypatch, bot)
+    target = MagicMock(id=4242)
+    bot._backfill_nutrition_entry(_backfill_msg("99999c"), target, "99999c")
+    assert stored["cal"] == []
+
+    # Protein-only tracker: the calorie half of a combined log is dropped.
+    stored = _tracking_everything(monkeypatch, bot, cal=False)
+    bot._backfill_nutrition_entry(
+        _backfill_msg("500c and 40p"), target, "500c and 40p",
+    )
+    assert stored["cal"] == [] and len(stored["pro"]) == 1
+
+
+def test_catchup_scans_forward_from_the_last_heartbeat(monkeypatch):
+    """The headline bug: pairing oldest_first=True with a limit told discord.py
+    to start at the channel's *first ever* message, so a busy channel spent
+    every boot re-reading its opening 1,000 posts and never reached today's."""
+    import app.bot as bot
+
+    seen = {}
+
+    class _Chan:
+        def history(self, **kwargs):
+            seen.update(kwargs)
+
+            async def _empty():
+                return
+                yield  # pragma: no cover
+            return _empty()
+
+    since = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    asyncio.run(bot._backfill_channel(_Chan(), 1000, since=since))
+    assert seen["after"] == since
+    assert seen["oldest_first"] is True
+
+    # /backfill has no `since`, so it walks back from the newest message —
+    # which is what "rescan the last N" means.
+    seen.clear()
+    asyncio.run(bot._backfill_channel(_Chan(), 200))
+    assert "after" not in seen
+    assert seen["limit"] == 200
+
+
+def test_catchup_since_uses_the_marker_but_is_bounded(monkeypatch):
+    import app.bot as bot
+
+    now = datetime.now(timezone.utc)
+    recent = now - timedelta(hours=3)
+    monkeypatch.setattr(bot.db, "meta_get", lambda k: recent.isoformat())
+    # A grace window either side, so a message posted during the last
+    # heartbeat interval isn't missed.
+    assert bot._catchup_since() <= recent
+    assert bot._catchup_since() > recent - timedelta(minutes=5)
+
+    # No marker (first boot, or a wiped DB) → a bounded lookback, not all of
+    # history.
+    monkeypatch.setattr(bot.db, "meta_get", lambda k: None)
+    floor = now - timedelta(days=bot._MAX_CATCHUP_DAYS)
+    assert abs((bot._catchup_since() - floor).total_seconds()) < 60
+
+    # A marker older than the cap is clamped to it.
+    monkeypatch.setattr(
+        bot.db, "meta_get", lambda k: (now - timedelta(days=400)).isoformat(),
+    )
+    assert abs((bot._catchup_since() - floor).total_seconds()) < 60
+
+
+def test_catchup_covers_every_channel_when_none_are_listed(monkeypatch):
+    """GYM_CHANNEL_IDS narrows where the bot *listens*; empty means everywhere.
+    The old catch-up looped over that list, so on the default config it scanned
+    nothing while live logging worked in every channel."""
+    import app.bot as bot
+
+    readable = MagicMock()
+    readable.permissions_for.return_value = MagicMock(
+        read_messages=True, read_message_history=True,
+    )
+    locked = MagicMock()
+    locked.permissions_for.return_value = MagicMock(
+        read_messages=False, read_message_history=False,
+    )
+    guild = MagicMock(text_channels=[readable, locked])
+    monkeypatch.setattr(bot, "GYM_CHANNEL_IDS", [])
+    monkeypatch.setattr(type(bot.bot), "guilds", property(lambda s: [guild]))
+
+    picked = bot._catchup_channels()
+    assert picked == [readable]     # the one it can actually read

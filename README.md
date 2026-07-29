@@ -116,10 +116,14 @@ Calories:
   replies with your running total. The message must be nothing but the amount
   (so "1500cal is crazy work" is ignored); add a description with
   `/calories add` instead. `@user 650kcal` logs it for someone else.
-  Chat calorie posts are also picked up by the startup/`/backfill` history
-  scan (deduped per message, dated to the original post), so messages sent
-  while the bot was offline — or before you set a target — get imported once
-  you've run `/calories setup`.
+- **Offline catch-up:** when the bot restarts it scans forward from the last
+  moment it was known to be running and imports anything it missed — calories,
+  protein and combined posts alike — reacting ✅ on each one so you can see it
+  landed. Entries are deduped per message and dated to the original post, so a
+  restart never double-counts and a backdated log still lands on its own day.
+  A first boot (or one after a wiped database) reaches back 14 days rather than
+  through the whole channel. `/backfill [limit]` does the same on demand for
+  the last N messages of one channel.
 - **Backdating:** add a day to a chat log to file it under that day —
   `650kcal yesterday`, `200c monday`, `coffee yesterday`, `40p 3 days ago`, or
   an ISO date (`500c 2026-06-28`). Works for calorie, protein, saved-food and
@@ -179,8 +183,9 @@ Saved foods (personal name → calorie shortcuts):
 Saved foods are per-user, so your `coffee` and someone else's can be different
 amounts. Chat shortcuts only fire on an exact full-message match of a food
 you've defined (optionally with a serving count), so normal chatter is never
-mistaken for food. They're matched live only — unlike `650kcal`-style posts,
-plain food words aren't picked up by the history backfill.
+mistaken for food. They're matched live only — unlike `650kcal`/`40p`-style
+posts, plain food words aren't picked up by the offline catch-up, since
+deciding whether a bare word is a food needs a lookup per message.
 
 Everyone with a calorie target gets a personal AI summary in the weekly
 report (see below).
