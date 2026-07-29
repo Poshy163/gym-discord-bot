@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import re
 
+from . import scaling
+
 # Optional multiplier prefix for label maths: labels list protein per 100 g,
 # so eating 70 g of a "43 g per 100 g" food is `0.7x43p` (= 30.1 g). Mirrors
-# the calorie parsers' multiplier. Accepts x / * / ×.
+# the calorie parsers' multiplier. Accepts x / * / ×. The friendlier spelling
+# — `43p 70g`, stating the serving once — comes from `app.scaling`.
 _MULT = r"(?:(?P<mult>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
 
 # A protein amount for slash commands: a number, optionally followed by "g"
@@ -29,16 +32,28 @@ def _apply_mult(m: re.Match[str]) -> float:
     return grams
 
 
-def parse_protein_amount(text: str) -> float | None:
-    """Parse a grams amount from free-form text, or None.
-
-    Used by ``/protein setup`` and ``/protein add``. A bare number is grams;
-    a multiplier prefix scales it (``0.7x43`` → 30.1 g for per-100g labels).
-    """
+def match_protein_amount(text: str) -> float | None:
+    """Match a grams amount **exactly as typed**, applying no message-wide
+    scale. The scaled half is :func:`parse_protein_amount`."""
     m = _AMOUNT_RE.match(text or "")
     if m is None:
         return None
     return _apply_mult(m)
+
+
+def parse_protein_amount(text: str) -> float | None:
+    """Parse a grams amount from free-form text, or None.
+
+    Used by ``/protein setup`` and ``/protein add``. A bare number is grams;
+    a multiplier prefix scales it (``0.7x43`` → 30.1 g for per-100g labels),
+    as does a message-wide scale token (``43p 70g``). A plain ``180g`` still
+    means 180 g of protein — the literal reading is always tried first.
+    """
+    resolved = scaling.resolve(text, match_protein_amount)
+    if resolved is None:
+        return None
+    grams, scale = resolved
+    return scaling.apply(grams, scale)
 
 
 # Chat auto-logging is deliberately strict: the message must be ONLY a number
@@ -56,19 +71,30 @@ _CHAT_RE_REVERSED = re.compile(
 )
 
 
-def parse_protein_chat_message(text: str) -> float | None:
-    """If ``text`` is *only* a protein amount with a marker, return grams.
-
-    Matches ``40p``, ``40 p``, ``40g protein``, ``40 protein``, the reversed
-    ``protein 40``, and per-100g label maths like ``0.7x43p``. Returns None
-    for anything else (incl. a bare ``40g`` or a number alone) so the caller
-    falls through to other parsers.
-    """
+def match_chat_protein(text: str) -> float | None:
+    """Match a chat protein amount **exactly as typed**, applying no
+    message-wide scale. The scaled half is :func:`parse_protein_chat_message`."""
     for rx in (_CHAT_RE, _CHAT_RE_REVERSED):
         m = rx.match(text or "")
         if m is not None:
             return _apply_mult(m)
     return None
+
+
+def parse_protein_chat_message(text: str) -> float | None:
+    """If ``text`` is *only* a protein amount with a marker, return grams.
+
+    Matches ``40p``, ``40 p``, ``40g protein``, ``40 protein``, the reversed
+    ``protein 40``, and per-100g label maths — either as a prefix multiplier
+    (``0.7x43p``) or as a scale token stating the serving once (``43p 70g``,
+    ``43p x0.7``). Returns None for anything else (incl. a bare ``40g`` or a
+    number alone) so the caller falls through to other parsers.
+    """
+    resolved = scaling.resolve(text, match_chat_protein)
+    if resolved is None:
+        return None
+    grams, scale = resolved
+    return scaling.apply(grams, scale)
 
 
 def format_grams(grams: float) -> str:

@@ -203,6 +203,19 @@ A lightweight, separate tracker for keeping protein **under** a daily ceiling
 entry together and replies with both totals. Only what you're tracking is
 logged; the rest is skipped with a note. React ❌ on the reply to remove both.
 
+**Per-100 g labels:** packets print their numbers per 100 g, so type the label
+values and add what you actually ate — `895kj 14.7p 110g` logs 110 g of a food
+listing 895 kJ and 14.7 g protein per 100 g. The bot does the ÷ 100 and says on
+the reply what it scaled by. `x1.1` works instead of `110g` if you'd rather give
+the multiplier, and writing one per amount (`895kj x1.1 14.7p x1.1`) is fine as
+long as they agree — if they disagree, nothing is logged and the bot says why
+rather than picking one. The older per-number prefix (`1.1x895kj`) still works.
+
+**Near misses:** auto-logging is all-or-nothing, so a message that *almost*
+parses used to vanish in silence. Now, if a post was clearly meant to be a food
+log but couldn't be read, the bot reacts ❓ and says what went wrong. Ordinary
+chat that happens to mention food is never nagged.
+
 Logging & editing:
 
 - `/log <equipment> <weight_kg> [user] [bodyweight]` — manual entry, optionally

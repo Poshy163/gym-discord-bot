@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+from . import scaling
+
 # Thermochemical-ish food-label constant: 1 kcal = 4.184 kJ.
 KJ_PER_KCAL = 4.184
 
@@ -23,6 +25,8 @@ def kcal_to_kj(kcal: float) -> float:
 # Optional multiplier prefix for label maths: food labels list energy per
 # 100 g, so eating 70 g of a "1640 kJ per 100 g" food is `0.7x1640kj`. The
 # multiplier scales the amount (0.7 × 1640 = 1148 kJ). Accepts x / * / ×.
+# `app.scaling` adds the friendlier way to say the same thing — state the
+# serving once, as `1640kj 70g` or `1640kj x0.7` — but this prefix stays.
 _MULT = r"(?:(?P<mult>\d+(?:\.\d+)?|\.\d+)\s*[x*×]\s*)?"
 
 # Accepts "850", "850c", "850 cal", "850kcal", "850 calories", "3,550kJ",
@@ -43,16 +47,10 @@ _ENERGY_RE = re.compile(
 _KJ_UNITS = {"kj", "kilojoule"}
 
 
-def parse_energy(text: str) -> tuple[float, str] | None:
-    """Parse a free-form energy amount into ``(kcal, unit_entered)``.
-
-    ``unit_entered`` is ``"kj"`` or ``"kcal"`` (what the user typed, so the
-    reply can echo the conversion). A multiplier prefix scales the amount:
-    ``0.7x1640kj`` is 0.7 × 1640 kJ — handy when the label only lists per-100g
-    values. Returns None when the text isn't an energy amount. Negative
-    amounts aren't representable by the grammar — corrections go through the
-    undo path instead.
-    """
+def match_energy(text: str) -> tuple[float, str] | None:
+    """Parse an energy amount **exactly as typed**, applying no message-wide
+    scale. See :func:`parse_energy` for the whole story; this is the half that
+    :mod:`app.scaling` retries against a scale-stripped string."""
     m = _ENERGY_RE.match(text or "")
     if m is None:
         return None
@@ -64,6 +62,24 @@ def parse_energy(text: str) -> tuple[float, str] | None:
     if unit in _KJ_UNITS:
         return kj_to_kcal(num), "kj"
     return num, "kcal"
+
+
+def parse_energy(text: str) -> tuple[float, str] | None:
+    """Parse a free-form energy amount into ``(kcal, unit_entered)``.
+
+    ``unit_entered`` is ``"kj"`` or ``"kcal"`` (what the user typed, so the
+    reply can echo the conversion). Per-100g label maths is supported two
+    ways: a multiplier prefix on the number (``0.7x1640kj``), or a
+    message-wide scale token stating the serving once (``1640kj 70g``,
+    ``1640kj x0.7``) — see :mod:`app.scaling`. Returns None when the text
+    isn't an energy amount. Negative amounts aren't representable by the
+    grammar — corrections go through the undo path instead.
+    """
+    resolved = scaling.resolve(text, match_energy)
+    if resolved is None:
+        return None
+    (kcal, unit), scale = resolved
+    return scaling.apply(kcal, scale), unit
 
 
 # Chat auto-logging is deliberately strict: the message must be ONLY the
@@ -87,15 +103,9 @@ _CHAT_ENERGY_RE = re.compile(
 )
 
 
-def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
-    """If ``text`` is *only* a calorie amount, return ``(kcal, unit, None)``.
-
-    Returns ``None`` for anything else (including amounts buried in a
-    sentence) so the caller can fall through to the regular lift parser.
-    ``unit`` is ``"kj"`` or ``"kcal"`` (normalised from what was typed). The
-    third element is always ``None`` — chat posts don't carry notes; use
-    ``/calories add`` for those.
-    """
+def match_chat_energy(text: str) -> tuple[float, str, str | None] | None:
+    """Match a chat calorie amount **exactly as typed**, applying no
+    message-wide scale. The scaled half is :func:`parse_chat_message`."""
     m = _CHAT_ENERGY_RE.match(text or "")
     if m is None:
         return None
@@ -106,6 +116,26 @@ def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
     unit = "kj" if unit_raw.rstrip("s") in _KJ_UNITS else "kcal"
     kcal = kj_to_kcal(num) if unit == "kj" else num
     return kcal, unit, None
+
+
+def parse_chat_message(text: str) -> tuple[float, str, str | None] | None:
+    """If ``text`` is *only* a calorie amount, return ``(kcal, unit, None)``.
+
+    Returns ``None`` for anything else (including amounts buried in a
+    sentence) so the caller can fall through to the regular lift parser.
+    ``unit`` is ``"kj"`` or ``"kcal"`` (normalised from what was typed). The
+    third element is always ``None`` — chat posts don't carry notes; use
+    ``/calories add`` for those.
+
+    A trailing scale token logs a per-100g label straight off the packet:
+    ``895kj 110g`` is 110 g of an 895 kJ/100 g food, and ``895kj x1.1`` says
+    the same thing as a multiplier. See :mod:`app.scaling`.
+    """
+    resolved = scaling.resolve(text, match_chat_energy)
+    if resolved is None:
+        return None
+    (kcal, unit, note), scale = resolved
+    return scaling.apply(kcal, scale), unit, note
 
 
 def normalize_food(name: str) -> str:

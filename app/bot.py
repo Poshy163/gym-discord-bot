@@ -1652,6 +1652,21 @@ def _zero_quip(kind: str) -> str:
     return random.choice(pool)
 
 
+def _is_nutrition_tracking(guild_id: int, target: object) -> bool:
+    """True when ``target`` has a calorie or protein target set.
+
+    Gates the "did you mean to log that?" nudge, so the bot stays silent for
+    people who never asked it to watch their food.
+    """
+    target_id = int(getattr(target, "id", 0) or 0)
+    if not target_id:
+        return False
+    return (
+        db.calorie_goal_get(guild_id, target_id) is not None
+        or db.protein_goal_get(guild_id, target_id) is not None
+    )
+
+
 async def _handle_calorie_message(
     message: discord.Message, target: object,
     kcal: float, unit: str, note: str | None,
@@ -2245,12 +2260,13 @@ def _protein_status(
 
 async def _handle_protein_message(
     message: discord.Message, target: object, grams: float,
-    *, logged_at: datetime | None = None,
+    *, logged_at: datetime | None = None, note: str | None = None,
 ) -> None:
     """Persist a chat-message protein entry (`40p`, `40g protein`).
 
     ``logged_at`` backdates the entry (e.g. `40p yesterday`); None files it
-    under the message time."""
+    under the message time. ``note`` annotates the reply card — used to show
+    the per-100g scaling a `43p 110g` post applied."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     goal = db.protein_goal_get(guild_id, target_id)
@@ -2293,17 +2309,20 @@ async def _handle_protein_message(
         LOG.exception("Failed to store protein entry for user %s", target_id)
         return
     LOG.info("Stored %.0fg protein for %s in #%s", grams, target, message.channel)
-    await _reply_protein_logged(message, target, goal, grams, logged_at=logged_at)
+    await _reply_protein_logged(
+        message, target, goal, grams, logged_at=logged_at, note=note,
+    )
 
 
 async def _reply_protein_logged(
     message: discord.Message, target: object, goal: sqlite3.Row, grams: float,
-    *, logged_at: datetime | None = None,
+    *, logged_at: datetime | None = None, note: str | None = None,
 ) -> None:
     """React ✅ and reply with what was added + that day's running total vs max.
 
     ``logged_at`` (a backdated post) anchors the total to that day and notes
-    it."""
+    it. ``note`` is a short annotation for the card (e.g. the serving weight a
+    per-100g post was scaled by)."""
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
@@ -2327,6 +2346,7 @@ async def _reply_protein_logged(
                 f"{suffix}{_backdate_label(logged_at)}",
                 status, colour,
                 author=target, streak=streak, banner=banner,
+                note=_safe_label(note, limit=64) if note else None,
             ),
             mention_author=False,
         )
@@ -2342,11 +2362,13 @@ async def _reply_protein_logged(
 
 async def _handle_combined_nutrition(
     message: discord.Message, target: object, kcal: float, grams: float,
-    *, logged_at: datetime | None = None,
+    *, logged_at: datetime | None = None, basis: str | None = None,
 ) -> None:
     """Log a message that carries BOTH a calorie and a protein amount
     (`500c and 40p`) — stores each entry the user is tracking and posts one
-    combined reply. ``logged_at`` backdates both (e.g. `500c and 40p yesterday`)."""
+    combined reply. ``logged_at`` backdates both (e.g. `500c and 40p yesterday`).
+    ``basis`` names the per-100g scaling applied (`895kj 14.7p 110g`), shown
+    under the totals so the arithmetic can be checked against the label."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     cal_goal = db.calorie_goal_get(guild_id, target_id)
@@ -2446,6 +2468,8 @@ async def _handle_combined_nutrition(
     tail = (
         f"\n{ui.subtext(f'skipped {chr(44).join(skipped)}')}" if skipped else ""
     )
+    if basis:
+        tail = f"\n{ui.subtext(basis)}{tail}"
     try:
         # Both macro icons mark this as a combined reply; the undo handler
         # removes every nutrition entry tied to the source message.
@@ -4045,10 +4069,17 @@ async def on_message(message: discord.Message) -> None:
 
     # Quick calorie logging path: `650kcal`, `200 cal toastie`, `2700kj`,
     # or `@user 650kcal` to log for someone else. The unit is mandatory
-    # (kcal/cal/kj) so plain lift numbers never match this branch.
+    # (kcal/cal/kj) so plain lift numbers never match this branch. A scale
+    # token (`2700kj 110g`) logs a per-100g label at the serving eaten; the
+    # note records what it was scaled by so the card can show its working.
     cal_hit = calories.parse_chat_message(nut_content)
     if cal_hit is not None:
-        await _handle_calorie_message(message, target, *cal_hit, logged_at=nut_dt)
+        cal_kcal, cal_unit, cal_note = cal_hit
+        await _handle_calorie_message(
+            message, target, cal_kcal, cal_unit,
+            cal_note or nutrition.chat_scale_note(nut_content),
+            logged_at=nut_dt,
+        )
         await bot.process_commands(message)
         return
 
@@ -4090,17 +4121,41 @@ async def on_message(message: discord.Message) -> None:
     if protein_grams is not None:
         await _handle_protein_message(
             message, target, protein_grams, logged_at=nut_dt,
+            note=nutrition.chat_scale_note(nut_content),
         )
         await bot.process_commands(message)
         return
 
     # Combined log: a message carrying BOTH a calorie and a protein amount,
-    # e.g. `500c and 40p`. Only fires when both tokens are present.
+    # e.g. `500c and 40p`. Only fires when both tokens are present. This is
+    # where per-100g posts land — a panel gives both macros, so `895kj 14.7p
+    # 110g` scales the pair together off one stated serving.
     combined = nutrition.parse_combined(nut_content)
     if combined is not None:
         await _handle_combined_nutrition(
             message, target, *combined, logged_at=nut_dt,
+            basis=nutrition.chat_scale_note(nut_content),
         )
+        await bot.process_commands(message)
+        return
+
+    # Every nutrition path missed. If the message was clearly *aiming* at a
+    # food log, say so rather than falling through in silence: auto-logging is
+    # all-or-nothing, and a miss is indistinguishable from a hit until the
+    # day's total comes up short. Gated on the target actually tracking, and
+    # on nothing word-shaped being left over, so ordinary chat is never nagged.
+    hint = nutrition.near_miss(nut_content)
+    # `_msg_guild_id`, not `gid`: it resolves the same storage server the
+    # nutrition handlers look their goals up in, including in an ambiguous DM.
+    if hint is not None and _is_nutrition_tracking(_msg_guild_id(message), target):
+        try:
+            await message.add_reaction("❓")
+        except discord.HTTPException:
+            pass
+        try:
+            await message.reply(f"❓ {hint}", mention_author=False)
+        except discord.HTTPException:
+            pass
         await bot.process_commands(message)
         return
 
@@ -4403,6 +4458,9 @@ async def _handle_calorie_edit(
         return True
 
     kcal, _unit, note = new_hit  # type: ignore[misc]
+    # Same note the live path builds, so editing `895kj 14.7p 110g` keeps the
+    # card showing what the figure was scaled by instead of dropping it.
+    note = note or nutrition.chat_scale_note(content)
     if goal is None:
         return existing is not None  # can't log without a target
     if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
@@ -16704,12 +16762,14 @@ async def calories_food_lookup_cmd(
     if top.serving_g:
         lines.append(f"• Stated serving: {top.serving_g:g} g")
     if kj is not None:
-        example = [f"`0.6x{kj:.0f}kj`"]
+        amounts = [f"{kj:.0f}kj"]
         if top.protein_per_100g is not None:
-            example.append(f"`0.6x{top.protein_per_100g:g}p`")
+            amounts.append(f"{top.protein_per_100g:g}p")
+        serving = f"{top.serving_g:g}" if top.serving_g else "60"
         lines.append(
-            f"\nAte 60 g? Log it as {' and '.join(example)} — scale the "
-            "0.6 to your grams ÷ 100."
+            f"\nLog it by posting the label values plus what you ate: "
+            f"`{' '.join(amounts)} {serving}g`. Swap in your own grams — "
+            "no dividing by 100."
         )
     if len(results) > 1:
         alts = ", ".join(
@@ -16941,9 +17001,13 @@ async def calories_label_cmd(
 
     if grams is None or kcal100 is None:
         if kj100 is not None:
+            amounts = f"{kj100:.0f}kj"
+            if info.protein_per_100g is not None:
+                amounts += f" {info.protein_per_100g:g}p"
+            serving = f"{info.serving_g:g}" if info.serving_g else "60"
             lines.append(
-                f"\nTo log it: re-run with `grams:`, or use the chat maths — "
-                f"e.g. `0.6x{kj100:.0f}kj` for 60 g (your grams ÷ 100)."
+                f"\nTo log it: re-run with `grams:`, or just post the values "
+                f"and what you ate — `{amounts} {serving}g`."
             )
         lines.append("\n*Read by AI — double-check against the label.*")
         await interaction.followup.send("\n".join(lines))

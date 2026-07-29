@@ -47,6 +47,34 @@ def test_parse_protein_chat_message_multiplier():
     assert protein.parse_protein_chat_message("0.7x43g") is None
 
 
+def test_parse_protein_chat_message_scale_token():
+    # 70 g of a food listing 43 g protein per 100 g, with the serving stated
+    # once as a weight instead of pre-divided into a multiplier.
+    assert protein.parse_protein_chat_message("43p 70g") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("43p 70 g") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("70g 43p") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("43p @70g") == pytest.approx(30.1)
+    # Or as a symbol-first multiplier.
+    assert protein.parse_protein_chat_message("43p x0.7") == pytest.approx(30.1)
+    assert protein.parse_protein_chat_message("43 protein x0.7") == pytest.approx(30.1)
+    # Contradictions are refused rather than half-applied.
+    assert protein.parse_protein_chat_message("43p x0.7 x0.8") is None
+    assert protein.parse_protein_chat_message("0.7x43p x0.7") is None
+    # A serving weight with no protein behind it is not a log.
+    assert protein.parse_protein_chat_message("70g") is None
+
+
+def test_scale_token_never_hijacks_a_plain_grams_amount():
+    # The literal reading always wins, so grams that ARE the protein stay the
+    # protein — this is what keeps `/protein setup 180g` meaning 180 g.
+    assert protein.parse_protein_amount("180g") == 180.0
+    assert protein.parse_protein_amount("40 g protein") == 40.0
+    assert protein.parse_protein_chat_message("40g protein") == 40.0
+    assert protein.parse_protein_chat_message("protein 40g") == 40.0
+    # But /protein add still accepts a per-100g label plus a serving.
+    assert protein.parse_protein_amount("43 70g") == pytest.approx(30.1)
+
+
 def test_parse_protein_chat_message_rejects_ambiguous():
     # A bare number or weight must NOT be read as protein.
     assert protein.parse_protein_chat_message("40") is None

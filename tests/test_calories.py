@@ -152,6 +152,53 @@ def test_parse_chat_message_rejects(text):
     assert parse_chat_message(text) is None
 
 
+# ---- scale token (per-100g labels, serving stated once) --------------------
+
+@pytest.mark.parametrize("text,kcal,unit", [
+    # 110 g of a food labelled 895 kJ per 100 g — the weight goes in as typed,
+    # no dividing by 100 in your head.
+    ("895kj 110g", 895.0 * 1.1 / 4.184, "kj"),
+    ("895kj 110 g", 895.0 * 1.1 / 4.184, "kj"),
+    ("895kj @110g", 895.0 * 1.1 / 4.184, "kj"),
+    ("110g 895kj", 895.0 * 1.1 / 4.184, "kj"),
+    # Same thing said as a multiplier, symbol first.
+    ("895kj x1.1", 895.0 * 1.1 / 4.184, "kj"),
+    ("895kj x 1.1", 895.0 * 1.1 / 4.184, "kj"),
+    ("430c 60g", 258.0, "kcal"),
+])
+def test_parse_chat_message_scale_token(text, kcal, unit):
+    result = parse_chat_message(text)
+    assert result is not None
+    got_kcal, got_unit, got_note = result
+    assert got_kcal == pytest.approx(kcal)
+    assert got_unit == unit
+    assert got_note is None  # the scale note is added by the reply layer
+
+
+@pytest.mark.parametrize("text", [
+    "895kj x1.1 x1.2",   # two scales that disagree — refuse, don't pick one
+    "1.1x895kj x1.1",    # prefix multiplier beside a scale token
+    "895kj 0g",
+    "895kj 9000g",
+    "110g",              # a serving with nothing to scale is not a log
+    "x1.1",
+    "bench 100kg x 5",   # a set count is not a scale
+])
+def test_parse_chat_message_scale_token_rejects(text):
+    assert parse_chat_message(text) is None
+
+
+def test_parse_energy_scale_token():
+    # /calories add takes the same syntax as chat.
+    result = parse_energy("1640kj 70g")
+    assert result is not None
+    kcal, unit = result
+    assert kcal == pytest.approx(0.7 * 1640.0 / 4.184)
+    assert unit == "kj"
+    # A weight with no energy behind it still isn't an amount.
+    assert parse_energy("70g") is None
+
+
 # ---- saved-food phrase parsing --------------------------------------------
 
 @pytest.mark.parametrize("text,servings,name", [
