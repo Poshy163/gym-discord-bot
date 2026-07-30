@@ -2622,3 +2622,151 @@ def test_backfill_channel_tallies_each_person_separately(monkeypatch):
     assert result.people[1].kcal == pytest.approx(350.0)
     assert result.people[1].grams == pytest.approx(40.0)
     assert result.people[2].kcal == pytest.approx(500.0)
+
+
+# ---------------------------------------------------------------------------
+# Revo attendance poller. The underlying signal is a per-DAY attendance flag
+# that Revo batches into its rewards system, so the poller's job is to notice a
+# NEWER day appearing — it can never know the time of day a member trained.
+# ---------------------------------------------------------------------------
+
+def _revo_row(**kw):
+    base = {
+        "user_id": 42, "notify_channel_id": 7, "notify_guild_id": None,
+        "last_checkin_date": None, "last_streak_weeks": None,
+    }
+    base.update(kw)
+    return base
+
+
+def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None):
+    """Drive _poll_one_account with the network + DB + Discord stubbed out.
+
+    Returns (sent_texts, fetch_calls, saved_state).
+    """
+    import app.bot as bot
+
+    now = now or datetime(2026, 7, 31, 14, 40, tzinfo=timezone.utc)
+    sent, fetches, saved = [], [], []
+
+    class _Chan:
+        async def send(self, text, **kw):
+            sent.append(text)
+
+    class _Client:
+        def get_streak_calendar(self, m, y):
+            fetches.append(("calendar", m, y))
+            if latest_iso is None:
+                return {}
+            d = datetime.strptime(latest_iso, "%Y-%m-%d")
+            return {d.day: True} if (d.month, d.year) == (m, y) else {}
+
+        def get_streak_weeks(self):
+            fetches.append(("streak",))
+            return streak
+
+    class _Loop:
+        # discord.Client.loop raises before the client connects, so the whole
+        # bot object is stubbed rather than patched attribute-by-attribute.
+        async def run_in_executor(self, executor, fn):
+            return fn()
+
+    class _StubBot:
+        loop = _Loop()
+
+        def get_channel(self, cid):
+            return _Chan()
+
+        async def fetch_channel(self, cid):  # pragma: no cover - not reached
+            return _Chan()
+
+    monkeypatch.setattr(bot, "DISPLAY_TZ", timezone.utc)
+    monkeypatch.setattr(bot, "bot", _StubBot())
+    monkeypatch.setattr(bot, "_client_for_user", lambda r: _Client())
+    monkeypatch.setattr(bot.db, "update_revo_checkin_state",
+                        lambda uid, cur, st: saved.append((uid, cur, st)))
+    monkeypatch.setattr(bot.db, "list_revo_accounts", lambda: [row])
+    monkeypatch.setattr(bot, "_bot_name", lambda uid, fallback: "Tester")
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now
+    monkeypatch.setattr(bot, "datetime", _FixedDatetime)
+
+    asyncio.run(bot._poll_one_account(row))
+    return sent, fetches, saved
+
+
+def test_poll_skips_the_round_trip_once_today_is_already_recorded(monkeypatch):
+    """The cursor only advances to a NEWER day and the calendar has no
+    sub-day resolution, so after today's check-in there is nothing to learn
+    until midnight. Those requests are pure waste against a rate-limited
+    portal — and skipping them is what makes a tight poll interval affordable."""
+    row = _revo_row(last_checkin_date="2026-07-31")
+    sent, fetches, saved = _run_poll(monkeypatch, row, latest_iso="2026-07-31")
+    assert fetches == []       # no HTTP at all
+    assert sent == []
+    assert saved == []         # and no pointless DB write
+
+
+def test_poll_announces_a_new_day_without_claiming_it_was_just_now(monkeypatch):
+    """Revo batches attendance in, so a session surfaced at 14:40 may have
+    happened at 6am. The wording must not claim "just checked in"."""
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=3)
+    sent, fetches, _saved = _run_poll(monkeypatch, row, latest_iso="2026-07-31")
+    assert len(sent) == 1
+    assert "trained at Revo today" in sent[0]
+    assert "just checked in" not in sent[0]
+    assert "<@42>" in sent[0]
+    assert fetches  # it really did fetch this time
+
+
+def test_poll_labels_an_older_visit_by_day(monkeypatch):
+    row = _revo_row(last_checkin_date="2026-07-20")
+    sent, _f, _s = _run_poll(monkeypatch, row, latest_iso="2026-07-30")
+    assert "yesterday" in sent[0]
+    assert "today" not in sent[0]
+
+
+def test_poll_first_run_after_linking_is_silent(monkeypatch):
+    """A freshly linked account must not replay its backfilled history."""
+    row = _revo_row(last_checkin_date=None)
+    sent, _f, saved = _run_poll(monkeypatch, row, latest_iso="2026-07-28")
+    assert sent == []
+    assert saved == [(42, "2026-07-28", 3)]  # baseline recorded
+
+
+def test_poll_does_not_re_announce_the_same_day(monkeypatch):
+    row = _revo_row(last_checkin_date="2026-07-28")
+    sent, _f, _s = _run_poll(monkeypatch, row, latest_iso="2026-07-28")
+    assert sent == []
+
+
+def test_poll_cursor_never_goes_backwards(monkeypatch):
+    """A calendar that momentarily reports an older day must not rewind the
+    cursor, or the next poll would re-announce a visit already posted."""
+    row = _revo_row(last_checkin_date="2026-07-28")
+    _sent, _f, saved = _run_poll(monkeypatch, row, latest_iso="2026-07-20")
+    assert saved == [(42, "2026-07-28", 3)]
+
+
+def test_club_detail_pin_prefers_the_precise_coordinate():
+    """PerfectGym rounds its coordinates — 25 of 77 pins land >200 m from the
+    door and Pitt St nearly 1 km out. Netpulse carries 6-14 decimal places, so
+    when its row is available the pin must come from there."""
+    import app.bot as bot
+    from app.revo_netpulse import Club
+    from app.revo_perfectgym import ClubDirEntry
+
+    entry = ClubDirEntry(id=1, name="Pitt St", address="188 Pitt St", city=None,
+                         club_number=None, lat=-33.8788, lng=151.2072,
+                         opening_date="2022-02-24T00:00:00", state="NSW")
+    precise = Club(uuid="u", name="Pitt St Sydney", city=None, state=None,
+                   mms="perfectgym", url=None, lat=-33.87025, lng=151.20805)
+
+    with_np = bot._format_revo_club_detail(entry, [], [], precise)
+    assert "-33.87025,151.20805" in with_np
+    # Falls back to the PerfectGym coordinate when Netpulse has no row.
+    without = bot._format_revo_club_detail(entry, [], [], None)
+    assert "-33.8788,151.2072" in without

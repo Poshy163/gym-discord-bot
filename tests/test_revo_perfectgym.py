@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
 
+from app import revo_client
 from app import revo_perfectgym as pg
 
 
@@ -331,7 +333,7 @@ _FAKE_CLUB_LIST = [
         "Latitude": -34.82900000,
         "Longitude": 138.69200000,
         "OpeningDate": "2022-11-01T00:00:00",
-        "StateId": 3,  # opaque grouping key — must NOT be used as the state code
+        "StateId": 3,  # confirmed → SA (see pg.STATE_BY_STATE_ID)
     },
     {
         "Id": 33,
@@ -377,14 +379,139 @@ def test_parse_club_list_missing_latlng_preserved_as_none():
     assert ghost.opening_date is None  # null date preserved
 
 
-def test_parse_club_list_state_from_directory_not_stateid():
-    """State comes from revo_client.state_for_club(name); the numeric StateId is
-    an opaque grouping key and must never be surfaced as the state code."""
+def test_parse_club_list_state_from_stateid_then_curated_names():
+    """StateId is the primary state source, with the curated name table behind it.
+
+    An id we haven't confirmed must never leak out as a state code — it falls
+    through to the name lookup, and if that doesn't know the club either, the
+    state stays None rather than becoming the raw integer.
+    """
     entries = {e.name: e for e in pg.parse_club_list(_FAKE_CLUB_LIST)}
-    assert entries["Modbury"].state == "SA"
-    assert entries["Balcatta"].state == "WA"
-    # Unknown club → None, NOT the raw StateId (9).
+    assert entries["Modbury"].state == "SA"      # StateId 3
+    assert entries["Balcatta"].state == "WA"     # StateId 6
+    # Unknown club AND unconfirmed StateId (9) → None, never "9".
     assert entries["Nowhere Test Club"].state is None
+
+
+def test_stateid_resolves_a_club_the_curated_names_do_not_know():
+    """The whole point of using StateId: a brand-new club Revo adds resolves to its
+    state with no code change, where the hand-maintained name table returns None."""
+    assert revo_client.state_for_club("Melrose Park") is None
+    (entry,) = pg.parse_club_list(
+        [{"Id": 91, "Name": "Melrose Park", "Address": "Tenancy 6, 1031 South Road",
+          "StateId": 3}]
+    )
+    assert entry.state == "SA"
+
+
+def test_unconfirmed_stateid_falls_back_to_the_curated_name():
+    """A club the names DO know keeps its state even under an unmapped StateId, so
+    an interstate expansion (a new id) degrades to the old behaviour, not to None."""
+    (entry,) = pg.parse_club_list(
+        [{"Id": 92, "Name": "Marion", "StateId": 4}]  # 4 is not in the whitelist
+    )
+    assert entry.state == "SA"
+
+
+def test_parse_club_list_keeps_full_name_and_tolerates_its_absence():
+    (with_full,) = pg.parse_club_list(
+        [{"Id": 76, "Name": "Nunawading OG", "FullName": "Nunawading - (Original)",
+          "StateId": 5}]
+    )
+    assert with_full.full_name == "Nunawading - (Original)"
+    assert with_full.name == "Nunawading OG"
+    # FullName is absent from the older shape → None, and callers fall back to name.
+    assert pg.parse_club_list([{"Id": 1, "Name": "Marion"}])[0].full_name is None
+
+
+# ---------------------------------------------------------------------------
+# Opening dates: an announced-but-unbuilt club is on the live board reporting 0,
+# so it has to be told apart from a genuinely quiet gym.
+# ---------------------------------------------------------------------------
+
+_TODAY = date(2026, 7, 31)
+
+
+def _entry(name, *, state=None, opening=None):
+    return pg.ClubDirEntry(
+        id=None, name=name, address=None, city=None, club_number=None,
+        lat=None, lng=None, opening_date=opening, state=state,
+    )
+
+
+def test_has_opened_past_future_and_unknown():
+    assert pg.has_opened(_entry("Marion", opening="2024-09-18T00:00:00"), _TODAY)
+    assert not pg.has_opened(_entry("Nedlands", opening="2026-09-30T00:00:00"), _TODAY)
+    # Opening today counts as open.
+    assert pg.has_opened(_entry("Today", opening="2026-07-31T00:00:00"), _TODAY)
+    # A missing or unparseable date must not hide a trading club.
+    assert pg.has_opened(_entry("NoDate", opening=None), _TODAY)
+    assert pg.has_opened(_entry("Junk", opening="not-a-date"), _TODAY)
+
+
+def test_future_openings_sorted_and_state_scoped():
+    directory = [
+        _entry("Nedlands", state="WA", opening="2026-09-30T00:00:00"),
+        _entry("Altona North", state="VIC", opening="2026-08-18T00:00:00"),
+        _entry("Marion", state="SA", opening="2024-09-18T00:00:00"),
+    ]
+    assert [e.name for e in pg.future_openings(directory, _TODAY)] == [
+        "Altona North", "Nedlands",
+    ]
+    assert [e.name for e in pg.future_openings(directory, _TODAY, state="wa")] == [
+        "Nedlands",
+    ]
+    assert pg.future_openings(directory, _TODAY, state="SA") == []
+
+
+# ---------------------------------------------------------------------------
+# enrich_occupancy — the join that makes the live board state-aware.
+# ---------------------------------------------------------------------------
+
+def test_enrich_occupancy_fills_state_the_board_omits():
+    """Occupancy carries no StateId, so a club the curated names miss arrives with
+    state=None and drops out of every state-scoped board. The directory fixes it."""
+    occupancy = [_occ("Melrose Park", 12, None)]
+    enriched = pg.enrich_occupancy(
+        occupancy, [_entry("Melrose Park", state="SA")], _TODAY,
+    )
+    assert [(c.name, c.state, c.count) for c in enriched] == [("Melrose Park", "SA", 12)]
+
+
+def test_enrich_occupancy_drops_clubs_that_have_not_opened():
+    """The regression this exists for: an unopened club reports 0 and would win
+    'quietest right now' outright."""
+    occupancy = [_occ("Altona North", 0, "VIC"), _occ("Cannington", 65, "WA")]
+    directory = [
+        _entry("Altona North", state="VIC", opening="2026-08-18T00:00:00"),
+        _entry("Cannington", state="WA", opening="2021-01-01T00:00:00"),
+    ]
+    enriched = pg.enrich_occupancy(occupancy, directory, _TODAY)
+    assert [c.name for c in enriched] == ["Cannington"]
+    # And the quietest club in scope is now a real one.
+    assert min(enriched, key=lambda c: c.count).name == "Cannington"
+
+
+def test_enrich_occupancy_never_discards_an_unmatched_live_count():
+    """A directory that lags the board must not cost us a real head-count."""
+    occupancy = [_occ("Brand New Club", 7, None)]
+    enriched = pg.enrich_occupancy(occupancy, [_entry("Marion", state="SA")], _TODAY)
+    assert [(c.name, c.count) for c in enriched] == [("Brand New Club", 7)]
+
+
+def test_enrich_occupancy_without_a_directory_is_a_no_op():
+    """The directory fetch is best-effort; an outage returns the board untouched."""
+    occupancy = [_occ("Altona North", 0, "VIC"), _occ("Cannington", 65, "WA")]
+    assert pg.enrich_occupancy(occupancy, [], _TODAY) == occupancy
+
+
+def test_enrich_occupancy_does_not_mutate_its_input():
+    """Callers pass rows straight out of the module TTL cache."""
+    occupancy = [_occ("Melrose Park", 12, None)]
+    before = list(occupancy)
+    pg.enrich_occupancy(occupancy, [_entry("Melrose Park", state="SA")], _TODAY)
+    assert occupancy == before
+    assert occupancy[0].state is None
 
 
 def test_parse_club_list_accepts_json_string_and_skips_garbage():
@@ -611,17 +738,19 @@ def test_membership_and_dir_reprs_carry_no_secrets():
     entry = pg.ClubDirEntry(id=25, name="Modbury", address="976 North East Road",
                             city="Modbury", club_number="404", lat=-34.829,
                             lng=138.692, opening_date="2022-11-01T00:00:00",
-                            state="SA")
+                            state="SA", full_name="Modbury")
     for r in (repr(status), repr(entry)):
         assert _FAKE_BARCODE not in r
         assert "CpAuthToken" not in r
         assert "UserNumber" not in r
         assert "@" not in r  # no email address
-    # Neither dataclass has a field that could ever hold a barcode/token.
+    # Neither dataclass has a field that could ever hold a barcode/token. This set
+    # is deliberately exact, not a subset check: a new field on a dataclass the bot
+    # logs and embeds has to be justified as public here before it can ship.
     assert set(vars(status)) == {"contract_status", "payment_ok", "has_card"}
     assert set(vars(entry)) == {
         "id", "name", "address", "city", "club_number",
-        "lat", "lng", "opening_date", "state",
+        "lat", "lng", "opening_date", "state", "full_name",
     }
 
 

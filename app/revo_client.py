@@ -253,10 +253,22 @@ def parse_rewards_landing(
 
 
 def parse_streak_weeks(html: str) -> Optional[int]:
-    """Pull the headline "N WEEKS" streak count from the streaks page."""
+    """Pull the headline "N WEEKS" streak count from the streaks page.
+
+    The digits are joined before being read, rather than captured as one ``\\d+``
+    run. Today this counter is a single unpadded ``<span>`` (``3``), but *every*
+    other counter on this portal — tickets, both draw countdowns — is split into
+    zero-padded one-digit spans. If Revo ever renders this one the same way, a
+    ``(\\d+)`` capture over the tag-stripped text would read ``1 3 WEEKS`` as
+    **3**: not a crash, not a ``None``, just a wrong-but-plausible streak that
+    nothing would flag. Joining the run handles both shapes identically.
+    """
     text = re.sub(r"<[^>]+>", " ", html)
-    m = re.search(r"(\d+)\s*WEEKS?", text, re.IGNORECASE)
-    return int(m.group(1)) if m else None
+    m = re.search(r"((?:\d\s*){1,4})WEEKS?", text, re.IGNORECASE)
+    if not m:
+        return None
+    digits = re.findall(r"\d", m.group(1))
+    return int("".join(digits)) if digits else None
 
 
 def parse_streak_calendar(body: str) -> dict[int, bool]:
@@ -444,6 +456,57 @@ def parse_raffle(html: str) -> dict[str, Optional[int]]:
     }
 
 
+# The raffle page renders BOTH opt buttons and hides the one that doesn't apply,
+# so which button is hidden tells us the member's current opt-in state. Note both
+# carry `data-opt-val="1"`: `optval` is a pure *toggle*, not a 0/1 setter, so there
+# is no read-only variant of the request — the DOM is the only way to read this.
+_OPT_BUTTON_RE = re.compile(
+    r"<button\b[^>]*\bid=\"opt(In|Out)\"[^>]*>", re.I
+)
+_DISPLAY_NONE_RE = re.compile(r"display:\s*none", re.I)
+
+
+def parse_raffle_optin(html: str) -> Optional[bool]:
+    """Whether the member is currently entered in the monthly raffle draw.
+
+    ``True`` = opted in, ``False`` = opted out, ``None`` = couldn't tell (page
+    reshaped, or neither button rendered) — never a silent ``False``.
+
+    Read from which of the two opt buttons the server hides: the portal renders
+    ``#optIn`` and ``#optOut`` together and shows only the *action available*, so a
+    visible ``#optIn`` means the member is currently **out**.
+
+    This matters because :func:`parse_raffle` will happily scrape countdowns out of
+    the ``#nextDrawWrapper`` block **even when the portal hides it**, which it does
+    for an opted-out member. Without this, the bot cheerfully tells someone their
+    tickets are "in the draw" when they aren't entered at all.
+    """
+    states: dict[str, bool] = {}
+    for m in _OPT_BUTTON_RE.finditer(html):
+        states[m.group(1).lower()] = bool(_DISPLAY_NONE_RE.search(m.group(0)))
+    hidden_in, hidden_out = states.get("in"), states.get("out")
+    if hidden_in is None or hidden_out is None:
+        return None
+    if hidden_in == hidden_out:
+        # Both shown or both hidden — the portal is in a shape we don't understand.
+        return None
+    return hidden_in  # optIn hidden ⇒ nothing to join ⇒ already in
+
+
+@dataclass(frozen=True)
+class RaffleInfo:
+    """Raffle countdowns plus whether this member is actually entered.
+
+    ``opted_in`` is ``None`` when the page didn't render a readable opt state, so
+    callers can stay quiet rather than assert a wrong answer. When it is ``False``
+    the countdowns are still *factually* the next draw dates, but the portal hides
+    them from this member — so a caller must not imply their tickets are in play.
+    """
+    monthly_draw_days: Optional[int]
+    major_draw_days: Optional[int]
+    opted_in: Optional[bool]
+
+
 # prize-pool.php renders two prize blurbs in DOM order [monthly, major], each as
 # a <div class="py-3 px-1"><p>…</p></div> block. Free-text scrape — if Revo
 # rewords or moves the blurbs, the missing side degrades to None.
@@ -625,8 +688,20 @@ class RevoClient:
     def get_tickets(self) -> tuple[Optional[int], list[TicketRow]]:
         return parse_tickets(self._get(TICKETS_PATH))
 
-    def get_raffle(self) -> dict[str, Optional[int]]:
-        return parse_raffle(self._get(RAFFLE_PATH))
+    def get_raffle(self) -> RaffleInfo:
+        """Draw countdowns **and** this member's raffle opt-in state, one fetch.
+
+        Both come off the same page, so they're parsed together rather than making
+        the caller GET it twice — and pairing them is what stops a caller from
+        announcing a countdown to someone who isn't entered.
+        """
+        html = self._get(RAFFLE_PATH)
+        days = parse_raffle(html)
+        return RaffleInfo(
+            monthly_draw_days=days["monthly_draw_days"],
+            major_draw_days=days["major_draw_days"],
+            opted_in=parse_raffle_optin(html),
+        )
 
 
 # ---------------------------------------------------------------------------

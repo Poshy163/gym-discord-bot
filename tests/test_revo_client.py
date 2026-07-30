@@ -268,6 +268,73 @@ def test_parse_raffle_extracts_countdowns():
     assert out == {"monthly_draw_days": 12, "major_draw_days": 145}
 
 
+# ---------------------------------------------------------------------------
+# Raffle opt-in state. parse_raffle scrapes the countdown block even when the
+# portal HIDES it, which is what it does for an opted-out member — so without
+# this the bot promises a draw to someone whose tickets aren't entered.
+# ---------------------------------------------------------------------------
+
+def _opt_buttons(*, hide_in: bool, hide_out: bool) -> str:
+    def btn(which: str, hidden: bool) -> str:
+        style = ' style="display: none"' if hidden else " "
+        return (
+            f'<button id="opt{which}" type="button" class="btn-opt" '
+            f'data-opt="{which}" data-opt-val="1"{style}>Opt {which}</button>'
+        )
+    return btn("In", hide_in) + btn("Out", hide_out)
+
+
+def test_parse_raffle_optin_reads_which_button_is_hidden():
+    # The portal shows only the action available: a visible "Opt In" button means
+    # the member is currently OUT.
+    assert revo_client.parse_raffle_optin(_opt_buttons(hide_in=False, hide_out=True)) is False
+    assert revo_client.parse_raffle_optin(_opt_buttons(hide_in=True, hide_out=False)) is True
+
+
+def test_parse_raffle_optin_unknown_rather_than_a_wrong_answer():
+    """An unreadable page must yield None, never a silent False."""
+    assert revo_client.parse_raffle_optin("<html>no buttons at all</html>") is None
+    # Only one button rendered → can't infer the state.
+    assert revo_client.parse_raffle_optin('<button id="optIn"></button>') is None
+    # Both shown or both hidden → a shape we don't understand.
+    assert revo_client.parse_raffle_optin(_opt_buttons(hide_in=False, hide_out=False)) is None
+    assert revo_client.parse_raffle_optin(_opt_buttons(hide_in=True, hide_out=True)) is None
+
+
+def test_parse_raffle_optin_matches_the_live_opted_out_shape():
+    """The exact markup the live portal served for an opted-out member: the
+    countdown wrapper is hidden, yet parse_raffle still reports numbers from it."""
+    html = (
+        '<div id="nextDrawWrapper" class="show-hide grid grid-cols-2" '
+        'style="display: none" >'
+        "<span>Monthly</span> Draw <span>0</span><span>6</span><span>Days</span>"
+        "<span>Major</span> Draw <span>0</span><span>6</span><span>Days</span>"
+        "</div>"
+        '<button id="optOut" type="button" class="btn-opt" data-opt="Out" '
+        'data-opt-val="1" style="display: none">Opt Out</button>'
+        '<button id="optIn" type="button" class="btn-opt" data-opt="In" '
+        'data-opt-val="1" >Opt In</button>'
+    )
+    assert revo_client.parse_raffle_optin(html) is False
+    # parse_raffle is happy to read the hidden block — that's exactly why the
+    # opt-in flag has to be carried alongside it.
+    assert revo_client.parse_raffle(html)["monthly_draw_days"] == 6
+
+
+def test_parse_streak_weeks_handles_padded_digit_spans():
+    """Every other counter on this portal is split into zero-padded one-digit
+    spans. If this one is ever rendered that way, a plain (\\d+) capture would read
+    "1 3 WEEKS" as 3 — a wrong-but-plausible streak nothing would flag."""
+    single = '<div id="tallyCounter"><span class="text-8xl">3</span></div><h2>WEEKS</h2>'
+    assert revo_client.parse_streak_weeks(single) == 3
+    padded = "<span>1</span><span>3</span><h2>WEEKS</h2>"
+    assert revo_client.parse_streak_weeks(padded) == 13
+    zero_padded = "<span>0</span><span>7</span><h2>WEEKS</h2>"
+    assert revo_client.parse_streak_weeks(zero_padded) == 7
+    assert revo_client.parse_streak_weeks("<p>1 WEEK</p>") == 1
+    assert revo_client.parse_streak_weeks("<p>nothing here</p>") is None
+
+
 def test_latest_attended_day():
     # Picks the highest attended day, ignoring missed days.
     assert revo_client.latest_attended_day({1: True, 10: True, 11: True, 12: False}) == 11

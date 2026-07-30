@@ -9979,11 +9979,15 @@ def _perfectgym_occupancy(user_id: int) -> list["revo_perfectgym.ClubOccupancy"]
     shared account is tried first (keeps it working for unlinked users) and a burst
     of calls reuses one fetch via the module TTL cache. Mirrors the resolution the
     /busy command used inline before it was hoisted here for reuse by /revo_clubs.
+
+    Rows are then enriched against the club directory (see
+    :func:`revo_perfectgym.enrich_occupancy`) to fill in the state the occupancy
+    payload omits and to drop clubs that haven't opened yet.
     """
     try:
         clubs = revo_perfectgym.shared_club_occupancy()
         if clubs:
-            return clubs
+            return _enrich_occupancy(user_id, clubs)
     except revo_perfectgym.PerfectGymUnavailable:
         pass  # no shared account configured — try the user's own creds
     except revo_perfectgym.PerfectGymAuthError:
@@ -9997,13 +10001,31 @@ def _perfectgym_occupancy(user_id: int) -> list["revo_perfectgym.ClubOccupancy"]
             client = _perfectgym_client_for_user(row)
             clubs = revo_perfectgym.club_occupancy_with_client(client)
             if clubs:
-                return clubs
+                return _enrich_occupancy(user_id, clubs)
         except revo_perfectgym.PerfectGymAuthError:
             _drop_cached_client(user_id)
             LOG.warning("PerfectGym per-user login failed (occupancy)")
         except Exception:  # pragma: no cover - network
             LOG.exception("PerfectGym per-user occupancy fetch failed")
     return []
+
+
+def _enrich_occupancy(
+    user_id: int, clubs: list["revo_perfectgym.ClubOccupancy"],
+) -> list["revo_perfectgym.ClubOccupancy"]:
+    """Join live counts to the directory for state + open-yet, best-effort.
+
+    The directory is separately cached for 6h, so this is nearly always free. It is
+    strictly an improvement pass: if the directory is unavailable the raw board is
+    returned unchanged, exactly as before, rather than failing the command.
+    """
+    try:
+        directory = _perfectgym_directory(user_id)
+    except Exception:  # pragma: no cover - defensive; _perfectgym_directory catches
+        return clubs
+    if not directory:
+        return clubs
+    return revo_perfectgym.enrich_occupancy(clubs, directory)
 
 
 def _perfectgym_directory(user_id: int) -> list["revo_perfectgym.ClubDirEntry"]:
@@ -10130,6 +10152,12 @@ def _revo_clubs_state_lines(
     shows its current head-count when the board is up (and "count unavailable" when
     it isn't). Alphabetical for a stable, scannable list. The total is None when
     the board is down for every club, so callers can omit it rather than print 0.
+
+    A club Revo has announced but not opened is listed with its opening date
+    instead of a count. It is genuinely useful to see ("a gym is coming to my
+    suburb"), but it must not read as a live number: the directory carries these
+    clubs early and the occupancy board reports ``0`` for them, so left alone they
+    look like the emptiest gym in the state.
     """
     st = state.strip().upper()
     occ_by_name = {c.name.lower(): c for c in occupancy}
@@ -10142,14 +10170,33 @@ def _revo_clubs_state_lines(
     for e in entries:
         occ = occ_by_name.get(e.name.lower())
         suburb = e.city or (occ.suburb if occ else None)
-        count_txt = f"{occ.count} in club now" if occ is not None else "count unavailable"
-        if occ is not None:
+        if not revo_perfectgym.has_opened(e):
+            count_txt = f"opens {_format_opening_date(e.opening_date)}"
+        elif occ is not None:
+            count_txt = f"{occ.count} in club now"
             total = (total or 0) + occ.count
+        else:
+            count_txt = "count unavailable"
         if suburb and suburb.lower() != e.name.lower():
             lines.append(f"• **{e.name}** — {suburb} ({count_txt})")
         else:
             lines.append(f"• **{e.name}** ({count_txt})")
     return st, lines, total
+
+
+def _format_opening_date(opening_date: str | None) -> str:
+    """A club ``OpeningDate`` as e.g. ``18 Aug 2026``, or ``"soon"`` if unusable.
+
+    Formatted straight off the date part rather than through :func:`_format_date`:
+    the directory's value is a *naive local* datetime, so reading it as UTC and
+    converting to DISPLAY_TZ would shift the day backwards for eastern-state clubs.
+    """
+    if not opening_date:
+        return "soon"
+    try:
+        return date.fromisoformat(opening_date[:10]).strftime("%d %b %Y").lstrip("0")
+    except (ValueError, TypeError):
+        return "soon"
 
 
 def _format_revo_clubs_state_list(
@@ -10206,16 +10253,84 @@ def _revo_clubs_state_embed(
     return embed
 
 
+def _club_hours_entry(
+    entry: "revo_perfectgym.ClubDirEntry",
+) -> "revo_netpulse.Club | None":
+    """The Netpulse directory row for a PerfectGym club, or None if unavailable.
+
+    Opening hours, a phone number and the club's IANA timezone exist **only** on
+    the Netpulse directory, which is public — no login, no shared account, nothing
+    to lock out — so this is safe to call for any user. Best-effort throughout: a
+    Netpulse outage, a missing dep, or a club Netpulse doesn't list yet (it only
+    lists clubs once they trade) all return None and the caller omits the line.
+
+    Matching is by normalised name against both `name` and `full_name`; the two
+    Nunawading sites are 138 m apart, so a nearest-coordinate join would silently
+    give one of them the other's hours.
+    """
+    if not revo_netpulse.available():
+        return None
+    try:
+        clubs = revo_netpulse.shared_club_directory()
+    except Exception:  # pragma: no cover - network
+        LOG.warning("Netpulse club directory fetch failed", exc_info=True)
+        return None
+    index = revo_netpulse.index_clubs_by_name(clubs)
+    for candidate in (entry.name, entry.full_name):
+        key = revo_netpulse.normalise_club_name(candidate)
+        if key and key in index:
+            return index[key]
+    return None
+
+
+def _format_club_hours_line(club: "revo_netpulse.Club | None") -> str | None:
+    """"🕒 Open 24 hours · staffed until 8pm" for one club, or None if unknown.
+
+    Everything here is best-effort: an unknown timezone, an undescribed weekday or
+    unparseable hours copy all yield ``None`` and the line is simply omitted. We
+    never render "closed" from a guess — that's the one wrong answer that would
+    actually cost someone a trip.
+    """
+    if club is None:
+        return None
+    status = revo_netpulse.club_status(club)
+    if status.open_now is None and status.staffed_now is None:
+        return None
+    if status.always_open:
+        parts = ["Open 24 hours"]
+    elif status.open_now:
+        parts = ["**Open now**"]
+    elif status.open_now is False:
+        parts = ["**Closed right now**"]
+    else:
+        parts = []
+    if status.staffed_now is True:
+        parts.append("staffed now")
+    elif status.staffed_now is False:
+        parts.append("unstaffed right now")
+    if not parts:
+        return None
+    line = f"🕒 {' · '.join(parts)}"
+    if status.today_raw:
+        # The verbatim copy carries the actual windows ("Staffed from 9am - 8pm"),
+        # which is more useful than re-rendering our parse of it.
+        line += f"\n-# {status.today_raw}"
+    return line
+
+
 def _format_revo_club_detail(
     entry: "revo_perfectgym.ClubDirEntry",
     occupancy: list["revo_perfectgym.ClubOccupancy"],
     nearest: list["revo_perfectgym.ClubDirEntry"],
+    hours_club: "revo_netpulse.Club | None" = None,
 ) -> str:
     """Render one club's card: address, maps link, state, live count + nearest 3.
 
     ``occupancy`` is the full live board (joined by name for the club's own count
     and each nearby club's count); ``nearest`` is :func:`revo_perfectgym.nearest_clubs`
-    output. Missing pieces (no geo, board down) are simply omitted.
+    output. ``hours_club`` is the matching Netpulse directory row, the only source
+    of opening hours and a phone number. Missing pieces (no geo, board down, no
+    hours) are simply omitted.
     """
     occ_by_name = {c.name.lower(): c for c in occupancy}
     header = f"🏋️ **{entry.name}**"
@@ -10226,15 +10341,37 @@ def _format_revo_club_detail(
         addr = entry.address
         if entry.city and entry.city.lower() not in addr.lower():
             addr = f"{addr}, {entry.city}"
+        # Several PerfectGym addresses already end in the postcode, so only add it
+        # when it isn't there (Netpulse's copy is normalised to 4 digits or None).
+        if (
+            hours_club is not None and hours_club.postal_code
+            and hours_club.postal_code not in addr
+        ):
+            addr = f"{addr} {hours_club.postal_code}"
         lines.append(f"📍 {addr}")
-    link = _maps_link(entry.lat, entry.lng)
+    # Prefer Netpulse's coordinates for the pin. PerfectGym's directory rounds:
+    # 15 clubs sit at ≤3 decimal places (≥110 m) and two at 2 (~1.1 km), which
+    # puts 25 of 77 pins more than 200 m from the door and Pitt St nearly a
+    # kilometre out. Netpulse carries 6–14 places for almost every club.
+    lat, lng = entry.lat, entry.lng
+    if hours_club is not None and hours_club.lat is not None:
+        lat, lng = hours_club.lat, hours_club.lng
+    link = _maps_link(lat, lng)
     if link:
         lines.append(f"🗺️ [Open in Google Maps]({link})")
+    if not revo_perfectgym.has_opened(entry):
+        lines.append(f"🚧 Not open yet — opens {_format_opening_date(entry.opening_date)}")
+        return "\n".join(lines)
+    hours_line = _format_club_hours_line(hours_club)
+    if hours_line:
+        lines.append(hours_line)
     own = occ_by_name.get(entry.name.lower())
     lines.append(
         f"👥 **{own.count}** in club right now" if own is not None
         else "👥 Live count unavailable right now"
     )
+    if hours_club is not None and hours_club.phone:
+        lines.append(f"☎️ {hours_club.phone}")
     if nearest:
         lines.append("")
         lines.append("📌 **Nearest other clubs**")
@@ -10648,7 +10785,12 @@ async def revo_clubs_cmd(
                     True,
                 )
             nearest = revo_perfectgym.nearest_clubs(directory, entry.name, limit=3)
-            return _format_revo_club_detail(entry, occupancy, nearest), False
+            return (
+                _format_revo_club_detail(
+                    entry, occupancy, nearest, _club_hours_entry(entry),
+                ),
+                False,
+            )
 
         # ---- an explicit state ----
         if wanted_state:
@@ -11339,6 +11481,23 @@ def _format_draw_countdown(days: int | None, label: str) -> str:
     return f"{label} draw: in **{days} day{'s' if days != 1 else ''}**"
 
 
+def _raffle_optin_note(opted_in: bool | None) -> str | None:
+    """A warning line when the member isn't actually entered in the monthly draw.
+
+    Silent when opted in, and silent when unknown — the portal only renders a
+    readable opt state on the raffle page, and guessing "not entered" at someone who
+    is would be worse than saying nothing. Only shown for the member's *own* account
+    (opt state is personal), which is why callers pass it through the same
+    `personal` gate as the ticket balance.
+    """
+    if opted_in is False:
+        return (
+            "-# ⚠️ You're **not entered** in the monthly draw — your tickets won't "
+            "be drawn until you opt in on the Revo rewards page."
+        )
+    return None
+
+
 @bot.tree.command(
     name="revo_tickets",
     description="Show a Revo Fitness ticket balance and recent earning history.",
@@ -11487,10 +11646,16 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
             f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''} "
             "in the draw"
         )
-    lines.append(_format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"))
+    lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
     if prize.get("monthly"):
         lines.append(f"-# 🏆 {prize['monthly']}")
-    lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
+    # Only the caller's own opt state is theirs to be told about, and it's only
+    # meaningful next to their own ticket count.
+    if personal:
+        note = _raffle_optin_note(raffle.opted_in)
+        if note:
+            lines.append(note)
+    lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
     if prize.get("major"):
         lines.append(f"-# 🏆 {prize['major']}")
     if not personal:
@@ -11627,8 +11792,14 @@ async def revo_summary_cmd(
         f"🔥 Weekly streak: {streak_txt}",
         f"📅 {month_name} check-ins: **{month_checkins}**",
         f"🎟️ Tickets available: {tickets_txt}",
-        _format_draw_countdown(raffle.get("monthly_draw_days"), "Monthly"),
+        _format_draw_countdown(raffle.monthly_draw_days, "Monthly"),
     ]
+    # Raffle opt state is personal, and this reply is public — only ever tell the
+    # member about their OWN, mirroring the _summary_status_line rule below.
+    if target == interaction.user:
+        optin_note = _raffle_optin_note(raffle.opted_in)
+        if optin_note:
+            lines.append(optin_note)
     membership = result.get("membership")
     if membership is not None:
         tier = " · ".join(
@@ -11654,7 +11825,7 @@ async def revo_summary_cmd(
         lines.insert(1, status_line)
     if prize.get("monthly"):
         lines.append(f"-# 🏆 {prize['monthly']}")
-    lines.append(_format_draw_countdown(raffle.get("major_draw_days"), "Major"))
+    lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
     if prize.get("major"):
         lines.append(f"-# 🏆 {prize['major']}")
     await interaction.followup.send(
@@ -12281,6 +12452,16 @@ async def _poll_one_account(row) -> None:
     prev_streak = row["last_streak_weeks"]
 
     now_local = datetime.now(DISPLAY_TZ)
+    today_iso = now_local.strftime("%Y-%m-%d")
+
+    # Once today is on the board there is nothing left to learn until midnight:
+    # the cursor only ever advances to a NEWER day, and the calendar has no
+    # finer resolution than the day (see docs/REVO_PORTAL.md §3.2.2). Skipping
+    # the round-trip here is what makes a tight poll interval affordable — it
+    # removes every request between the day's check-in and midnight, which on a
+    # training day is the majority of them.
+    if prev_checkin == today_iso:
+        return
 
     def _fetch() -> "tuple[str | None, int | None] | str":
         """Return (latest_checkin_iso, streak_weeks) or an error string."""
@@ -12354,13 +12535,31 @@ async def _poll_one_account(row) -> None:
     )
     checkin_date = datetime.strptime(latest_iso, "%Y-%m-%d").date()
     today = now_local.date()
+
+    # Turn the anecdote "it seems to land ~2:30am / ~2:30pm" into data. Revo
+    # publishes attendance into the rewards system on its own schedule, and this
+    # is the only place we can observe when a day actually appeared: log the
+    # wall clock at detection plus how old the visit already was. A few weeks of
+    # these lines pins the real cadence (and would catch it changing).
+    LOG.info(
+        "Revo check-in detected user=%s visit_date=%s detected_at=%s (%s UTC) "
+        "lag_days=%d",
+        user_id, latest_iso, now_local.strftime("%Y-%m-%d %H:%M %Z"),
+        now_local.astimezone(timezone.utc).strftime("%H:%M"),
+        (today - checkin_date).days,
+    )
+
+    # Deliberately NOT "just checked in". The underlying signal is a per-DAY
+    # attendance flag that Revo batches into the rewards system, so by the time
+    # we see it the session can be many hours old — claiming "just" is usually
+    # wrong. "Trained today" is what the data actually supports.
     if checkin_date == today:
-        text = f"🏋️ <@{user_id}> just checked in at Revo!{streak_tail}"
+        text = f"🏋️ <@{user_id}> trained at Revo today!{streak_tail}"
     else:
         when = "yesterday" if checkin_date == today - timedelta(days=1) else (
             f"{checkin_date.strftime('%a')} {checkin_date.day} {checkin_date.strftime('%b')}"
         )
-        text = f"🏋️ <@{user_id}> checked in at Revo ({when}){streak_tail}"
+        text = f"🏋️ <@{user_id}> trained at Revo ({when}){streak_tail}"
 
     # Celebrate the first check-in that pushes the weekly streak past a
     # milestone (4/8/12/26/52 weeks).
@@ -13341,6 +13540,17 @@ def _register_rpc_methods() -> None:
 def _rpc_reload_config() -> dict:
     """Re-read settings and rebind the hot ones without restarting."""
     _bind_config(config_mod.load(db, decrypt=_box.decryptor()))
+    # Rebinding the global is not enough for a @tasks.loop: discord.py captured
+    # the interval when the decorator ran at import, so a dashboard change to
+    # REVO_POLL_MINUTES would silently do nothing until the next restart while
+    # the UI reported success. change_interval reschedules the running loop.
+    if revo_attendance_poll.is_running():
+        try:
+            if revo_attendance_poll.minutes != REVO_POLL_MINUTES:
+                revo_attendance_poll.change_interval(minutes=REVO_POLL_MINUTES)
+                LOG.info("Revo poll interval now %d minutes", REVO_POLL_MINUTES)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to apply the new Revo poll interval")
     LOG.info("Configuration reloaded from the dashboard.")
     return {"ok": True}
 

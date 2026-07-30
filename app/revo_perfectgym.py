@@ -62,12 +62,20 @@ and :func:`parse_membership_status` (non-sensitive contract flags only).
 Confirmed extra reads (do not re-probe)
 ---------------------------------------
 * **CLUB DIRECTORY (public, no PII):** ``GET /ClientPortal2/Geo/GetClubList`` →
-  array of ``{Id, Name, Address, City:{Name}, ClubNumber, Latitude, Longitude,
-  OpeningDate, StateId}``. Occupancy has no club-id, so this is joined *by name*
-  for ids/geo. ``StateId`` is an opaque grouping key — state comes from
-  :func:`revo_client.state_for_club`, not from it. Cached with the long
+  array of ``{Id, Name, FullName, Address, City:{Name}, ClubNumber, Latitude,
+  Longitude, OpeningDate, OpeningDateLocal, BrandingId, StateId}``. Occupancy has
+  no club-id, so this is joined *by name* for ids/geo. ``StateId`` **does** map to
+  an AU state code (:data:`STATE_BY_STATE_ID`) and is the primary state source,
+  with :func:`revo_client.state_for_club` as the fallback. Cached with the long
   ``CLUB_DIR_TTL_SECONDS`` (directory ≈ static), separate from the 60s occupancy
   cache.
+* ``Clubs/GetClubs`` returns a **byte-identical** payload to ``Geo/GetClubList``
+  — same 79 clubs, same fields. There is nothing to gain by calling both.
+* ``Clubs/GetAvailableClassesClubs`` returns the same club shape filtered to the
+  clubs that actually run classes (3 of 79: Cranbourne, Glenelg, Pitt St).
+* The directory lists clubs **before they open**, and those clubs also appear on
+  the live occupancy board reporting ``0`` — see :func:`enrich_occupancy` /
+  :func:`has_opened`, which is what keeps them out of "quietest right now".
 
 Import-safe: ``requests`` is imported lazily so the bot boots without it — check
 :func:`available` (or catch :class:`PerfectGymUnavailable`) before use.
@@ -81,7 +89,8 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from typing import Any, Optional
 
 from . import revo_client  # for state_for_club() — the primary state source
@@ -128,6 +137,22 @@ _ENV_PASS = "REVO_PASS"
 # Australian state/territory tokens, longest-first so "NSW"/"VIC" win over a
 # shorter accidental match when scanning an address tail.
 _AU_STATES = ("NSW", "VIC", "QLD", "TAS", "ACT", "SA", "WA", "NT")
+
+# PerfectGym's internal ``StateId`` → AU state code.
+#
+# This used to be treated as an unmappable opaque key, so state resolution leaned
+# entirely on the hand-curated :data:`revo_client._CLUB_NAMES_BY_STATE` name list —
+# which silently drops every club Revo opens until someone edits the table by hand.
+# Derived empirically instead: cross-referencing all 79 directory clubs against the
+# curated names gives **zero conflicts** (NSW 5/5, SA 16/16, VIC 19/19, WA 35/35),
+# and each of the clubs the curated list *couldn't* place lands on the id its
+# suburb implies. Only these four ids appear — Revo doesn't operate in QLD/TAS/NT/ACT.
+#
+# Deliberately a WHITELIST: an id we haven't confirmed maps to ``None`` and falls
+# back to the curated name lookup, so a future interstate expansion degrades to the
+# old behaviour instead of surfacing a raw integer as a state code. To extend it,
+# re-run the cross-reference — don't guess.
+STATE_BY_STATE_ID: dict[int, str] = {1: "NSW", 3: "SA", 5: "VIC", 6: "WA"}
 
 
 class PerfectGymUnavailable(RuntimeError):
@@ -367,6 +392,11 @@ class ClubDirEntry:
     lng: Optional[float]
     opening_date: Optional[str]
     state: Optional[str]
+    #: The directory's ``FullName`` — a longer display label that differs from
+    #: ``name`` for exactly one club today ("Nunawading OG" → "Nunawading -
+    #: (Original)"). Defaults to ``None``, and callers should fall back to
+    #: ``name``; it's last in the field order only because the others predate it.
+    full_name: Optional[str] = None
 
 
 def _city_name(value: Any) -> Optional[str]:
@@ -379,12 +409,17 @@ def _city_name(value: Any) -> Optional[str]:
 def parse_club_list(payload: Any) -> list[ClubDirEntry]:
     """Parse ``Geo/GetClubList`` into a list of :class:`ClubDirEntry` (public data).
 
-    Accepts the raw array, a ``{"...": [...]}`` wrapper, or a JSON string. The
-    ``state`` is derived from :func:`revo_client.state_for_club` (the bot's single
-    curated name→state source) — the payload's numeric ``StateId`` is only an
-    internal grouping key with no public code mapping, so it is intentionally
-    ignored. Entries without a usable ``Name`` are skipped; missing lat/lng are
-    preserved as ``None`` (some just-announced clubs aren't geocoded yet).
+    Accepts the raw array, a ``{"...": [...]}`` wrapper, or a JSON string. Entries
+    without a usable ``Name`` are skipped; missing lat/lng are preserved as ``None``
+    (some just-announced clubs aren't geocoded yet).
+
+    ``state`` resolves from :data:`STATE_BY_STATE_ID` first, falling back to
+    :func:`revo_client.state_for_club`. The payload's ``StateId`` was previously
+    dismissed as unmappable, so a club stayed state-less until someone hand-added
+    it to the curated name table — which is exactly how four live clubs (including
+    an already-open one) ended up invisible to every state-scoped command. An id
+    outside the confirmed whitelist still yields the curated answer, so an
+    unrecognised id can never leak out as a state code.
     """
     obj = _as_obj(payload)
     if isinstance(obj, dict):
@@ -414,10 +449,101 @@ def parse_club_list(payload: Any) -> list[ClubDirEntry]:
                 lat=_as_opt_float(entry.get("Latitude")),
                 lng=_as_opt_float(entry.get("Longitude")),
                 opening_date=_as_opt_str(entry.get("OpeningDate")),
-                # Primary + only source, consistent with parse_members_in_clubs.
-                state=revo_client.state_for_club(name),
+                # StateId when it's one we've confirmed, else the curated names.
+                state=(
+                    STATE_BY_STATE_ID.get(_as_opt_int(entry.get("StateId")))  # type: ignore[arg-type]
+                    or revo_client.state_for_club(name)
+                ),
+                full_name=_as_opt_str(entry.get("FullName")),
             )
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Opening dates — telling a not-yet-built club apart from a quiet one
+# ---------------------------------------------------------------------------
+
+def _opening_day(opening_date: Optional[str]) -> Optional[date]:
+    """The ``date`` part of a directory ``OpeningDate``, or ``None`` if unusable.
+
+    The field is a naive local ISO datetime (``2026-08-18T00:00:00``); only the day
+    matters here. Some long-standing clubs carry an obvious placeholder
+    (``2000-01-01``) — that parses fine and is safely in the past.
+    """
+    if not opening_date:
+        return None
+    try:
+        return date.fromisoformat(opening_date[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def has_opened(entry: "ClubDirEntry", today: Optional[date] = None) -> bool:
+    """True when *entry* is a club members can actually walk into today.
+
+    Announced-but-unbuilt clubs are already in the directory **and already on the
+    live occupancy board reporting 0** — so without this check they read as the
+    quietest gym in the state. An unparseable/missing date counts as open: the
+    directory's placeholder dates are past, and a club we can't date is far more
+    likely to be trading than not.
+    """
+    opened = _opening_day(entry.opening_date)
+    if opened is None:
+        return True
+    return opened <= (today or date.today())
+
+
+def future_openings(
+    directory: list[ClubDirEntry],
+    today: Optional[date] = None,
+    state: Optional[str] = None,
+) -> list[ClubDirEntry]:
+    """Clubs that haven't opened yet, soonest first (optionally one state only)."""
+    ref = today or date.today()
+    st = (state or "").strip().upper()
+    out = [
+        e for e in directory
+        if not has_opened(e, ref) and (not st or (e.state or "").upper() == st)
+    ]
+    out.sort(key=lambda e: (_opening_day(e.opening_date) or date.max, e.name.lower()))
+    return out
+
+
+def enrich_occupancy(
+    occupancy: list[ClubOccupancy],
+    directory: list[ClubDirEntry],
+    today: Optional[date] = None,
+) -> list[ClubOccupancy]:
+    """Fix up live occupancy rows using the directory, matching *by name*.
+
+    Two corrections, both of which the occupancy payload can't make on its own —
+    it carries no ``StateId`` and no opening date, only a name and an address:
+
+    * **State** is taken from the directory entry (which resolves via
+      :data:`STATE_BY_STATE_ID`), so a club the curated name table doesn't know
+      still lands in its state's board instead of being silently dropped.
+    * **Not-yet-open clubs are removed**, because they sit on the board reporting
+      ``0`` and would otherwise win "quietest right now" outright.
+
+    A row with no directory match is kept exactly as-is — a live count is never
+    discarded just because the directory lags. Returns a new list; inputs are
+    untouched, so this stays safe to call on cached tuples.
+    """
+    if not directory:
+        return list(occupancy)
+    by_name = {e.name.lower(): e for e in directory}
+    ref = today or date.today()
+    out: list[ClubOccupancy] = []
+    for occ in occupancy:
+        entry = by_name.get(occ.name.lower())
+        if entry is None:
+            out.append(occ)
+            continue
+        if not has_opened(entry, ref):
+            continue
+        state = entry.state or occ.state
+        out.append(occ if state == occ.state else replace(occ, state=state))
     return out
 
 

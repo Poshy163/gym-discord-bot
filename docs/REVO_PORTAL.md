@@ -1,10 +1,16 @@
 # Revo Fitness Client Portal — Reverse-Engineering Notes
 
-> ⚠️ **Security note:** Credentials were shared in plaintext during research. Rotate the
-> Revo password and never commit credentials to the repo. Treat these notes as
-> "what we discovered" — usage terms of revofitness.com.au may restrict scraping.
-> Use a single low-frequency poll, identify the bot in `User-Agent`, and stop if
-> they object.
+> ⚠️ **Security note:** Credentials have been shared in plaintext during research
+> more than once (most recently 2026-07). **Rotate the Revo password**, and never
+> commit credentials to the repo. Treat these notes as "what we discovered" —
+> usage terms of revofitness.com.au may restrict scraping. Use a single
+> low-frequency poll, identify the bot in `User-Agent`, and stop if they object.
+>
+> 🧭 **Probing this again?** Read **§9.3** (mine the Angular templates — the
+> highest-yield discovery channel, and ~30 templates are still unmined), **§8.1**
+> (PerfectGym status taxonomy) and **§7.1** (Netpulse response oracle) *before*
+> spending requests. Several conclusions in older revisions of this file were
+> confidently wrong; each corrected one is marked ✅ **Correction** inline.
 
 ## 1. Base / Auth
 
@@ -83,12 +89,14 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/` (L2 onl
 | GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance for any month (see §3.2.1) |
 | GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned |
 | GET | `/portal/rewards/raffle.php` | ✅ | Tickets + countdowns to monthly + major draws |
-| GET | `/portal/rewards/raffle.php?optval=<0\|1>` | ⚠️ | **State-changing** — toggles monthly raffle opt-in. JSON `{"Status":"0\|1"}`. Do **not** call casually. |
+| GET | `/portal/rewards/raffle.php?optval=1` | ⚠️ | **State-changing** — a pure **TOGGLE** of monthly raffle opt-in (both buttons send `optval=1`; it is *not* a `0`/`1` setter). JSON `{"Status":"0\|1"}`. **Never call this** — read the opt state from the DOM instead (§3.4). |
+| GET | `/portal/rewards/major-prize-winners.php` | ✅ | Past major-draw dates + winners (initial, surname, postcode). Real draw dates; ⚠️ third-party PII (§3.4). |
 | GET | `/portal/rewards/prize-pool.php` | ✅ | Same counters + current prize copy |
 | GET | `/portal/rewards/faq.php` | ✅ | Static |
 | GET | `/portal/rewards/terms-and-conditions.php` | ✅ | Static |
 | GET | `/portal/massage-chair.php` | ⛔ | **Blocked (2026-07):** now hit by the same `Invalid Access! B` guard as club-counter (§1.2). (The `API/massage-chair-qr.php` JSON route still works, but the client never used it.) |
-| GET | `/portal/API/massage-chair-qr.php?hcId=<id>` | ✅ (L2) | **JSON** `{"qrCode":"qr_<uuid>","validUntilUtc":"<iso8601>"}` — the data the QR actually encodes. `$intHCID` is rendered into the page. |
+| GET | `/portal/API/massage-chair-qr.php` | ✅ (L2) | **JSON** `{"qrCode":"qr_<uuid>","validUntilUtc":"<iso8601>"}` — the data the QR actually encodes. ⚠️ **`hcId` is NOT required** (a bare GET returns a valid 200), and this **mints an access credential** on every call, so don't call it casually. `validUntilUtc` is the only second-resolution timestamp on the portal — a rolling `now + TTL` expiry, *not* an event time, but it does prove the backend **can** emit sub-day times, so the calendar's day-granularity is a schema choice rather than a platform limit. |
+| — | `/portal/api/` vs `/portal/API/` | ✅ | The **same directory** — IIS is case-insensitive. Both index pages return the literal `:)`. |
 | GET | `/portal/API/` | ✅ | Returns literal `:)` (parallel to lowercase `/api/`) |
 | GET | `/portal/dashboard.php` | 🚫 | 302 → upgrade page **even at L2**. Mobile-app-only. |
 | GET | `/portal/profile.php` | 🚫 | 302 even at L2. Mobile-app-only. |
@@ -176,6 +184,165 @@ Key points:
 Parsed by `app.revo_client.parse_streak_calendar()` and exposed on the
 client as `RevoClient.get_streak_calendar(month, year) -> {dom: bool}`.
 
+#### 3.2.2 Check-in latency — why the feed can never be real-time
+
+The attendance feed is **structurally incapable of being real-time**, and it is
+worth recording exactly why so nobody re-litigates it.
+
+**1. There is no timestamp anywhere.** The calendar's finest unit is a *day*: a
+cell is `"0"` or `"1"`. No Revo backend exposes when a member walked in. This
+isn't an assumption — the entire member-facing API surface has been enumerated:
+- `revocentral` — every check-in/visit/history route 302s even at L2 (§1.1, §2).
+- **PerfectGym ClientPortal2 — exhaustively mapped.** Both discovery channels
+  were run to completion: the JS bundles, *and* all 101 fetchable Angular
+  templates (§9.3), yielding **56 declared API routes**. None is a visit log. A
+  35-name sweep for `Visits`/`Entrances`/`Attendance`/… returned the bogus-route
+  404 for every spelling (§12.1). `Profile/Skills/GetMemberActivities` — the last
+  plausible candidate, PerfectGym's activity-tracking module — returns `[]`;
+  Revo doesn't use it.
+- Netpulse — `check-ins` in all 6 spellings 404, and `exerciser/{uuid}/stats` is
+  all zeros (§7.1).
+
+> ✅ **The decisive evidence: Revo's own tenant feature flags.** The SPA shell
+> injects `cpConfig`, and its `features` array *is* the definitive list of what
+> PerfectGym has switched on for Revo:
+> ```
+> Login, LoginPassword, LoginMyWellness, ContractDetails, AddContract,
+> AddAdditionalContract, UpgradeContract, UpgradeContractAfterCommitment,
+> FreezeContract, ChangeContractPaymentSource, AddNewPaymentSource,
+> PayContract, Classes, ShowAgreementsOnUserProfile
+> ```
+> Contracts, payments, classes, agreements. **There is no visits, attendance,
+> activity or check-in feature on the tenant at all** — so the endpoints aren't
+> hidden, they are not provisioned. This is stronger than any amount of probing
+> and it is the reason to stop looking here. Re-read this list before re-opening
+> the question; if Revo ever enables such a feature it will appear here first.
+
+> **And there is no push channel.** The shell loads a `signalR` bundle, which
+> looks promising — but it is served **0 bytes**, and every hub mount point
+> (`/signalr`, `/signalr/negotiate`, `/signalr/hubs`, `/hubs`, `notificationHub`,
+> …) 404s under `/ClientPortal2`. SignalR is referenced by the white-label
+> framework and switched off for this tenant. No websocket, no server push.
+
+**The rewards counters all share ONE refresh job.** The obvious hope is that some
+other rewards value updates on a faster schedule than the calendar. It doesn't:
+fetched in one near-simultaneous pass, the landing's streak (3) matches
+`streaks.php`'s "3 WEEKS", and the landing's ticket tile (35) matches
+`ticket-tally.php`'s balance (35). A mismatch would have been direct evidence of
+separate jobs; there is none. `ticket-tally` is strictly *slower* (its newest
+`Attendance` row lagged 4 days, date-only).
+
+**The calendar cannot be coaxed into returning more.** `streaks.php?m=&y=` was
+re-requested with `d=`, `day=`, `detail=`, `full=`, `format=`, `verbose=`,
+`times=` and with `X-Requested-With: XMLHttpRequest` — **all eight returned a
+byte-identical body** (same sha256, same 387 bytes). The cell universe is strictly
+`null` / `"0"` / `"1"`.
+
+**Also ruled out (2026-07), so nobody re-runs these:**
+
+- **No undiscovered Revo host.** `api.`, `app.`, `my.`, `members.`, `member.`,
+  `portal.`, `mobile.`, `account.` and `auth.revofitness.com.au` are all
+  **NXDOMAIN**. The marketing site names no app backend, and a grep of its 1.26 MB
+  of theme JS finds no occupancy/attendance API. `revocentral` remains the only
+  member host on the domain.
+- **The current phone app is still the Netpulse/EGYM one** (App Store listing
+  credits EGYM and points its privacy URL at netpulse.com) — i.e. the backend we
+  already exhausted, not a newer PerfectGym-native app.
+- **Netpulse has exactly one push surface and it is dark.** Of 29 candidate
+  push/feed/sync/device/gamification routes, 27 are 404. The survivors:
+  `exerciser/{uuid}/rewards` (500, the provisioned-but-dark control) and
+  `exerciser/{uuid}/notifications`, which returns
+  `{status, errors, data:{lastCheckTime:<epoch-ms>, notifications:[]}}`. The
+  array is **empty even with `?lastCheckTime=0`** (a cursor reset that would
+  surface any retained history), and `lastCheckTime` is a client poll cursor, not
+  a visit time. The tenant provisions no push categories at all, so a check-in
+  notification could never appear there.
+- **Arbox** (`api.arboxapp.com`, Revo's studio-booking vendor) is the one genuinely
+  new member-data host, but it is WAF-protected, behind separate credentials, and
+  its "check-in" is *class attendance* — not the 24/7 gym-floor entry the bot
+  announces. Not a drop-in replacement, and not pursued.
+- **A `/portal/API/` directory exists** (index returns `:)`, listing disabled). All
+  18 read-named check-in / visit / last-visit / attendance guesses 302 to the same
+  catch-all `level-two-feature.php` that `robots.txt` and `sitemap.xml` hit — the
+  portal's uniform "no such route" signal, and cleanly distinguishable from
+  `massage-chair-qr.php`'s real 200 JSON.
+- **The only time-of-day field on the whole portal** is
+  `API/massage-chair-qr.php` → `validUntilUtc`. It is a **QR expiry minted at
+  request time** (returned even with no `hcId`), not a record of a visit. Useless
+  as a check-in signal — and it mints an access credential, so don't call it.
+- **The `Invalid Access! B` guard is not client-settable.** 21 requests (3 targets ×
+  7 header shapes: bot UA, full browser UA, `X-Requested-With`, `Referer`,
+  `Origin`, `Sec-Fetch-*`, `X-Forwarded-For`) all returned the identical 17-byte
+  body. It keys on something we cannot set from here — consistent with the
+  IP/app-context theory in §1.2, and not worth further attempts.
+
+So the best any implementation can ever say is **"trained today"**, never
+"checked in at 6:42am". The announcement wording reflects that deliberately.
+
+**2. Revo batches attendance in, roughly twice a day.** Observed behaviour is
+that a day flips to attended around **05:00 and 17:00 UTC** (≈2:30pm / 2:30am
+Adelaide — the clean UTC alignment is what gives the two-batch reading away).
+A morning session therefore surfaces hours later, at the next batch.
+
+> ⚠️ This cadence is **inferred**, not measured — from observed announcement
+> clustering plus the UTC alignment. `_poll_one_account` now logs
+> `Revo check-in detected user=… visit_date=… detected_at=… lag_days=…` every
+> time the cursor advances, so a few weeks of logs will confirm or correct it
+> (and catch it changing). Check there before assuming these times.
+
+**The delay is upstream of HTTP — there is no cache to bust.** `streaks.php` was
+fetched three times 20 s apart: the responses were byte-identical, and carried
+**no `Last-Modified`, no `ETag`, no `Age` and no `Cache-Control`** (bare
+`Date` + `Server: Microsoft-IIS/10.0`). So the page is generated fresh per
+request and reflects the rewards database *immediately*; nothing is being served
+stale to us. That has two consequences:
+1. The lag is in **Revo ingesting turnstile data into the rewards database**, not
+   in delivery. No request-shaping, cache-busting header or query parameter can
+   move it — this is not a client-side problem.
+2. The cadence is **not observable from the protocol**. Headers reveal nothing
+   about when the underlying data last changed, so the only way to measure it is
+   to watch the data itself flip — which needs a real gym visit. That is exactly
+   what the new detection log line is for.
+
+**Consequences for the poller.** The poll interval is *not* the bottleneck —
+`REVO_POLL_MINUTES` defaults to 10, against a source that changes twice a day.
+Lowering it buys at most a few minutes and costs proportionally more requests
+against a portal the notes ask us to treat gently (§6). What *is* worth doing:
+- **Skip the fetch once today is already recorded.** The cursor only advances to
+  a newer day, so between a detected check-in and midnight there is nothing left
+  to learn. `_poll_one_account` returns early in that case, removing the majority
+  of a training day's requests.
+- **Don't say "just".** By the time the batch lands the session may be many hours
+  old.
+
+#### 3.2.3 The only real-time path: external presence, not Revo
+
+Since no Revo backend can ever say *when* someone trained, genuinely real-time
+detection has to come from a signal the member already emits. This project
+already has one wired up: **Home Assistant** (`docs/HOME_ASSISTANT.md`).
+
+The pieces are all in place, which is what makes this the realistic option:
+- `ha_poll` already runs every `HA_POLL_MINUTES` (default 10, **floor 1**) and
+  already calls `GET /api/states` per linked member — so `person.*` and
+  `device_tracker.*` entities are **already in hand every cycle**.
+  `_ha_visible_states` filters only operator-ignored entities, not by domain.
+- HA's companion app sets a `device_tracker`/`person` state to the **zone name**
+  on crossing, and exposes `latitude`/`longitude`/`gps_accuracy` attributes.
+- We already have every club's coordinates and `revo_perfectgym.haversine_km`.
+
+A 150 m geofence is unambiguous nationwide: excluding the two co-located
+Nunawading sites, the closest pair of Revo clubs is **1.45 km apart**. Use the
+**Netpulse** coordinates (§7.2) — PerfectGym's are rounded (§9) and would put the
+fence in the wrong place for 25 clubs.
+
+> ⚠️ **Not built, deliberately.** This is location tracking of members, which is a
+> different privacy proposition from reading a gym's attendance flag, and it is
+> the member's decision rather than the operator's. If it is ever built it must be
+> strictly opt-in per member, and it should degrade to the Revo calendar rather
+> than replace it. Note also that *being at the club* is not the same fact as
+> *having checked in* — someone can walk past — so the honest design is to
+> announce on presence and let the calendar confirm the visit later.
+
 ### 3.3 Tickets / Attendance log — `/portal/rewards/ticket-tally.php`
 
 > ⚠️ **DOM reorder (2026-07):** each history row is now a three-column grid
@@ -209,6 +376,14 @@ Tickets Available: 31
 ```
 - "Tickets Available" is the headline number (digit-grouped — concatenate the single-digit `<span>` cells before "Tickets Available").
 - Each row = `(date_dd/mm/yyyy, delta_int, source_string)` in the DOM; `TicketRow` still exposes them as `(delta, source, date)`.
+- ✅ **Correction (2026-07): the page renders the FULL history, not "the most
+  recent ~10 entries"** as this section used to claim. A live fetch returned all
+  22 rows back to the `Welcome` row with no pagination, and the parsed row deltas
+  **sum exactly to the headline balance** — so no row is dropped, double-counted,
+  or mis-paired with the wrong date.
+- ✅ **A fourth source label is live: `BONUSDAILY`** (alongside `Attendance`,
+  `Monthiversary`, `Welcome`). Any code that switches on the source string has to
+  tolerate it.
 - ⚠️ **`Attendance` rows are NOT a per-visit check-in log.** Verified 2026-06-12:
   the per-day streaks calendar (§3.2.1) showed check-ins on June 1, 10, 11, while
   ticket-tally's newest `Attendance` row was June 7 — days 10 and 11 never appeared.
@@ -221,6 +396,38 @@ Tickets Available: 31
 ### 3.4 Raffle / Prize pool
 
 - `raffle.php` — shows `Monthly Draw N days` and `Major Draw N days` countdowns; current ticket balance.
+- ⚠️ **The countdown block is server-rendered with `style="display: none"` for a
+  member who is opted OUT — and `parse_raffle` happily scrapes numbers out of it.**
+  This was a live user-visible bug: `/revo_raffle` told an opted-out member
+  "**35** tickets in the draw · Monthly draw: in **6 days**" when their tickets
+  were not entered in anything.
+  - **Opt state is readable from the DOM.** The page renders *both* buttons and
+    hides the one that doesn't apply, so a **visible `#optIn` means the member is
+    currently OUT**:
+    ```html
+    <button id="optOut" … data-opt-val="1" style="display: none">
+    <button id="optIn"  … data-opt-val="1" >
+    ```
+  - Parsed by `revo_client.parse_raffle_optin(html) -> bool | None` (`None` when
+    the page didn't render a readable state — never a silent `False`), and served
+    together with the countdowns by `RevoClient.get_raffle() -> RaffleInfo`, which
+    pairs them off a single fetch so a caller can't announce one without the other.
+  - `/revo_raffle` and `/revo_summary` now warn when `opted_in is False`, and only
+    ever for the member's **own** account — opt state is personal and both replies
+    are public.
+  - ✅ **Correction to §2's table: `optval` is a pure TOGGLE, not a `0`/`1`
+    setter.** `script.js` sends `data-opt-val="1"` from *both* buttons and then
+    shows/hides based on the returned `Status`. There is no read-only variant of
+    that request and no way to *set* a specific state — which is the other reason
+    the DOM is the only safe way to read this.
+- **`major-prize-winners.php`** (✅ L1, **new to these notes**) — the only place on
+  the portal that exposes actual **draw dates and outcomes**: one `<h3>` per draw
+  under `<section id="major-draw-winners">`, formatted
+  `Major draw (DD/MM/YYYY) <Initial>. <Surname> <postcode>, …`. Observed cadence is
+  **weekly (Mondays)**, which contradicts the single "Major Draw 6 Days" countdown
+  — worth resolving before anyone builds the §5-E push reminder.
+  ⚠️ **Third-party PII**: other members' surname + postcode. Revo publishes it to
+  logged-in members, but do **not** repost individual winners into Discord.
 - `prize-pool.php` — same numbers + current prize **copy**. Two blurbs render in
   DOM order `[monthly, major]` as `<div class="py-3 px-1"><p>…</p></div>` blocks
   (e.g. monthly *"EVERY GYM HAS A WINNER! Win Revo merch and 3 months free
@@ -289,7 +496,10 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
   per-day streaks calendar (§3.2.1) for each linked user, tracks the most recent
   attended day in `revo_account.last_checkin_date`, and posts to the configured
   notify channel when a newer day appears:
-  `"🏋️ @user just checked in at Revo! — streak: 7 weeks 🔥"`.
+  `"🏋️ @user trained at Revo today! — streak: 7 weeks 🔥"`.
+  (Wording is deliberately *not* "just checked in" — the signal is a batched
+  per-day flag, so the session is often hours old by the time we see it. See
+  §3.2.2 for why real-time is structurally impossible.)
 - ⚠️ **Originally specced against `ticket-tally.php` — that was wrong** (see §3.3):
   ticket rows are a weekly reward grant, not per-visit, so the feed lagged days and
   dropped most check-ins. Driving it off the calendar fixed the "delayed/missed"
@@ -378,22 +588,119 @@ for the read-only client.
   credential login** — `POST /np/exerciser/login` with `username`/`password`
   sets a `JSESSIONID` cookie and returns the exerciser `uuid`. Same
   session-cookie shape as the web portal; no phone-TLS interception needed.
-- **Occupancy & check-ins are NOT provisioned for Revo's tenant.**
-  `gym-busyness` returns `{"message":"The requested resource does not exist."}`
-  and `check-ins/history` returns `{"checkIns": []}`. Every club in the
-  directory reports `"mms": "perfectgym"` — **Revo runs member management /
-  access / occupancy on PerfectGym, not Netpulse**, so those endpoints are dark
-  *here*. That `mms: perfectgym` signal is exactly what pointed us at the
-  **PerfectGym ClientPortal2** backend, whose occupancy endpoint **did** restore
-  `/busy` (see **§8**). (A per-visit feed is still unavailable.)
+
+### 7.1 The response oracle (2026-07) — read this before probing Netpulse again
+
+An unauthenticated calibration pass established what each response actually means.
+This costs **zero logins**, because 403-vs-404 is observable without auth:
+
+| Response | Meaning |
+|---|---|
+| `403 {"message":"Access is denied"}` | Route **exists** and is protected (proved against the known-good `exerciser/{uuid}/membership`) |
+| `500 {"message":"General Error"}` | Route exists **and is wired**, but the tenant's backing service is unconfigured — the genuine "provisioned-but-dark" signature |
+| `404 {"message":"The requested resource does not exist."}` | **Not in the routing table at all** |
+
+> ⚠️ **Correction — this invalidates a documented inference.** The older notes read
+> `{"message":"The requested resource does not exist."}` as *"Netpulse knows the
+> route but Revo's tenant lacks it"*. It is simply Netpulse's **generic 404 body**:
+> a bogus control route (`zzz-no-such-route-xyz`) returns it byte-for-byte. So
+> `gym-busyness` is not a "dark tenant feature" — **that route does not exist**.
+> Likewise `check-ins/history` does **not** return `{"checkIns": []}`; it 404s, as
+> do six other spellings. The end conclusion (no per-visit feed on Netpulse) is
+> unchanged, but the evidence behind it was weaker than documented. Exactly one
+> route shows the true provisioned-but-dark 500: `exerciser/{uuid}/rewards`.
+
+- **Occupancy & check-ins are unavailable here.** Every club in the directory
+  reports `"mms": "perfectgym"` — **Revo runs member management / access /
+  occupancy on PerfectGym, not Netpulse.** That `mms: perfectgym` signal is
+  exactly what pointed us at the **PerfectGym ClientPortal2** backend, whose
+  occupancy endpoint **did** restore `/busy` (see **§8**). (A per-visit feed is
+  still unavailable — see §12.)
 - **What Netpulse *does* give:** the member's **membership** (type/subtype/join
-  date) and a full **club directory** (name, suburb/state, hours, geo). Those
-  are the only two surfaces `app/revo_netpulse.py` exposes.
+  date) and — the valuable one — a full **club directory** (§7.2).
+- **Dead, but provisioned:** `exerciser/{uuid}/stats` returns 200 with every
+  counter a hard zero (workouts/calories/distance/goals) — Netpulse's
+  workout-tracking module is unused by Revo, and this is *not* a visit counter.
+  `exerciser/{uuid}/challenges` and `challenges` both return `[]`.
+
+### 7.2 Club directory — `GET company/children` (**NO AUTHENTICATION**)
+
+The richest public club record Revo publishes, and the **only** source of opening
+hours, a phone number, and each club's IANA timezone. Implemented as
+`revo_netpulse.fetch_club_directory()` / `shared_club_directory()` (6h TTL).
+
+> ✅ **It needs no credentials at all.** A bare session with no `JSESSIONID`
+> returns 200 with a byte-identical body. `NetpulseClient.get_clubs()` was calling
+> `_ensure_login()` for nothing. The credential-free path means hours and geo cost
+> no account risk and have no session to expire — which is why `/revo_clubs` uses
+> it for every caller, linked or not.
+
+> ✅ **`responseType` is ignored.** `basic`, `full` and no parameter at all return
+> the same bytes (sha256 `986a41b8…`, 77707 B, 77 clubs). The old "try
+> `responseType=full`" note is moot — `basic` was returning every field the whole
+> time; the client was **discarding** them, not failing to request them.
+
+Per club: `uuid`, `name`, `timezone` (IANA, 77/77), `phone`, `email`, `url`,
+`mms`, `gymChainId`, `photos`, `workingHours`, `workingHoursFreeText`, and
+`address{addressLine1, city, postalCode, stateOrProvince, lat, lng}`.
+
+- **`stateOrProvince` is a poor state source** — null for 64 of 77, and one club
+  spells it `"Victoria"` rather than `"VIC"`. Use
+  `revo_perfectgym.STATE_BY_STATE_ID` (§9) instead.
+- **Hours are human copy, not structured data.** Across all 77 clubs (539 day
+  cells) there are only these shapes:
+  - `"Open 24 Hours\nStaffed from 9am - 8pm"` — **420 cells**, two distinct facts
+    packed into one string. The staffed window must **not** be read as the opening
+    window; the club is card-accessible all night either way.
+  - `"00:00-23:59"` — 14 cells, the machine-readable form of 24/7.
+  - `"Open from 5:30am - 10pm"` / `"Open 7:00am-7:00pm"` / `"Open from 6am - 9pm"`
+    — ~35 cells across the handful of limited-hours clubs.
+  - 10 clubs have `workingHours: null`; **7 of them** still describe their hours in
+    the HTML `workingHoursFreeText`, which the parser falls back to. Only
+    **Dayton, Noarlunga and Nunawading (Original)** end up with no hours at all.
+- Parsed by `revo_netpulse.parse_day_hours()` / `parse_hours()` into `DayHours`,
+  and evaluated by `club_status(club, now)` → `ClubStatus(open_now, staffed_now,
+  always_open, local_time, today_raw)`. **Everything degrades to `None`, never to
+  a guessed "closed"** — an unknown timezone, an undescribed weekday or
+  unrecognised copy all read as "unknown", because a wrong "closed" is the one
+  answer that costs someone a trip. Evaluation happens in the **club's own**
+  timezone: Revo spans four, so a server-local comparison would be up to three
+  hours out.
+
+#### 7.2.1 Joining Netpulse hours to the PerfectGym directory
+
+The two backends **disagree on four club names** — Netpulse appends a state or
+city (`Knoxfield Vic`, `Rivervale WA`, `Pitt St Sydney`) and spells one site
+`Nunawading (Original)` where PerfectGym uses `Nunawading OG` (whose `FullName`
+is `Nunawading - (Original)`).
+
+`revo_netpulse.normalise_club_name()` reconciles all four: lowercase, strip to
+bare alphanumerics, drop a trailing state/city token. Matched against **both**
+PerfectGym's `Name` and `FullName` it gives a clean **1:1 join across all 77
+clubs**, and the only unmatched PerfectGym entries are the two that haven't opened
+(Netpulse lists a club once it trades).
+
+> ⚠️ **Do not join these two directories by coordinates.** It looks tempting —
+> both carry lat/lng, 74 of 77 nearest-matches land within 500 m — but the two
+> Nunawading sites are **138 m apart**, so nearest-neighbour silently hands
+> `Nunawading` the *other* club's hours and leaves `Nunawading OG` unmatched.
+> That is a wrong answer that looks entirely plausible. Match by name.
 - **Secrets:** the login + membership responses carry a `JSESSIONID`,
   `externalAuthToken`/`IdToken`/`RefreshToken`, `egymAccountId`, and a
   membership `barcode`/`agreementNumber`/`barcodeExpiresAt` (a live door-access
   credential). The client never logs, returns, or stores them; the parsers are
-  the scrubbing boundary.
+  the scrubbing boundary. (In practice the three `external*Token` fields and
+  `egymAccountId` are **null** on Revo's tenant — the scrubbing still stands, but
+  don't expect to find them populated.)
+- ⚠️ **`exerciser/{uuid}/profile` is a NEW secret class — deliberately not wired
+  up.** It returns 200 with real data and carries `birthday`, `weight`,
+  `gender`, `phoneNumber`, `email`, `firstname`/`lastname`, `barcode`, **and
+  `clientLoginId` / `clientLoginPasscode`** — the last two are login credentials
+  not listed anywhere else in these notes. The only genuinely new *non*-sensitive
+  facts it adds are `birthday`, `weight` and the member's own `timezone`. If it is
+  ever implemented, the parser must scrub the credential fields at the boundary
+  the way `parse_membership` does, and nothing about it belongs in a public
+  channel.
 - **Not the same vendor as bookings:** Revo's studio/pilates bookings run on
   **Arbox** (`revoFitness.arbox.app.com`) — a different backend again, only
   relevant if class bookings are ever wanted.
@@ -449,7 +756,25 @@ per-user factory and a ~60s TTL cache (`OCCUPANCY_TTL_SECONDS`) so a burst of
 `/busy` calls doesn't re-hit PerfectGym — mirroring the `revo_client` /
 `revo_netpulse` patterns.
 
-### 8.1 How `/busy` behaves now
+### 8.1 Response taxonomy — how to tell a real route from a missing one
+
+Established by probing with bogus controls alongside every real call. Without
+this, an absent route and a real-but-misparameterised one are indistinguishable
+and a sweep produces nonsense.
+
+| Response | Meaning |
+|---|---|
+| `404` + a ~17 KB HTML error page | **No such route.** |
+| `400` + `Error occured. CorrelationId:"…"` | Route **exists**; params missing/wrong. |
+| `499` + that same CorrelationId body | Route exists, handler ran and refused — **also proves existence**. |
+| `403` | Route exists; this member/tenant isn't entitled (e.g. `Family/*`, `Files/*`). |
+| `200` + bare `null`, `[]`, or 0 bytes | Route exists but had nothing to say — **often a bad argument rather than a real empty result** (see the `DailyClasses` trap in §9.2). |
+
+⚠️ A `200` is the weakest signal here, not the strongest. Always run the same call
+with a deliberately invalid argument: if the bogus and the real call return the
+same bytes, the response carries no information about your argument at all.
+
+### 8.2 How `/busy` behaves now
 
 - **No club arg:** shows the member's **home club** live count (identity via the
   rewards-landing fav club, count via the PerfectGym board) **plus a
@@ -478,23 +803,59 @@ club directory does — it's the same list the "find a club" map draws from — 
 it's joined to occupancy *by name* for ids/geo. Read-only, no PII.
 
 - **DIRECTORY:** `GET /ClientPortal2/Geo/GetClubList` (CpAuthToken cookie) →
-  `200` JSON array:
+  `200` JSON array (79 clubs as of 2026-07):
   ```json
   [
-    {"Id":25,"Name":"Modbury","Address":"976 North East Road",
+    {"Id":25,"Name":"Modbury","FullName":"Modbury","Address":"976 North East Road",
      "City":{"Id":"66731","Name":"Modbury","Country":"AU"},
      "ClubNumber":"404","Latitude":-34.829,"Longitude":138.692,
-     "OpeningDate":"2022-11-01T00:00:00","StateId":3},
+     "OpeningDate":"2022-11-01T00:00:00","OpeningDateLocal":"2022-11-01T00:00:00",
+     "BrandingId":null,"StateId":3},
     …
   ]
   ```
-  - Fields kept: `Id`, `Name`, `Address`, `City` (nested `{Name}` **or** a bare
-    string — both accepted), `ClubNumber`, `Latitude`/`Longitude` (float, `null`
-    for just-announced clubs → preserved as `None`), `OpeningDate`.
-  - **`StateId` is an opaque internal grouping key** with no public code mapping —
-    it is **intentionally ignored**. The AU state code comes from
-    `revo_client.state_for_club(name)` (the bot's single curated name→state
-    source), consistent with `parse_members_in_clubs`.
+  - Fields kept: `Id`, `Name`, `FullName`, `Address`, `City` (nested `{Name}` **or**
+    a bare string — both accepted), `ClubNumber`, `Latitude`/`Longitude` (float,
+    `null` preserved as `None`), `OpeningDate`.
+  - ⚠️ **These coordinates are rounded — don't use them for anything precise.**
+    15 clubs sit at ≤3 decimal places (≥110 m) and two at 2 (~1.1 km). Measured
+    against Netpulse's, **25 of 77 pins are >200 m out and Pitt St is 987 m out**;
+    worse, the two Nunawading sites are given *identical* coordinates here even
+    though they are 138 m apart. **Netpulse's directory (§7.2) carries 6–14
+    decimal places** for almost every club — use it for map pins and for any
+    distance/geofence work, and keep these only as the fallback.
+    `_format_revo_club_detail` already prefers the Netpulse coordinate.
+  - `FullName` differs from `Name` for exactly one club today (`Nunawading OG` →
+    `Nunawading - (Original)`); callers fall back to `name`. `OpeningDateLocal` is
+    identical to `OpeningDate` for all 79 clubs, and `BrandingId` is `null` for all
+    79 — neither is worth reading.
+  - ✅ **Correction (2026-07): `StateId` is NOT unmappable, and treating it as such
+    was silently breaking state scoping.** The mapping is
+    **`1=NSW, 3=SA, 5=VIC, 6=WA`** — derived by cross-referencing all 79 directory
+    clubs against the curated name table: **zero conflicts** (NSW 5/5, SA 16/16,
+    VIC 19/19, WA 35/35), and every club the curated table *couldn't* place lands on
+    the id its suburb implies. Only those four ids appear (Revo has no QLD/TAS/NT/ACT
+    clubs). Now `revo_perfectgym.STATE_BY_STATE_ID` is the **primary** state source,
+    with `revo_client.state_for_club(name)` as the fallback.
+    - **Why it mattered:** the curated name table only grows when a human edits it,
+      so it had gone stale — it failed to place 4 live clubs (**Melrose Park**, SA,
+      *already open since 2026-07-21 with 12 people in it*; **Nunawading OG**, VIC;
+      **Altona North**, VIC; **Nedlands**, WA) and still lists 12 names absent from
+      the live directory. A club with `state=None` is filtered out of **every**
+      state-scoped surface — `/busy`'s board, its quietest line, and `/revo_clubs`'
+      home-state list — so Melrose Park was simply invisible.
+    - The mapping is a **whitelist**: an unconfirmed id yields `None` and falls back
+      to the curated name, so an interstate expansion degrades to the old behaviour
+      rather than leaking a raw integer as a state code.
+  - ⚠️ **The directory lists clubs BEFORE they open** (`OpeningDate` in the future),
+    **and those clubs are also on the live occupancy board reporting `0`.** Left
+    alone they win "quietest right now" outright: before this was handled, `/busy`
+    nationwide reported **Altona North — 0 in club** as the quietest Revo gym, a
+    club that doesn't open until 2026-08-18. Note the two bugs *masked* each other —
+    Altona North was excluded from VIC's board only because its state was unknown, so
+    fixing `StateId` alone would have moved the bad row from the national board onto
+    VIC's. Handled by `revo_perfectgym.has_opened()` / `enrich_occupancy()`;
+    `future_openings()` exposes the coming-soon list deliberately instead.
 - **Caching:** the directory changes on the order of *months*, so it gets its own
   cache with a **6h TTL** (`CLUB_DIR_TTL_SECONDS`), separate from the 60s
   occupancy cache so a directory fetch never evicts (or is evicted by) the
@@ -503,14 +864,32 @@ it's joined to occupancy *by name* for ids/geo. Read-only, no PII.
   is still the scrubbing boundary (whitelisted public fields only).
 
 Exposed as `PerfectGymClient.get_club_list() -> list[ClubDirEntry(id, name,
-address, city, club_number, lat, lng, opening_date, state)]`, with:
+address, city, club_number, lat, lng, opening_date, state, full_name)]`, with:
 - `haversine_km(a,b)` — pure great-circle distance (km).
 - `nearest_clubs(entries, origin_name, limit)` — clubs sorted by distance from a
   named origin (origin + uncoordinated clubs excluded).
 - `join_occupancy_to_dir(occupancy, directory)` — attaches directory
   `id`/`lat`/`lng`/`opening_date` to each occupancy row by name (unmatched rows
   kept with `None` geo).
+- `has_opened(entry, today=None)` — is this club trading yet? A missing or
+  unparseable `OpeningDate` counts as **open** (the directory's placeholder dates
+  are all in the past, and an undateable club is far likelier to be trading).
+- `future_openings(directory, today=None, state=None)` — not-yet-open clubs,
+  soonest first, optionally one state.
+- `enrich_occupancy(occupancy, directory, today=None)` — the join that makes the
+  live board correct: fills in the `state` the occupancy payload omits (it carries
+  no `StateId`, only a name and an address) and **drops not-yet-open clubs**.
+  Returns a new list, so it is safe to call on the cached tuples. A row with no
+  directory match is kept as-is — a live count is never discarded just because the
+  directory lags — and an empty directory makes it a no-op, so a directory outage
+  degrades to the old behaviour instead of failing the command.
 - module-level `shared_club_list()` / `club_list_with_client(client)` (6h TTL).
+
+`bot._perfectgym_occupancy()` applies `enrich_occupancy` to every board it hands
+out, so `/busy` and `/revo_clubs` both get the corrected data with no per-command
+changes. The directory side is 6h-cached, so this costs nothing in the steady state.
+`/revo_clubs` renders a not-yet-open club as `opens 18 Aug 2026` rather than a
+head-count — the info is genuinely useful, it just must not read as a live number.
 
 ### 9.1 `/revo_clubs`
 
@@ -519,12 +898,88 @@ address, city, club_number, lat, lng, opening_date, state)]`, with:
   `Name — Suburb (X in club now)` by joining the live board. Degrades to
   "count unavailable" per club when the board is down; if the home state can't be
   determined it asks the user to name a club or link.
-- **Club arg:** that club's **address**, a **Google-Maps link** from lat/lng, its
-  **state**, its **live count**, and the **nearest 3 other clubs** (with distance
-  + each one's live count). Public data → shared account is fine; still gated by
-  `REVO_DISABLED` + `available()`.
+- **Club arg:** that club's **address** (+ postcode), a **Google-Maps link** from
+  lat/lng, its **state**, its **opening hours / staffed status right now**, its
+  **live count**, a **phone number**, and the **nearest 3 other clubs** (with
+  distance + each one's live count). Public data → shared account is fine; still
+  gated by `REVO_DISABLED` + `available()`.
+  - Hours/phone/postcode come from the **credential-free Netpulse directory**
+    (§7.2), joined by normalised name (§7.2.1) via `bot._club_hours_entry()`.
+    Entirely best-effort: a Netpulse outage, a missing dep, or a club it doesn't
+    list yet just omits those lines.
+  - A club that **hasn't opened yet** shows `🚧 Not open yet — opens 18 Aug 2026`
+    and stops there, rather than reporting the `0` the live board carries for it.
 - This supersedes the deferred Netpulse `/revo_clubs` idea — there is a **single**
   clubs command, backed by PerfectGym `Geo/GetClubList`.
+
+### 9.2 Classes — 3 clubs run them, and the timetable is NOT reachable
+
+`GET /ClientPortal2/Clubs/GetAvailableClassesClubs` returns the same club shape as
+the directory, filtered to the clubs that actually run classes. Today that is
+**3 of 79: Cranbourne, Glenelg, Pitt St.** (Revo's studio/pilates bookings run on
+**Arbox**, a fourth backend — see §7.)
+
+A `/revo_classes` command **cannot** be built today — not because the routes are
+missing, but because **Revo publishes no timetables through PerfectGym**. The real
+timetable routes were found (via §9.3) and all answer `200`:
+
+| Route | Params | Result |
+|---|---|---|
+| `Classes/ClassCalendar/DailyClasses` | `clubId`, `date=YYYY-MM-DD` | `{CalendarData:[{Hour,Classes:[…]}], PagerData:{…}}` — `CalendarData` **`[]` every time** |
+| `Classes/ClassCalendar/WeeklyClasses` | `clubId`, `date` (anchors 7 days) | zone → hour → day grid; `CalendarData` **`[]` every time** |
+| `Classes/ClassCalendar/GetCalendarFilters` | `clubId` | 5 arrays, **all empty** |
+
+Coverage behind that verdict: all 3 class-running clubs × every 7-day page across
+the whole bookable horizon, plus 8 spot-check clubs, past/future dates, and the
+SPA's full parameter set — `CalendarData` was `[]` in 100% of 40 calls.
+
+Two traps worth recording, both of which make a naive probe *look* successful:
+- `DailyClasses` **silently resets an unparseable or out-of-range `date` to today**
+  and returns a normal empty envelope — no `400`, no error. A bogus `clubId`
+  returns `200` with a bare `null` body.
+- `GetCalendarFilters` returns a **byte-identical 110-byte constant** for all 33
+  club ids tried, *and* with no `clubId` at all, *and* with no session cookie. It
+  therefore carries **zero per-club information** — do not read its emptiness as
+  evidence about any particular club.
+
+The other two class routes — `Classes/ClassCalendar/Details` (`classId`) and
+`GetClassTickets` (`classId`,`userId`) — need a `classId` only a timetable listing
+could supply, so they're unreachable in practice. `MyCalendar` covers *your own
+bookings*, not what's on (§12.1). The routes are ready if Revo ever loads
+timetables; until then there is nothing to render.
+
+### 9.3 How to find new routes: mine the Angular templates, not the JS bundles
+
+The most productive discovery channel on ClientPortal2, and the one that found
+`ContractList`, `DailyClasses`/`WeeklyClasses`, `GetProfileForEdit` and
+`GetFamilyMembersForEdit` — **none of which appear in the JS bundles at all**.
+
+The SPA declares many of its API calls in **HTML templates**, not JavaScript. In
+the minified bundle `$View` is literally `function $View(n,t){return t}`, so every
+`templateUrl` string is a **fetchable path**:
+
+```
+GET /ClientPortal2/<Area>/Views/<Name>        → 200 text/html (raw Angular partial)
+GET /ClientPortal2/<Area>/Components/<X>/<Y>  → 200 text/html
+```
+
+Each partial carries the two things a probe needs:
+
+```html
+<baf:data-source url="Classes/ClassCalendar/DailyClasses" params="{…}" name="…">
+<baf:model name="params">{ clubId, date, categoryId, trainerId, zoneId }</baf:model>
+```
+
+i.e. **the real route and its exact parameter names**. Controls confirm the signal
+is real: 4/4 invented template paths behave differently from real ones.
+
+Recommended order for any future spelunking:
+1. Pull the bundles (`loadJs("bundles/…")` in the SPA shell) → module/route list.
+2. **Fetch every `<Area>/Views/<Name>` template** and grep for `baf:data-source`.
+3. Only then probe, using the §8.1 status taxonomy to tell real routes apart.
+
+Roughly **30 listed templates are still unmined** — one cheap unauthenticated-ish
+GET each, and the single highest-yield thing to do next.
 
 ## 10. Membership status slice — `User.Member.NotificationsData`
 
@@ -590,7 +1045,8 @@ Per-visit / per-club / per-timestamp check-in history is **not** available to a
 member client on **any** Revo backend:
 - **Web portal (`revocentral`):** every check-in/visit/history route 302s even at
   L2 — mobile-app-only (§1.1, §2, §5-H).
-- **Netpulse (EGYM):** `check-ins/history` returns `{"checkIns": []}` and
+- **Netpulse (EGYM):** `check-ins/history` **404s** (it does *not* return
+  `{"checkIns": []}` — that older claim is corrected in §7.1) and
   occupancy isn't provisioned for Revo's tenant — Revo runs on PerfectGym (§7).
 - **PerfectGym ClientPortal2:** exposes live all-clubs occupancy (§8), the public
   club directory (§9) and the login-profile membership slice (§10). It does **not**
@@ -599,6 +1055,35 @@ member client on **any** Revo backend:
   touch. The per-day **streaks calendar** (§3.2.1) remains the finest check-in
   signal available, and the attendance poller drives off it. **Do not re-probe for
   a member visit-history endpoint — it is operator-API-only.**
+
+### 12.1 Re-confirmed 2026-07, with a validated oracle
+
+This conclusion has been re-tested rather than inherited, because §1.2 was wrong
+once before. A 35-name sweep (`Visits`, `Entrances`, `Entries`, `Attendance`,
+`History`, `Access`, `Turnstile`, `ClubVisits`, `MemberVisits`, `Statistics`,
+`Activity` × several `Area/Controller/Action` spellings) returned the 17 KB
+bogus-route 404 page for **every** name. The sweep is trustworthy because the same
+run contained a positive control: `MyCalendar/MyCalendar/Get*Activities` returned
+`400` on a bare GET and `200` on a POST, proving 400-vs-404 discriminates real
+routes from absent ones.
+
+**There is also no richer mobile API.** The Revo iOS app rides this same
+ClientPortal2 cookie surface (plus Netpulse), not a versioned REST API:
+`/api/v1/`, `/api/v2/`, `/ClientPortal2/api/`, `/swagger`, `/swagger/v1/swagger.json`
+and `/openapi.json` are all 404, and no `Authorization: Bearer` flow exists. The
+operator app *is* present but gated — `/MobileApp/`, `/GoFit/`, `/pgapi/` all
+302 to the `/Pgm/` staff portal, which a member `CpAuthToken` does not unlock.
+
+> ⚠️ **`MyCalendar/MyCalendar/GetPastActivities` is NOT a visit log** — the name
+> invites exactly that mistake. It, plus `GetRecentActivities` /
+> `GetFutureActivities`, are the paginated feeds behind `GetCalendar`'s
+> `PastItems`/`RecentItems`/`FutureItems`: **class / PT / facility BOOKINGS**.
+> POST with `{"page":N}`, shape `{Page, Items, HasMore}`. All three return
+> `Items: []` for a member who doesn't book classes, which is most Revo members —
+> Revo runs classes at only 3 of 79 clubs (§9.2).
+
+See **§14** for the two member reads that *were* confirmed new — neither is a visit
+log, and neither is implemented.
 
 ## 13. Profile first name + photo — `/seeprofile` and auto-nicknames
 
@@ -634,3 +1119,79 @@ successful link the bot best-effort fetches `get_first_name()` via the member's 
 per-user client and overwrites their nickname (owner-approved; non-fatal if the
 fetch fails). The old manual `/set_nick` + `/remove_nick` commands were **retired**
 — nicknames are no longer set by hand.
+
+## 14. Confirmed-new member reads — documented, deliberately NOT implemented
+
+Two endpoints returned rich, real, non-duplicated member data. Both were
+reproduced independently against the live backend. **Neither is wired up**, and
+that is a decision rather than an omission: this bot posts into shared Discord
+channels, and both carry data classes nothing in the repo currently handles.
+
+They are written up in enough detail to build from directly if wanted.
+
+### 14.1 `GET /Profile/Contracts/ContractList?userId=<own Member.Id>` — the real contract
+
+Today the bot's *entire* membership surface is one scraped flag —
+`MembershipStatus.contract_status` off the login body (§10), rendered as
+`💳 Membership: Current`. This is the actual contract behind it.
+
+- `userId` is **required** (400 without it). CpAuthToken cookie. ~2 KB.
+- Shape: `{Contracts:[…], Addons:[…], CanAddContract, CanAddAdditionalContract}`.
+  Each row: `Name`, `Club{Id,Name,…}`, `CommitmentPeriod`, `SignupDate`,
+  `StartDate`, `EndDate`, `CommitmentDate`, `CurrentFreezeEndDate`,
+  **`NextPaymentDate`**, `Cost{Gross,Net,Tax}`, `PaymentInterval`, `PaymentPlanId`,
+  `IsAdditional`, `CanBeEarlyTerminated`, `CollectedDeposit`/`RemainingDeposit`.
+- **`Addons` are separate contracts**, each with its own id, cost and next-payment
+  date — not a name list on the main contract. Derive `is_addon` from which array
+  a row came from, not only from `IsAdditional`.
+- `ShortDescription`/`FullDescription` come back **empty** — `Name` is the only
+  reliable plan label. `CurrentFreezeEndDate` is in-schema but was never observed
+  populated (the test account isn't frozen).
+- Genuinely new capability it would unlock: plan + price + billing interval, and
+  **`NextPaymentDate` / `CurrentFreezeEndDate` are pollable** — "your membership
+  bills in 3 days", "your freeze ends tomorrow". Nothing in the bot can do that.
+
+> 🔒 **If this is ever built, these are not optional.**
+> 1. **Own credentials only** — the `/revo_card` rule (§11). Falling back to the
+>    shared `REVO_USER` account would show every caller the *host's* plan and price.
+> 2. **`ephemeral=True` on every path.** This is personal financial data.
+> 3. **`userId` is never user-supplied** — always the caller's own `Member.Id` from
+>    their own login body. Don't put a `userId` parameter on any function a command
+>    can reach; whether a foreign id is honoured server-side was deliberately not
+>    tested.
+> 4. **No module-level cache.** `shared_club_occupancy`/`shared_club_list` are
+>    cached because they're the same public list for everyone. This is per-member —
+>    a shared cache is a cross-member leak.
+> 5. Project a narrow whitelist at the parser, as `parse_membership_status` does;
+>    never log the body.
+
+### 14.2 `GET /Profile/Profile/GetProfileForEdit?userId=<own Member.Id>` — full profile
+
+Returns `Model.PersonalData` with `BirthDate` + `IsBirthDateMasked`, `ReferralCode`,
+`Sex`, full `Address`+`PostalCode`, `Email`, `Phone`, `Photo{Url,TempToken}` and
+**`UserNumber` — the door-access barcode (§11)**. Note it is *not* a superset of the
+login profile: it adds those fields but **drops** `HomeClubId`/`DefaultClubId`/
+`NotificationsData`.
+
+The only genuinely new facts are `BirthDate` and `ReferralCode`.
+
+> 🔒 **The most PII-dense body on the backend.** One GET returns an entry barcode,
+> an unmasked date of birth, an email, a phone number, a street address and a live
+> signed photo URL. If a birthday feature is ever wanted: whitelist to **`(month,
+> day)` only — never the year**, return `None` when `IsBirthDateMasked`, store MM-DD
+> so a DB leak reveals nothing about age, fetch once at `/revo_link` time (never
+> from the daily loop), and treat announcing it as opt-in — a member did not consent
+> to a public birthday post just because the bot could read it off a billing page.
+
+**Do not** use this as a photo-URL refresh shortcut for `/seeprofile`. The
+signature does rotate per GET, but `get_photo_url(refresh=True)` already works, and
+this trades one login for pulling a far more sensitive body.
+
+### 14.3 Also confirmed: `Profile/Profile/GetFamilyMembersForEdit?userId=<id>`
+
+The friends-and-family list that `Family/Family/GetFriendsAndFamily` 403s on, under
+a different name: `[{UserId, UserNumber, FirstName, LastName, PhotoUrl, Relation,
+BindedDate, EndDate}]`. `Relation` is `FamilyChild | FriendAccess`. Carries
+`UserNumber` (barcode) and a signed `PhotoUrl` **for other people**, so the same
+rules as §11 apply per row. The test account has no relatives, so only the
+self-row returns — the populated shape is unverified.
