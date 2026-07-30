@@ -15,7 +15,7 @@ from . import config as _config
 from . import targets
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lifts (
@@ -568,6 +568,69 @@ CREATE TABLE IF NOT EXISTS hevy_imported (
     imported_at TEXT    NOT NULL,
     PRIMARY KEY (user_id, workout_id)
 );
+
+-- Members linked to their Home Assistant body-composition sensors. Unlike Hevy
+-- and Strava there is no per-member credential here: one operator-supplied URL
+-- and long-lived token (HA_BASE_URL / HA_TOKEN, held in app_settings) reach the
+-- whole server, so what a member links is ``entity_prefix`` — the shared prefix
+-- of their entity ids ("joshua_s" for sensor.joshua_s_weight and its siblings).
+-- Storing the prefix rather than ten entity ids means a scale that starts
+-- reporting a new metric is picked up on the next poll with no re-link.
+-- ``weight_entity`` is the entity the prefix was derived from, kept so
+-- /ha_status can name it and so an oddly-named weight sensor still resolves.
+-- ``guild_id`` is where the weigh-in is logged and the alert is posted.
+CREATE TABLE IF NOT EXISTS ha_account (
+    user_id        INTEGER PRIMARY KEY,
+    guild_id       INTEGER NOT NULL,
+    entity_prefix  TEXT    NOT NULL,
+    weight_entity  TEXT,
+    friendly_name  TEXT,
+    alerts_enabled INTEGER NOT NULL DEFAULT 1,
+    last_synced_at TEXT,
+    linked_at      TEXT    NOT NULL,
+    backfilled_at  TEXT,
+    -- The last reading actually imported from Home Assistant. Needed because
+    -- restarting Home Assistant re-creates every entity, which gives each one a
+    -- FRESH last_changed while the value is unchanged. Since last_changed is the
+    -- de-duplication key, without this a routine HA update would log and
+    -- announce a duplicate weigh-in for every linked member. Comparing the value
+    -- tells a restored state apart from a real one; see app/bot._ha_import_reading.
+    last_reading_at TEXT,
+    last_weight_kg  REAL
+);
+
+-- One row per imported weigh-in, keyed by the weight sensor's ``last_changed``
+-- (see app/ha_client.reading_key). This is what makes the poll idempotent: a
+-- restart, a re-link or a manual /ha_sync all recompute the same key and so
+-- cannot double-log a weigh-in or re-post its alert.
+CREATE TABLE IF NOT EXISTS ha_imported (
+    user_id     INTEGER NOT NULL,
+    reading_key TEXT    NOT NULL,
+    imported_at TEXT    NOT NULL,
+    PRIMARY KEY (user_id, reading_key)
+);
+
+-- Body-composition metrics beyond bodyweight (body fat %, muscle mass, BMI,
+-- BMR, water %, ...). Deliberately long-and-narrow — one row per metric per
+-- weigh-in — so a scale that reports a metric the bot has never seen needs a
+-- registry entry in app/ha_client.METRICS and no schema migration. Bodyweight
+-- itself is NOT duplicated here; it goes through ``set_bodyweight`` so it keeps
+-- feeding TDEE, protein links, goals and the graphs.
+-- The UNIQUE key makes re-importing the same weigh-in a no-op.
+CREATE TABLE IF NOT EXISTS body_metrics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    guild_id    INTEGER NOT NULL,
+    metric      TEXT    NOT NULL,
+    value       REAL    NOT NULL,
+    unit        TEXT,
+    source      TEXT    NOT NULL DEFAULT 'home_assistant',
+    recorded_at TEXT    NOT NULL,
+    UNIQUE (user_id, metric, recorded_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_body_metrics_user
+    ON body_metrics (user_id, metric, recorded_at);
 
 -- ---------------------------------------------------------------------------
 -- Web dashboard support: a mirror of the guild's member/role state plus a
@@ -3009,6 +3072,253 @@ class Database:
             return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------
+    # Home Assistant linked entities + body-composition metrics
+    # ------------------------------------------------------------------
+
+    def ha_link(
+        self, user_id: int, guild_id: int, entity_prefix: str,
+        weight_entity: str | None = None, friendly_name: str | None = None,
+    ) -> None:
+        """Link (or re-link) a member to their Home Assistant entity prefix.
+
+        No credential is stored: the server URL and token are settings, shared by
+        everyone. Re-linking keeps ``last_synced_at`` and the import history — a
+        member correcting their prefix should not get their whole history
+        re-announced — but clears ``backfilled_at`` so the new prefix's history is
+        pulled in once.
+
+        Pointing at a *different* prefix also clears the replay-guard columns.
+        They describe the previous scale's last reading, and carrying them over
+        would let a stale weight silently swallow the new scale's first weigh-in."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO ha_account
+                    (user_id, guild_id, entity_prefix, weight_entity,
+                     friendly_name, alerts_enabled, last_synced_at, linked_at)
+                VALUES (?, ?, ?, ?, ?, 1, NULL, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    guild_id       = excluded.guild_id,
+                    entity_prefix  = excluded.entity_prefix,
+                    weight_entity  = excluded.weight_entity,
+                    friendly_name  = excluded.friendly_name,
+                    linked_at      = excluded.linked_at,
+                    backfilled_at  = NULL,
+                    last_reading_at = CASE
+                        WHEN ha_account.entity_prefix = excluded.entity_prefix
+                        THEN ha_account.last_reading_at ELSE NULL END,
+                    last_weight_kg = CASE
+                        WHEN ha_account.entity_prefix = excluded.entity_prefix
+                        THEN ha_account.last_weight_kg ELSE NULL END
+                """,
+                (user_id, guild_id, (entity_prefix or "").strip().lower(),
+                 (weight_entity or "").strip().lower() or None, friendly_name,
+                 _normalize_iso(None)),
+            )
+
+    def ha_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM ha_account WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+    def list_ha_accounts(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute("SELECT * FROM ha_account"))
+
+    def ha_prefix_owner(self, entity_prefix: str) -> int | None:
+        """The user_id already linked to ``entity_prefix``, or None.
+
+        ``ha_account`` is keyed on user_id, so nothing in the schema stops two
+        members claiming the same sensors. That has to be refused at the command
+        layer instead — see app/bot.ha_link_cmd for why claiming someone else's
+        scale is a privacy problem and not just a data-quality one."""
+        prefix = (entity_prefix or "").strip().lower()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id FROM ha_account WHERE entity_prefix = ?",
+                (prefix,),
+            ).fetchone()
+            return int(row["user_id"]) if row is not None else None
+
+    def ha_unlink(self, user_id: int) -> bool:
+        """Remove a link. Returns True if a row existed.
+
+        The recorded weigh-ins and body metrics are kept — unlinking a scale is
+        not a request to delete your weight history.
+
+        The ``ha_imported`` ledger is kept too, which is the less obvious half.
+        Clearing it would make unlink/relink — the obvious thing to try when sync
+        looks stuck — re-import every weigh-in still inside the backfill window,
+        and ``set_bodyweight`` always appends, so the member would end up with
+        each of those weigh-ins recorded twice and announced again. Keeping the
+        ledger costs one small row per weigh-in and makes relinking safe."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM ha_account WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def ha_set_alerts(self, user_id: int, enabled: bool) -> bool:
+        """Turn channel announcements on/off for one member. Returns True if a
+        linked row was updated. Syncing continues either way — this only controls
+        whether the weigh-in is posted publicly."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE ha_account SET alerts_enabled = ? WHERE user_id = ?",
+                (1 if enabled else 0, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def ha_mark_synced(self, user_id: int, at: datetime | None = None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE ha_account SET last_synced_at = ? WHERE user_id = ?",
+                (_normalize_iso(at), user_id),
+            )
+
+    def ha_mark_backfilled(
+        self, user_id: int, at: datetime | None = None,
+    ) -> None:
+        """Record that this link has had its one-time history backfill, so
+        routine polls stop asking the recorder for old states."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE ha_account SET backfilled_at = ? WHERE user_id = ?",
+                (_normalize_iso(at), user_id),
+            )
+
+    def ha_reading_imported(self, user_id: int, reading_key: str) -> bool:
+        """True if this weigh-in has already been imported for this user."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM ha_imported WHERE user_id = ? AND reading_key = ?",
+                (user_id, str(reading_key)),
+            ).fetchone() is not None
+
+    def ha_mark_reading(self, user_id: int, reading_key: str) -> bool:
+        """Claim ``reading_key`` for this user. Returns True if newly recorded
+        (False if already present), so two overlapping polls can't both import
+        the same weigh-in — the loser of the INSERT race skips it.
+
+        Claiming deliberately does **not** touch the replay-guard columns. Those
+        describe a weigh-in that was actually *written*, and the claim happens
+        before the write: setting them here meant a failed write left the guard
+        pointing at a weigh-in that does not exist, which then blocked the retry.
+        :meth:`ha_note_reading` records them after the write succeeds."""
+        key = str(reading_key or "")
+        if not key:
+            return False
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO ha_imported "
+                "(user_id, reading_key, imported_at) VALUES (?, ?, ?)",
+                (user_id, key, _normalize_iso(None)),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def ha_note_reading(
+        self, user_id: int, weight_kg: float, measured_at: datetime | None = None,
+    ) -> None:
+        """Record the weigh-in just written as this account's latest.
+
+        ``last_weight_kg`` is the Home-Assistant-restart replay guard's
+        comparison point. ``last_reading_at`` is the *measurement* time — not the
+        de-duplication key — because it is also what tells an integration that
+        starts publishing its own measurement log which entries were already
+        imported under the old timestamp-keyed scheme."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE ha_account SET last_reading_at = ?, last_weight_kg = ? "
+                "WHERE user_id = ?",
+                (_normalize_iso(measured_at), float(weight_kg), user_id),
+            )
+
+    def ha_release_reading(self, user_id: int, reading_key: str) -> bool:
+        """Give back a claim made by :meth:`ha_mark_reading`.
+
+        The claim is taken *before* the weigh-in is written, so that two
+        overlapping polls can't both import it. That ordering means a failed
+        write would otherwise leave the key claimed and the weigh-in permanently
+        lost — the next poll would see it as already imported. Releasing on
+        failure makes the retry work instead."""
+        key = str(reading_key or "")
+        if not key:
+            return False
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM ha_imported WHERE user_id = ? AND reading_key = ?",
+                (user_id, key),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def add_body_metrics(
+        self, guild_id: int, user_id: int, metrics: Mapping[str, tuple[float, str]],
+        recorded_at: datetime | None = None, source: str = "home_assistant",
+    ) -> int:
+        """Record body-composition metrics for one weigh-in. Returns rows written.
+
+        ``metrics`` maps a metric key (see app/ha_client.METRICS) to
+        ``(value, unit)``. Re-importing the same weigh-in is a no-op thanks to the
+        UNIQUE key, so callers don't have to check first. Bodyweight is not
+        accepted here — it belongs in ``bodyweights`` via
+        :meth:`set_bodyweight`, which is the single choke point the protein link
+        and the TDEE model hang off."""
+        ts = _normalize_iso(recorded_at)
+        written = 0
+        with self._conn() as c:
+            for metric, pair in metrics.items():
+                if metric == "weight":
+                    continue
+                try:
+                    value = float(pair[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                unit = str(pair[1]) if len(pair) > 1 and pair[1] else None
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO body_metrics "
+                    "(user_id, guild_id, metric, value, unit, source, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, guild_id, str(metric), value, unit, source, ts),
+                )
+                written += cur.rowcount or 0
+        return written
+
+    def latest_body_metrics(self, user_id: int) -> dict[str, sqlite3.Row]:
+        """Newest row per metric for this user, as ``{metric: row}``.
+
+        Global per user like :meth:`get_latest_bodyweight` — one body, one set of
+        numbers, whichever server the scale reading landed in."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT metric, value, unit, source, recorded_at
+                  FROM body_metrics
+                 WHERE user_id = ?
+                   AND recorded_at = (
+                       SELECT MAX(recorded_at) FROM body_metrics b2
+                        WHERE b2.user_id = body_metrics.user_id
+                          AND b2.metric = body_metrics.metric
+                   )
+                """,
+                (user_id,),
+            ).fetchall()
+            return {str(r["metric"]): r for r in rows}
+
+    def body_metric_history(
+        self, user_id: int, metric: str, limit: int = 1000,
+    ) -> list[sqlite3.Row]:
+        """One metric's history for this user, oldest-first (plots left to
+        right without an extra reverse, matching :meth:`bodyweight_history`)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT value, unit, recorded_at FROM body_metrics "
+                "WHERE user_id = ? AND metric = ? "
+                "ORDER BY recorded_at ASC, id ASC LIMIT ?",
+                (user_id, str(metric), int(limit)),
+            ).fetchall()
+
+    # ------------------------------------------------------------------
     # Bot-wide user nicknames
     # ------------------------------------------------------------------
 
@@ -3274,19 +3584,31 @@ class Database:
     def bodyweight_history(
         self, guild_id: int, user_id: int, limit: int = 1000,
     ) -> list[sqlite3.Row]:
-        """Return this user's bodyweight measurements oldest-first.
+        """Return this user's ``limit`` most recent measurements, oldest-first.
 
         Used by ``/bodyweight_history`` and ``/bodyweight_graph`` so the
         timeline plots left-to-right without an extra reverse step. Global:
         weigh-ins from every server are one timeline (``guild_id`` unused).
+
+        The limit takes the **newest** rows, not the oldest. A plain
+        ``ORDER BY recorded_at ASC LIMIT ?`` truncates the wrong end, so once a
+        user had more rows than the limit every caller silently showed ancient
+        data — and app/bot.py's coaching context, which reads ``rows[-1]`` as the
+        latest weigh-in, reported a months-old weight as current. Hand-logging
+        takes years to reach the limits in use (1000, 400, 60); a smart scale
+        syncing through Home Assistant reaches 60 in two months, which is how
+        this surfaced.
         """
         with self._conn() as c:
-            return c.execute(
-                "SELECT weight_kg, recorded_at FROM bodyweights "
-                "WHERE user_id = ? "
-                "ORDER BY recorded_at ASC, id ASC LIMIT ?",
+            rows = c.execute(
+                "SELECT weight_kg, recorded_at FROM ("
+                "  SELECT weight_kg, recorded_at, id FROM bodyweights "
+                "   WHERE user_id = ? "
+                "   ORDER BY recorded_at DESC, id DESC LIMIT ?"
+                ") ORDER BY recorded_at ASC, id ASC",
                 (user_id, int(limit)),
             ).fetchall()
+            return rows
 
     def latest_bodyweights_bulk(
         self, guild_id: int, user_ids: list[int],

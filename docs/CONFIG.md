@@ -136,9 +136,10 @@ you can fix it. Alerting that wants the stricter test should use
 Secrets are encrypted at rest with a key at **`/data/.secret_key`** (mode 0600),
 generated on first boot.
 
-**Back that file up with your database.** Without it, every stored secret and
-every linked Revo, Strava and Hevy account is unrecoverable. This replaces the
-old advice to back up your `.env` for the `*_FERNET_KEY` values.
+**Back that file up with your database.** Without it, every stored secret is
+unrecoverable — every linked Revo, Strava and Hevy account, and the Home
+Assistant access token. This replaces the old advice to back up your `.env` for
+the `*_FERNET_KEY` values.
 
 What the encryption does and does not do, plainly:
 

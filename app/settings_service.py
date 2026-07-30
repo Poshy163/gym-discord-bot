@@ -475,11 +475,14 @@ def _mask(key: str, raw: str) -> str:
 
     Tokens whose prefix identifies the application (the Discord token, the
     Fernet keys) get no hint at all -- a Discord token's first segment is the
-    base64 application ID.
+    base64 application ID. HA_TOKEN joins them for a different reason: a Home
+    Assistant long-lived token is full control of somebody's house, and its
+    last 4 characters identify nothing an operator could not read off the URL
+    field beside it, so the hint is pure downside.
     """
     if not raw:
         return ""
-    if key == "DISCORD_TOKEN" or key.endswith("_FERNET_KEY"):
+    if key in ("DISCORD_TOKEN", "HA_TOKEN") or key.endswith("_FERNET_KEY"):
         return "•" * 8
     if len(raw) <= 4:
         return "•" * 8

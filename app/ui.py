@@ -56,6 +56,9 @@ STRAVA = discord.Colour(0xFC4C02)
 #: #313338, i.e. an invisible rail on the bot's highest-traffic embed. This is
 #: their brand blue instead, which survives both themes.
 HEVY = discord.Colour(0x3F8CFF)
+#: Home Assistant's brand blue. Bright enough to hold its own against Discord
+#: dark without the washed-out look their pale UI blue gets on #313338.
+HOME_ASSISTANT = discord.Colour(0x18BCF2)
 
 # ---------------------------------------------------------------------------
 # Discord's hard limits. Exceeding any of these is a 400, not a truncation.

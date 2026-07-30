@@ -390,6 +390,29 @@ Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, `/strava_latest`
 (show the most recent activity on demand), and owner-only `/strava_subscribe`,
 `/strava_subscription`, `/strava_unsubscribe`.
 
+## Home Assistant smart-scale sync
+
+If your scale is in [Home Assistant](https://www.home-assistant.io/), the bot
+reads weigh-ins straight out of it — nobody has to type a number into chat. A new
+reading is logged as that member's **bodyweight** (so it feeds TDEE, protein
+targets, goals and the graphs exactly like a typed `bw 106.3`) and announced in
+the bodyweight-reminder channel. Body fat %, muscle mass, BMI, BMR and the rest
+are kept too, and shown by `/ha_body`.
+
+Quick version: set `HA_BASE_URL` and `HA_TOKEN` (a long-lived access token from
+your Home Assistant profile → **Security**), then members run `/ha_entities` to
+see what's there and `/ha_link entity:<their prefix>` to claim theirs. Full
+walkthrough — including why Docker can't resolve `homeassistant.local` — is in
+[docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md). Set `HA_DISABLED=1` to turn it
+off.
+
+The bot is **read-only**: it only ever GETs states and history, so it cannot
+change anything in your home.
+
+Commands: `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_sync`, `/ha_status`,
+`/ha_alerts` (keep your own weigh-ins out of the channel), `/ha_unlink`,
+`/ha_help`.
+
 ## Direct messages
 
 You can run **any** command in a DM with the bot, not just in a server channel.
@@ -486,7 +509,8 @@ the bot in the Discord Developer Portal. Full setup is in
 7. (Optional) In **Settings → Discord → Auto-scan channels**, list the channel
    IDs you want parsed for lifts. Leave it blank to watch every channel.
 
-Everything else — reminders, the daily update, Strava, Revo, Hevy, AI features —
+Everything else — reminders, the daily update, Strava, Revo, Hevy, Home
+Assistant, AI features —
 is configured in the same Settings tab. See [docs/CONFIG.md](docs/CONFIG.md) for
 the full model, including how to pin values in compose if you prefer.
 
@@ -496,7 +520,8 @@ the full model, including how to pin values in compose if you prefer.
 
 Data lives in the `gym-data` Docker volume at `/data/gym.sqlite3` — back it up
 if you care about your PRs, **together with `/data/.secret_key`**, which is what
-decrypts your stored Strava/Revo/Hevy credentials.
+decrypts your stored Strava/Revo/Hevy credentials and your Home Assistant
+access token.
 
 ### Upgrading from a version configured with `.env`
 

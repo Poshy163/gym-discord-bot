@@ -119,6 +119,17 @@ PRE_REFACTOR_DEFAULTS = {
     "HEVY_DISABLED": False,
     "HEVY_FEED_CHANNEL_ID": None,
     "HEVY_POLL_MINUTES": 15,
+    # home assistant — no pre-refactor equivalent (the integration was added
+    # after settings moved into the database), so these assert the shipped
+    # defaults rather than a historical os.getenv call. An unconfigured
+    # deployment must resolve to "feature off": no URL and no token means
+    # HAConfig.configured is False and the poll never starts.
+    "HA_DISABLED": False,
+    "HA_BASE_URL": "",
+    "HA_TOKEN": "",
+    "HA_POLL_MINUTES": 10,
+    "HA_BACKFILL_DAYS": 14,
+    "HA_VERIFY_SSL": True,
     # toggles
     "ENABLE_PRESENCE_TRACKING": False,
     "ENABLE_VOICE_TRACKING": True,
@@ -445,3 +456,58 @@ def test_every_setting_has_a_group_and_a_label():
     for key, s in config_mod.SPEC.items():
         assert s.group in config_mod.GROUP_LABELS, key
         assert s.kind, key
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant URL / token validation
+# ---------------------------------------------------------------------------
+
+#: Structurally a JWT -- three base64url segments -- but not a real token.
+#: The middle segment is deliberately longer than 63 characters, because that
+#: is the DNS label limit and therefore the thing that makes HA_BASE_URL
+#: reject an access token pasted into the URL field.
+_HA_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJleGFtcGxlLW5vdC1hLXJlYWwtdG9rZW4iLCJpYXQiOjAsImV4cCI6MCwibm90ZSI6InRlc3QtZml4dHVyZSJ9."
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
+
+
+@pytest.mark.parametrize("raw", [
+    "http://homeassistant.local:8123",
+    "http://192.168.1.50:8123",
+    "homeassistant.local:8123",
+    "http://homeassistant",          # single-label Docker service name
+    "localhost:8123",
+    "https://ha.example.com",
+    "http://[::1]:8123",
+    "",
+])
+def test_ha_base_url_accepts_real_addresses(raw):
+    assert config_mod.validate("HA_BASE_URL", raw) is None
+
+
+@pytest.mark.parametrize("raw,needle", [
+    # The important one: the token pasted into the URL field. Its base64 segments
+    # exceed the 63-char DNS label limit, which is what catches it -- and a
+    # rejection here is the difference between an error at the point of entry and
+    # a credential echoed back by the connection-failure message.
+    (_HA_JWT, "address you open Home Assistant on"),
+    ("http://user:pass@ha:8123", "does not use user:password"),
+    ("http://ha:notaport", "not a valid port"),
+    ("http://ha:99999", "between 1 and 65535"),
+    ("has spaces", "cannot contain spaces"),
+    ("ftp://ha:8123", "http:// or https://"),
+])
+def test_ha_base_url_rejects_what_would_fail_at_runtime(raw, needle):
+    message = config_mod.validate("HA_BASE_URL", raw)
+    assert message is not None and needle in message
+
+
+def test_ha_token_rejects_a_wrapped_paste():
+    """Home Assistant splits the Authorization header on the first space, so an
+    embedded newline produces a 401 that reads as "wrong token"."""
+    assert config_mod.validate("HA_TOKEN", _HA_JWT) is None
+    for bad in [_HA_JWT[:40] + "\n" + _HA_JWT[40:], _HA_JWT[:40] + " " + _HA_JWT[40:]]:
+        message = config_mod.validate("HA_TOKEN", bad)
+        assert message is not None and "one piece" in message

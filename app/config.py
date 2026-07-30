@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
@@ -449,6 +450,40 @@ _SETTINGS: tuple[Setting, ...] = (
        help="Managed automatically -- only set this if you are migrating an "
             "existing deployment."),
 
+    # ---- Home Assistant --------------------------------------------------
+    # One server, one token, everybody's sensors -- so unlike Hevy/Strava the
+    # credential is a setting rather than a per-member link. HA_BASE_URL and
+    # HA_TOKEN are sibling_env because app/ha_client.py reads them with
+    # os.getenv from inside executor threads, the same reason the Strava
+    # credentials are.
+    _S("HA_DISABLED", "bool", "0", "homeassistant", _bool,
+       apply="worker", label="Disable Home Assistant entirely"),
+    _S("HA_BASE_URL", "str", "", "homeassistant", _rstrip_slash,
+       apply="worker", sibling_env=True, label="Home Assistant URL",
+       help="e.g. http://homeassistant.local:8123 -- the address you open the "
+            "dashboard on. A trailing '/' or '/api' is trimmed for you."),
+    _S("HA_TOKEN", "secret", "", "homeassistant", _strip,
+       apply="worker", secret=True, sibling_env=True,
+       label="Long-lived access token",
+       help="Home Assistant -> your profile -> Security -> Long-lived access "
+            "tokens -> Create token. Stored encrypted. Read-only use: the bot "
+            "only ever GETs states and history."),
+    _S("HA_POLL_MINUTES", "int", "10", "homeassistant", _floor_int(1),
+       apply="worker", min=1, max=1440, label="Poll interval (minutes)",
+       help="How often to check for new weigh-ins. A scale only reports when "
+            "someone stands on it, so this is cheap."),
+    _S("HA_BACKFILL_DAYS", "int", "14", "homeassistant", _floor_int(0),
+       apply="worker", min=0, max=90, label="Import weigh-ins from the last (days)",
+       help="How far back past weigh-ins are imported. The first link is "
+            "announced as one summary rather than an alert each. 0 means the "
+            "current reading only. Where the history comes from depends on the "
+            "scale -- see docs/HOME_ASSISTANT.md; if it comes from Home "
+            "Assistant's recorder, that keeps 10 days by default."),
+    _S("HA_VERIFY_SSL", "bool", "1", "homeassistant", _bool,
+       apply="worker", sibling_env=True, label="Verify the TLS certificate",
+       help="Turn off only for an https:// Home Assistant using a self-signed "
+            "certificate. Plain http:// on your LAN is unaffected."),
+
     # ---- Presence / voice / moderation -----------------------------------
     _S("ENABLE_PRESENCE_TRACKING", "bool", "false", "presence", _bool,
        apply="worker", label="Presence & activity tracking",
@@ -585,6 +620,7 @@ GROUP_LABELS: dict[str, str] = {
     "strava": "Strava",
     "revo": "Revo Fitness",
     "hevy": "Hevy",
+    "homeassistant": "Home Assistant",
     "presence": "Presence",
     "voice": "Voice",
     "moderation": "Moderation",
@@ -598,7 +634,8 @@ GROUP_LABELS: dict[str, str] = {
 #: Render order for the Settings tab -- most-used first.
 GROUP_ORDER: tuple[str, ...] = (
     "discord", "admin", "core", "reminder", "daily", "report",
-    "strava", "revo", "hevy", "gemini", "messages", "presence", "voice",
+    "strava", "revo", "hevy", "homeassistant", "gemini", "messages",
+    "presence", "voice",
     "moderation", "gameicons", "backup", "webui", "storage", "logging",
 )
 
@@ -817,6 +854,64 @@ def validate(key: str, raw: str) -> str | None:
         return ("':memory:' cannot be shared between the supervisor and the "
                 "bot -- each would get its own empty database.")
 
+    if key == "HA_BASE_URL":
+        # There is no "url" kind, and the coercion only strips a trailing slash,
+        # so without this a pasted token, an entity id, or a bare word would save
+        # cleanly and then fail on every poll with a connection error the operator
+        # has no way to trace back to this field.
+        error = _bad_host(raw)
+        if error:
+            return error
+
+    if key == "HA_TOKEN" and any(ch.isspace() for ch in raw.strip()):
+        # A long-lived token is a long JWT and gets pasted out of a scrolling
+        # text box, so it arrives with a wrapped newline more often than not.
+        # HA splits the Authorization header on the first space, so an embedded
+        # one produces a 401 that reads as "wrong token".
+        return ("That token contains a space or line break -- copy it again in "
+                "one piece (it should be a single long line).")
+
+    return None
+
+
+#: A DNS label: 1-63 chars of letters/digits/hyphen, not starting or ending with
+#: a hyphen. The 63-char ceiling is what catches a mis-pasted access token, whose
+#: base64 segments run well past it — and a rejected token here is the difference
+#: between an error at the point of entry and a credential echoed back into a
+#: Discord reply by the connection-failure message.
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _bad_host(raw: str) -> str | None:
+    """Validate an operator-entered base URL. Returns an error, or None.
+
+    Accepts what actually works: a bare host, a host:port, either scheme, a
+    single-label Docker service name (``http://homeassistant``), and an IP. The
+    aim is to reject values that would save cleanly and then fail on every poll.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    if any(ch.isspace() for ch in text):
+        return "A URL cannot contain spaces -- did a token get pasted here?"
+    scheme, sep, rest = text.partition("://")
+    if sep and scheme.lower() not in ("http", "https"):
+        return "Must start with http:// or https:// (or just the host:port)."
+    authority = (rest if sep else text).split("/")[0]
+    if "@" in authority:
+        return ("Home Assistant does not use user:password in the URL -- put the "
+                "long-lived access token in the token field instead.")
+    host, _, port = authority.rpartition(":") if ":" in authority else (
+        authority, "", "")
+    if port and not port.isdigit():
+        return f"{port!r} is not a valid port number."
+    if port and not (0 < int(port) < 65536):
+        return "Port must be between 1 and 65535."
+    if host.startswith("[") and host.endswith("]"):
+        return None  # bracketed IPv6 literal; trust it rather than reimplement it
+    if not host or not all(_HOST_LABEL.match(part) for part in host.split(".")):
+        return ("Must be the address you open Home Assistant on, e.g. "
+                "http://192.168.1.50:8123 or http://homeassistant.local:8123.")
     return None
 
 
