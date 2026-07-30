@@ -569,11 +569,29 @@ CREATE TABLE IF NOT EXISTS hevy_imported (
     PRIMARY KEY (user_id, workout_id)
 );
 
--- Members linked to their Home Assistant body-composition sensors. Unlike Hevy
--- and Strava there is no per-member credential here: one operator-supplied URL
--- and long-lived token (HA_BASE_URL / HA_TOKEN, held in app_settings) reach the
--- whole server, so what a member links is ``entity_prefix`` — the shared prefix
--- of their entity ids ("joshua_s" for sensor.joshua_s_weight and its siblings).
+-- Each member's own Home Assistant, set up with /setup_ha. The long-lived access
+-- token is stored Fernet-encrypted in ``token_enc`` — plaintext is never
+-- persisted, matching the Hevy/Strava/Revo convention.
+--
+-- Deliberately separate from ``ha_account`` below, which records *which sensors*
+-- on that server are theirs. Two tables rather than two nullable columns because
+-- the states are genuinely independent: a member can have a verified server with
+-- no entities chosen yet (the normal state between /setup_ha and /ha_link), and
+-- "" is a legitimate entity prefix (a single-person install has bare
+-- sensor.weight), so it cannot double as "not chosen yet".
+CREATE TABLE IF NOT EXISTS ha_server (
+    user_id     INTEGER PRIMARY KEY,
+    base_url    TEXT    NOT NULL,
+    token_enc   TEXT    NOT NULL,
+    ha_version  TEXT,
+    location    TEXT,
+    verified_at TEXT,
+    linked_at   TEXT    NOT NULL
+);
+
+-- Members linked to their Home Assistant body-composition sensors. What a member
+-- links is ``entity_prefix`` — the shared prefix of their entity ids
+-- ("joshua_s" for sensor.joshua_s_weight and its siblings).
 -- Storing the prefix rather than ten entity ids means a scale that starts
 -- reporting a new metric is picked up on the next poll with no re-link.
 -- ``weight_entity`` is the entity the prefix was derived from, kept so
@@ -3074,6 +3092,84 @@ class Database:
     # ------------------------------------------------------------------
     # Home Assistant linked entities + body-composition metrics
     # ------------------------------------------------------------------
+
+    def ha_server_set(
+        self, user_id: int, base_url: str, token_enc: str,
+        ha_version: str | None = None, location: str | None = None,
+    ) -> None:
+        """Store (or replace) a member's Home Assistant credential.
+
+        ``token_enc`` must already be a Fernet token — this layer never sees the
+        plaintext, matching :meth:`hevy_link`. Re-running /setup_ha against the
+        same server replaces the credential without touching which entities the
+        member has linked, so rotating a token doesn't cost them their setup."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO ha_server
+                    (user_id, base_url, token_enc, ha_version, location,
+                     verified_at, linked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    base_url    = excluded.base_url,
+                    token_enc   = excluded.token_enc,
+                    ha_version  = excluded.ha_version,
+                    location    = excluded.location,
+                    verified_at = excluded.verified_at
+                """,
+                (user_id, base_url, token_enc, ha_version, location,
+                 _normalize_iso(None), _normalize_iso(None)),
+            )
+
+    def ha_server_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM ha_server WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+    def ha_server_forget(self, user_id: int) -> bool:
+        """Remove a member's stored credential. Returns True if one existed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM ha_server WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def list_ha_synced(self) -> list[sqlite3.Row]:
+        """Every member who has BOTH a credential and chosen entities.
+
+        The poll's work list. A member with a server but no entities yet, or
+        entities but no credential, is not pollable and is skipped here rather
+        than being filtered in the loop."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT a.*, s.base_url, s.token_enc
+                  FROM ha_account a
+                  JOIN ha_server  s ON s.user_id = a.user_id
+                """
+            ))
+
+    def ha_synced_get(self, user_id: int) -> sqlite3.Row | None:
+        """One member's account row with their credential joined in.
+
+        The same shape :meth:`list_ha_synced` yields, so ``/ha_sync`` can hand the
+        poll's own function a row it recognises."""
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT a.*, s.base_url, s.token_enc
+                  FROM ha_account a
+                  JOIN ha_server  s ON s.user_id = a.user_id
+                 WHERE a.user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+    def count_ha_servers(self) -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) AS n FROM ha_server").fetchone()
+            return int(row["n"]) if row else 0
 
     def ha_link(
         self, user_id: int, guild_id: int, entity_prefix: str,

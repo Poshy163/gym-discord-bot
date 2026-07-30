@@ -555,19 +555,17 @@ def test_normalize_base_url(raw, expected):
     assert ha_client.normalize_base_url(raw) == expected
 
 
-def test_config_from_env_and_configured():
-    assert not ha_client.config_from_env({}).configured
-    assert not ha_client.config_from_env({"HA_BASE_URL": "ha:8123"}).configured
-    assert not ha_client.config_from_env({"HA_TOKEN": "t"}).configured
-    cfg = ha_client.config_from_env(
-        {"HA_BASE_URL": "ha:8123/", "HA_TOKEN": "  tok  "})
+def test_config_for_normalises_and_reports_configured():
+    assert not ha_client.config_for("", "").configured
+    assert not ha_client.config_for("ha:8123", "").configured
+    assert not ha_client.config_for("", "t").configured
+    cfg = ha_client.config_for("ha:8123/", "  tok  ")
     assert cfg.configured
     assert cfg.base_url == "http://ha:8123"
     assert cfg.token == "tok"
     assert cfg.verify_ssl is True
-    assert ha_client.config_from_env(
-        {"HA_BASE_URL": "ha:8123", "HA_TOKEN": "t", "HA_VERIFY_SSL": "0"},
-    ).verify_ssl is False
+    assert ha_client.config_for(
+        "ha:8123", "t", verify_ssl=False).verify_ssl is False
 
 
 # ---------------------------------------------------------------------------
@@ -1032,13 +1030,12 @@ _JWT = (
     ("", True),
 ])
 def test_verify_ssl_fails_closed(value, ok):
-    assert ha_client.config_from_env(
-        {"HA_VERIFY_SSL": value}).verify_ssl is ok
+    assert ha_client.verify_ssl_from_env({"HA_VERIFY_SSL": value}) is ok
 
 
 def test_unrecognised_verify_ssl_is_logged(caplog):
     with caplog.at_level("WARNING"):
-        ha_client.config_from_env({"HA_VERIFY_SSL": "enabled"})
+        ha_client.verify_ssl_from_env({"HA_VERIFY_SSL": "enabled"})
     assert "keeping certificate verification ON" in caplog.text
 
 
@@ -1108,3 +1105,173 @@ def test_summarize_reading_reports_no_delta_against_a_newer_weight():
         "weight_kg": 107.0, "recorded_at": "2026-07-20T00:00:00+00:00",
     })
     assert ok["delta_kg"] == -0.7 and ok["days_since"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Per-member credentials
+# ---------------------------------------------------------------------------
+
+def test_token_encryption_roundtrip(monkeypatch):
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("HA_FERNET_KEY", Fernet.generate_key().decode())
+    sealed = ha_client.encrypt_token("long-lived-token")
+    assert sealed != "long-lived-token"
+    assert ha_client.decrypt_token(sealed) == "long-lived-token"
+    assert ha_client.fernet_ready() is True
+
+
+@pytest.mark.parametrize("name", [
+    "HA_FERNET_KEY", "HEVY_FERNET_KEY", "STRAVA_FERNET_KEY", "REVO_FERNET_KEY",
+])
+def test_fernet_falls_back_through_every_other_integrations_key(monkeypatch, name):
+    """One generated key has to serve all four clients, which is why the chain
+    ends at REVO_FERNET_KEY — see app/secretbox.py:FERNET_KEYS."""
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv(name, Fernet.generate_key().decode())
+    assert ha_client.fernet_ready() is True
+    assert ha_client.decrypt_token(ha_client.encrypt_token("t")) == "t"
+
+
+def test_fernet_not_ready_without_any_key(monkeypatch):
+    for name in ("HA_FERNET_KEY", "HEVY_FERNET_KEY", "STRAVA_FERNET_KEY",
+                 "REVO_FERNET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    assert ha_client.fernet_ready() is False
+    with pytest.raises(ha_client.HAUnavailable):
+        ha_client.encrypt_token("t")
+
+
+def test_a_token_sealed_with_another_key_is_reported_not_crashed(monkeypatch):
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("HA_FERNET_KEY", Fernet.generate_key().decode())
+    sealed = ha_client.encrypt_token("t")
+    monkeypatch.setenv("HA_FERNET_KEY", Fernet.generate_key().decode())
+    with pytest.raises(ha_client.HAUnavailable) as exc:
+        ha_client.decrypt_token(sealed)
+    assert "/setup_ha" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Re-reported weigh-ins (one measurement, two measurement ids)
+# ---------------------------------------------------------------------------
+# Taken from a real Renpho scale: it reports the weight the instant you step on,
+# then re-reports the SAME measurement ~16s later once impedance is available,
+# under a fresh measurement id. Id de-duplication cannot see that, and the pair
+# announced itself twice.
+
+REREPORTED = {
+    "entity_id": "sensor.scale_joshua_s_weight",
+    "state": "106.3",
+    "attributes": {
+        "unit_of_measurement": "kg",
+        "weight_history": [
+            {"measurement_id": "2d16547578", "weight": 107.3, "weight_unit": "kg",
+             "timestamp": "2026-07-30T04:45:19.725299+00:00", "body_fat": 22.2},
+            {"measurement_id": "9780b4f22e", "weight": 106.3, "weight_unit": "kg",
+             "timestamp": "2026-07-30T04:47:39.717892+00:00"},
+            {"measurement_id": "81f32f5bdb", "weight": 106.3, "weight_unit": "kg",
+             "timestamp": "2026-07-30T04:47:55.374189+00:00", "body_fat": 21.8},
+        ],
+    },
+    "last_changed": "2026-07-30T04:47:55.374491+00:00",
+}
+
+
+def test_collapse_folds_a_re_reported_weigh_in():
+    rows = ha_client.readings_from_history_attr(REREPORTED)
+    assert len(rows) == 3
+    folded = ha_client.collapse_same_weight(rows)
+    # The 16-seconds-apart pair at 106.3 becomes one weigh-in; 107.3 survives.
+    assert [r["weight_kg"] for r in folded] == [107.3, 106.3]
+    kept = folded[-1]
+    # The EARLIEST key survives, so it still de-duplicates against whatever was
+    # already imported when the pair straddles two polls.
+    assert kept["key"] == "id:9780b4f22e"
+    assert kept["measured_at"].second == 39
+    # ...but it carries the later, richer body composition.
+    assert kept["metrics"]["body_fat_pct"]["value"] == 21.8
+    assert kept["folded"] == ["id:81f32f5bdb"]
+
+
+def test_collapse_keeps_genuine_consecutive_weigh_ins():
+    """The real pair 24 seconds apart differed in weight (106.4 then 106.7), and
+    weight is the discriminator, so both survive."""
+    rows = ha_client.readings_from_history_attr(WEIGHT_WITH_HISTORY)
+    folded = ha_client.collapse_same_weight(rows)
+    assert [r["weight_kg"] for r in folded] == [106.3, 106.4, 106.7]
+
+
+def test_collapse_respects_the_window():
+    """Same weight, but hours apart — two real weigh-ins, not a re-report."""
+    def at(hour):
+        return {"weight_kg": 100.0, "key": f"id:{hour}",
+                "measured_at": datetime(2026, 7, 30, hour, tzinfo=timezone.utc),
+                "metrics": {}}
+    folded = ha_client.collapse_same_weight([at(6), at(7)])
+    assert len(folded) == 2
+    # Inside the window they fold.
+    assert len(ha_client.collapse_same_weight(
+        [at(6), at(6)], window_seconds=900)) == 1
+
+
+def test_collapse_is_a_no_op_on_an_empty_or_single_list():
+    assert ha_client.collapse_same_weight([]) == []
+    one = ha_client.readings_from_history_attr(WEIGHT_WITH_HISTORY)[:1]
+    assert len(ha_client.collapse_same_weight(one)) == 1
+
+
+# ---------------------------------------------------------------------------
+# ha_server: the per-member credential row
+# ---------------------------------------------------------------------------
+
+def test_ha_server_set_get_forget(db):
+    assert db.ha_server_get(1) is None
+    db.ha_server_set(1, "https://home.example.com", "enc", ha_version="2026.8",
+                     location="Home")
+    row = db.ha_server_get(1)
+    assert row["base_url"] == "https://home.example.com"
+    assert row["token_enc"] == "enc"
+    assert row["ha_version"] == "2026.8"
+    assert row["verified_at"] is not None
+    assert db.count_ha_servers() == 1
+    # Re-running /setup_ha replaces the credential in place.
+    db.ha_server_set(1, "https://home.example.com", "enc2")
+    assert db.ha_server_get(1)["token_enc"] == "enc2"
+    assert db.count_ha_servers() == 1
+    assert db.ha_server_forget(1) is True
+    assert db.ha_server_forget(1) is False
+    assert db.ha_server_get(1) is None
+
+
+def test_rotating_a_token_keeps_the_entity_link(db):
+    """Making a fresh token in Home Assistant must not cost someone their setup."""
+    db.ha_server_set(1, "https://home.example.com", "enc")
+    db.ha_link(1, 42, "joshua_s", weight_entity="sensor.joshua_s_weight")
+    db.ha_server_set(1, "https://home.example.com", "enc-rotated")
+    assert db.ha_get(1)["entity_prefix"] == "joshua_s"
+    assert db.ha_server_get(1)["token_enc"] == "enc-rotated"
+
+
+def test_list_ha_synced_needs_both_halves(db):
+    """The poll's work list. A member with only one half is not pollable."""
+    db.ha_server_set(1, "https://a.example.com", "enc")      # server, no link
+    db.ha_link(2, 42, "sam")                                  # link, no server
+    assert db.list_ha_synced() == []
+    db.ha_link(1, 42, "joshua_s")
+    rows = db.list_ha_synced()
+    assert len(rows) == 1
+    # The joined shape carries the credential, so the poll can build a config.
+    assert rows[0]["user_id"] == 1
+    assert rows[0]["base_url"] == "https://a.example.com"
+    assert rows[0]["token_enc"] == "enc"
+    assert db.ha_synced_get(1)["base_url"] == "https://a.example.com"
+    assert db.ha_synced_get(2) is None
+
+
+def test_two_members_keep_separate_servers(db):
+    db.ha_server_set(1, "https://home.joshua.example", "enc-a")
+    db.ha_server_set(2, "http://192.168.1.9:8123", "enc-b")
+    db.ha_link(1, 42, "joshua_s")
+    db.ha_link(2, 42, "sam")
+    urls = {r["user_id"]: r["base_url"] for r in db.list_ha_synced()}
+    assert urls == {1: "https://home.joshua.example", 2: "http://192.168.1.9:8123"}

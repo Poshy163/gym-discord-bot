@@ -262,13 +262,15 @@ def _bind_config(cfg: config_mod.Config) -> None:
     g["HEVY_POLL_MINUTES"] = cfg["HEVY_POLL_MINUTES"]
 
     # -- Home Assistant ---------------------------------------------------
-    # HA_BASE_URL / HA_TOKEN / HA_VERIFY_SSL are deliberately absent: they are
-    # sibling_env keys that app/ha_client.py reads with os.getenv from inside
-    # executor threads, exactly as the Strava credentials are.
+    # No URL or token here: each member's own credential lives encrypted in
+    # ha_server, set with /setup_ha. HA_FERNET_KEY is absent for the usual
+    # reason — app/ha_client.py reads it with os.getenv, so it is a sibling_env
+    # key the supervisor exports into this process's environment.
     g["HA_DISABLED"] = cfg["HA_DISABLED"]
     g["HA_POLL_MINUTES"] = cfg["HA_POLL_MINUTES"]
     g["HA_BACKFILL_DAYS"] = cfg["HA_BACKFILL_DAYS"]
     g["HA_IGNORE_ENTITIES"] = set(cfg["HA_IGNORE_ENTITIES"])
+    g["HA_VERIFY_SSL"] = cfg["HA_VERIFY_SSL"]
 
 
 _bind_config(CFG)
@@ -3066,8 +3068,9 @@ async def on_ready() -> None:
         ha_poll.start()
         alert_channel = _ha_alert_channel_id()
         LOG.info(
-            "Home Assistant weigh-in poll scheduled every %d minutes%s",
-            HA_POLL_MINUTES,
+            "Home Assistant weigh-in poll scheduled every %d minutes for %d "
+            "connected member(s)%s",
+            HA_POLL_MINUTES, db.count_ha_servers(),
             f" → <#{alert_channel}>" if alert_channel else "",
         )
         if not alert_channel:
@@ -7784,13 +7787,14 @@ def _help_sections() -> dict[str, discord.Embed]:
             "Home Assistant", "🏠 Home Assistant",
             (
                 "`/ha_help` — how the smart-scale sync works\n"
-                "`/ha_link` — link your scale's sensors (weigh-ins sync as bodyweight)\n"
-                "`/ha_entities` — list the body sensors the bot can see\n"
+                "`/setup_ha` — connect your own Home Assistant (url + token)\n"
+                "`/ha_link` — pick which of its sensors are yours\n"
+                "`/ha_entities` — list the body sensors it can see\n"
                 "`/ha_body [member]` — latest body-composition numbers\n"
                 "`/ha_sync` — check for a new weigh-in now\n"
                 "`/ha_alerts` — announce your weigh-ins, or keep them quiet\n"
-                "`/ha_status` — check your link\n"
-                "`/ha_unlink` — stop syncing"
+                "`/ha_status` — check your connection\n"
+                "`/ha_unlink` — disconnect and delete your token"
             ),
         )
         sections["Home Assistant"].colour = ui.HOME_ASSISTANT
@@ -12461,19 +12465,47 @@ def _hevy_enabled() -> bool:
     )
 
 
-def _ha_cfg() -> "ha_client.HAConfig":
-    return ha_client.config_from_env()
-
-
 def _ha_enabled() -> bool:
-    """True when Home Assistant is switched on, ``requests`` is importable, and
-    a server URL + token are configured. Deliberately does not require an
-    announcement channel: weigh-ins still import as bodyweight without one, the
-    same way Hevy imports lifts with no feed channel."""
+    """True when Home Assistant is switched on and the deps + a Fernet key exist.
+
+    Deliberately says nothing about whether any *member* has set a server up —
+    every member brings their own with ``/setup_ha``, so this is only about
+    whether the feature can work at all. It also doesn't require an announcement
+    channel: weigh-ins still import as bodyweight without one, the same way Hevy
+    imports lifts with no feed channel."""
     return (
         not HA_DISABLED
         and ha_client.available()
-        and _ha_cfg().configured
+        and ha_client.fernet_ready()
+    )
+
+
+def _ha_cfg_for(row) -> "ha_client.HAConfig | None":
+    """Build a connection config from a member's stored server row, or None.
+
+    None means the stored token can't be read — a rotated Fernet key, or a row
+    written before the key existed. The caller tells them to re-run ``/setup_ha``
+    rather than failing silently on every poll."""
+    if row is None:
+        return None
+    # Tolerate a row that carries no credential columns at all — an account row
+    # straight from ha_get rather than the joined shape list_ha_synced yields.
+    # The caller reads this as "not connected", which is the truth.
+    keys = row.keys()
+    if "token_enc" not in keys or "base_url" not in keys:
+        return None
+    if not row["token_enc"] or not row["base_url"]:
+        return None
+    try:
+        token = ha_client.decrypt_token(row["token_enc"])
+    except ha_client.HAError:
+        LOG.warning(
+            "Home Assistant: unreadable token for user %s — skipping",
+            row["user_id"],
+        )
+        return None
+    return ha_client.config_for(
+        row["base_url"], token, verify_ssl=HA_VERIFY_SSL,
     )
 
 
@@ -15069,6 +15101,34 @@ def _ha_valid_weight(weight_kg: float) -> bool:
     return not (MAX_WEIGHT_KG > 0 and weight_kg > MAX_WEIGHT_KG)
 
 
+def _ha_store_metrics(
+    user_id: int, guild_id: int, metrics: dict | None, measured_at: datetime,
+) -> int:
+    """Write a reading's non-weight metrics. Returns rows written.
+
+    Idempotent by the table's UNIQUE key, which is what lets a re-reported
+    weigh-in top up the body composition it didn't have the first time without
+    the caller checking anything."""
+    if not metrics:
+        return 0
+    payload = {
+        k: (float(v["value"]), str(v.get("unit") or ""))
+        for k, v in metrics.items()
+        if k != ha_client.WEIGHT_KEY
+    }
+    if not payload:
+        return 0
+    try:
+        return db.add_body_metrics(
+            guild_id, user_id, payload, recorded_at=measured_at,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception(
+            "Home Assistant: failed to store body metrics for %s", user_id,
+        )
+        return 0
+
+
 def _ha_import_reading(
     user_id: int, guild_id: int, weight_kg: float, measured_at: datetime,
     metrics: dict | None = None, replay_guard_kg: float | None = None,
@@ -15105,6 +15165,13 @@ def _ha_import_reading(
             )
         return None
     if db.ha_reading_imported(user_id, key):
+        # Already logged — but a scale that re-reports a weigh-in with body
+        # composition attached can deliver the richer half on a later poll than
+        # the bare weight. Top the metrics up (the UNIQUE key makes it a no-op if
+        # they're already there) and still return None, so nothing is re-logged
+        # and nothing is announced twice.
+        if metrics:
+            _ha_store_metrics(user_id, guild_id, metrics, measured_at)
         return None
     if replay_guard_kg is not None and abs(weight_kg - replay_guard_kg) < 0.005:
         LOG.debug(
@@ -15129,22 +15196,7 @@ def _ha_import_reading(
     # Only now that a row exists: the guard has to describe a weigh-in that was
     # actually written, or a failed write leaves it blocking its own retry.
     db.ha_note_reading(user_id, weight_kg, measured_at)
-    written = 0
-    if metrics:
-        payload = {
-            k: (float(v["value"]), str(v.get("unit") or ""))
-            for k, v in metrics.items()
-            if k != ha_client.WEIGHT_KEY
-        }
-        if payload:
-            try:
-                written = db.add_body_metrics(
-                    guild_id, user_id, payload, recorded_at=measured_at,
-                )
-            except Exception:  # pragma: no cover - defensive
-                LOG.exception(
-                    "Home Assistant: failed to store body metrics for %s", user_id,
-                )
+    written = _ha_store_metrics(user_id, guild_id, metrics, measured_at)
     return {
         "weight_kg": weight_kg,
         "measured_at": measured_at,
@@ -15183,7 +15235,7 @@ async def _ha_fetch_history(
     backfilled afterwards, and treating a timed-out recorder as "no history"
     would burn the one-time import on a transient error. Either way the live
     reading still imports — a missing history must not block today's weigh-in."""
-    if not entity_id or days <= 0:
+    if cfg is None or not entity_id or days <= 0:
         return []
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -15278,38 +15330,54 @@ async def _ha_sync_account(
         cutoff = datetime.now(timezone.utc) - timedelta(
             days=min(max(HA_BACKFILL_DAYS, 0), ha_client.MAX_BACKFILL_DAYS),
         )
-        # Anything at or before the newest weigh-in already imported is skipped.
-        # This is what makes a *source switch* safe: a member synced on the
-        # last_changed path has those weigh-ins recorded under ISO-timestamp keys,
-        # and the same measurements arriving under `id:` keys would otherwise
-        # re-import and re-announce every one of them. The trade-off is that a
-        # measurement back-dated into the log after the fact is not picked up.
+        newest = attr_readings[-1]
+        for entry in attr_readings:
+            if entry is newest or entry["measured_at"] >= cutoff:
+                pending.append(entry)
+        # Fold re-reports of one weigh-in together FIRST, before either guard
+        # below looks at the list. A scale reports the weight the moment you step
+        # on, then re-reports the same measurement seconds later with body
+        # composition attached under a fresh measurement id — which id
+        # de-duplication cannot see, so the pair announced itself twice. Folding
+        # early also matters because the survivor keeps the *earliest* key, which
+        # is what lets the already-imported check below recognise it.
+        pending = ha_client.collapse_same_weight(pending)
+        # The last entry and the live sensors are usually the same weigh-in, so
+        # hand it the full metric set rather than the one or two the log carries.
+        # Only when the weights agree, though: an integration that writes the
+        # sensor before appending to its log leaves a live reading that is a
+        # *newer* measurement, and merging then files this weigh-in's body
+        # composition against the previous one. Queue it separately instead.
+        if reading is not None:
+            live_kg = float(reading["weight_kg"])
+            latest = pending[-1] if pending else None
+            same = (
+                latest is not None
+                and abs(live_kg - float(latest["weight_kg"])) < 0.005
+            )
+            if same:
+                pending[-1] = ha_client.merge_live_metrics(
+                    latest, reading.get("metrics") or {},
+                )
+            elif reading["measured_at"] > newest["measured_at"]:
+                pending.append(reading)
+        # Anything at or before the newest weigh-in already imported contributes
+        # its metrics but can never become a new weigh-in. That is what makes a
+        # *source switch* safe: a member synced on the last_changed path has those
+        # weigh-ins recorded under ISO-timestamp keys, and the same measurements
+        # arriving under `id:` keys would otherwise re-import and re-announce
+        # every one of them. Marking rather than dropping them keeps the body
+        # composition a re-report carries, which dropping threw away.
         through = (
             ha_client.parse_ha_time(row["last_reading_at"])
             if "last_reading_at" in row.keys() else None
         )
-        newest = attr_readings[-1]
-        for entry in attr_readings:
-            if through is not None and entry["measured_at"] <= through:
-                continue
-            if entry is newest or entry["measured_at"] >= cutoff:
-                pending.append(entry)
-        # The newest history entry and the live sensors are usually the same
-        # weigh-in, so hand it the full metric set instead of the one or two the
-        # entry carries. Only when the weights agree, though: an integration that
-        # writes the sensor before appending to its log leaves a live reading that
-        # is a *newer* measurement, and merging then files this weigh-in's body
-        # composition against the previous one. In that case queue the live
-        # reading separately instead of dropping it.
-        if reading is not None:
-            live_kg = float(reading["weight_kg"])
-            same = abs(live_kg - float(newest["weight_kg"])) < 0.005
-            if same and pending and pending[-1] is newest:
-                pending[-1] = ha_client.merge_live_metrics(
-                    newest, reading.get("metrics") or {},
-                )
-            elif not same and reading["measured_at"] > newest["measured_at"]:
-                pending.append(reading)
+        if through is not None:
+            pending = [
+                {**entry, "metrics_only": True}
+                if entry["measured_at"] <= through else entry
+                for entry in pending
+            ]
     else:
         if reading is not None:
             pending.append({**reading, "live": True})
@@ -15318,7 +15386,7 @@ async def _ha_sync_account(
                 (reading or {}).get("entity_id") or row["weight_entity"] or ""
             )
             history = await _ha_fetch_history(
-                _ha_cfg(), entity_id,
+                _ha_cfg_for(row), entity_id,
                 min(HA_BACKFILL_DAYS, ha_client.MAX_BACKFILL_DAYS),
                 unit=str(
                     (weight_state.get("attributes") or {}).get(
@@ -15357,6 +15425,11 @@ async def _ha_sync_account(
     imported: list[dict] = []
     for entry in pending:
         kg = float(entry["weight_kg"])
+        if entry.get("metrics_only"):
+            _ha_store_metrics(
+                user_id, guild_id, entry.get("metrics"), entry["measured_at"],
+            )
+            continue
         r = _ha_import_reading(
             user_id, guild_id, kg, entry["measured_at"], entry.get("metrics"),
             replay_guard_kg=guard if entry.get("live") else None,
@@ -15443,32 +15516,45 @@ async def _ha_sync_account(
     return result
 
 
-@tasks.loop(minutes=HA_POLL_MINUTES)
-async def ha_poll() -> None:
-    """Poll Home Assistant once and fan the response out to every linked member."""
-    if not _ha_enabled():
-        return
-    accounts = db.list_ha_accounts()
-    if not accounts:
-        return
-    cfg = _ha_cfg()
+async def _ha_fetch_states_for(row) -> list[dict] | None:
+    """Fetch one member's states, or None on any failure (already logged).
+
+    Each member has their own Home Assistant, so this is one request per member
+    per cycle rather than a single shared dump. A member whose server is down,
+    whose token was revoked, or whose reverse proxy is misbehaving must not stop
+    anybody else syncing — hence None rather than an exception."""
+    cfg = _ha_cfg_for(row)
+    if cfg is None or not cfg.configured:
+        return None
 
     def _fetch() -> list[dict]:
         return ha_client.fetch_states(cfg)
 
     try:
-        states = _ha_visible_states(await bot.loop.run_in_executor(None, _fetch))
+        return _ha_visible_states(await bot.loop.run_in_executor(None, _fetch))
     except ha_client.HAAuthError:
         LOG.warning(
-            "Home Assistant rejected the access token — weigh-in sync is "
-            "paused until HA_TOKEN is replaced."
+            "Home Assistant rejected user %s's access token — their sync is "
+            "paused until they re-run /setup_ha.", row["user_id"],
         )
-        return
     except ha_client.HAError as exc:
-        LOG.info("Home Assistant: state fetch failed: %s", exc)
+        LOG.info(
+            "Home Assistant: state fetch failed for user %s: %s",
+            row["user_id"], exc,
+        )
+    return None
+
+
+@tasks.loop(minutes=HA_POLL_MINUTES)
+async def ha_poll() -> None:
+    """Poll each member's own Home Assistant for new weigh-ins."""
+    if not _ha_enabled():
         return
-    for row in accounts:
+    for row in db.list_ha_synced():
         try:
+            states = await _ha_fetch_states_for(row)
+            if states is None:
+                continue
             await _ha_sync_account(row, states)
         except Exception:  # pragma: no cover - defensive
             LOG.exception(
@@ -15563,14 +15649,22 @@ def _ha_resolve_target(raw: str, states: list[dict]) -> dict | None:
     return scored[0][1]
 
 
-async def _ha_states_or_error(interaction: discord.Interaction) -> list[dict] | None:
-    """Fetch ``/api/states``, replying with a diagnosis on failure.
+async def _ha_states_or_error(
+    interaction: discord.Interaction, cfg: "ha_client.HAConfig | None",
+) -> list[dict] | None:
+    """Fetch a member's ``/api/states``, replying with a diagnosis on failure.
 
-    Returns None when it replied — callers just return. The messages name the
-    setting to fix, because "couldn't connect" sends an operator hunting through
-    Docker logs for something the dashboard could have told them.
+    Returns None when it replied — callers just return. Each message names the
+    thing *they* can change, because "couldn't connect" sends someone hunting
+    through logs for something the bot already knows.
     """
-    cfg = _ha_cfg()
+    if cfg is None or not cfg.configured:
+        await interaction.followup.send(
+            "I couldn't read your stored Home Assistant token. Re-run "
+            "`/setup_ha` to set it again.",
+            ephemeral=True,
+        )
+        return None
 
     def _fetch() -> list[dict]:
         return ha_client.fetch_states(cfg)
@@ -15579,21 +15673,23 @@ async def _ha_states_or_error(interaction: discord.Interaction) -> list[dict] | 
         return _ha_visible_states(await bot.loop.run_in_executor(None, _fetch))
     except ha_client.HAAuthError:
         await interaction.followup.send(
-            "❌ Home Assistant rejected the access token. An admin needs to "
-            "make a new one (HA → your profile → **Security** → Long-lived "
-            "access tokens) and paste it into **Settings → Home Assistant**.",
+            "❌ Home Assistant rejected your access token — it was probably "
+            "revoked. Make a new one (Home Assistant → your profile → "
+            "**Security** → Long-lived access tokens) and run `/setup_ha` again.",
             ephemeral=True,
         )
         return None
     except ha_client.HABanned as exc:
         await interaction.followup.send(f"❌ {exc}", ephemeral=True)
         return None
+    except ha_client.HACertError as exc:
+        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+        return None
     except ha_client.HAUnreachable as exc:
         # The client's message already names the likely fix (usually the mDNS
         # hostname), so don't bury it under a generic hint.
         await interaction.followup.send(
-            f"⚠️ {exc}\nThe address lives in **Settings → Home Assistant → "
-            "Home Assistant URL**.",
+            f"⚠️ {exc}\nRun `/setup_ha` with a corrected address if that's wrong.",
             ephemeral=True,
         )
         return None
@@ -15602,6 +15698,132 @@ async def _ha_states_or_error(interaction: discord.Interaction) -> list[dict] | 
             f"⚠️ Home Assistant returned an error: {exc}", ephemeral=True,
         )
         return None
+
+
+@bot.tree.command(
+    name="setup_ha",
+    description="Connect your own Home Assistant so your weigh-ins sync automatically.",
+)
+@app_commands.describe(
+    url="Where your Home Assistant lives, e.g. https://home.example.com",
+    token="A long-lived access token: HA → your profile → Security → Create token.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def setup_ha_cmd(
+    interaction: discord.Interaction, url: str, token: str,
+) -> None:
+    """Store, verify and (where unambiguous) finish a member's HA setup."""
+    if not _ha_enabled():
+        await interaction.response.send_message(
+            "Home Assistant integration isn't available (disabled, or the host "
+            "is missing `requests`/`cryptography` or an encryption key).",
+            ephemeral=True,
+        )
+        return
+    gid = _ctx_guild_id(interaction)
+    if not gid:
+        await interaction.response.send_message(
+            "I couldn't tell which server to link this to — DM me from a server "
+            "we share, or set your default with `/server`.",
+            ephemeral=True,
+        )
+        return
+
+    problem = config_mod.bad_base_url(url) or config_mod.bad_access_token(token)
+    if problem:
+        await interaction.response.send_message(f"❌ {problem}", ephemeral=True)
+        return
+
+    # Ephemeral from the very first response: the token is an argument, so the
+    # reply must never be public even on the error paths.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    cfg = ha_client.config_for(url, token, verify_ssl=HA_VERIFY_SSL)
+
+    def _verify() -> dict:
+        return ha_client.ping(cfg)
+
+    try:
+        info = await bot.loop.run_in_executor(None, _verify)
+    except ha_client.HAAuthError:
+        await interaction.followup.send(
+            "❌ Home Assistant answered, but rejected that token. Create a fresh "
+            "one under your profile → **Security** → Long-lived access tokens "
+            "and paste the whole thing.",
+            ephemeral=True,
+        )
+        return
+    except ha_client.HAError as exc:
+        await interaction.followup.send(
+            f"⚠️ Couldn't reach Home Assistant: {exc}", ephemeral=True,
+        )
+        return
+
+    try:
+        db.ha_server_set(
+            interaction.user.id, cfg.base_url, ha_client.encrypt_token(cfg.token),
+            ha_version=info.get("version") or None,
+            location=info.get("location") or None,
+        )
+    except ha_client.HAUnavailable as exc:
+        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+        return
+
+    version = f" (HA {info['version']})" if info.get("version") else ""
+    lines = [
+        f"✅ Connected to `{cfg.base_url}`{version}. Your token is stored "
+        f"**encrypted**, and the bot only ever reads — it never changes anything "
+        f"in your home."
+    ]
+
+    # Finish the job where it is unambiguous. Most people have exactly one set of
+    # body sensors, and making them run a second command to confirm the only
+    # option is friction for its own sake.
+    states = await _ha_states_or_error(interaction, cfg)
+    if states is None:
+        return
+    grouped = ha_client.group_body_entities(states)
+    live = {p: m for p, m in grouped.items()
+            if ha_client.build_reading(m) is not None}
+    existing = db.ha_get(interaction.user.id)
+
+    if len(live) == 1 and existing is None:
+        prefix = next(iter(live))
+        found = _ha_describe_prefix(prefix, live[prefix])
+        db.ha_link(
+            interaction.user.id, gid, prefix,
+            weight_entity=found["weight_entity"],
+            friendly_name=found["friendly_name"] or None,
+        )
+        channel_id = _ha_alert_channel_id()
+        lines.append(
+            f"Linked your **{len(live[prefix])} body sensors** automatically "
+            f"(`{prefix or '(no prefix)'}`) — it was the only set with a reading."
+        )
+        lines.append(
+            f"Weigh-ins sync about every {HA_POLL_MINUTES} min and log as your "
+            f"bodyweight, so TDEE, protein targets and the graphs follow along"
+            + (f", and post to <#{channel_id}>." if channel_id else ".")
+        )
+        lines.append("`/ha_alerts` keeps them out of the channel, `/ha_body` "
+                     "shows your numbers.")
+    elif existing is not None:
+        lines.append(
+            f"You're already linked to `{existing['entity_prefix'] or '(no prefix)'}`"
+            " — that's unchanged. Use `/ha_link` to point at a different set."
+        )
+    elif not live:
+        lines.append(
+            "I couldn't find any body-composition sensors with a reading on it "
+            "yet. Stand on your scale once, then run `/ha_entities`."
+        )
+    else:
+        names = ", ".join(f"`{p or '(no prefix)'}`" for p in sorted(live)[:6])
+        lines.append(
+            f"Found **{len(live)}** sets of body sensors: {names}. Pick yours "
+            f"with `/ha_link entity:<name>`."
+        )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(
@@ -15621,9 +15843,8 @@ async def ha_link_cmd(
 ) -> None:
     if not _ha_enabled():
         await interaction.response.send_message(
-            "Home Assistant integration isn't available (disabled, the host is "
-            "missing `requests`, or no server URL/token is configured in "
-            "**Settings → Home Assistant**).",
+            "Home Assistant integration isn't available (disabled, or the host "
+            "is missing `requests`/`cryptography` or an encryption key).",
             ephemeral=True,
         )
         return
@@ -15647,8 +15868,22 @@ async def ha_link_cmd(
         )
         return
 
+    server = db.ha_server_get(target.id)
+    if server is None:
+        await interaction.response.send_message(
+            "Connect a Home Assistant first with `/setup_ha url:<address> "
+            "token:<token>`."
+            if target.id == interaction.user.id else
+            f"{target.mention} hasn't connected a Home Assistant yet — only they "
+            "can do that, with `/setup_ha`.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
     await interaction.response.defer(thinking=True, ephemeral=True)
-    states = await _ha_states_or_error(interaction)
+    # The entities come from the TARGET member's own server, not a shared one.
+    states = await _ha_states_or_error(interaction, _ha_cfg_for(server))
     if states is None:
         return
 
@@ -15730,8 +15965,16 @@ async def ha_entities_cmd(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+    server = db.ha_server_get(interaction.user.id)
+    if server is None:
+        await interaction.response.send_message(
+            "Connect your Home Assistant first with `/setup_ha url:<address> "
+            "token:<token>` — then this lists the body sensors it can see.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.defer(thinking=True, ephemeral=True)
-    states = await _ha_states_or_error(interaction)
+    states = await _ha_states_or_error(interaction, _ha_cfg_for(server))
     if states is None:
         return
     grouped = ha_client.group_body_entities(states)
@@ -15844,11 +16087,17 @@ async def ha_unlink_cmd(
             ephemeral=True,
         )
         return
+    # Both halves go: the entity link and the stored credential. Leaving a token
+    # encrypted in the database after someone asked to disconnect would be the
+    # wrong default, even though it is unreadable without the key.
     removed = db.ha_unlink(target.id)
+    forgot = db.ha_server_forget(target.id)
     await interaction.response.send_message(
-        "🗑️ Home Assistant unlinked — no more weigh-ins will sync. Your "
-        "recorded weight history is kept."
-        if removed else "No Home Assistant link to remove.",
+        "🗑️ Home Assistant disconnected — your stored access token was deleted "
+        "and no more weigh-ins will sync. Your recorded weight history is kept, "
+        "and so is the record of which weigh-ins were already imported, so "
+        "reconnecting later won't import them twice."
+        if (removed or forgot) else "No Home Assistant connection to remove.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -15861,25 +16110,44 @@ async def ha_unlink_cmd(
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def ha_status_cmd(interaction: discord.Interaction) -> None:
+    server = db.ha_server_get(interaction.user.id)
     row = db.ha_get(interaction.user.id)
-    if row is None:
+    if server is None and row is None:
         await interaction.response.send_message(
-            "No Home Assistant link. Use `/ha_entities` to see what's "
-            "available, then `/ha_link`.",
+            "No Home Assistant connected. Set one up with `/setup_ha "
+            "url:<address> token:<token>` — see `/ha_help`.",
             ephemeral=True,
         )
         return
     channel_id = _ha_alert_channel_id()
-    lines = [
-        f"✅ Linked to `{row['entity_prefix'] or '(no prefix)'}`"
-        + (f" via `{row['weight_entity']}`" if row["weight_entity"] else ""),
-        f"Last checked: {row['last_synced_at'] or 'not yet'}",
-        "Announcements: "
-        + ("**on** → <#%s>" % channel_id
-           if row["alerts_enabled"] and channel_id
-           else "**off**" if not row["alerts_enabled"]
-           else "**on**, but no announcement channel is configured"),
-    ]
+    lines: list[str] = []
+    if server is None:
+        # Possible after an upgrade: the link predates per-member credentials.
+        lines.append(
+            "⚠️ No Home Assistant connected — run `/setup_ha` to reconnect. "
+            "Your entity link and weight history are still here."
+        )
+    else:
+        version = f" (HA {server['ha_version']})" if server["ha_version"] else ""
+        lines.append(f"🏠 Connected to `{server['base_url']}`{version}")
+    if row is None:
+        lines.append(
+            "No sensors linked yet — `/ha_entities` to see what's there, then "
+            "`/ha_link`."
+        )
+    else:
+        lines.append(
+            f"✅ Linked to `{row['entity_prefix'] or '(no prefix)'}`"
+            + (f" via `{row['weight_entity']}`" if row["weight_entity"] else "")
+        )
+        lines.append(f"Last checked: {row['last_synced_at'] or 'not yet'}")
+        lines.append(
+            "Announcements: "
+            + ("**on** → <#%s>" % channel_id
+               if row["alerts_enabled"] and channel_id
+               else "**off**" if not row["alerts_enabled"]
+               else "**on**, but no announcement channel is configured")
+        )
     latest = db.get_latest_bodyweight(0, interaction.user.id)
     if latest is not None:
         lines.append(
@@ -15938,10 +16206,19 @@ async def ha_sync_cmd(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+    server = db.ha_server_get(interaction.user.id)
+    if server is None:
+        await interaction.response.send_message(
+            "Connect your Home Assistant first with `/setup_ha`.", ephemeral=True,
+        )
+        return
     await interaction.response.defer(thinking=True, ephemeral=True)
-    states = await _ha_states_or_error(interaction)
+    states = await _ha_states_or_error(interaction, _ha_cfg_for(server))
     if states is None:
         return
+    # _ha_sync_account reads base_url/token off the row, which list_ha_synced
+    # joins in; a row straight from ha_get has neither.
+    row = db.ha_synced_get(interaction.user.id) or row
     result = await _ha_sync_account(row, states, force_backfill=True)
     if result["new"]:
         extra = (
@@ -16066,26 +16343,40 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
-        name="Linking",
+        name="Setting it up",
         value=(
-            "1. `/ha_entities` — see which sensors the bot can find.\n"
-            "2. `/ha_link entity:joshua_s` — claim yours. A full entity id "
-            "(`sensor.joshua_s_weight`) works too.\n"
-            "The prefix is what gets stored, so a metric your scale adds later "
-            "is picked up with no re-link."
+            "**1.** In Home Assistant, click your name (bottom left) → "
+            "**Security** → *Long-lived access tokens* → **Create token**. Copy "
+            "it — Home Assistant only shows it once.\n"
+            "**2.** Run `/setup_ha url:<your address> token:<the token>`. Best "
+            "done in a **DM with me** so the token isn't typed into a channel; "
+            "the reply is always ephemeral either way.\n"
+            "If your scale is the only thing there with body sensors, that's it "
+            "— I link it for you. Otherwise pick yours with `/ha_link`."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Your server, your token",
+        value=(
+            "Everyone connects their **own** Home Assistant, so people on "
+            "different servers can all use this. Your token is stored "
+            "**encrypted** and nobody else — including admins — can read it. "
+            "`/ha_unlink` deletes it."
         ),
         inline=False,
     )
     embed.add_field(
         name="Commands",
         value=(
-            "`/ha_link` — link your sensors\n"
-            "`/ha_entities` — list what's on the server\n"
+            "`/setup_ha` — connect your Home Assistant\n"
+            "`/ha_entities` — list the body sensors it can see\n"
+            "`/ha_link` — pick which sensors are yours\n"
             "`/ha_body` — your latest body-composition numbers\n"
             "`/ha_sync` — check for a new weigh-in now\n"
-            "`/ha_status` — link + last check\n"
+            "`/ha_status` — connection + link + last check\n"
             "`/ha_alerts` — announce weigh-ins, or keep them quiet\n"
-            "`/ha_unlink` — stop syncing\n"
+            "`/ha_unlink` — disconnect and delete your token\n"
             "`/ha_help` — this message"
         ),
         inline=False,
@@ -16102,9 +16393,8 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
         embed.add_field(
             name="⚠️ Currently unavailable",
             value=(
-                "An admin hasn't finished setting this up: it needs a Home "
-                "Assistant URL and a long-lived access token in **Settings → "
-                "Home Assistant**."
+                "The host is missing a dependency or an encryption key, so "
+                "connections can't be stored right now."
             ),
             inline=False,
         )

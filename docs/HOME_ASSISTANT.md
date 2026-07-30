@@ -15,17 +15,18 @@ member stands on the scale
   sensor.joshua_s_weight = 106.30 kg
         │
         ▼  (bot polls every HA_POLL_MINUTES)
-  GET <HA_BASE_URL>/api/states        (one call, all members)
+  GET <their own HA>/api/states       (one call per connected member)
         │
         ├─▶ db.set_bodyweight()   — dedup on the scale's measurement id
         ├─▶ body_metrics          — the other nine numbers
         └─▶ embed to the bodyweight-reminder channel
 ```
 
-The difference from Strava and Hevy is worth being explicit about: those store a
-**credential per member**. Home Assistant is **one server with one credential**,
-and every member's sensors live on it. So the URL and token are operator
-settings, and what a member links is their slice of the entity namespace.
+Every member connects **their own** Home Assistant, the same way Hevy and Strava
+work: they run `/setup_ha` with an address and a long-lived access token, and that
+token is stored **encrypted per user**. So people on different servers can all use
+the feature, and no operator ever holds somebody else's house key. What they link
+on top of that is their slice of that server's entity namespace.
 
 The bot is **read-only** — it only ever issues `GET /api/states`,
 `GET /api/states/<entity>`, `GET /api/history/period/…`, `GET /api/config` and
@@ -35,47 +36,54 @@ The bot is **read-only** — it only ever issues `GET /api/states`,
 
 ## Requirements
 
-- Home Assistant, reachable from wherever the bot runs.
+- A Home Assistant reachable from wherever the bot runs — a LAN address if the
+  bot is on the same network, or a public hostname if not.
 - A **long-lived access token**: Home Assistant → click your name (bottom left)
-  → **Security** → *Long-lived access tokens* → **Create token**.
+  → **Security** → *Long-lived access tokens* → **Create token**. It is shown
+  once.
 - A scale integration that exposes body-composition sensors. Anything works whose
   entity ids follow HA's normal shape — Renpho/Xiaomi/Withings BLE integrations,
   ESPHome, or a template sensor you wrote yourself.
-- `requests` (already bundled for the Strava/Revo/Hevy features).
+- `requests` and `cryptography` (already bundled for the Strava/Revo/Hevy
+  features).
 
 ## Configuration
 
 Dashboard → **Settings → Home Assistant**:
 
+There is deliberately **no URL or token here** — those are per member, set with
+`/setup_ha`. What the dashboard owns is the global tuning:
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Disable Home Assistant entirely | off | Turns the integration off. |
-| Home Assistant URL | — | e.g. `http://192.168.1.50:8123`. A trailing `/` or `/api` is trimmed for you. |
-| Long-lived access token | — | Stored encrypted. Fully masked in the dashboard. |
-| Poll interval (minutes) | `10` | How often to check for new weigh-ins (minimum 1). |
+| Poll interval (minutes) | `10` | How often to check for new weigh-ins (minimum 1). One request per connected member per cycle. |
 | Import weigh-ins from the last (days) | `14` | How far back past weigh-ins are imported. `0` means only the current reading. It's a rolling window, not a one-off: a weigh-in that predates it is never imported, so raise it before linking if you want more. |
 | Ignore entities containing | — | Comma-separated fragments; any body sensor whose entity id contains one is ignored entirely. See below. |
 | Verify the TLS certificate | on | Turn off **only** for an `https://` Home Assistant with a self-signed certificate. |
 
 Changing any of these stages a bot restart; press **Apply & restart bot**.
 
-The integration stays off until both a URL and a token are set — an unconfigured
-deployment never starts the poll and the `/ha_*` commands say so.
+Nothing else needs configuring — members connect themselves. Who is connected
+shows on each member's page in the dashboard as a 🏠 chip, with the host they
+connected to; their token is encrypted and is never displayed.
 
 > These also have `HA_*` environment-variable equivalents, which take priority if
 > set. See `.env.example`.
 
-### `homeassistant.local` and Docker
+### What address to give `/setup_ha`
 
-If the bot runs in Docker, **use the LAN IP, not `homeassistant.local`**.
-`.local` is mDNS; a container's resolver doesn't speak it without avahi and host
-multicast, so the address that works perfectly in your browser fails here. The
-bot detects this specific failure and says so rather than reporting a bare DNS
-error. The alternatives, in order of least trouble:
+If the bot runs in Docker, **don't use `homeassistant.local`**. `.local` is mDNS;
+a container's resolver doesn't speak it without avahi and host multicast, so the
+address that works perfectly in your browser fails for the bot. It detects this
+specific failure and says so rather than reporting a bare DNS error. Use instead:
 
-1. `HA_BASE_URL=http://192.168.1.50:8123` — just use the IP.
-2. `extra_hosts: ["homeassistant.local:192.168.1.50"]` in `docker-compose.yml`.
-3. `network_mode: host` (Linux only).
+1. The LAN IP — `http://192.168.1.50:8123` — if the bot is on the same network.
+2. A public hostname — `https://home.example.com` — if it isn't. This is the only
+   option that works for a member whose Home Assistant is somewhere else
+   entirely, which is the normal case once more than one person uses the feature.
+3. `extra_hosts: ["homeassistant.local:192.168.1.50"]` in `docker-compose.yml`,
+   or `network_mode: host` on Linux, if you would rather keep the name.
 
 ### Where announcements go
 
@@ -89,6 +97,10 @@ Nobody is @-mentioned. Members who don't want their numbers posted run
 
 ## Member usage
 
+- `/setup_ha url:<address> token:<token>` — connect your Home Assistant. Best run
+  in a **DM with the bot** so the token isn't typed into a channel; the reply is
+  ephemeral either way. If your scale is the only thing on there with body
+  sensors, this links it for you and you're done.
 - `/ha_entities` — list the body sensors the bot can see, grouped by person. It
   shows **no weights except your own**: a Home Assistant server is a household, so
   it often carries sensors for people who aren't in the Discord at all and have no
@@ -100,9 +112,10 @@ Nobody is @-mentioned. Members who don't want their numbers posted run
 - `/ha_sync` — check for a new weigh-in right now.
 - `/ha_status` — your link, and when it was last checked.
 - `/ha_alerts enabled:<true|false>` — announce your weigh-ins, or keep them quiet.
-- `/ha_unlink` — stop syncing. Your recorded weight history is kept, and so is
-  the record of which weigh-ins were already imported, so re-linking later picks
-  up where it left off instead of importing everything a second time.
+- `/ha_unlink` — disconnect. Your stored access token is **deleted**. Your
+  recorded weight history is kept, and so is the record of which weigh-ins were
+  already imported, so reconnecting later picks up where it left off instead of
+  importing everything a second time.
 - `/ha_help` — the in-Discord version of this page.
 
 Admins can pass `member:` to `/ha_link` and `/ha_unlink` to act on someone else's

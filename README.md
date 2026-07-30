@@ -399,19 +399,22 @@ targets, goals and the graphs exactly like a typed `bw 106.3`) and announced in
 the bodyweight-reminder channel. Body fat %, muscle mass, BMI, BMR and the rest
 are kept too, and shown by `/ha_body`.
 
-Quick version: set `HA_BASE_URL` and `HA_TOKEN` (a long-lived access token from
-your Home Assistant profile → **Security**), then members run `/ha_entities` to
-see what's there and `/ha_link entity:<their prefix>` to claim theirs. Full
-walkthrough — including why Docker can't resolve `homeassistant.local` — is in
+Each member connects **their own** Home Assistant, so people on different servers
+can all use it and no operator holds anyone else's credentials. Nothing to
+configure: a member runs `/setup_ha url:<address> token:<token>` with a long-lived
+access token from their Home Assistant profile → **Security**, and if their scale
+is the only thing there with body sensors it links itself. Their token is stored
+**encrypted**; `/ha_unlink` deletes it. Full walkthrough — including what address
+to use, since Docker can't resolve `homeassistant.local` — is in
 [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md). Set `HA_DISABLED=1` to turn it
 off.
 
 The bot is **read-only**: it only ever GETs states and history, so it cannot
-change anything in your home.
+change anything in anyone's home.
 
-Commands: `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_sync`, `/ha_status`,
-`/ha_alerts` (keep your own weigh-ins out of the channel), `/ha_unlink`,
-`/ha_help`.
+Commands: `/setup_ha`, `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_sync`,
+`/ha_status`, `/ha_alerts` (keep your own weigh-ins out of the channel),
+`/ha_unlink`, `/ha_help`.
 
 ## Direct messages
 

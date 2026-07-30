@@ -125,8 +125,6 @@ PRE_REFACTOR_DEFAULTS = {
     # deployment must resolve to "feature off": no URL and no token means
     # HAConfig.configured is False and the poll never starts.
     "HA_DISABLED": False,
-    "HA_BASE_URL": "",
-    "HA_TOKEN": "",
     "HA_POLL_MINUTES": 10,
     "HA_BACKFILL_DAYS": 14,
     "HA_IGNORE_ENTITIES": set(),
@@ -144,6 +142,7 @@ PRE_REFACTOR_DEFAULTS = {
     "REVO_FERNET_KEY": "",
     "STRAVA_FERNET_KEY": "",
     "HEVY_FERNET_KEY": "",
+    "HA_FERNET_KEY": "",
     # Derived from DB_PATH's directory when blank, matching the old
     # `os.getenv(K) or os.path.join(os.path.dirname(DB_PATH) or ".", ...)`.
     "BACKUP_DIR": os.path.join("/data", "backups"),
@@ -460,7 +459,7 @@ def test_every_setting_has_a_group_and_a_label():
 
 
 # ---------------------------------------------------------------------------
-# Home Assistant URL / token validation
+# Home Assistant URL / token validation (helpers used by /setup_ha)
 # ---------------------------------------------------------------------------
 
 #: Structurally a JWT -- three base64url segments -- but not a real token.
@@ -485,7 +484,7 @@ _HA_JWT = (
     "",
 ])
 def test_ha_base_url_accepts_real_addresses(raw):
-    assert config_mod.validate("HA_BASE_URL", raw) is None
+    assert config_mod.bad_base_url(raw) is None
 
 
 @pytest.mark.parametrize("raw,needle", [
@@ -501,14 +500,17 @@ def test_ha_base_url_accepts_real_addresses(raw):
     ("ftp://ha:8123", "http:// or https://"),
 ])
 def test_ha_base_url_rejects_what_would_fail_at_runtime(raw, needle):
-    message = config_mod.validate("HA_BASE_URL", raw)
+    message = config_mod.bad_base_url(raw)
     assert message is not None and needle in message
 
 
 def test_ha_token_rejects_a_wrapped_paste():
     """Home Assistant splits the Authorization header on the first space, so an
     embedded newline produces a 401 that reads as "wrong token"."""
-    assert config_mod.validate("HA_TOKEN", _HA_JWT) is None
+    assert config_mod.bad_access_token(_HA_JWT) is None
     for bad in [_HA_JWT[:40] + "\n" + _HA_JWT[40:], _HA_JWT[:40] + " " + _HA_JWT[40:]]:
-        message = config_mod.validate("HA_TOKEN", bad)
+        message = config_mod.bad_access_token(bad)
         assert message is not None and "one piece" in message
+    # And things that are not a token at all.
+    assert config_mod.bad_access_token("") is not None
+    assert config_mod.bad_access_token("hunter2") is not None

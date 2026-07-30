@@ -41,13 +41,16 @@ LOG = logging.getLogger("gymbot.secretbox")
 
 KEY_FILENAME = ".secret_key"
 
-#: The three names the sibling clients look for, in the order a generated key
-#: must satisfy them. ``revo_client`` reads only REVO_FERNET_KEY and has no
-#: fallback chain (app/revo_client.py:81); ``strava_client`` falls back to it
-#: (app/strava_client.py:104) and ``hevy_client`` falls back to both
-#: (app/hevy_client.py:68). So a single key stored as REVO_FERNET_KEY is the
-#: only choice that serves all three at once.
-FERNET_KEYS = ("REVO_FERNET_KEY", "STRAVA_FERNET_KEY", "HEVY_FERNET_KEY")
+#: The names the sibling clients look for, in the order a generated key must
+#: satisfy them. ``revo_client`` reads only REVO_FERNET_KEY and has no fallback
+#: chain (app/revo_client.py:81); ``strava_client`` falls back to it
+#: (app/strava_client.py:104), ``hevy_client`` falls back to both
+#: (app/hevy_client.py:68) and ``ha_client`` falls back to all three
+#: (app/ha_client.py). So a single key stored as REVO_FERNET_KEY is the only
+#: choice that serves every one of them at once.
+FERNET_KEYS = (
+    "REVO_FERNET_KEY", "STRAVA_FERNET_KEY", "HEVY_FERNET_KEY", "HA_FERNET_KEY",
+)
 GENERATED_FERNET_KEY = "REVO_FERNET_KEY"
 
 

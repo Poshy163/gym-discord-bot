@@ -648,8 +648,15 @@ def test_sync_falls_back_to_last_changed_without_a_history_attribute(monkeypatch
 # /ha_entities: discovery listing and its privacy rule
 # ---------------------------------------------------------------------------
 
+def _connect(user_id: int) -> None:
+    """Give a member a stored server row. The token is never decrypted in these
+    tests because _ha_states_or_error is stubbed, so any ciphertext will do."""
+    _bot_db.ha_server_set(user_id, "http://ha.example.com:8123", "enc-token")
+
+
 def _run_entities(caller_id: int, states: list[dict], monkeypatch):
     """Invoke /ha_entities as `caller_id` and return the embed it sent."""
+    _connect(caller_id)
     monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
     monkeypatch.setattr(bot_mod, "_ha_states_or_error",
                         AsyncMock(return_value=states))
@@ -710,10 +717,12 @@ def test_entities_collects_dead_buckets_into_one_line(monkeypatch):
 
 def test_entities_says_so_when_nothing_has_a_reading(monkeypatch):
     monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    uid = _user()
+    _connect(uid)
     monkeypatch.setattr(bot_mod, "_ha_states_or_error", AsyncMock(
         return_value=[_state("sensor.dead_weight", "unavailable", "kg")]))
     interaction = AsyncMock()
-    interaction.user.id = _user()
+    interaction.user.id = uid
     asyncio.run(bot_mod.ha_entities_cmd.callback(interaction))
     sent = interaction.followup.send.call_args
     assert sent.kwargs.get("embed") is None
@@ -744,15 +753,28 @@ def test_ignored_entities_are_dropped_everywhere(monkeypatch):
 
 
 def test_entities_reports_an_empty_server_without_an_embed(monkeypatch):
+    uid = _user()
+    _connect(uid)
     monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
     monkeypatch.setattr(bot_mod, "_ha_states_or_error",
                         AsyncMock(return_value=[_state("light.kitchen", "on")]))
     interaction = AsyncMock()
-    interaction.user.id = _user()
+    interaction.user.id = uid
     asyncio.run(bot_mod.ha_entities_cmd.callback(interaction))
     sent = interaction.followup.send.call_args
     assert sent.kwargs.get("embed") is None
     assert "couldn't see any body-composition sensors" in sent.args[0]
+
+
+def test_entities_asks_you_to_connect_your_own_server_first(monkeypatch):
+    """There is nothing to list until the member has connected a server, and it
+    must not reach the network to discover that."""
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    interaction = AsyncMock()
+    interaction.user.id = _user()
+    asyncio.run(bot_mod.ha_entities_cmd.callback(interaction))
+    assert "/setup_ha" in interaction.response.send_message.call_args.args[0]
+    assert interaction.followup.send.call_args is None
 
 
 def test_link_refuses_a_prefix_another_member_already_owns(monkeypatch):
@@ -770,6 +792,7 @@ def test_link_refuses_a_prefix_another_member_already_owns(monkeypatch):
                         AsyncMock(return_value=states))
     monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
     monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", set())
+    _connect(thief)
 
     interaction = AsyncMock()
     interaction.user.id = thief
@@ -790,6 +813,7 @@ def test_relinking_your_own_prefix_still_works(monkeypatch):
                         AsyncMock(return_value=states))
     monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
     monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", set())
+    _connect(uid)
     interaction = AsyncMock()
     interaction.user.id = uid
     asyncio.run(bot_mod.ha_link_cmd.callback(interaction, "mine"))
@@ -809,6 +833,7 @@ def test_admin_can_reassign_a_prefix_and_the_old_link_goes(monkeypatch):
                         AsyncMock(return_value=states))
     monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
     monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", {admin})
+    _connect(new)
 
     interaction = AsyncMock()
     interaction.user.id = admin
@@ -1026,3 +1051,261 @@ def test_history_backfill_uses_the_live_entitys_unit(monkeypatch):
     # And the live reading itself converted.
     assert _bot_db.get_latest_bodyweight(GUILD, uid)["weight_kg"] == pytest.approx(
         106.32, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# /setup_ha and the per-member model
+# ---------------------------------------------------------------------------
+
+def _fernet_key(monkeypatch) -> None:
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("HA_FERNET_KEY", Fernet.generate_key().decode())
+
+
+class _StubLoop:
+    """`bot.loop` raises outside a running client, and /setup_ha offloads its
+    verification call to an executor. Running the callable inline is enough."""
+
+    async def run_in_executor(self, _executor, fn):
+        return fn()
+
+
+class _StubBot:
+    loop = _StubLoop()
+
+    def get_guild(self, _gid):
+        return None
+
+
+def _stub_bot(monkeypatch) -> None:
+    monkeypatch.setattr(bot_mod, "bot", _StubBot())
+
+
+_TOKEN = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJleGFtcGxlLW5vdC1hLXJlYWwtdG9rZW4iLCJpYXQiOjAsImV4cCI6MH0."
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
+
+
+def _run_setup(uid: int, url: str, token: str, monkeypatch, *, states=None,
+               ping=None) -> str:
+    """Invoke /setup_ha and return every message it sent, joined."""
+    _fernet_key(monkeypatch)
+    _stub_bot(monkeypatch)
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
+    monkeypatch.setattr(ha_client, "ping",
+                        lambda cfg: ping or {"ok": True, "version": "2026.8"})
+    monkeypatch.setattr(
+        bot_mod, "_ha_states_or_error",
+        AsyncMock(return_value=states if states is not None else []))
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    asyncio.run(bot_mod.setup_ha_cmd.callback(interaction, url, token))
+    sent = []
+    for call in (list(interaction.response.send_message.call_args_list)
+                 + list(interaction.followup.send.call_args_list)):
+        if call.args:
+            sent.append(str(call.args[0]))
+    return "\n".join(sent)
+
+
+def test_setup_ha_stores_the_token_encrypted(monkeypatch):
+    uid = _user()
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch)
+    assert "Connected to" in out
+    row = _bot_db.ha_server_get(uid)
+    assert row["base_url"] == "https://home.example.com"
+    # The plaintext is never persisted.
+    assert _TOKEN not in row["token_enc"]
+    assert ha_client.decrypt_token(row["token_enc"]) == _TOKEN
+
+
+def test_setup_ha_auto_links_the_only_sensor_group(monkeypatch):
+    """Most people have exactly one set of body sensors, and making them run a
+    second command to confirm the only option is friction for its own sake."""
+    uid = _user()
+    states = [
+        _state("sensor.myscale_joshua_weight", "106.3", "kg"),
+        _state("sensor.myscale_joshua_body_fat_percentage", "21.8", "%"),
+    ]
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch,
+                     states=states)
+    assert "automatically" in out
+    assert _bot_db.ha_get(uid)["entity_prefix"] == "myscale_joshua"
+
+
+def test_setup_ha_asks_which_when_several_groups_exist(monkeypatch):
+    uid = _user()
+    states = [
+        _state("sensor.joshua_weight", "106.3", "kg"),
+        _state("sensor.sam_weight", "72.0", "kg"),
+    ]
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch,
+                     states=states)
+    assert "/ha_link" in out
+    # Nothing guessed.
+    assert _bot_db.ha_get(uid) is None
+
+
+def test_setup_ha_skips_dead_groups_when_auto_linking(monkeypatch):
+    """A dead Apple Health bridge must not be picked as the only candidate."""
+    uid = _user()
+    states = [
+        _state("sensor.joshua_s_iphone_weight", "unavailable", "kg"),
+        _state("sensor.realscale_joshua_weight", "106.3", "kg"),
+    ]
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch,
+                     states=states)
+    assert "automatically" in out
+    assert _bot_db.ha_get(uid)["entity_prefix"] == "realscale_joshua"
+
+
+def test_setup_ha_says_so_when_nothing_has_a_reading(monkeypatch):
+    uid = _user()
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch,
+                     states=[_state("sensor.x_weight", "unavailable", "kg")])
+    assert "Stand on your scale" in out
+    assert _bot_db.ha_get(uid) is None
+
+
+def test_setup_ha_rejects_a_bad_url_before_any_network_call(monkeypatch):
+    uid = _user()
+    _stub_bot(monkeypatch)
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
+
+    def _boom(cfg):
+        pytest.fail("verified a URL that should have been rejected outright")
+
+    monkeypatch.setattr(ha_client, "ping", _boom)
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    asyncio.run(bot_mod.setup_ha_cmd.callback(interaction, "not a url", _TOKEN))
+    assert "spaces" in interaction.response.send_message.call_args.args[0]
+    assert _bot_db.ha_server_get(uid) is None
+
+
+def test_setup_ha_rejects_a_wrapped_token_before_any_network_call(monkeypatch):
+    uid = _user()
+    _stub_bot(monkeypatch)
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
+    monkeypatch.setattr(ha_client, "ping",
+                        lambda cfg: pytest.fail("should not have pinged"))
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    wrapped = _TOKEN[:30] + "\n" + _TOKEN[30:]
+    asyncio.run(bot_mod.setup_ha_cmd.callback(
+        interaction, "https://home.example.com", wrapped))
+    assert "one piece" in interaction.response.send_message.call_args.args[0]
+    assert _bot_db.ha_server_get(uid) is None
+
+
+def test_setup_ha_reports_a_rejected_token_without_storing_it(monkeypatch):
+    uid = _user()
+    _fernet_key(monkeypatch)
+    _stub_bot(monkeypatch)
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "_ctx_guild_id", lambda i: GUILD)
+
+    def _reject(cfg):
+        raise ha_client.HAAuthError("nope")
+
+    monkeypatch.setattr(ha_client, "ping", _reject)
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    asyncio.run(bot_mod.setup_ha_cmd.callback(
+        interaction, "https://home.example.com", _TOKEN))
+    assert "rejected that token" in interaction.followup.send.call_args.args[0]
+    assert _bot_db.ha_server_get(uid) is None
+
+
+def test_setup_ha_keeps_an_existing_entity_link(monkeypatch):
+    """Rotating a token must not cost someone their setup."""
+    uid = _user()
+    _bot_db.ha_server_set(uid, "https://home.example.com", "old")
+    _bot_db.ha_link(uid, GUILD, "already_mine")
+    out = _run_setup(uid, "https://home.example.com", _TOKEN, monkeypatch,
+                     states=[_state("sensor.other_weight", "80.0", "kg")])
+    assert "already linked" in out
+    assert _bot_db.ha_get(uid)["entity_prefix"] == "already_mine"
+
+
+def test_unlink_deletes_the_stored_token(monkeypatch):
+    uid = _user()
+    _bot_db.ha_server_set(uid, "https://home.example.com", "enc")
+    _bot_db.ha_link(uid, GUILD, "mine")
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", set())
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    asyncio.run(bot_mod.ha_unlink_cmd.callback(interaction))
+    message = interaction.response.send_message.call_args.args[0]
+    assert "token was deleted" in message
+    assert _bot_db.ha_server_get(uid) is None
+    assert _bot_db.ha_get(uid) is None
+
+
+def test_cfg_for_tolerates_a_row_without_credentials():
+    """An account row straight from ha_get carries no credential columns; that
+    must read as "not connected" rather than raising."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "mine")
+    assert bot_mod._ha_cfg_for(_bot_db.ha_get(uid)) is None
+    assert bot_mod._ha_cfg_for(None) is None
+
+
+def test_a_re_reported_weigh_in_imports_once(monkeypatch):
+    """The live bug: a scale reports the weight, then re-reports the same
+    measurement seconds later with body composition under a new id."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
+    now = datetime.now(timezone.utc)
+    entries = [
+        {"measurement_id": "bare", "weight": 106.3, "weight_unit": "kg",
+         "timestamp": (now - timedelta(seconds=30)).isoformat()},
+        {"measurement_id": "full", "weight": 106.3, "weight_unit": "kg",
+         "timestamp": (now - timedelta(seconds=14)).isoformat(),
+         "body_fat": 21.8},
+    ]
+    result, embeds = _sync(
+        uid, _scale_state(entries, current="106.3"), monkeypatch)
+    assert result["new"] == 1
+    assert len(embeds) == 1
+    assert len(_bot_db.bodyweight_history(GUILD, uid)) == 1
+    # Body composition is still stored -- here from the live sibling sensor,
+    # which wins over the history entry's own value.
+    assert _bot_db.latest_body_metrics(uid)["body_fat_pct"]["value"] == 35.4
+
+
+def test_the_richer_half_tops_up_metrics_on_a_later_poll(monkeypatch):
+    """When the pair straddles two polls the second must not re-log the weigh-in,
+    but must still contribute the body composition it carries."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "topup")
+    now = datetime.now(timezone.utc)
+    bare = {"measurement_id": "bare", "weight": 99.0, "weight_unit": "kg",
+            "timestamp": (now - timedelta(seconds=40)).isoformat()}
+
+    def _states(history):
+        return [{
+            "entity_id": "sensor.topup_weight", "state": "99.0",
+            "attributes": {"unit_of_measurement": "kg",
+                           "weight_history": history},
+            "last_changed": now.isoformat(), "last_updated": now.isoformat(),
+        }]
+
+    # Poll 1 sees only the bare report, and no sibling sensors at all.
+    r1, e1 = _sync(uid, _states([bare]), monkeypatch)
+    assert r1["new"] == 1 and len(e1) == 1
+    assert _bot_db.latest_body_metrics(uid) == {}
+
+    # Poll 2 sees the re-report carrying body fat.
+    full = {"measurement_id": "full", "weight": 99.0, "weight_unit": "kg",
+            "timestamp": (now - timedelta(seconds=24)).isoformat(),
+            "body_fat": 18.5}
+    r2, e2 = _sync(uid, _states([bare, full]), monkeypatch)
+    assert r2["new"] == 0, "must not log the same weigh-in twice"
+    assert e2 == [], "and must not announce it twice"
+    assert _bot_db.latest_body_metrics(uid)["body_fat_pct"]["value"] == 18.5

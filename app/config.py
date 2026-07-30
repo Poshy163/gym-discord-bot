@@ -451,23 +451,13 @@ _SETTINGS: tuple[Setting, ...] = (
             "existing deployment."),
 
     # ---- Home Assistant --------------------------------------------------
-    # One server, one token, everybody's sensors -- so unlike Hevy/Strava the
-    # credential is a setting rather than a per-member link. HA_BASE_URL and
-    # HA_TOKEN are sibling_env because app/ha_client.py reads them with
-    # os.getenv from inside executor threads, the same reason the Strava
-    # credentials are.
+    # There is deliberately no URL or token here. Every member brings their own
+    # Home Assistant, set up with /setup_ha, and the credential is stored
+    # Fernet-encrypted per user like the Hevy/Strava/Revo ones -- so an operator
+    # never holds somebody else's house key, and members on different servers can
+    # all use the feature. What is left here is the global tuning.
     _S("HA_DISABLED", "bool", "0", "homeassistant", _bool,
        apply="worker", label="Disable Home Assistant entirely"),
-    _S("HA_BASE_URL", "str", "", "homeassistant", _rstrip_slash,
-       apply="worker", sibling_env=True, label="Home Assistant URL",
-       help="e.g. http://homeassistant.local:8123 -- the address you open the "
-            "dashboard on. A trailing '/' or '/api' is trimmed for you."),
-    _S("HA_TOKEN", "secret", "", "homeassistant", _strip,
-       apply="worker", secret=True, sibling_env=True,
-       label="Long-lived access token",
-       help="Home Assistant -> your profile -> Security -> Long-lived access "
-            "tokens -> Create token. Stored encrypted. Read-only use: the bot "
-            "only ever GETs states and history."),
     _S("HA_POLL_MINUTES", "int", "10", "homeassistant", _floor_int(1),
        apply="worker", min=1, max=1440, label="Poll interval (minutes)",
        help="How often to check for new weigh-ins. A scale only reports when "
@@ -486,9 +476,16 @@ _SETTINGS: tuple[Setting, ...] = (
             "never polled. Use it for the phantom entities a phone or fitness "
             "bridge creates and then never writes to, e.g. _iphone."),
     _S("HA_VERIFY_SSL", "bool", "1", "homeassistant", _bool,
-       apply="worker", sibling_env=True, label="Verify the TLS certificate",
-       help="Turn off only for an https:// Home Assistant using a self-signed "
-            "certificate. Plain http:// on your LAN is unaffected."),
+       apply="worker", label="Verify the TLS certificate",
+       help="Turn off only if someone's Home Assistant uses a self-signed "
+            "certificate. Plain http:// on a LAN is unaffected. This applies to "
+            "every member, so prefer a real certificate."),
+    _S("HA_FERNET_KEY", "secret", "", "homeassistant", _strip,
+       apply="worker", secret=True, sibling_env=True,
+       label="Home Assistant encryption key",
+       help="Encrypts every member's stored access token at rest. Managed "
+            "automatically -- only set this if you are migrating an existing "
+            "deployment. Rotating it makes stored tokens unreadable."),
 
     # ---- Presence / voice / moderation -----------------------------------
     _S("ENABLE_PRESENCE_TRACKING", "bool", "false", "presence", _bool,
@@ -860,23 +857,6 @@ def validate(key: str, raw: str) -> str | None:
         return ("':memory:' cannot be shared between the supervisor and the "
                 "bot -- each would get its own empty database.")
 
-    if key == "HA_BASE_URL":
-        # There is no "url" kind, and the coercion only strips a trailing slash,
-        # so without this a pasted token, an entity id, or a bare word would save
-        # cleanly and then fail on every poll with a connection error the operator
-        # has no way to trace back to this field.
-        error = _bad_host(raw)
-        if error:
-            return error
-
-    if key == "HA_TOKEN" and any(ch.isspace() for ch in raw.strip()):
-        # A long-lived token is a long JWT and gets pasted out of a scrolling
-        # text box, so it arrives with a wrapped newline more often than not.
-        # HA splits the Authorization header on the first space, so an embedded
-        # one produces a 401 that reads as "wrong token".
-        return ("That token contains a space or line break -- copy it again in "
-                "one piece (it should be a single long line).")
-
     return None
 
 
@@ -888,12 +868,14 @@ def validate(key: str, raw: str) -> str | None:
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
-def _bad_host(raw: str) -> str | None:
-    """Validate an operator-entered base URL. Returns an error, or None.
+def bad_base_url(raw: str) -> str | None:
+    """Validate a user-entered Home Assistant URL. Returns an error, or None.
 
     Accepts what actually works: a bare host, a host:port, either scheme, a
-    single-label Docker service name (``http://homeassistant``), and an IP. The
-    aim is to reject values that would save cleanly and then fail on every poll.
+    single-label Docker service name (``http://homeassistant``), a public domain
+    and an IP. The aim is to reject values that would be accepted and then fail
+    on every poll with a connection error nobody can trace back to what they
+    typed. Called by ``/setup_ha`` before anything is stored.
     """
     text = raw.strip()
     if not text:
@@ -917,7 +899,28 @@ def _bad_host(raw: str) -> str | None:
         return None  # bracketed IPv6 literal; trust it rather than reimplement it
     if not host or not all(_HOST_LABEL.match(part) for part in host.split(".")):
         return ("Must be the address you open Home Assistant on, e.g. "
-                "http://192.168.1.50:8123 or http://homeassistant.local:8123.")
+                "`http://192.168.1.50:8123` or `https://home.example.com`.")
+    return None
+
+
+def bad_access_token(raw: str) -> str | None:
+    """Validate a user-pasted long-lived access token. Returns an error, or None.
+
+    A long-lived token is a long JWT copied out of a scrolling text box, so it
+    arrives with a wrapped newline more often than not. Home Assistant splits the
+    Authorization header on the first space, so an embedded one produces a 401
+    that reads as "wrong token" and sends the member back to make another.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "I need the access token as well."
+    if any(ch.isspace() for ch in text):
+        return ("That token has a space or line break in it -- copy it again in "
+                "one piece (it should be a single long line).")
+    if text.count(".") != 2 or len(text) < 60:
+        return ("That doesn't look like a long-lived access token. Create one "
+                "under your Home Assistant profile -> Security -> Long-lived "
+                "access tokens, and paste the whole thing.")
     return None
 
 

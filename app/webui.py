@@ -759,6 +759,14 @@ def build_app(
             "audit": audit,
             "strava_linked": db.get_strava_account(uid) is not None,
             "revo_linked": db.get_revo_account(uid) is not None,
+            # The member's own Home Assistant. Only ever the host they connected
+            # to -- the stored token is encrypted and is never exposed here.
+            "ha_server": (
+                lambda r: r["base_url"] if r is not None else None
+            )(db.ha_server_get(uid)),
+            "ha_prefix": (
+                lambda r: r["entity_prefix"] if r is not None else None
+            )(db.ha_get(uid)),
             "presence_tracked": db.presence_is_tracked(gid, uid),
             "presence_tracking_available": bool(
                 _presence_enabled() and presence_track is not None
@@ -2905,6 +2913,7 @@ async function memberView(uid){
       <div class="muted">${esc(m.username||"")}</div>
       <div class="chips">${d.strava_linked?'<span class="pill">🟧 Strava</span>':''}
         ${d.revo_linked?'<span class="pill">🟢 Revo</span>':''}
+        ${d.ha_server?`<span class="pill" title="${esc(d.ha_server)}${d.ha_prefix?" · "+esc(d.ha_prefix):" · no sensors linked yet"}">🏠 Home Assistant</span>`:''}
         ${d.calorie_streak>=2?`<span class="pill">🔥 ${d.calorie_streak}d calories</span>`:''}
         ${d.protein_streak>=2?`<span class="pill">🔥 ${d.protein_streak}d protein</span>`:''}
         ${m.present?'':'<span class="pill faint">left server</span>'}</div></div></div>

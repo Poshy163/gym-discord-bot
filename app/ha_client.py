@@ -1,11 +1,11 @@
 """Home Assistant integration client.
 
-Unlike Hevy (per-member API key) and Strava (per-member OAuth token), Home
-Assistant is **one server with one credential**: an operator supplies the base
-URL and a long-lived access token once, and everybody's sensors live on it. So
-the credential is a *setting* (``HA_BASE_URL`` / ``HA_TOKEN``, encrypted at rest
-by the settings layer like every other ``secret``), and what each member links
-is their slice of the entity namespace.
+Like Hevy (per-member API key) and Strava (per-member OAuth token), every member
+brings **their own** Home Assistant: they supply a base URL and a long-lived
+access token with ``/setup_ha``, and the token is stored Fernet-encrypted per
+user — the plaintext is never persisted, and an operator never holds somebody
+else's house key. What they link on top of that is their slice of that server's
+entity namespace.
 
 A Renpho/Withings/Xiaomi body-composition scale exposed through HA lands as one
 sensor per metric, all sharing a per-person prefix::
@@ -104,6 +104,12 @@ try:  # pragma: no cover - trivial import guard
 except Exception:  # pragma: no cover
     requests = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - trivial import guard
+    from cryptography.fernet import Fernet, InvalidToken  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    Fernet = None  # type: ignore[assignment]
+    InvalidToken = Exception  # type: ignore[assignment]
+
 
 def available() -> bool:
     """True when the optional ``requests`` dep is importable."""
@@ -146,7 +152,11 @@ def normalize_base_url(raw: str) -> str:
 
 @dataclass(frozen=True)
 class HAConfig:
-    """Resolved Home Assistant connection settings."""
+    """One member's Home Assistant connection.
+
+    Built per request from their stored row — every member brings their own
+    server, so there is no process-wide configuration to read.
+    """
 
     base_url: str = ""
     token: str = ""
@@ -158,25 +168,86 @@ class HAConfig:
         return bool(self.base_url and self.token)
 
 
-def config_from_env(env: Mapping[str, str] | None = None) -> HAConfig:
-    """Build an :class:`HAConfig` from the process environment.
+def config_for(base_url: str, token: str, *, verify_ssl: bool = True) -> HAConfig:
+    """Build a config from a member's stored URL and their decrypted token."""
+    return HAConfig(
+        base_url=normalize_base_url(base_url),
+        token=(token or "").strip(),
+        verify_ssl=verify_ssl,
+    )
 
-    Mirrors ``strava_client.config_from_env``: the supervisor exports the
-    resolved settings into the worker's environment, so this module reads
-    ``os.getenv`` directly and never touches the database.
+
+# ---------------------------------------------------------------------------
+# Token encryption (mirrors the Hevy/Strava/Revo Fernet scheme)
+# ---------------------------------------------------------------------------
+
+#: Falls back through every other integration's key, so one generated key serves
+#: them all. See app/secretbox.py:FERNET_KEYS for why REVO_FERNET_KEY is last.
+_FERNET_ENVS = (
+    "HA_FERNET_KEY", "HEVY_FERNET_KEY", "STRAVA_FERNET_KEY", "REVO_FERNET_KEY",
+)
+
+
+def _fernet() -> "Fernet":
+    if Fernet is None:
+        raise HAUnavailable(
+            "The 'cryptography' package is required to store Home Assistant "
+            "access tokens."
+        )
+    key = ""
+    for env in _FERNET_ENVS:
+        key = os.environ.get(env, "").strip()
+        if key:
+            break
+    if not key:
+        raise HAUnavailable(
+            "Set $HA_FERNET_KEY (or reuse $HEVY_FERNET_KEY / $STRAVA_FERNET_KEY "
+            "/ $REVO_FERNET_KEY) to a Fernet key."
+        )
+    try:
+        return Fernet(key.encode())
+    except Exception as exc:  # pragma: no cover - bad key shape
+        raise HAUnavailable(f"Invalid Fernet key: {exc}") from exc
+
+
+def encrypt_token(plaintext: str) -> str:
+    """Encrypt an access token for at-rest storage. Returns a urlsafe string."""
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_token(token: str) -> str:
+    """Inverse of :func:`encrypt_token`."""
+    try:
+        return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:  # pragma: no cover - corrupted DB row
+        raise HAUnavailable(
+            "Stored Home Assistant token is unreadable — re-run /setup_ha."
+        ) from exc
+
+
+def fernet_ready() -> bool:
+    """True when a Fernet key is configured, so /setup_ha can store a token."""
+    if Fernet is None:
+        return False
+    return any(os.environ.get(env, "").strip() for env in _FERNET_ENVS)
+
+
+def verify_ssl_from_env(env: Mapping[str, str] | None = None) -> bool:
+    """Resolve ``HA_VERIFY_SSL``, failing closed on an unrecognised value.
+
+    Deliberately the inverse test of a truthy list -- "is this explicitly false"
+    rather than "is this true" -- so a typo leaves certificate verification ON.
+    Written the other way round, every value the truthy list didn't happen to
+    contain silently disabled TLS validation on token-bearing requests.
     """
     src = os.environ if env is None else env
-    verify = (src.get("HA_VERIFY_SSL", "1") or "1").strip().lower()
-    if verify and verify not in _EXPLICITLY_FALSE and verify not in _TRUE:
+    raw = (src.get("HA_VERIFY_SSL", "1") or "1").strip().lower()
+    if raw and raw not in _EXPLICITLY_FALSE and raw not in _TRUE:
         LOG.warning(
             "HA_VERIFY_SSL=%r isn't a recognised on/off value — keeping "
-            "certificate verification ON. Use 0 to switch it off.", verify,
+            "certificate verification ON. Use 0 to switch it off.", raw,
         )
-    return HAConfig(
-        base_url=normalize_base_url(src.get("HA_BASE_URL", "")),
-        token=(src.get("HA_TOKEN", "") or "").strip(),
-        verify_ssl=verify not in _EXPLICITLY_FALSE,
-    )
+    return raw not in _EXPLICITLY_FALSE
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +296,8 @@ def _unreachable_hint(cfg: HAConfig, exc: Exception) -> str:
             f"(e.g. http://192.168.1.50:8123)."
         )
     if resolution_failed:
-        return f"Couldn't resolve {host} — check the hostname in HA_BASE_URL."
+        return (f"Couldn't resolve {host} — check the address, then re-run "
+                "/setup_ha.")
     return f"Couldn't reach {host or 'Home Assistant'}: {text[:160]}"
 
 
@@ -825,6 +897,58 @@ def readings_from_history_attr(
             "metrics": metrics,
         })
     out.sort(key=lambda r: r["measured_at"])
+    return out
+
+
+#: How close two same-weight readings must be to count as one weigh-in. A scale
+#: reports the weight the instant you step on and then re-reports the *same*
+#: measurement seconds later once it has an impedance reading, under a fresh
+#: measurement id — 16 seconds apart on the install this was built against. Id
+#: de-duplication cannot see that, so the pair announced twice.
+SAME_WEIGHT_WINDOW_SECONDS = 900
+
+
+def collapse_same_weight(
+    readings: list[dict], *, window_seconds: int = SAME_WEIGHT_WINDOW_SECONDS,
+) -> list[dict]:
+    """Fold re-reports of one weigh-in into a single reading. Oldest-first in/out.
+
+    Two readings collapse when they carry the **same weight** and land within
+    ``window_seconds`` of each other. The survivor keeps the *earliest* key and
+    timestamp — so it still de-duplicates against whatever was already imported
+    when the pair straddles two polls — and the *union* of the metrics, with the
+    later (richer) values winning, because the second report is the one that
+    carries body composition.
+
+    Weight equality is the discriminator on purpose. Two genuine weigh-ins
+    seconds apart differ in kilograms (106.4 then 106.7 on the real install);
+    a re-report of the same measurement does not. And treating an identical
+    repeat as one weigh-in is the behaviour :func:`reading_key` already
+    documents, so this is consistent rather than a new rule.
+    """
+    out: list[dict] = []
+    for reading in readings:
+        weight = reading.get("weight_kg")
+        when = reading.get("measured_at")
+        match = None
+        if isinstance(when, datetime):
+            for kept in out:
+                kept_when = kept.get("measured_at")
+                if not isinstance(kept_when, datetime):
+                    continue
+                if abs(float(kept.get("weight_kg", 0)) - float(weight or 0)) >= 0.005:
+                    continue
+                if abs((when - kept_when).total_seconds()) <= window_seconds:
+                    match = kept
+                    break
+        if match is None:
+            out.append(dict(reading))
+            continue
+        merged = dict(match.get("metrics") or {})
+        merged.update(reading.get("metrics") or {})
+        match["metrics"] = merged
+        # Track what was folded in, so a caller can say so if it wants to.
+        match.setdefault("folded", []).append(reading.get("key", ""))
     return out
 
 
