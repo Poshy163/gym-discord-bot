@@ -1249,3 +1249,24 @@ def test_member_payload_reports_a_home_assistant_link_without_the_token(tmp_path
             await client.close()
             db.close()
     _run(go())
+
+
+def test_recent_weigh_ins_render_in_the_viewers_timezone(tmp_path):
+    """The list showed the stored UTC string, so a weigh-in the scale recorded at
+    2:17 PM in Adelaide read as 04:47. fmtTs is the dashboard's existing helper
+    and localises via the browser."""
+    async def go():
+        db = Database(tmp_path / "tz.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/")
+            body = await r.text()
+            assert "fmtTs(p.at)" in body
+            # The raw-string slicing this replaced must not come back.
+            assert 'String(p.at||"").replace' not in body
+        finally:
+            await client.close()
+            db.close()
+    _run(go())

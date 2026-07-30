@@ -15554,6 +15554,21 @@ async def _ha_offer_undo(
         LOG.info("Home Assistant: couldn't add the undo reaction")
 
 
+def _ha_when(value: object) -> str:
+    """Render a stored UTC timestamp for Discord, in the reader's own timezone.
+
+    ``<t:epoch:f>`` is localised by each client, which beats formatting against
+    DISPLAY_TIMEZONE: members are not all in the operator's timezone, and a raw
+    stored value is in UTC and reads as simply wrong to everybody. Falls back to
+    the raw string if it can't be parsed, since a slightly ugly timestamp is
+    better than none.
+    """
+    when = value if isinstance(value, datetime) else ha_client.parse_ha_time(value)
+    if when is None:
+        return str(value) if value else "not yet"
+    return f"<t:{int(when.timestamp())}:f>"
+
+
 def _ha_stamp(when: datetime) -> str:
     """The exact string ``set_bodyweight`` stored this weigh-in under.
 
@@ -16304,7 +16319,7 @@ async def ha_status_cmd(interaction: discord.Interaction) -> None:
             f"✅ Linked to `{row['entity_prefix'] or '(no prefix)'}`"
             + (f" via `{row['weight_entity']}`" if row["weight_entity"] else "")
         )
-        lines.append(f"Last checked: {row['last_synced_at'] or 'not yet'}")
+        lines.append(f"Last checked: {_ha_when(row['last_synced_at'])}")
         lines.append(
             "Announcements: "
             + ("**on** → <#%s>" % channel_id
@@ -16316,7 +16331,7 @@ async def ha_status_cmd(interaction: discord.Interaction) -> None:
     if latest is not None:
         lines.append(
             f"Latest weight on file: **{float(latest['weight_kg']):.2f} kg** "
-            f"({latest['recorded_at']})"
+            f"({_ha_when(latest['recorded_at'])})"
         )
     if not _ha_enabled():
         lines.append(
@@ -16466,9 +16481,15 @@ async def ha_body_cmd(
     # yield first — metrics are resolved per-metric, so a scale that stopped
     # reporting one of them leaves an older row in the set.
     when = max((row["recorded_at"] for row in metrics.values()), default=None)
-    embed.set_footer(
-        text=f"Measured {when}" if when else "Weight only — no scale linked yet"
-    )
+    measured = ha_client.parse_ha_time(when)
+    if measured is not None:
+        # The embed's own timestamp rather than text in the footer: Discord
+        # localises it per reader, and it does NOT render <t:…> markup inside a
+        # footer, so spelling the time out there would show UTC to everybody.
+        embed.timestamp = measured
+        embed.set_footer(text="Measured")
+    else:
+        embed.set_footer(text="Weight only, no scale linked yet")
     await interaction.response.send_message(
         embed=embed, ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),

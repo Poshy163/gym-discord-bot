@@ -1511,3 +1511,70 @@ def test_undo_reports_nothing_to_do_when_already_gone(monkeypatch):
     msg = _posted_message(9011)
     assert _react(monkeypatch, msg, _Payload(9011, uid)) is True
     assert "Nothing to undo" in msg.edit.call_args.kwargs["content"]
+
+
+# ---------------------------------------------------------------------------
+# Timestamps are shown in the reader's timezone, not UTC
+# ---------------------------------------------------------------------------
+
+def test_ha_when_renders_a_discord_timestamp():
+    """Stored values are UTC. Printing them raw showed "2026-07-30 04:47" to
+    somebody in Adelaide whose scale said 2:17 PM. Discord's <t:…> markup is
+    localised by each client, which also beats formatting against a single
+    configured timezone when members aren't all in it."""
+    stored = "2026-07-30T04:47:39.717892+00:00"
+    rendered = bot_mod._ha_when(stored)
+    assert rendered == "<t:1785386859:f>"
+    # A datetime works too, and agrees with the string form.
+    assert bot_mod._ha_when(
+        datetime(2026, 7, 30, 4, 47, 39, 717892, tzinfo=timezone.utc),
+    ) == rendered
+
+
+def test_ha_when_falls_back_rather_than_showing_nothing():
+    assert bot_mod._ha_when(None) == "not yet"
+    assert bot_mod._ha_when("") == "not yet"
+    # Unparseable but present: better a slightly ugly timestamp than none.
+    assert bot_mod._ha_when("sometime tuesday") == "sometime tuesday"
+
+
+def test_ha_body_puts_the_time_in_the_embed_timestamp(monkeypatch):
+    """Discord does not render <t:…> inside a footer, so spelling the time out
+    there would show UTC to everybody. The embed's own timestamp is localised."""
+    uid = _user()
+    when = datetime(2026, 7, 30, 4, 47, 39, tzinfo=timezone.utc)
+    _bot_db.add_body_metrics(GUILD, uid, {"body_fat_pct": (21.8, "%")},
+                             recorded_at=when)
+    _bot_db.set_bodyweight(GUILD, uid, 106.3, recorded_at=when)
+
+    monkeypatch.setattr(bot_mod, "bot", _StubBot())
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    interaction.user.display_name = "Poshy"
+    monkeypatch.setattr(bot_mod, "_deny_invisible_target",
+                        AsyncMock(return_value=False))
+    asyncio.run(bot_mod.ha_body_cmd.callback(interaction))
+    embed = interaction.response.send_message.call_args.kwargs["embed"]
+    assert embed.timestamp == when
+    # ...and the footer carries no raw timestamp of its own.
+    assert "2026-07-30" not in (embed.footer.text or "")
+    assert "04:47" not in (embed.footer.text or "")
+
+
+def test_ha_status_does_not_print_a_raw_utc_string(monkeypatch):
+    uid = _user()
+    _bot_db.ha_server_set(uid, "https://home.example.com", "enc")
+    _bot_db.ha_link(uid, GUILD, "mine")
+    _bot_db.ha_mark_synced(uid)
+    _bot_db.set_bodyweight(
+        GUILD, uid, 106.3,
+        recorded_at=datetime(2026, 7, 30, 4, 47, 39, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(bot_mod, "bot", _StubBot())
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    asyncio.run(bot_mod.ha_status_cmd.callback(interaction))
+    message = interaction.response.send_message.call_args.args[0]
+    assert "<t:" in message, "timestamps must be Discord-localised"
+    assert "2026-07-30T04:47" not in message
+    assert "+00:00" not in message

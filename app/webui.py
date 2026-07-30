@@ -2509,7 +2509,7 @@ function bwList(pts,uid){
   return `<details class="bwlist"><summary class="link">Recent weigh-ins (${pts.length})</summary>
     <table><tbody>${rows.map(p=>`<tr>
       <td><b>${Number(p.weight_kg).toFixed(2)}</b> kg</td>
-      <td class="muted">${esc(String(p.at||"").replace("T"," ").slice(0,16))}</td>
+      <td class="muted">${esc(fmtTs(p.at))}</td>
       <td class="right">${p.id?`<a class="link danger" onclick="delBodyweight('${uid}',${p.id},'${Number(p.weight_kg).toFixed(2)}')">delete</a>`:''}</td>
     </tr>`).join("")}</tbody></table></details>`;
 }
