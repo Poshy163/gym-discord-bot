@@ -54,6 +54,7 @@ Dashboard → **Settings → Home Assistant**:
 | Long-lived access token | — | Stored encrypted. Fully masked in the dashboard. |
 | Poll interval (minutes) | `10` | How often to check for new weigh-ins (minimum 1). |
 | Import weigh-ins from the last (days) | `14` | How far back past weigh-ins are imported. `0` means only the current reading. It's a rolling window, not a one-off: a weigh-in that predates it is never imported, so raise it before linking if you want more. |
+| Ignore entities containing | — | Comma-separated fragments; any body sensor whose entity id contains one is ignored entirely. See below. |
 | Verify the TLS certificate | on | Turn off **only** for an `https://` Home Assistant with a self-signed certificate. |
 
 Changing any of these stages a bot restart; press **Apply & restart bot**.
@@ -210,10 +211,13 @@ into the log after the fact isn't picked up.
   indefinitely, but only over the websocket API, which the bot doesn't use.
 - **One person, two weight sensors.** An Apple Health or Google Fit bridge often
   creates `sensor.<name>_iphone_weight` and then never writes to it, so it sits at
-  `unavailable` forever. `/ha_link` ranks a sensor that *has* a current reading
-  above one that merely matches your name more tightly, because linking the dead
-  one looks like success and then never syncs. `/ha_entities` flags any bucket
-  with nothing writing to it. To link a silent one deliberately — a new scale
+  `unavailable` forever. Three things keep that from mattering: `/ha_link` ranks a
+  sensor that *has* a current reading above one that merely matches your name more
+  tightly (linking the dead one looks like success and then never syncs);
+  `/ha_entities` collects everything nothing is writing to into one line at the
+  bottom rather than giving it equal billing; and **Ignore entities containing**
+  removes it altogether — set it to `_iphone` and those entities are not listed,
+  not linkable and never polled. To link a silent group deliberately — a new scale
   nobody has stood on yet — give its exact prefix or entity id.
 - **Weigh-ins are filed under the server you linked from** (or your `/server`
   default when linking via DM), matching Hevy and Strava. Bodyweight itself is

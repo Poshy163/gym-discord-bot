@@ -690,11 +690,57 @@ def test_entities_shows_your_own_weight_and_marks_it_yours(monkeypatch):
     assert "yours" in value and "99.90" in value
 
 
-def test_entities_flags_a_bucket_nothing_writes_to(monkeypatch):
+def test_entities_collects_dead_buckets_into_one_line(monkeypatch):
+    """A phantom Apple Health group given the same full-size field as a working
+    scale is what makes the list confusing and the wrong choice tempting."""
     embed = _run_entities(_user(), [
         _state("sensor.dead_bridge_weight", "unavailable", "kg"),
+        _state("sensor.real_scale_weight", "80.0", "kg"),
     ], monkeypatch)
-    assert "no current reading" in embed.fields[0].value
+    names = [f.name for f in embed.fields]
+    assert "Nothing writing to these" in names
+    dead = next(f.value for f in embed.fields if f.name == "Nothing writing to these")
+    assert "dead_bridge" in dead
+    # ...and it points at the setting that removes them for good.
+    assert "Ignore entities containing" in dead
+    # The working scale still gets a field of its own.
+    assert any("real_scale" in f.value for f in embed.fields
+               if f.name != "Nothing writing to these")
+
+
+def test_entities_says_so_when_nothing_has_a_reading(monkeypatch):
+    monkeypatch.setattr(bot_mod, "_ha_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "_ha_states_or_error", AsyncMock(
+        return_value=[_state("sensor.dead_weight", "unavailable", "kg")]))
+    interaction = AsyncMock()
+    interaction.user.id = _user()
+    asyncio.run(bot_mod.ha_entities_cmd.callback(interaction))
+    sent = interaction.followup.send.call_args
+    assert sent.kwargs.get("embed") is None
+    assert "none of them have a reading" in sent.args[0]
+
+
+def test_ignored_entities_are_dropped_everywhere(monkeypatch):
+    """The fragment filter is applied where states enter the feature, so the
+    exclusion holds for the listing, for linking and for syncing alike."""
+    states = [
+        _state("sensor.joshua_s_iphone_weight", "unavailable", "kg"),
+        _state("sensor.joshua_s_iphone_body_fat_percentage", "unavailable", "%"),
+        _state("sensor.renpho_joshua_s_weight", "106.3", "kg"),
+    ]
+    monkeypatch.setattr(bot_mod, "HA_IGNORE_ENTITIES", {"_iphone"})
+    kept = bot_mod._ha_visible_states(states)
+    assert [s["entity_id"] for s in kept] == ["sensor.renpho_joshua_s_weight"]
+    # Linking can no longer resolve to the ignored group, even by exact prefix.
+    assert bot_mod._ha_resolve_target("joshua_s_iphone", kept) is None
+    assert bot_mod._ha_resolve_target("joshua", kept)["prefix"] == (
+        "renpho_joshua_s")
+    # Matching is case-insensitive and substring-based, not whole-id.
+    monkeypatch.setattr(bot_mod, "HA_IGNORE_ENTITIES", {"IPHONE".lower()})
+    assert len(bot_mod._ha_visible_states(states)) == 1
+    # Unset means no filtering at all -- same list object back, no copying.
+    monkeypatch.setattr(bot_mod, "HA_IGNORE_ENTITIES", set())
+    assert bot_mod._ha_visible_states(states) is states
 
 
 def test_entities_reports_an_empty_server_without_an_embed(monkeypatch):

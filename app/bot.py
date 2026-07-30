@@ -268,6 +268,7 @@ def _bind_config(cfg: config_mod.Config) -> None:
     g["HA_DISABLED"] = cfg["HA_DISABLED"]
     g["HA_POLL_MINUTES"] = cfg["HA_POLL_MINUTES"]
     g["HA_BACKFILL_DAYS"] = cfg["HA_BACKFILL_DAYS"]
+    g["HA_IGNORE_ENTITIES"] = set(cfg["HA_IGNORE_ENTITIES"])
 
 
 _bind_config(CFG)
@@ -12484,6 +12485,29 @@ def _ha_alert_channel_id() -> int | None:
     return BODYWEIGHT_REMINDER_CHANNEL_ID
 
 
+def _ha_visible_states(states: list[dict]) -> list[dict]:
+    """Drop entities the operator asked to ignore, before anything else sees them.
+
+    Applied at the two points states enter the feature — the poll and the command
+    helper — so the exclusion holds for the listing, for linking and for syncing
+    without each of those having to remember.
+
+    This exists for phantom entities. A phone or fitness-tracker bridge (Apple
+    Health, Google Fit) creates ``sensor.<name>_iphone_weight`` and its siblings
+    and then never writes to them, so they sit at ``unavailable`` forever while
+    cluttering discovery and inviting somebody to link the wrong one.
+    """
+    if not HA_IGNORE_ENTITIES:
+        return states
+    out = []
+    for state in states:
+        eid = str(state.get("entity_id") or "").lower()
+        if any(fragment in eid for fragment in HA_IGNORE_ENTITIES):
+            continue
+        out.append(state)
+    return out
+
+
 async def _ha_alert_channel():
     """Resolve the announcement channel, or None.
 
@@ -15433,7 +15457,7 @@ async def ha_poll() -> None:
         return ha_client.fetch_states(cfg)
 
     try:
-        states = await bot.loop.run_in_executor(None, _fetch)
+        states = _ha_visible_states(await bot.loop.run_in_executor(None, _fetch))
     except ha_client.HAAuthError:
         LOG.warning(
             "Home Assistant rejected the access token — weigh-in sync is "
@@ -15552,7 +15576,7 @@ async def _ha_states_or_error(interaction: discord.Interaction) -> list[dict] | 
         return ha_client.fetch_states(cfg)
 
     try:
-        return await bot.loop.run_in_executor(None, _fetch)
+        return _ha_visible_states(await bot.loop.run_in_executor(None, _fetch))
     except ha_client.HAAuthError:
         await interaction.followup.send(
             "❌ Home Assistant rejected the access token. An admin needs to "
@@ -15737,29 +15761,33 @@ async def ha_entities_cmd(interaction: discord.Interaction) -> None:
         str(r["entity_prefix"] or ""): int(r["user_id"])
         for r in db.list_ha_accounts()
     }
-    for prefix in sorted(grouped)[:24]:
+    # Buckets nothing is writing to are collected separately. Giving a phantom
+    # Apple Health group the same full-size field as a working scale is what makes
+    # the list confusing and the wrong choice tempting; one grey line at the
+    # bottom says it is there without competing for attention.
+    dead: list[str] = []
+    shown = 0
+    for prefix in sorted(grouped):
         mine = grouped[prefix]
         owner = owners.get(prefix)
+        reading = ha_client.build_reading(mine)
+        someone_else = owner is not None and owner != interaction.user.id
+        if reading is None and not someone_else:
+            dead.append(prefix or "(no prefix)")
+            continue
+        if shown >= 20:
+            continue
+        shown += 1
         bits = [f"{len(mine)} sensor{'s' if len(mine) != 1 else ''}"]
-        if owner is not None and owner != interaction.user.id:
+        if someone_else:
             bits.append("🔗 linked to another member")
         else:
-            reading = ha_client.build_reading(mine)
             if owner is not None:
                 bits.append("🔗 **yours**")
-                if reading is not None:
-                    bits.append(f"**{reading['weight_kg']:.2f} kg**")
-            if reading is not None:
-                when = reading.get("measured_at")
-                if isinstance(when, datetime):
-                    bits.append(f"last read <t:{int(when.timestamp())}:R>")
-                elif owner is None:
-                    bits.append("reading available")
-            else:
-                # Worth saying plainly: an Apple Health or Google Fit bridge
-                # creates these entities and then never writes to them, so a
-                # member who links one gets silence rather than an error.
-                bits.append("⚠️ no current reading — nothing is writing to it")
+                bits.append(f"**{reading['weight_kg']:.2f} kg**")
+            when = reading.get("measured_at") if reading else None
+            if isinstance(when, datetime):
+                bits.append(f"last read <t:{int(when.timestamp())}:R>")
         # The prefix is the thing to type but it is often machine-generated
         # (`renpho_scale_aa_bb_cc_dd_ee_ff_joshua_s`), so lead with the friendly
         # name and show the prefix as the code to copy.
@@ -15772,8 +15800,29 @@ async def ha_entities_cmd(interaction: discord.Interaction) -> None:
             value=f"`{prefix or '(no prefix)'}`\n" + " · ".join(bits),
             inline=False,
         )
-    if len(grouped) > 24:
-        embed.set_footer(text=f"…and {len(grouped) - 24} more")
+    listed = ", ".join(f"`{p}`" for p in dead[:6])
+    more = f" …and {len(dead) - 6} more" if len(dead) > 6 else ""
+    hint = (
+        "A phone or fitness bridge usually creates these and never fills them "
+        "in. Hide them for good by adding a fragment like `_iphone` to "
+        "**Settings → Home Assistant → Ignore entities containing**."
+    )
+    if shown == 0:
+        # Everything is dead. A list of corpses is not the useful answer here;
+        # what to do about it is.
+        await interaction.followup.send(
+            "I can see body sensors, but none of them have a reading: "
+            f"{listed}{more}\nStand on the scale once and try again — most only "
+            f"publish a value after their first measurement.\n{hint}",
+            ephemeral=True,
+        )
+        return
+    if dead:
+        embed.add_field(
+            name="Nothing writing to these",
+            value=f"{listed}{more}\n{hint}",
+            inline=False,
+        )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 

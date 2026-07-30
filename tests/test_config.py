@@ -129,6 +129,7 @@ PRE_REFACTOR_DEFAULTS = {
     "HA_TOKEN": "",
     "HA_POLL_MINUTES": 10,
     "HA_BACKFILL_DAYS": 14,
+    "HA_IGNORE_ENTITIES": set(),
     "HA_VERIFY_SSL": True,
     # toggles
     "ENABLE_PRESENCE_TRACKING": False,

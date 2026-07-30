@@ -479,6 +479,12 @@ _SETTINGS: tuple[Setting, ...] = (
             "current reading only. Where the history comes from depends on the "
             "scale -- see docs/HOME_ASSISTANT.md; if it comes from Home "
             "Assistant's recorder, that keeps 10 days by default."),
+    _S("HA_IGNORE_ENTITIES", "csv", "", "homeassistant", _csv_lower,
+       apply="worker", label="Ignore entities containing",
+       help="Comma-separated text fragments. Any body sensor whose entity id "
+            "contains one is ignored completely -- not listed, not linkable, "
+            "never polled. Use it for the phantom entities a phone or fitness "
+            "bridge creates and then never writes to, e.g. _iphone."),
     _S("HA_VERIFY_SSL", "bool", "1", "homeassistant", _bool,
        apply="worker", sibling_env=True, label="Verify the TLS certificate",
        help="Turn off only for an https:// Home Assistant using a self-signed "
