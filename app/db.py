@@ -603,6 +603,8 @@ CREATE TABLE IF NOT EXISTS ha_account (
     entity_prefix  TEXT    NOT NULL,
     weight_entity  TEXT,
     friendly_name  TEXT,
+    -- Vestigial: announcements used to have a per-member opt-out here. They are
+    -- unconditional now, and nothing reads or writes this column anymore.
     alerts_enabled INTEGER NOT NULL DEFAULT 1,
     last_synced_at TEXT,
     linked_at      TEXT    NOT NULL,
@@ -619,8 +621,8 @@ CREATE TABLE IF NOT EXISTS ha_account (
 
 -- One row per imported weigh-in, keyed by the weight sensor's ``last_changed``
 -- (see app/ha_client.reading_key). This is what makes the poll idempotent: a
--- restart, a re-link or a manual /ha_sync all recompute the same key and so
--- cannot double-log a weigh-in or re-post its alert.
+-- restart or a re-link both recompute the same key and so cannot double-log a
+-- weigh-in or re-post its alert.
 CREATE TABLE IF NOT EXISTS ha_imported (
     user_id     INTEGER NOT NULL,
     reading_key TEXT    NOT NULL,
@@ -3180,22 +3182,6 @@ class Database:
                 """
             ))
 
-    def ha_synced_get(self, user_id: int) -> sqlite3.Row | None:
-        """One member's account row with their credential joined in.
-
-        The same shape :meth:`list_ha_synced` yields, so ``/ha_sync`` can hand the
-        poll's own function a row it recognises."""
-        with self._conn() as c:
-            return c.execute(
-                """
-                SELECT a.*, s.base_url, s.token_enc
-                  FROM ha_account a
-                  JOIN ha_server  s ON s.user_id = a.user_id
-                 WHERE a.user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-
     def count_ha_servers(self) -> int:
         with self._conn() as c:
             row = c.execute("SELECT COUNT(*) AS n FROM ha_server").fetchone()
@@ -3282,17 +3268,6 @@ class Database:
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM ha_account WHERE user_id = ?", (user_id,)
-            )
-            return (cur.rowcount or 0) > 0
-
-    def ha_set_alerts(self, user_id: int, enabled: bool) -> bool:
-        """Turn channel announcements on/off for one member. Returns True if a
-        linked row was updated. Syncing continues either way — this only controls
-        whether the weigh-in is posted publicly."""
-        with self._conn() as c:
-            cur = c.execute(
-                "UPDATE ha_account SET alerts_enabled = ? WHERE user_id = ?",
-                (1 if enabled else 0, user_id),
             )
             return (cur.rowcount or 0) > 0
 

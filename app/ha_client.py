@@ -760,8 +760,8 @@ def reading_key(measured_at: datetime | None) -> str:
       That is the behaviour we want — the alternative spams the channel every
       poll for an unchanged reading.
     * The key is derived from HA's own timestamp rather than "now", so a bot
-      restart, a re-link, or a manual ``/ha_sync`` all recompute the same key
-      and cannot double-post history.
+      restart or a re-link both recompute the same key and cannot double-post
+      history.
     """
     if measured_at is None:
         return ""

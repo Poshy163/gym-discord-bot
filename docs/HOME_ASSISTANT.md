@@ -92,8 +92,8 @@ already uses for the weekly "drop your current weight" nudge. Deliberately not a
 new setting: the reminder and the answer to it belong in the same place. Leave it
 blank and weigh-ins are still recorded, just not announced.
 
-Nobody is @-mentioned. Members who don't want their numbers posted run
-`/ha_alerts enabled:false`, which keeps syncing but stops the announcing.
+Nobody is @-mentioned. Announcements are always on — link only sensors you're
+fine broadcasting.
 
 ## Member usage
 
@@ -104,14 +104,12 @@ Nobody is @-mentioned. Members who don't want their numbers posted run
 - `/ha_entities` — list the body sensors the bot can see, grouped by person. It
   shows **no weights except your own**: a Home Assistant server is a household, so
   it often carries sensors for people who aren't in the Discord at all and have no
-  `/ha_alerts` opt-out to reach for. What it does show is when each one last read,
-  which is how you identify yours — you just stood on it.
+  say in whether their weight shows up here. What it does show is when each one
+  last read, which is how you identify yours — you just stood on it.
 - `/ha_link entity:joshua_s` — claim yours. A full entity id
   (`sensor.joshua_s_weight`) or a friendly name (`Joshua`) works too.
 - `/ha_body [member]` — the latest body-composition numbers on file.
-- `/ha_sync` — check for a new weigh-in right now.
 - `/ha_status` — your link, and when it was last checked.
-- `/ha_alerts enabled:<true|false>` — announce your weigh-ins, or keep them quiet.
 - `/ha_unlink` — disconnect. Your stored access token is **deleted**. Your
   recorded weight history is kept, and so is the record of which weigh-ins were
   already imported, so reconnecting later picks up where it left off instead of
@@ -123,10 +121,10 @@ behalf; everyone else can only link themselves.
 
 A set of sensors can only be claimed by **one** member. Linking a prefix somebody
 else already owns is refused — otherwise a member could claim another person's
-scale and have their weigh-ins imported and announced under the wrong name, which
-would also defeat that person's `/ha_alerts` opt-out. An admin can reassign a
-prefix (the previous owner's link is removed, since two links to one scale would
-import every weigh-in twice), which is how a genuine mix-up gets fixed.
+scale and have their weigh-ins imported and announced under the wrong name. An
+admin can reassign a prefix (the previous owner's link is removed, since two
+links to one scale would import every weigh-in twice), which is how a genuine
+mix-up gets fixed.
 
 ## How linking works
 
@@ -189,8 +187,8 @@ changed value. Two consequences, both intended:
   unchanged value is recognised as a restored state — so a routine HA update
   doesn't announce a round of duplicates.
 
-Either way the poll is idempotent: a bot restart, a re-link, or spamming
-`/ha_sync` all recompute the same keys and cannot double-log or re-announce.
+Either way the poll is idempotent: a bot restart or a re-link both recompute
+the same keys and cannot double-log or re-announce.
 
 **Switching between the two.** An integration update can start publishing a
 measurement log for a scale that previously had none, which changes the key scheme
@@ -272,4 +270,4 @@ other dashboard edit.
 | "this machine's IP is in its ip_bans.yaml" | A 403. Home Assistant's `http.ban` middleware blocked the bot. Remove the entry from `ip_bans.yaml` and restart HA — retrying won't clear it. |
 | `/ha_entities` finds nothing | Either the scale integration isn't set up, or nobody has stood on it yet — most scales create their entities only after the first reading. |
 | No weigh-in after standing on the scale | Check the sensor actually changed value in HA (Developer tools → States). An unchanged value is not a new weigh-in. |
-| Weigh-ins import but aren't announced | `BODYWEIGHT_REMINDER_CHANNEL_ID` is unset, or you ran `/ha_alerts enabled:false`. `/ha_status` says which. |
+| Weigh-ins import but aren't announced | `BODYWEIGHT_REMINDER_CHANNEL_ID` is unset. `/ha_status` says which. |

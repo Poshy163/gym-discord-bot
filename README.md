@@ -417,8 +417,7 @@ dashboard, under **Bodyweight trend**.
 The bot is **read-only**: it only ever GETs states and history, so it cannot
 change anything in anyone's home.
 
-Commands: `/setup_ha`, `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_sync`,
-`/ha_status`, `/ha_alerts` (keep your own weigh-ins out of the channel),
+Commands: `/setup_ha`, `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_status`,
 `/ha_unlink`, `/ha_help`.
 
 ## Direct messages

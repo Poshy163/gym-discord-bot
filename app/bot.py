@@ -7797,8 +7797,6 @@ def _help_sections() -> dict[str, discord.Embed]:
                 "`/ha_link` — pick which of its sensors are yours\n"
                 "`/ha_entities` — list the body sensors it can see\n"
                 "`/ha_body [member]` — latest body-composition numbers\n"
-                "`/ha_sync` — check for a new weigh-in now\n"
-                "`/ha_alerts` — announce your weigh-ins, or keep them quiet\n"
                 "`/ha_status` — check your connection\n"
                 "`/ha_unlink` — disconnect and delete your token"
             ),
@@ -12518,7 +12516,7 @@ def _ha_cfg_for(row) -> "ha_client.HAConfig | None":
 #: Where weigh-in announcements go. Reuses the channel the bot already nags
 #: people to weigh in on rather than adding a fourth feed-channel setting — the
 #: reminder and the answer to it belong in the same place. Unset means import
-#: silently. Per-member opt-out lives on ``ha_account.alerts_enabled``.
+#: silently — there is no per-member opt-out.
 def _ha_alert_channel_id() -> int | None:
     return BODYWEIGHT_REMINDER_CHANNEL_ID
 
@@ -15144,9 +15142,9 @@ def _ha_import_reading(
 
     None means "nothing to do": already imported, a restored state, out of
     range, or lost the claim race. The claim (``ha_mark_reading``) happens
-    *before* the write and before any announcement, so a manual ``/ha_sync``
-    overlapping a poll cannot double-log or double-post — whichever call loses
-    the INSERT OR IGNORE simply returns None.
+    *before* the write and before any announcement, so two overlapping sync
+    attempts for the same member cannot double-log or double-post —
+    whichever call loses the INSERT OR IGNORE simply returns None.
 
     ``key`` is the de-duplication key. It comes from the scale's own
     ``measurement_id`` when the integration publishes one and falls back to the
@@ -15186,7 +15184,7 @@ def _ha_import_reading(
         )
         return None
     if not db.ha_mark_reading(user_id, key):
-        return None  # raced with another poll or an /ha_sync
+        return None  # raced with another sync attempt
     protein_grams = None
     try:
         protein_grams = db.set_bodyweight(
@@ -15264,17 +15262,14 @@ async def _ha_fetch_history(
         return None
 
 
-async def _ha_sync_account(
-    row, states: list[dict], *, force_backfill: bool = False,
-) -> dict:
+async def _ha_sync_account(row, states: list[dict]) -> dict:
     """Import a linked member's new weigh-ins and announce the newest one.
 
     ``states`` is the shared ``/api/states`` response, fetched once per poll.
 
-    On the first sync (or a forced one) it also pulls ``HA_BACKFILL_DAYS`` of
-    history from HA's recorder and posts a **single** summary rather than one
-    alert per historical weigh-in. Returns a stats dict rather than raising, so
-    ``/ha_sync`` can report what happened.
+    On the first sync it also pulls ``HA_BACKFILL_DAYS`` of history from HA's
+    recorder and posts a **single** summary rather than one alert per
+    historical weigh-in. Returns a stats dict rather than raising.
     """
     result: dict = {
         "new": 0, "metrics": 0, "backfill": False, "latest_kg": None,
@@ -15292,15 +15287,11 @@ async def _ha_sync_account(
     never_backfilled = (
         "backfilled_at" not in row.keys() or row["backfilled_at"] is None
     )
-    backfill = (
-        (first_sync or force_backfill or never_backfilled)
-        and HA_BACKFILL_DAYS > 0
-    )
+    backfill = (first_sync or never_backfilled) and HA_BACKFILL_DAYS > 0
     result["backfill"] = backfill
-    # Whether a multi-weigh-in import is announced as "linked their scale". Not
-    # the same question as whether to *fetch* history: /ha_sync forces a fetch,
-    # and telling a member who ran it that they had just linked their scale — in
-    # public — is wrong.
+    # Whether a multi-weigh-in import is announced as "linked their scale".
+    # Kept separate from `backfill` so a HA_BACKFILL_DAYS=0 install still
+    # recognises a first sync as a link event, not a routine weigh-in.
     is_first_import = first_sync or never_backfilled
 
     # The comparison point has to be read before anything is written, and it
@@ -15458,8 +15449,6 @@ async def _ha_sync_account(
     result["latest_kg"] = newest["weight_kg"]
     result["protein_grams"] = newest["protein_grams"]
 
-    if not row["alerts_enabled"]:
-        return result
     channel = await _ha_alert_channel()
     if channel is None:
         return result
@@ -15472,9 +15461,8 @@ async def _ha_sync_account(
 
     # A first-time history import gets ONE summary; anything else gets an embed
     # per weigh-in. Gated on `is_first_import` rather than on the count or on
-    # `backfill`, because neither a member who stood on the scale twice between
-    # polls nor one who ran /ha_sync is linking their scale, and neither must be
-    # publicly told they just did.
+    # `backfill`, because a member who stood on the scale twice between polls
+    # is not linking their scale, and must not be publicly told they just did.
     try:
         if is_first_import and len(imported) > 1:
             weights = [r["weight_kg"] for r in imported]
@@ -15984,8 +15972,7 @@ async def setup_ha_cmd(
             f"bodyweight, so TDEE, protein targets and the graphs follow along"
             + (f", and post to <#{channel_id}>." if channel_id else ".")
         )
-        lines.append("`/ha_alerts` keeps them out of the channel, `/ha_body` "
-                     "shows your numbers.")
+        lines.append("`/ha_body` shows your numbers.")
     elif existing is not None:
         lines.append(
             f"You're already linked to `{existing['entity_prefix'] or '(no prefix)'}`"
@@ -16084,9 +16071,9 @@ async def ha_link_cmd(
     # Refuse a prefix somebody else already claimed. Without this the admin gate
     # above protects nothing: a member reads another person's prefix off
     # /ha_entities, links themselves to it, and that person's weigh-ins import
-    # and announce under the wrong name — defeating their /ha_alerts opt-out and
-    # corrupting both people's weight history. Admins may reassign, since that is
-    # how a genuine mix-up gets fixed.
+    # and announce under the wrong name — publicly misattributing their weigh-ins
+    # and corrupting both people's weight history. Admins may reassign, since
+    # that is how a genuine mix-up gets fixed.
     owner = db.ha_prefix_owner(found["prefix"])
     if (owner is not None and owner != target.id
             and interaction.user.id not in ADMIN_USER_IDS):
@@ -16125,7 +16112,7 @@ async def ha_link_cmd(
         f"tracking `{found['weight_entity']}`.{where}\n"
         f"Weigh-ins sync about every {HA_POLL_MINUTES} min and log as "
         f"bodyweight, so TDEE, protein targets and the graphs all follow along. "
-        f"`/ha_alerts` turns the announcement off, `/ha_unlink` stops syncing.",
+        f"`/ha_unlink` stops syncing.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -16176,7 +16163,7 @@ async def ha_entities_cmd(interaction: discord.Interaction) -> None:
     )
     # Who already owns which prefix. A Home Assistant server is a household, so it
     # routinely carries sensors for people who are not in this Discord at all and
-    # therefore have no `/ha_alerts` opt-out to reach for. So only the caller's own
+    # have no say in whether their weight shows up here. So only the caller's own
     # bucket shows a weight. Every other bucket shows *when* it last read, which
     # is what you actually identify yours by — you just stood on it.
     owners = {
@@ -16322,9 +16309,7 @@ async def ha_status_cmd(interaction: discord.Interaction) -> None:
         lines.append(f"Last checked: {_ha_when(row['last_synced_at'])}")
         lines.append(
             "Announcements: "
-            + ("**on** → <#%s>" % channel_id
-               if row["alerts_enabled"] and channel_id
-               else "**off**" if not row["alerts_enabled"]
+            + (f"**on** → <#{channel_id}>" if channel_id
                else "**on**, but no announcement channel is configured")
         )
     latest = db.get_latest_bodyweight(0, interaction.user.id)
@@ -16338,94 +16323,6 @@ async def ha_status_cmd(interaction: discord.Interaction) -> None:
             "⚠️ The integration is currently unavailable, so nothing is syncing."
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-@bot.tree.command(
-    name="ha_alerts",
-    description="Turn the channel announcement of your weigh-ins on or off.",
-)
-@app_commands.describe(enabled="On posts each weigh-in to the channel; off keeps syncing quietly.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def ha_alerts_cmd(
-    interaction: discord.Interaction, enabled: bool,
-) -> None:
-    if not db.ha_set_alerts(interaction.user.id, enabled):
-        await interaction.response.send_message(
-            "You don't have a Home Assistant link yet — see `/ha_help`.",
-            ephemeral=True,
-        )
-        return
-    await interaction.response.send_message(
-        "📣 Weigh-ins will be announced in the channel."
-        if enabled else
-        "🤫 Weigh-ins will sync quietly — they still count towards your "
-        "bodyweight history, TDEE and targets, they're just not posted.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(
-    name="ha_sync",
-    description="Check Home Assistant for a new weigh-in right now.",
-)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def ha_sync_cmd(interaction: discord.Interaction) -> None:
-    if not _ha_enabled():
-        await interaction.response.send_message(
-            "Home Assistant integration isn't available right now.",
-            ephemeral=True,
-        )
-        return
-    row = db.ha_get(interaction.user.id)
-    if row is None:
-        await interaction.response.send_message(
-            "You haven't linked Home Assistant yet — see `/ha_help`.",
-            ephemeral=True,
-        )
-        return
-    server = db.ha_server_get(interaction.user.id)
-    if server is None:
-        await interaction.response.send_message(
-            "Connect your Home Assistant first with `/setup_ha`.", ephemeral=True,
-        )
-        return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    states = await _ha_states_or_error(interaction, _ha_cfg_for(server))
-    if states is None:
-        return
-    # _ha_sync_account reads base_url/token off the row, which list_ha_synced
-    # joins in; a row straight from ha_get has neither.
-    row = db.ha_synced_get(interaction.user.id) or row
-    result = await _ha_sync_account(row, states, force_backfill=True)
-    if result["new"]:
-        extra = (
-            f" and {result['metrics']} body-composition value"
-            f"{'s' if result['metrics'] != 1 else ''}"
-            if result["metrics"] else ""
-        )
-        msg = (
-            f"✅ Imported {result['new']} weigh-in"
-            f"{'s' if result['new'] != 1 else ''}{extra}. "
-            f"Latest: **{result['latest_kg']:.2f} kg**."
-        )
-        if result["protein_grams"]:
-            msg += f"\nProtein max updated to **{result['protein_grams']} g**."
-    else:
-        mine = _ha_states_for(row, states)
-        if ha_client.build_reading(mine) is None:
-            msg = (
-                "⚠️ No current weight reading for "
-                f"`{row['entity_prefix'] or '(no prefix)'}`. Scales report "
-                "`unavailable` while asleep — stand on it and try again."
-            )
-        else:
-            msg = (
-                "Nothing new — Home Assistant's latest reading is already on "
-                "file. A repeat of the same weight isn't a new weigh-in."
-            )
-    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(
@@ -16558,9 +16455,7 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
             "`/ha_entities` — list the body sensors it can see\n"
             "`/ha_link` — pick which sensors are yours\n"
             "`/ha_body` — your latest body-composition numbers\n"
-            "`/ha_sync` — check for a new weigh-in now\n"
             "`/ha_status` — connection + link + last check\n"
-            "`/ha_alerts` — announce weigh-ins, or keep them quiet\n"
             "`/ha_unlink` — disconnect and delete your token\n"
             "`/ha_help` — this message"
         ),
@@ -16569,8 +16464,9 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Privacy",
         value=(
-            "Weigh-ins are announced in the channel by default — `/ha_alerts "
-            "enabled:false` keeps yours private while still recording them."
+            "Weigh-ins are always announced in the channel — link only sensors "
+            "you're fine broadcasting. `/ha_unlink` stops syncing (and "
+            "announcing) altogether."
         ),
         inline=False,
     )
@@ -16594,7 +16490,7 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
             inline=False,
         )
     embed.set_footer(text="Read-only · the bot never changes anything in your home")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(

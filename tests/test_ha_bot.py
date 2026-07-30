@@ -99,8 +99,8 @@ def test_import_is_idempotent_for_the_same_reading():
     uid = _user()
     _bot_db.ha_link(uid, GUILD, "j")
     assert _ha_import_reading(uid, GUILD, 106.3, _at(30)) is not None
-    # Same last_changed → same key → already imported. This is what makes an
-    # /ha_sync overlapping the poll loop safe.
+    # Same last_changed → same key → already imported. This is what makes
+    # overlapping sync attempts safe.
     assert _ha_import_reading(uid, GUILD, 106.3, _at(30)) is None
     assert len(_bot_db.bodyweight_history(GUILD, uid)) == 1
 
@@ -561,19 +561,6 @@ def test_sync_routine_double_weigh_in_posts_one_embed_each(monkeypatch):
     assert "0.30 kg" in embeds[1].description
 
 
-def test_sync_respects_the_per_member_alert_opt_out(monkeypatch):
-    uid = _user()
-    _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
-    _bot_db.ha_set_alerts(uid, False)
-    result, embeds = _sync(
-        uid, _scale_state([_entry(5, 106.7, "m1")], current="106.7"), monkeypatch)
-    # Still imported — opting out silences the announcement, it doesn't stop the
-    # weigh-in counting towards bodyweight history and targets.
-    assert result["new"] == 1
-    assert embeds == []
-    assert _bot_db.get_latest_bodyweight(GUILD, uid)["weight_kg"] == 106.7
-
-
 def test_sync_ignores_entries_older_than_the_backfill_window(monkeypatch):
     uid = _user()
     _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
@@ -668,9 +655,9 @@ def _run_entities(caller_id: int, states: list[dict], monkeypatch):
 
 def test_entities_shows_nobody_elses_weight(monkeypatch):
     """A Home Assistant server is a household, so it carries sensors for people
-    who are not in the Discord at all and therefore have no /ha_alerts opt-out to
-    reach for. Only the caller's own bucket shows a number; the rest show *when*
-    they last read, which is what you actually identify yours by.
+    who are not in the Discord at all and have no say in whether their weight
+    shows up here. Only the caller's own bucket shows a number; the rest show
+    *when* they last read, which is what you actually identify yours by.
     """
     mine_uid, other_uid = _user(), _user()
     _bot_db.ha_link(other_uid, GUILD, "housemate")
@@ -780,8 +767,8 @@ def test_entities_asks_you_to_connect_your_own_server_first(monkeypatch):
 def test_link_refuses_a_prefix_another_member_already_owns(monkeypatch):
     """Without this the admin gate protects nothing: a member reads someone
     else's prefix off /ha_entities, links themselves to it, and that person's
-    weigh-ins import and announce under the wrong name — defeating their
-    /ha_alerts opt-out and corrupting both people's weight history.
+    weigh-ins import and announce under the wrong name — publicly
+    misattributing their weigh-ins and corrupting both people's weight history.
     """
     owner, thief = _user(), _user()
     states = [_state("sensor.victim_weight", "72.0", "kg")]
@@ -974,24 +961,6 @@ def test_a_successful_empty_history_does_mark_the_backfill(monkeypatch):
                      last_changed=datetime.now(timezone.utc).isoformat())]
     _sync(uid, states, monkeypatch)
     assert _bot_db.ha_get(uid)["backfilled_at"] is not None
-
-
-def test_manual_sync_does_not_announce_a_link(monkeypatch):
-    """/ha_sync forces a history fetch. Telling a member who ran it — in public —
-    that they had just linked their scale is wrong."""
-    uid = _user()
-    _bot_db.ha_link(uid, GUILD, "manual")
-    first = [_entry(120, 100.0, "m1")]
-    _sync(uid, _scale_state(first, current="100.0", prefix="manual"), monkeypatch)
-
-    later = first + [_entry(20, 101.0, "m2"), _entry(5, 102.0, "m3")]
-    result, embeds = _sync(
-        uid, _scale_state(later, current="102.0", prefix="manual"),
-        monkeypatch, force_backfill=True)
-    assert result["new"] == 2
-    assert result["backfill"] is True     # history WAS fetched...
-    assert len(embeds) == 2               # ...but announced as weigh-ins
-    assert not any("linked their scale" in e.title for e in embeds)
 
 
 def test_unlink_then_relink_does_not_duplicate_weigh_ins(monkeypatch):

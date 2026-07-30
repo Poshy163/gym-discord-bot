@@ -818,8 +818,8 @@ def test_ha_reading_dedupe(db):
     key = "2026-07-30T03:16:06+00:00"
     assert db.ha_reading_imported(1, key) is False
     assert db.ha_mark_reading(1, key) is True
-    # The second claim loses — this is the lock that stops a poll and an
-    # /ha_sync running together from double-posting one weigh-in.
+    # The second claim loses — this is the lock that stops two overlapping
+    # syncs from double-posting one weigh-in.
     assert db.ha_mark_reading(1, key) is False
     assert db.ha_reading_imported(1, key) is True
     # Per-user isolation: two people can weigh in at the same instant.
@@ -882,15 +882,6 @@ def test_relinking_a_different_prefix_clears_the_replay_guard(db):
     assert row["last_reading_at"] is None
 
 
-def test_ha_set_alerts(db):
-    assert db.ha_set_alerts(1, False) is False  # no link yet
-    db.ha_link(1, 42, "joshua_s")
-    assert db.ha_set_alerts(1, False) is True
-    assert db.ha_get(1)["alerts_enabled"] == 0
-    assert db.ha_set_alerts(1, True) is True
-    assert db.ha_get(1)["alerts_enabled"] == 1
-
-
 def test_ha_mark_synced_and_backfilled(db):
     db.ha_link(1, 42, "joshua_s")
     db.ha_mark_synced(1)
@@ -919,7 +910,7 @@ def test_add_body_metrics_is_idempotent_per_weigh_in(db):
     when = datetime(2026, 7, 30, 3, 16, 6, tzinfo=timezone.utc)
     payload = {"body_fat_pct": (35.2, "%")}
     assert db.add_body_metrics(42, 1, payload, recorded_at=when) == 1
-    # Re-importing the same reading writes nothing, so /ha_sync is safe to spam.
+    # Re-importing the same reading writes nothing, so a repeated sync is safe.
     assert db.add_body_metrics(42, 1, payload, recorded_at=when) == 0
 
 
@@ -1264,8 +1255,6 @@ def test_list_ha_synced_needs_both_halves(db):
     assert rows[0]["user_id"] == 1
     assert rows[0]["base_url"] == "https://a.example.com"
     assert rows[0]["token_enc"] == "enc"
-    assert db.ha_synced_get(1)["base_url"] == "https://a.example.com"
-    assert db.ha_synced_get(2) is None
 
 
 def test_two_members_keep_separate_servers(db):
