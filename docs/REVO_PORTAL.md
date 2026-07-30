@@ -705,6 +705,48 @@ clubs**, and the only unmatched PerfectGym entries are the two that haven't open
   **Arbox** (`revoFitness.arbox.app.com`) — a different backend again, only
   relevant if class bookings are ever wanted.
 
+### 7.3 The app front — probed 2026-07, nothing new
+
+Revo's phone app is the client for this backend, so "does the *app* see more than
+we do?" is a fair question. It doesn't. Four angles, all negative:
+
+- **`X-NP-API-Version` is ignored.** `1.0`, `1.5`, `2.0`, `3.0`, `4.0`, `5.0`,
+  `99.0` and omitting the header entirely all return **byte-identical** bodies
+  (same sha256). There is no newer API generation to opt into, and it does not
+  enrich an authenticated payload either — `exerciser/{uuid}/membership` returns
+  the same 16 keys at every version.
+- **`devicePlatform` is ignored.** `ANDROID` / `IOS` / `WEB` are byte-identical,
+  so the iOS app (the one that shows the live counter) gets no special surface.
+- **There is no app/tenant config blob.** 34 of 38 candidates 404 —
+  `config`, `settings`, `features`, `modules`, `brand`, `tenant`, `version`,
+  and the `company/{uuid}/…` variants of each. Netpulse has no equivalent of
+  PerfectGym's decisive `cpConfig` list.
+- **`company/{clubUuid}/classes` returns `[]`** — this was flagged as "the single
+  best follow-up on this backend"; it is now tested and empty, matching the
+  PerfectGym class calendar (§9.2).
+- **No workout read surface.** The app advertises workout tracking, but all 21
+  `exerciser/{uuid}/{workouts,trainings,sessions,logs,history,…}` spellings are
+  ABSENT. Only a **top-level `workout` exists, and it is `405` (POST-only)** — the
+  app *submits* workouts, and reading them back is not provisioned for this
+  tenant. Consistent with `exerciser/{uuid}/stats` being all zeros (§7.1).
+
+**What the app's own store listing claims** is the useful corroboration, because a
+feature it advertises would need an endpoint behind it:
+
+| Advertised feature | What backs it | Already ours? |
+|---|---|---|
+| "Live Member Counter" | anonymous per-club head-count | yes — `/busy` (§8) |
+| "Manage Your Membership" | PerfectGym contracts | yes — §10, §14.1 |
+| "Track your workouts" | *self-logged* workouts, POST-only | n/a (that's Hevy's job) |
+| "Scan for Access" | the app **emits** the door QR | — see below |
+| "Connect your Devices" | Apple Health / Fitbit / Garmin / Strava | third-party |
+
+> 🔑 **The listing never offers a visit or check-in history** — and "Scan for
+> Access" explains why. The app's role in a check-in is to **emit the credential**,
+> not to record the event. The record lands on PerfectGym's *access-control /
+> operator* side, exactly where §12 places visit history. There is nothing to read
+> back because the member-facing product was never designed to show it.
+
 ## 8. Live occupancy — PerfectGym ClientPortal2 (the source that restored `/busy`)
 
 Revo runs member management / access / **occupancy** on **PerfectGym** (every
