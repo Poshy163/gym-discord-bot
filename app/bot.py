@@ -43,7 +43,7 @@ from .aliases import (
     normalize_token,
 )
 
-from .db import KEEP, Database
+from .db import KEEP, Database, _normalize_iso as db_normalize_iso
 from .graphing import daily_best_points, running_best_values, trend_values
 from .message_targeting import strip_leading_user_mention
 from .overview import lift_overview
@@ -5746,7 +5746,13 @@ async def on_raw_reaction_add(
         return
     rec = db.get_reply(payload.message_id)
     if rec is None:
-        # Not a lift reply — maybe a calorie reply.
+        # Not a lift reply — maybe a Home Assistant weigh-in, or a calorie reply.
+        # Weigh-ins go first because they are identified by a tracking row or by
+        # their own embed footer, so they can decline cleanly; the nutrition
+        # handler resolves via the reply's *referenced* message and has no such
+        # signal to bow out on.
+        if await _handle_ha_reaction_undo(payload):
+            return
         await _handle_nutrition_reaction_undo(payload)
         return
     target_user_id = int(rec["target_user_id"])
@@ -15473,12 +15479,18 @@ async def _ha_sync_account(
         if is_first_import and len(imported) > 1:
             weights = [r["weight_kg"] for r in imported]
             times = [r["measured_at"] for r in imported]
-            await channel.send(embed=_ha_backfill_embed(username, {
+            posted = await channel.send(embed=_ha_backfill_embed(username, {
                 "count": len(imported),
                 "first": min(times), "last": max(times),
                 "min_kg": min(weights), "max_kg": max(weights),
                 "latest_kg": newest["weight_kg"],
             }))
+            # The summary stands for the whole batch, so one ❌ undoes all of it —
+            # which is exactly what somebody wants after a bad first import.
+            await _ha_offer_undo(
+                posted, user_id, guild_id,
+                [r["measured_at"] for r in imported],
+            )
         else:
             # Oldest-first, each diffed against the one before it, so two
             # readings minutes apart read as a sequence rather than as two
@@ -15501,11 +15513,14 @@ async def _ha_sync_account(
                     },
                     running,
                 )
-                await channel.send(
+                posted = await channel.send(
                     embed=_ha_weighin_embed(
                         username, payload, entry["protein_grams"],
                     ),
                     allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await _ha_offer_undo(
+                    posted, user_id, guild_id, [entry["measured_at"]],
                 )
                 running = {
                     "weight_kg": entry["weight_kg"],
@@ -15514,6 +15529,155 @@ async def _ha_sync_account(
     except discord.HTTPException:  # pragma: no cover - best effort
         LOG.info("Home Assistant: failed to announce weigh-in for %s", user_id)
     return result
+
+
+async def _ha_offer_undo(
+    message: "discord.Message", user_id: int, guild_id: int,
+    measured_ats: list[datetime],
+) -> None:
+    """Record what an announcement covers and add the ❌ affordance.
+
+    Best effort on both halves: a missing reaction permission must not turn a
+    successful import into an error, and the tracking row is still worth having
+    because somebody can add the ❌ themselves."""
+    stamps = [_ha_stamp(when) for when in measured_ats if when is not None]
+    if not stamps:
+        return
+    try:
+        db.ha_track_reply(message.id, user_id, guild_id, stamps)
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Home Assistant: failed to track weigh-in reply")
+        return
+    try:
+        await message.add_reaction("❌")
+    except discord.HTTPException:  # pragma: no cover - best effort
+        LOG.info("Home Assistant: couldn't add the undo reaction")
+
+
+def _ha_stamp(when: datetime) -> str:
+    """The exact string ``set_bodyweight`` stored this weigh-in under.
+
+    Undo matches on the timestamp, so this has to agree with the database's own
+    normalisation byte for byte — hence calling it rather than formatting here."""
+    return db_normalize_iso(when)
+
+
+def _ha_undo_scope(payload, rec) -> tuple[int, list[str]] | None:
+    """Who owns the weigh-ins an ❌ is trying to undo, and which ones.
+
+    ``rec`` is the tracking row when the announcement was recorded. Returns None
+    when the reactor isn't allowed: the member themselves or an admin, matching
+    the lift-undo rule."""
+    user_id = int(rec["user_id"])
+    if payload.user_id not in ({user_id} | ADMIN_USER_IDS):
+        return None
+    stamps = [s for s in str(rec["recorded_ats"] or "").split(",") if s]
+    return (user_id, stamps) if stamps else None
+
+
+async def _ha_undo_untracked(payload, message) -> tuple[int, list[str]] | None:
+    """Work out what an *untracked* weigh-in announcement covers, from its embed.
+
+    Announcements posted before the tracking table existed carry no row, and the
+    ask was explicitly that those be undoable too. The embed has everything
+    needed: the weight in its description and the measurement time as its
+    timestamp. Looking the pair up in ``bodyweights`` also yields the user id,
+    which the embed only carries as a display name.
+
+    Returns None when this isn't one of ours, the weigh-in can't be found, or the
+    reactor isn't the member or an admin.
+    """
+    if not message.embeds:
+        return None
+    embed = message.embeds[0]
+    footer = (getattr(embed.footer, "text", "") or "")
+    if not footer.startswith("Home Assistant"):
+        return None
+    if embed.timestamp is None:
+        # The batch summary has no timestamp, so there is nothing to match on.
+        return None
+    match = re.search(r"\*\*([\d.]+)\s*kg\*\*", embed.description or "")
+    if match is None:
+        return None
+    try:
+        weight = float(match.group(1))
+    except ValueError:
+        return None
+    # Try the reactor's own weigh-ins first. Two members weighing the same at the
+    # same instant is unlikely but possible, and resolving to the wrong person's
+    # row is the one outcome worth engineering against. Only an admin acting on
+    # somebody else's announcement falls through to the unrestricted search.
+    row = db.find_bodyweight_near(weight, embed.timestamp,
+                                  user_id=payload.user_id)
+    if row is None and payload.user_id in ADMIN_USER_IDS:
+        row = db.find_bodyweight_near(weight, embed.timestamp)
+    if row is None:
+        return None
+    user_id = int(row["user_id"])
+    if payload.user_id not in ({user_id} | ADMIN_USER_IDS):
+        return None
+    return user_id, [str(row["recorded_at"])]
+
+
+async def _handle_ha_reaction_undo(payload) -> bool:
+    """❌ on a weigh-in announcement removes that import. True if handled.
+
+    Deliberately last in the reaction chain, after lifts and nutrition: those
+    identify their messages by a tracking row, and this one falls back to reading
+    the embed, so it must not get first refusal on somebody else's message.
+    """
+    rec = db.ha_get_reply(payload.message_id)
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except discord.HTTPException:
+            return False
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return False
+    if message.author.id != (bot.user.id if bot.user else 0):
+        return False
+
+    if rec is not None:
+        scope = _ha_undo_scope(payload, rec)
+        if scope is None:
+            return False
+        # Claim it before deleting anything, so two simultaneous reactions can't
+        # both run the delete.
+        if db.ha_delete_reply(payload.message_id) == 0:
+            return False
+        guild_id = int(rec["guild_id"])
+    else:
+        scope = await _ha_undo_untracked(payload, message)
+        if scope is None:
+            return False
+        guild_id = _msg_guild_id(message)
+    user_id, stamps = scope
+
+    actor_name = None
+    reactor = None
+    if message.guild is not None:
+        reactor = message.guild.get_member(payload.user_id)
+    if reactor is not None:
+        actor_name = _display_name(reactor)
+    removed = db.delete_weighins_at(
+        user_id, stamps, guild_id=guild_id,
+        actor_id=payload.user_id, actor_name=actor_name,
+    )
+    by_admin = payload.user_id in ADMIN_USER_IDS and payload.user_id != user_id
+    who = "an admin" if by_admin else "the member"
+    note = (
+        f"↩️ Removed {_plural(removed, 'weigh-in')} at {who}'s request. "
+        f"It won't be re-imported."
+        if removed else "↩️ Nothing to undo (already removed)."
+    )
+    try:
+        await message.edit(content=note, embed=None)
+    except discord.HTTPException:  # pragma: no cover - best effort
+        LOG.info("Home Assistant: couldn't edit the undone announcement")
+    return True
 
 
 async def _ha_fetch_states_for(row) -> list[dict] | None:
@@ -16386,6 +16550,16 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "Weigh-ins are announced in the channel by default — `/ha_alerts "
             "enabled:false` keeps yours private while still recording them."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Got a bad reading?",
+        value=(
+            "React ❌ on the announcement and that weigh-in is removed, along "
+            "with the body-composition numbers measured with it. It won't be "
+            "re-imported. Works on old announcements too, and on a first-link "
+            "summary it undoes the whole batch."
         ),
         inline=False,
     )

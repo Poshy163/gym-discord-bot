@@ -10,6 +10,7 @@ an action isn't wired up.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -1116,6 +1117,134 @@ def test_nutrition_targets_requires_auth(tmp_path):
                 "guild": "1", "user": "5", "calorie_weekday": 1500,
             })
             assert r.status in (401, 403)
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+# ---------------------------------------------------------------------------
+# Deleting a bogus weigh-in from the dashboard
+# ---------------------------------------------------------------------------
+# A smart scale can log a reading nobody wants kept -- a half-finished
+# measurement, or one it assigned to the wrong profile. A stray weight is not
+# cosmetic: it moves TDEE, the bodyweight-linked protein target and every
+# true-load line on the leaderboard.
+
+def test_bodyweight_delete_removes_the_row_and_its_metrics(tmp_path):
+    async def go():
+        db = Database(tmp_path / "bw.sqlite3")
+        when = datetime(2026, 7, 30, 4, 45, 19, tzinfo=timezone.utc)
+        db.set_bodyweight(7, 99, 107.3, recorded_at=when)
+        db.add_body_metrics(7, 99, {"body_fat_pct": (22.2, "%")},
+                            recorded_at=when)
+        row_id = db.bodyweight_history(7, 99)[0]["id"]
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/bodyweight/delete",
+                                  json={"guild": 7, "id": row_id})
+            assert r.status == 200
+            assert (await r.json())["ok"] is True
+            assert db.bodyweight_history(7, 99) == []
+            # The body composition measured with it goes too.
+            assert db.latest_body_metrics(99) == {}
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_bodyweight_delete_requires_auth(tmp_path):
+    async def go():
+        db = Database(tmp_path / "bw2.sqlite3")
+        db.set_bodyweight(7, 99, 107.3)
+        row_id = db.bodyweight_history(7, 99)[0]["id"]
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            r = await client.post("/api/bodyweight/delete",
+                                  json={"guild": 7, "id": row_id})
+            assert r.status in (401, 403)
+            # And nothing was removed.
+            assert len(db.bodyweight_history(7, 99)) == 1
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_bodyweight_delete_reports_a_missing_row(tmp_path):
+    async def go():
+        db = Database(tmp_path / "bw3.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/bodyweight/delete",
+                                  json={"guild": 7, "id": 999999})
+            assert r.status == 200
+            assert (await r.json())["ok"] is False
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_bodyweight_delete_rejects_a_payload_with_no_id(tmp_path):
+    async def go():
+        db = Database(tmp_path / "bw4.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.post("/api/bodyweight/delete", json={"guild": 7})
+            assert r.status == 400
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_payload_carries_bodyweight_ids(tmp_path):
+    """The dashboard cannot offer a delete without the row id."""
+    async def go():
+        db = Database(tmp_path / "bw5.sqlite3")
+        db.set_bodyweight(7, 99, 106.3)
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/member?guild=7&user=99")
+            assert r.status == 200
+            body = await r.json()
+            assert body["bodyweights"]
+            assert body["bodyweights"][0]["id"]
+            assert body["bodyweights"][0]["weight_kg"] == 106.3
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_payload_reports_a_home_assistant_link_without_the_token(tmp_path):
+    async def go():
+        db = Database(tmp_path / "bw6.sqlite3")
+        db.ha_server_set(99, "https://home.example.com", "super-secret-cipher")
+        db.ha_link(99, 7, "joshua_s")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/member?guild=7&user=99")
+            body = await r.json()
+            assert body["ha_server"] == "https://home.example.com"
+            assert body["ha_prefix"] == "joshua_s"
+            # The stored credential must never reach the dashboard, encrypted or
+            # otherwise.
+            assert "super-secret-cipher" not in str(body)
+            assert "token" not in " ".join(body)
         finally:
             await client.close()
             db.close()

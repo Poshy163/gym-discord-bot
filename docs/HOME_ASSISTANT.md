@@ -199,6 +199,30 @@ again. So on the measurement-id path the bot skips anything at or before the new
 weigh-in it has already recorded. The trade-off is that a measurement back-dated
 into the log after the fact isn't picked up.
 
+## Undoing a weigh-in
+
+A scale logs things you don't want kept: a test step-on, a half-finished
+measurement, or one it assigned to the wrong person's profile. A stray weight is
+not cosmetic — it moves TDEE, the bodyweight-linked protein target and every
+true-load line on the leaderboard — so there are two ways to remove one.
+
+**React ❌ on the announcement.** The member it belongs to, or an admin, can react
+with ❌ and that weigh-in is removed along with the body-composition numbers
+measured with it. The message is rewritten to say what happened. This works on
+announcements posted *before* this feature existed too: the bot identifies the
+weigh-in from the weight and timestamp in the embed. On a first-link summary
+("Imported 4 past weigh-ins") the ❌ undoes **the whole batch**, which is the case
+you want after a bad import.
+
+An undone weigh-in does **not** come back. The record of having seen it is kept
+deliberately, so the next poll doesn't re-import what you just removed.
+
+**Or delete individual readings in the dashboard.** Open the member → **Bodyweight
+trend** → *Recent weigh-ins*, and each row has a delete link. That's the route for
+picking one bogus point out of an otherwise-good import — a `107.30 kg` that was
+really somebody else standing on the scale, say. Deletions are audited like every
+other dashboard edit.
+
 ## Behaviour notes
 - **A sleeping scale is not a weigh-in.** Scales report `unavailable` most of the
   time and `unknown` before their first reading; neither is ever imported.

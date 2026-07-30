@@ -749,7 +749,10 @@ def build_app(
         cal_today, _ = db.calorie_total_between(gid, uid, start, end)
         pro_today, _ = db.protein_total_between(gid, uid, start, end)
         bw = [
-            {"weight_kg": r["weight_kg"], "at": r["recorded_at"]}
+            # ``id`` is what makes a single bogus reading deletable -- a scale can
+            # log a mis-assigned or half-finished measurement, and without the row
+            # id the only recourse was editing the database by hand.
+            {"id": r["id"], "weight_kg": r["weight_kg"], "at": r["recorded_at"]}
             for r in db.bodyweight_history(gid, uid, limit=400)
         ]
         return web.json_response({
@@ -1312,6 +1315,18 @@ def build_app(
         ok = db.web_delete_protein(gid, int(body["id"]), _actor(request))
         return web.json_response({"ok": ok})
 
+    async def api_bodyweight_delete(request: web.Request) -> web.Response:
+        """Remove one weigh-in, and the body metrics measured with it.
+
+        Needed because a smart scale can log a reading nobody wants kept: a
+        half-finished measurement, or one it assigned to the wrong profile. A
+        stray weight is not cosmetic -- it moves TDEE, the bodyweight-linked
+        protein target and every true-load line on the leaderboard."""
+        _require(request)
+        gid, body = await _edit_ctx(request)
+        ok = db.web_delete_bodyweight(gid, int(body["id"]), _actor(request))
+        return web.json_response({"ok": ok})
+
     async def api_food_set(request: web.Request) -> web.Response:
         _require(request)
         try:
@@ -1753,6 +1768,7 @@ def build_app(
         web.post("/api/lifts/edit", api_lift_edit),
         web.post("/api/calories/delete", api_calorie_delete),
         web.post("/api/protein/delete", api_protein_delete),
+        web.post("/api/bodyweight/delete", api_bodyweight_delete),
         web.post("/api/foods/set", api_food_set),
         web.post("/api/foods/delete", api_food_delete),
         web.post("/api/foods/alias/set", api_food_alias_set),
@@ -2032,6 +2048,11 @@ select:hover,.btn:hover{border-color:#3a4350;background:var(--panel2)}
 .btn.primary:hover{filter:brightness(1.08)}
 .btn.danger{color:#ff9a96;border-color:#5c2b2b}
 .btn.danger:hover{background:#3a1d1d}
+.link.danger{color:#ff9a96}
+td.right{text-align:right}
+.bwlist{margin-top:10px}
+.bwlist summary{cursor:pointer;font-size:13px}
+.bwlist table{margin-top:6px;font-size:13px}
 form.inline{margin:0}
 
 /* nav */
@@ -2475,6 +2496,28 @@ function sparkline(pts){
     <linearGradient id="fade" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>
     <path class="area" d="${area}"/><path class="line" d="${line}"/></svg>
     <div class="pgrow faint"><span>${mn.toFixed(1)} kg</span><span>latest ${ys[ys.length-1].toFixed(1)} kg</span><span>${mx.toFixed(1)} kg</span></div>`;
+}
+
+// Newest-first, because a reading you want gone is almost always a recent one —
+// a scale that mis-assigned a measurement or logged a half-finished one. A stray
+// weight is not cosmetic: it moves TDEE, the bodyweight-linked protein target and
+// every true-load line on the leaderboard, so it needs to be removable here
+// rather than by hand-editing the database.
+function bwList(pts,uid){
+  if(!pts||!pts.length)return '';
+  const rows=pts.slice().reverse().slice(0,12);
+  return `<details class="bwlist"><summary class="link">Recent weigh-ins (${pts.length})</summary>
+    <table><tbody>${rows.map(p=>`<tr>
+      <td><b>${Number(p.weight_kg).toFixed(2)}</b> kg</td>
+      <td class="muted">${esc(String(p.at||"").replace("T"," ").slice(0,16))}</td>
+      <td class="right">${p.id?`<a class="link danger" onclick="delBodyweight('${uid}',${p.id},'${Number(p.weight_kg).toFixed(2)}')">delete</a>`:''}</td>
+    </tr>`).join("")}</tbody></table></details>`;
+}
+
+async function delBodyweight(uid,id,kg){
+  if(!confirm(`Delete the ${kg} kg weigh-in?\n\nIt won't be re-imported, and any body-composition numbers measured with it go too.`))return;
+  const r=await post("/api/bodyweight/delete",{guild,user:uid,id});
+  if(r&&r.ok){toast("Weigh-in deleted");member(uid);}else{toast("Could not delete it");}
 }
 
 function toast(m){const t=document.getElementById("toast");t.textContent=m;
@@ -2926,7 +2969,8 @@ async function memberView(uid){
         ${bar("Calories",n.calorie_today,n.calorie_goal," kcal",false)}
         ${bar("Protein",n.protein_today,n.protein_goal," g",true)}
         ${targetsTable(n.targets,uid)}</div>
-      <div class="box"><h3>Bodyweight trend</h3>${sparkline(bw)}</div>
+      <div class="box"><h3>Bodyweight trend</h3>${sparkline(bw)}
+        ${bwList(bw,uid)}</div>
     </div>
     <div class="grid2">
       <div class="box"><h3 style="display:flex;justify-content:space-between">Saved foods

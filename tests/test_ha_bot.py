@@ -1309,3 +1309,205 @@ def test_the_richer_half_tops_up_metrics_on_a_later_poll(monkeypatch):
     assert r2["new"] == 0, "must not log the same weigh-in twice"
     assert e2 == [], "and must not announce it twice"
     assert _bot_db.latest_body_metrics(uid)["body_fat_pct"]["value"] == 18.5
+
+
+# ---------------------------------------------------------------------------
+# Undoing an imported weigh-in with the ❌ reaction
+# ---------------------------------------------------------------------------
+
+class _Payload:
+    """Stands in for discord.RawReactionActionEvent."""
+
+    def __init__(self, message_id: int, user_id: int, channel_id: int = 5150):
+        self.message_id = message_id
+        self.user_id = user_id
+        self.channel_id = channel_id
+        self.emoji = "❌"
+
+
+def _posted_message(message_id: int, *, embeds=None, guild=None):
+    """A message the bot posted, as the reaction handler will re-fetch it."""
+    msg = AsyncMock()
+    msg.id = message_id
+    msg.author.id = 4242            # matches the stub bot user below
+    msg.embeds = embeds or []
+    msg.guild = guild
+    return msg
+
+
+def _reaction_bot(message):
+    """A bot stub whose channel returns `message` from fetch_message."""
+    channel = AsyncMock()
+    channel.fetch_message = AsyncMock(return_value=message)
+
+    class _Bot:
+        loop = _StubLoop()
+        user = type("U", (), {"id": 4242})()
+        # _msg_guild_id falls back to the single shared guild for a DM-less
+        # message, so this has to exist even when it is empty.
+        guilds: list = []
+
+        def get_channel(self, _cid):
+            return channel
+
+        def get_guild(self, _gid):
+            return None
+
+    return _Bot()
+
+
+def _react(monkeypatch, message, payload, *, admins=frozenset()):
+    monkeypatch.setattr(bot_mod, "bot", _reaction_bot(message))
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", set(admins))
+    return asyncio.run(bot_mod._handle_ha_reaction_undo(payload))
+
+
+def test_undo_removes_the_weigh_in_and_its_metrics(monkeypatch):
+    uid = _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 106.3, when,
+                       {"body_fat_pct": {"value": 21.8, "unit": "%"}})
+    stamp = bot_mod._ha_stamp(when)
+    _bot_db.ha_track_reply(9001, uid, GUILD, [stamp])
+
+    msg = _posted_message(9001)
+    assert _react(monkeypatch, msg, _Payload(9001, uid)) is True
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+    # The body composition measured with it goes too, or /ha_body reports numbers
+    # for a weigh-in that no longer exists.
+    assert _bot_db.latest_body_metrics(uid) == {}
+    # The message is rewritten rather than left showing a weigh-in that is gone.
+    assert "Removed 1 weigh-in" in msg.edit.call_args.kwargs["content"]
+
+
+def test_undo_does_not_let_it_come_back(monkeypatch):
+    """Somebody who undoes an import is saying they don't want it, so the ledger
+    entry stays and the next poll must not re-import it."""
+    uid = _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 106.3, when, key="id:m1")
+    _bot_db.ha_track_reply(9002, uid, GUILD, [bot_mod._ha_stamp(when)])
+    _react(monkeypatch, _posted_message(9002), _Payload(9002, uid))
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+    assert _ha_import_reading(uid, GUILD, 106.3, when, key="id:m1") is None
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+
+
+def test_only_the_member_or_an_admin_can_undo(monkeypatch):
+    uid, stranger, admin = _user(), _user(), _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 106.3, when)
+    _bot_db.ha_track_reply(9003, uid, GUILD, [bot_mod._ha_stamp(when)])
+
+    # A bystander is ignored silently, and the weigh-in survives.
+    assert _react(monkeypatch, _posted_message(9003),
+                  _Payload(9003, stranger)) is False
+    assert len(_bot_db.bodyweight_history(GUILD, uid)) == 1
+    # An admin may.
+    assert _react(monkeypatch, _posted_message(9003), _Payload(9003, admin),
+                  admins={admin}) is True
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+
+
+def test_a_second_reaction_does_not_double_delete(monkeypatch):
+    """Two reactions landing together must not both run the delete -- the
+    tracking row is claimed by deleting it, exactly as the lift path does."""
+    uid = _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 106.3, when)
+    _bot_db.ha_track_reply(9004, uid, GUILD, [bot_mod._ha_stamp(when)])
+    assert _react(monkeypatch, _posted_message(9004), _Payload(9004, uid)) is True
+    assert _react(monkeypatch, _posted_message(9004), _Payload(9004, uid)) is False
+
+
+def test_undo_on_a_backfill_summary_removes_the_whole_batch(monkeypatch):
+    """One ❌ on the summary undoes the import it stands for, which is the case
+    somebody wants after a bad first import."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "j")
+    stamps = []
+    for day, kg in ((20, 108.0), (24, 107.2), (30, 106.3)):
+        when = _at(day)
+        _ha_import_reading(uid, GUILD, kg, when, key=f"id:{day}")
+        stamps.append(bot_mod._ha_stamp(when))
+    _bot_db.ha_track_reply(9005, uid, GUILD, stamps)
+    msg = _posted_message(9005)
+    assert _react(monkeypatch, msg, _Payload(9005, uid)) is True
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+    assert "Removed 3 weigh-ins" in msg.edit.call_args.kwargs["content"]
+
+
+def test_undo_declines_a_message_that_is_not_ours(monkeypatch):
+    """It runs before the nutrition handler, so it must bow out cleanly rather
+    than swallowing somebody else's reply."""
+    uid = _user()
+    msg = _posted_message(9006, embeds=[])
+    assert _react(monkeypatch, msg, _Payload(9006, uid)) is False
+    msg.edit.assert_not_called()
+
+
+def _ha_embed(weight: float, when: datetime, entity="sensor.x_weight"):
+    """An announcement embed as _ha_weighin_embed builds it."""
+    reading = {
+        "weight_kg": weight, "measured_at": when, "entity_id": entity,
+        "delta_kg": None, "days_since": None, "metrics": {},
+    }
+    return _ha_weighin_embed("Someone", reading, None)
+
+
+def test_undo_works_retroactively_from_the_embed(monkeypatch):
+    """Announcements posted before the tracking table existed carry no row. The
+    embed still has the weight and the measurement time, and looking that pair up
+    yields the user id too -- which the embed only has as a display name."""
+    uid = _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 106.3, when,
+                       {"bmi": {"value": 28.0, "unit": ""}})
+    assert _bot_db.ha_get_reply(9007) is None      # no tracking row at all
+
+    msg = _posted_message(9007, embeds=[_ha_embed(106.3, when)])
+    assert _react(monkeypatch, msg, _Payload(9007, uid)) is True
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+    assert _bot_db.latest_body_metrics(uid) == {}
+
+
+def test_retroactive_undo_still_checks_who_reacted(monkeypatch):
+    uid, stranger = _user(), _user()
+    when = _at(29)
+    _bot_db.ha_link(uid, GUILD, "j")
+    _ha_import_reading(uid, GUILD, 101.5, when)
+    msg = _posted_message(9008, embeds=[_ha_embed(101.5, when)])
+    assert _react(monkeypatch, msg, _Payload(9008, stranger)) is False
+    assert len(_bot_db.bodyweight_history(GUILD, uid)) == 1
+
+
+def test_retroactive_undo_ignores_a_foreign_embed(monkeypatch):
+    """Only embeds this feature posted are candidates -- the footer says so."""
+    uid = _user()
+    embed = _ha_embed(106.3, _at(30))
+    embed.set_footer(text="Strava · something else")
+    msg = _posted_message(9009, embeds=[embed])
+    assert _react(monkeypatch, msg, _Payload(9009, uid)) is False
+
+
+def test_retroactive_undo_when_no_matching_weigh_in_exists(monkeypatch):
+    uid = _user()
+    msg = _posted_message(9010, embeds=[_ha_embed(55.5, _at(15))])
+    assert _react(monkeypatch, msg, _Payload(9010, uid)) is False
+    msg.edit.assert_not_called()
+
+
+def test_undo_reports_nothing_to_do_when_already_gone(monkeypatch):
+    uid = _user()
+    when = _at(30)
+    _bot_db.ha_link(uid, GUILD, "j")
+    # Tracked, but the row was already removed some other way.
+    _bot_db.ha_track_reply(9011, uid, GUILD, [bot_mod._ha_stamp(when)])
+    msg = _posted_message(9011)
+    assert _react(monkeypatch, msg, _Payload(9011, uid)) is True
+    assert "Nothing to undo" in msg.edit.call_args.kwargs["content"]

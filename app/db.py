@@ -7,7 +7,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -650,6 +650,20 @@ CREATE TABLE IF NOT EXISTS body_metrics (
 CREATE INDEX IF NOT EXISTS idx_body_metrics_user
     ON body_metrics (user_id, metric, recorded_at);
 
+-- Weigh-in announcements the bot posted, so an ❌ on one undoes exactly that
+-- import. Mirrors ``reply_tracking`` for chat-logged lifts, including the
+-- claim-by-delete race guard. ``recorded_ats`` is a comma-separated list of the
+-- weigh-in timestamps the message covers -- usually one, but a first-link
+-- backfill summary stands for the whole batch, and a bad import is exactly the
+-- case somebody wants to undo in one go.
+CREATE TABLE IF NOT EXISTS ha_reply_tracking (
+    reply_message_id INTEGER PRIMARY KEY,
+    user_id          INTEGER NOT NULL,
+    guild_id         INTEGER NOT NULL,
+    recorded_ats     TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL
+);
+
 -- ---------------------------------------------------------------------------
 -- Web dashboard support: a mirror of the guild's member/role state plus a
 -- unified audit log. These are populated by the bot (members intent required)
@@ -829,6 +843,22 @@ def _normalize_iso(dt: datetime | None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Inverse of :func:`_normalize_iso`, tolerating a naive or 'Z'-suffixed value.
+
+    Returns None rather than raising, because the callers are matching stored
+    timestamps against ones that arrived from Discord or Home Assistant and a
+    malformed one should narrow the search, not break it.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 @dataclass
@@ -3380,6 +3410,162 @@ class Database:
                 written += cur.rowcount or 0
         return written
 
+    # ------------------------------------------------------------------
+    # Undoing an imported weigh-in
+    # ------------------------------------------------------------------
+
+    def ha_track_reply(
+        self, reply_message_id: int, user_id: int, guild_id: int,
+        recorded_ats: "Iterable[str]",
+    ) -> None:
+        """Remember which weigh-ins an announcement stands for."""
+        stamps = ",".join(str(s) for s in recorded_ats if s)
+        if not stamps:
+            return
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO ha_reply_tracking "
+                "(reply_message_id, user_id, guild_id, recorded_ats, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (reply_message_id, user_id, guild_id, stamps,
+                 _normalize_iso(None)),
+            )
+
+    def ha_get_reply(self, reply_message_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM ha_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            ).fetchone()
+
+    def ha_delete_reply(self, reply_message_id: int) -> int:
+        """Claim an announcement for undo. Returns rows deleted.
+
+        The caller uses the rowcount as a lock, exactly as the lift path does: if
+        two reactions land together only one gets 1 and goes on to delete the
+        weigh-in, and the other no-ops instead of double-deleting."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM ha_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            )
+            return cur.rowcount or 0
+
+    def find_bodyweight_near(
+        self, weight_kg: float, recorded_at: datetime | str,
+        *, window_seconds: int = 5, user_id: int | None = None,
+    ) -> sqlite3.Row | None:
+        """Find a weigh-in by value and approximate time, for an untracked message.
+
+        Announcements posted before ``ha_reply_tracking`` existed carry no row, so
+        an ❌ on one has to identify the weigh-in from what the embed shows: the
+        weight and the timestamp. Home Assistant timestamps are microsecond, so
+        matching to a few seconds is effectively unique — and it yields the
+        ``user_id`` too, which the embed only has as a display name.
+
+        ``user_id`` narrows the search to one member. Callers should pass the
+        person reacting, because two members weighing the same at the same instant
+        is unlikely but not impossible, and silently resolving to the wrong
+        person's row is the one outcome worth engineering against here.
+        """
+        when = recorded_at if isinstance(recorded_at, datetime) else (
+            _parse_iso(recorded_at)
+        )
+        if when is None:
+            return None
+        low = _normalize_iso(when - timedelta(seconds=window_seconds))
+        high = _normalize_iso(when + timedelta(seconds=window_seconds))
+        sql = (
+            "SELECT * FROM bodyweights "
+            "WHERE recorded_at BETWEEN ? AND ? "
+            "  AND ABS(weight_kg - ?) < 0.005 "
+        )
+        params: list = [low, high, float(weight_kg)]
+        if user_id is not None:
+            sql += "  AND user_id = ? "
+            params.append(int(user_id))
+        sql += "ORDER BY recorded_at ASC, id ASC LIMIT 1"
+        with self._conn() as c:
+            return c.execute(sql, params).fetchone()
+
+    def delete_weighins_at(
+        self, user_id: int, recorded_ats: "Iterable[str]",
+        guild_id: int = 0, actor_id: int | None = None,
+        actor_name: str | None = None,
+    ) -> int:
+        """Delete weigh-ins by exact timestamp, with their body metrics.
+
+        Returns the number of ``bodyweights`` rows removed. The body-composition
+        rows for the same instant go too — they describe the same weigh-in, and
+        leaving them would have ``/ha_body`` reporting numbers for a weigh-in that
+        no longer exists.
+
+        The ``ha_imported`` ledger entry is deliberately **kept**: somebody who
+        undoes an import is saying they don't want it, and releasing the key would
+        have the next poll import it straight back.
+        """
+        stamps = [str(s) for s in recorded_ats if s]
+        if not stamps:
+            return 0
+        placeholders = ",".join("?" * len(stamps))
+        removed = 0
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT id, weight_kg, recorded_at FROM bodyweights "
+                f"WHERE user_id = ? AND recorded_at IN ({placeholders})",
+                (user_id, *stamps),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids = [int(r["id"]) for r in rows]
+            id_places = ",".join("?" * len(ids))
+            cur = c.execute(
+                f"DELETE FROM bodyweights WHERE id IN ({id_places})", ids,
+            )
+            removed = cur.rowcount or 0
+            c.execute(
+                f"DELETE FROM body_metrics WHERE user_id = ? "
+                f"AND recorded_at IN ({placeholders})",
+                (user_id, *stamps),
+            )
+            detail = ", ".join(f"{float(r['weight_kg']):g} kg" for r in rows[:4])
+            if len(rows) > 4:
+                detail += f" and {len(rows) - 4} more"
+            self._audit_data(
+                c, guild_id, "bodyweight_delete", subject_id=user_id,
+                actor_id=actor_id if actor_id is not None else user_id,
+                actor_name=actor_name,
+                detail=f"removed {detail}",
+            )
+        return removed
+
+    def web_delete_bodyweight(
+        self, guild_id: int, row_id: int, actor_name: str,
+    ) -> bool:
+        """Delete one weigh-in from the dashboard, with its body metrics.
+
+        Bodyweight is global per user, so a row shown in any guild's dashboard is
+        deletable by its id; ``guild_id`` only labels the audit entry."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, weight_kg, recorded_at FROM bodyweights "
+                "WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            c.execute("DELETE FROM bodyweights WHERE id = ?", (row_id,))
+            c.execute(
+                "DELETE FROM body_metrics WHERE user_id = ? AND recorded_at = ?",
+                (row["user_id"], row["recorded_at"]),
+            )
+            self._audit(
+                c, guild_id, "data", "bodyweight_delete",
+                actor_name=actor_name, subject_id=row["user_id"],
+                detail=f"{float(row['weight_kg']):g} kg (web)",
+            )
+            return True
+
     def latest_body_metrics(self, user_id: int) -> dict[str, sqlite3.Row]:
         """Newest row per metric for this user, as ``{metric: row}``.
 
@@ -3697,7 +3883,7 @@ class Database:
         """
         with self._conn() as c:
             rows = c.execute(
-                "SELECT weight_kg, recorded_at FROM ("
+                "SELECT id, weight_kg, recorded_at FROM ("
                 "  SELECT weight_kg, recorded_at, id FROM bodyweights "
                 "   WHERE user_id = ? "
                 "   ORDER BY recorded_at DESC, id DESC LIMIT ?"

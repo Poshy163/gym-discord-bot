@@ -409,6 +409,11 @@ to use, since Docker can't resolve `homeassistant.local` — is in
 [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md). Set `HA_DISABLED=1` to turn it
 off.
 
+Bad reading? React ❌ on the announcement — the member it belongs to, or an
+admin, removes that weigh-in and the body composition measured with it, and it is
+not re-imported. Individual points can also be deleted from a member's page in the
+dashboard, under **Bodyweight trend**.
+
 The bot is **read-only**: it only ever GETs states and history, so it cannot
 change anything in anyone's home.
 
