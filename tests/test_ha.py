@@ -891,13 +891,21 @@ def test_ha_mark_synced_and_backfilled(db):
     assert row["backfilled_at"] is not None
 
 
+def _add_metrics_for_weighin(db, when, metrics, *, user_id=1, guild_id=42):
+    """Store the parent weigh-in before its composition, like the HA importer."""
+    db.set_bodyweight(guild_id, user_id, 100.0, recorded_at=when)
+    return db.add_body_metrics(
+        guild_id, user_id, metrics, recorded_at=when,
+    )
+
+
 def test_add_body_metrics_and_latest(db):
     when = datetime(2026, 7, 30, 3, 16, 6, tzinfo=timezone.utc)
-    written = db.add_body_metrics(42, 1, {
+    written = _add_metrics_for_weighin(db, when, {
         "body_fat_pct": (35.2, "%"),
         "muscle_mass_kg": (65.48, "kg"),
         "bmi": (36.8, ""),
-    }, recorded_at=when)
+    })
     assert written == 3
     latest = db.latest_body_metrics(1)
     assert set(latest) == {"body_fat_pct", "muscle_mass_kg", "bmi"}
@@ -909,15 +917,25 @@ def test_add_body_metrics_and_latest(db):
 def test_add_body_metrics_is_idempotent_per_weigh_in(db):
     when = datetime(2026, 7, 30, 3, 16, 6, tzinfo=timezone.utc)
     payload = {"body_fat_pct": (35.2, "%")}
-    assert db.add_body_metrics(42, 1, payload, recorded_at=when) == 1
+    assert _add_metrics_for_weighin(db, when, payload) == 1
     # Re-importing the same reading writes nothing, so a repeated sync is safe.
     assert db.add_body_metrics(42, 1, payload, recorded_at=when) == 0
+
+
+def test_add_body_metrics_requires_its_parent_weigh_in(db):
+    """A deleted HA weigh-in must not have its composition resurrected later."""
+    when = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    assert db.add_body_metrics(
+        42, 1, {"body_fat_pct": (35.2, "%")}, recorded_at=when,
+    ) == 0
+    assert db.latest_body_metrics(1) == {}
 
 
 def test_add_body_metrics_refuses_weight(db):
     """Weight belongs in `bodyweights` via set_bodyweight, which is where the
     protein link and the TDEE model hang off it."""
     when = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    db.set_bodyweight(42, 1, 106.3, recorded_at=when)
     assert db.add_body_metrics(
         42, 1, {"weight": (106.3, "kg")}, recorded_at=when) == 0
     assert db.latest_body_metrics(1) == {}
@@ -925,10 +943,20 @@ def test_add_body_metrics_refuses_weight(db):
 
 def test_add_body_metrics_skips_unparseable_values(db):
     when = datetime(2026, 7, 30, tzinfo=timezone.utc)
-    written = db.add_body_metrics(42, 1, {
+    written = _add_metrics_for_weighin(db, when, {
         "bmi": ("oops", ""),
         "body_fat_pct": (35.2, "%"),
-    }, recorded_at=when)
+    })
+    assert written == 1
+    assert set(db.latest_body_metrics(1)) == {"body_fat_pct"}
+
+
+def test_add_body_metrics_skips_non_finite_values(db):
+    when = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    written = _add_metrics_for_weighin(db, when, {
+        "bmi": (float("nan"), ""),
+        "body_fat_pct": (35.2, "%"),
+    })
     assert written == 1
     assert set(db.latest_body_metrics(1)) == {"body_fat_pct"}
 
@@ -936,10 +964,13 @@ def test_add_body_metrics_skips_unparseable_values(db):
 def test_latest_body_metrics_picks_the_newest_per_metric(db):
     older = datetime(2026, 7, 20, tzinfo=timezone.utc)
     newer = datetime(2026, 7, 30, tzinfo=timezone.utc)
-    db.add_body_metrics(42, 1, {"body_fat_pct": (37.0, "%"),
-                                "bmi": (38.0, "")}, recorded_at=older)
+    _add_metrics_for_weighin(
+        db, older, {"body_fat_pct": (37.0, "%"), "bmi": (38.0, "")},
+    )
     # Only body fat is re-measured; BMI must still resolve to the older row.
-    db.add_body_metrics(42, 1, {"body_fat_pct": (35.2, "%")}, recorded_at=newer)
+    _add_metrics_for_weighin(
+        db, newer, {"body_fat_pct": (35.2, "%")},
+    )
     latest = db.latest_body_metrics(1)
     assert latest["body_fat_pct"]["value"] == 35.2
     assert latest["bmi"]["value"] == 38.0
@@ -947,9 +978,10 @@ def test_latest_body_metrics_picks_the_newest_per_metric(db):
 
 def test_body_metric_history_is_oldest_first(db):
     for day, value in ((20, 37.0), (25, 36.0), (30, 35.2)):
-        db.add_body_metrics(
-            42, 1, {"body_fat_pct": (value, "%")},
-            recorded_at=datetime(2026, 7, day, tzinfo=timezone.utc),
+        _add_metrics_for_weighin(
+            db,
+            datetime(2026, 7, day, tzinfo=timezone.utc),
+            {"body_fat_pct": (value, "%")},
         )
     rows = db.body_metric_history(1, "body_fat_pct")
     assert [r["value"] for r in rows] == [37.0, 36.0, 35.2]
@@ -958,8 +990,110 @@ def test_body_metric_history_is_oldest_first(db):
 
 def test_body_metrics_are_per_user(db):
     when = datetime(2026, 7, 30, tzinfo=timezone.utc)
-    db.add_body_metrics(42, 1, {"bmi": (36.8, "")}, recorded_at=when)
+    _add_metrics_for_weighin(db, when, {"bmi": (36.8, "")})
     assert db.latest_body_metrics(2) == {}
+
+
+def test_body_metric_history_limit_keeps_the_newest_rows(db):
+    """Smart-scale history caps must trim the old end, not the current one."""
+    for day in range(1, 11):
+        _add_metrics_for_weighin(
+            db,
+            datetime(2026, 7, day, tzinfo=timezone.utc),
+            {"body_fat_pct": (30.0 + day, "%")},
+        )
+    rows = db.body_metric_history(1, "body_fat_pct", limit=3)
+    assert [r["value"] for r in rows] == [38.0, 39.0, 40.0]
+
+
+def test_body_metric_histories_batches_metrics_with_independent_caps(db):
+    for day in range(1, 5):
+        _add_metrics_for_weighin(
+            db,
+            datetime(2026, 7, day, tzinfo=timezone.utc),
+            {
+                "body_fat_pct": (30.0 + day, "%"),
+                "bmi": (20.0 + day, ""),
+            },
+        )
+    histories = db.body_metric_histories(
+        1, ("body_fat_pct", "bmi"), limit_per_metric=2,
+    )
+    assert [r["value"] for r in histories["body_fat_pct"]] == [33.0, 34.0]
+    assert [r["value"] for r in histories["bmi"]] == [23.0, 24.0]
+
+
+def test_body_metric_summaries_use_the_exact_requested_window(db):
+    for day, value in ((1, 31.0), (2, 30.0), (3, 29.0), (5, 1.0)):
+        _add_metrics_for_weighin(
+            db,
+            datetime(2026, 7, day, tzinfo=timezone.utc),
+            {"body_fat_pct": (value, "%")},
+        )
+    rows = db.body_metric_summaries_between(
+        1,
+        ("body_fat_pct",),
+        "2026-07-02T00:00:00+00:00",
+        "2026-07-03T23:59:59+00:00",
+    )
+    assert len(rows) == 1
+    assert rows[0]["first_value"] == 30.0
+    assert rows[0]["latest_value"] == 29.0
+    assert rows[0]["samples"] == 2
+
+
+def test_latest_body_metric_snapshot_does_not_mix_weigh_ins(db):
+    older = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    newer = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    _add_metrics_for_weighin(
+        db, older, {"body_fat_pct": (37.0, "%"), "bmi": (38.0, "")},
+    )
+    _add_metrics_for_weighin(
+        db, newer, {"body_fat_pct": (35.2, "%")},
+    )
+    snapshot = db.latest_body_metric_snapshot(1)
+    assert snapshot is not None
+    assert snapshot["recorded_at"].startswith("2026-07-30")
+    assert set(snapshot["metrics"]) == {"body_fat_pct"}
+    assert snapshot["weight_kg"] == 100.0
+
+
+def test_web_delete_keeps_metrics_until_last_duplicate_parent_is_gone(db):
+    when = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    _add_metrics_for_weighin(
+        db, when, {"body_fat_pct": (35.2, "%")},
+    )
+    # The old schema permits two bodyweight rows for one measurement instant.
+    db.set_bodyweight(42, 1, 100.0, recorded_at=when)
+    ids = [r["id"] for r in db.bodyweight_history(42, 1)]
+    assert len(ids) == 2
+
+    assert db.web_delete_bodyweight(42, ids[0], "operator") is True
+    assert db.latest_body_metrics(1)
+    assert db.web_delete_bodyweight(42, ids[1], "operator") is True
+    assert db.latest_body_metrics(1) == {}
+
+
+def test_migration_removes_legacy_orphan_body_metrics(tmp_path):
+    path = tmp_path / "ha-orphans.sqlite3"
+    first = Database(path)
+    when = "2026-07-30T00:00:00+00:00"
+    # Reproduce a row written by the pre-fix metrics-only path after its parent
+    # weigh-in had been deleted. The public writer now rejects this state.
+    with first._conn() as c:
+        c.execute(
+            "INSERT INTO body_metrics "
+            "(user_id, guild_id, metric, value, unit, source, recorded_at) "
+            "VALUES (1, 42, 'body_fat_pct', 35.2, '%', "
+            "'home_assistant', ?)",
+            (when,),
+        )
+    first.close()
+
+    migrated = Database(path)
+    with migrated._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM body_metrics").fetchone()[0] == 0
+    migrated.close()
 
 
 def test_bodyweight_history_limit_keeps_the_newest_rows(db):

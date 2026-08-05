@@ -23,6 +23,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 from app.bot import (  # noqa: E402
     _backdate_label,
     _build_progress_payload,
+    _coach_body_composition_block,
     _day_window_for,
     _e1rm_progression,
     _get_main_activity,
@@ -274,17 +275,59 @@ def test_build_progress_payload_is_json_serializable():
     _bot_db.calorie_goal_set(99, 7, "Sam", 2400)
     _bot_db.calorie_add(99, 7, "Sam", 600)
     _bot_db.protein_goal_set(99, 7, "Sam", 190)
-    _bot_db.set_bodyweight(99, 7, 84.0)
+    measured = datetime.now(timezone.utc) - timedelta(days=1)
+    _bot_db.set_bodyweight(99, 7, 84.0, recorded_at=measured)
+    _bot_db.add_body_metrics(
+        99, 7, {"body_fat_pct": (21.8, "%")}, recorded_at=measured,
+    )
     _bot_db.goal_set(99, 7, "bench", 120, False)
 
-    payload = _build_progress_payload(99, 7, "Sam", 30)
+    payload = _build_progress_payload(
+        99, 7, "Sam", 30, include_body_composition=True,
+    )
     # Must serialize cleanly for the Gemini prompt.
     blob = json.dumps(payload, default=str)
     assert "lifting" in payload and "nutrition" in payload
     assert payload["nutrition"]["calorie_goal_kcal"] == 2400
     assert payload["bodyweight"]["latest_kg"] == 84.0
+    composition = payload["bodyweight"]["smart_scale_composition"]
+    assert composition["metrics"][0]["metric"] == "body_fat_pct"
+    assert "hydration" in composition["source_note"]
+    public_payload = _build_progress_payload(99, 7, "Sam", 30)
+    assert public_payload["bodyweight"]["smart_scale_composition"] is None
     assert any(g["equipment"] == "bench" for g in payload["lifting"]["goals"])
     assert len(blob) > 0
+
+
+def test_coach_composition_covers_full_window_and_excludes_future():
+    user_id = 990_007
+    guild_id = 990_099
+    now = datetime.now(timezone.utc)
+    readings = [(now - timedelta(days=300), 30.0)]
+    readings.extend(
+        (now - timedelta(days=day), 20.0 + day / 100)
+        for day in range(181, 0, -1)
+    )
+    # This value would become the apparent latest if the upper window bound
+    # were missing.
+    readings.append((now + timedelta(days=1), 99.0))
+    for measured, value in readings:
+        _bot_db.set_bodyweight(
+            guild_id, user_id, 80.0, recorded_at=measured,
+        )
+        _bot_db.add_body_metrics(
+            guild_id,
+            user_id,
+            {"body_fat_pct": (value, "%")},
+            recorded_at=measured,
+        )
+
+    block = _coach_body_composition_block(user_id, 365)
+    assert block is not None
+    metric = block["metrics"][0]
+    assert metric["measurements"] == 182
+    assert metric["change_in_window"] == pytest.approx(-9.99, abs=0.1)
+    assert metric["latest"] != 99.0
 
 
 def _rep_row(equipment, weight_kg, reps, at):

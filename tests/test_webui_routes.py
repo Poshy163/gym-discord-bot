@@ -10,7 +10,7 @@ an action isn't wired up.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -1365,6 +1365,76 @@ def test_member_payload_reports_a_home_assistant_link_without_the_token(tmp_path
             # otherwise.
             assert "super-secret-cipher" not in str(body)
             assert "token" not in " ".join(body)
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_payload_carries_bounded_registry_body_metric_histories(tmp_path):
+    async def go():
+        db = Database(tmp_path / "body-metrics.sqlite3")
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for index in range(95):
+            when = start + timedelta(days=index)
+            # Composition rows belong to the weigh-in at the same timestamp.
+            db.set_bodyweight(7, 99, 80 + index / 100, recorded_at=when)
+            db.add_body_metrics(
+                7, 99, {"body_fat_pct": (20 + index / 10, "%")},
+                recorded_at=when,
+            )
+        db.add_body_metrics(
+            7, 99,
+            {"bmi": (25.4, ""), "future_scale_metric": (123.0, "widgets")},
+            recorded_at=start + timedelta(days=94),
+        )
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/member?guild=7&user=99")
+            assert r.status == 200
+            body = await r.json()
+
+            metrics = {m["key"]: m for m in body["body_metrics"]}
+            # The public payload is driven by ha_client.METRICS, not arbitrary
+            # strings that happen to exist in the database.
+            assert set(metrics) == {"body_fat_pct", "bmi"}
+            fat = metrics["body_fat_pct"]
+            assert fat["label"] == "Body fat"
+            assert fat["unit"] == "%"
+            assert fat["precision"] == 1
+            assert len(fat["points"]) == 90
+            # The cap keeps the newest window, while preserving plot order.
+            assert fat["points"][0]["value"] == 20.5
+            assert fat["points"][-1]["value"] == 29.4
+            assert fat["points"][-1]["unit"] == "%"
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_member_page_renders_neutral_body_metric_trends_and_refreshes_delete(tmp_path):
+    async def go():
+        db = Database(tmp_path / "body-metric-view.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/")
+            body = await r.text()
+            assert "bodyMetricCards(bodyMetrics)" in body
+            assert "vs previous" in body
+            assert "Date.parse(p.at)" in body
+            assert "newest.unit||m.unit" in body
+            assert "can shift with hydration, meals, exercise, and time of day" in body
+            delete_fn = body[
+                body.index("async function delBodyweight"):
+                body.index("function toast", body.index("async function delBodyweight"))
+            ]
+            assert "memberView(uid)" in delete_fn
+            assert "member(uid)" not in delete_fn
         finally:
             await client.close()
             db.close()

@@ -56,7 +56,7 @@ from yarl import URL  # already a hard dependency of aiohttp
 
 from aiohttp import web
 
-from . import game_icons, presence, targets
+from . import game_icons, ha_client, presence, targets
 from .voicetime import summarize_voice
 
 LOG = logging.getLogger("gymbot.webui")
@@ -68,6 +68,11 @@ SESSION_TTL_SECONDS = 7 * 24 * 3600  # a week
 # (app.bot._MAX_TARGET_KCAL / _MAX_PROTEIN_TARGET_G).
 _MAX_TARGET_KCAL = 20_000
 _MAX_TARGET_PROTEIN_G = 500
+
+# A member can accumulate years of daily scale readings. The dashboard only
+# needs a recent trend window, and bounding each registry metric here prevents
+# one member response from growing with the age of the database.
+_MEMBER_BODY_METRIC_HISTORY_LIMIT = 90
 
 # A callable the bot can inject so the dashboard can resync members/roles on
 # demand (the "Refresh" button). Optional — None disables the button.
@@ -756,6 +761,39 @@ def build_app(
             {"id": r["id"], "weight_kg": r["weight_kg"], "at": r["recorded_at"]}
             for r in db.bodyweight_history(gid, uid, limit=400)
         ]
+        metric_specs = tuple(
+            metric for metric in ha_client.METRICS
+            if metric.key != ha_client.WEIGHT_KEY
+        )
+        metric_histories = db.body_metric_histories(
+            uid,
+            (metric.key for metric in metric_specs),
+            limit_per_metric=_MEMBER_BODY_METRIC_HISTORY_LIMIT,
+        )
+        body_metrics = []
+        for metric in metric_specs:
+            # Weight already has its richer, deletable timeline above. Keeping it
+            # out of this collection also avoids presenting the same reading twice.
+            rows = metric_histories.get(metric.key, [])
+            if not rows:
+                continue
+            body_metrics.append({
+                "key": metric.key,
+                "label": metric.label,
+                "unit": metric.unit,
+                "emoji": metric.emoji,
+                "precision": metric.precision,
+                "points": [
+                    {
+                        "value": r["value"],
+                        # Stored units describe the normalized value. Fall back
+                        # to the registry for old rows that predate unit storage.
+                        "unit": r["unit"] or metric.unit,
+                        "at": r["recorded_at"],
+                    }
+                    for r in rows
+                ],
+            })
         return web.json_response({
             "member": _member_dict(member) if member else {"user_id": str(uid)},
             "roles": [_role_dict(r) for r in roles],
@@ -806,6 +844,7 @@ def build_app(
                 for r in db.goal_list(gid, uid)
             ],
             "bodyweights": bw,
+            "body_metrics": body_metrics,
         })
 
     async def api_roles(request: web.Request) -> web.Response:
@@ -2318,6 +2357,24 @@ border-bottom:1px solid #1e242e;font-size:.9rem}
 .spark{width:100%;height:64px;display:block}
 .spark path.line{fill:none;stroke:url(#grad);stroke-width:2}
 .spark path.area{fill:url(#fade);opacity:.25}
+.bodycomp{margin-bottom:1.4rem}
+.bm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem}
+.bm-card{min-width:0;background:#0d111780;border:1px solid var(--line);
+border-radius:11px;padding:.75rem .8rem}
+.bm-head{display:flex;align-items:center;gap:.4rem;color:var(--muted);
+font-size:.76rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bm-value{margin-top:.35rem;font-size:1.35rem;font-weight:700;
+font-variant-numeric:tabular-nums}
+.bm-unit{font-size:.78rem;color:var(--muted);font-weight:500}
+.bm-meta{display:flex;justify-content:space-between;align-items:center;gap:.4rem;
+min-height:1.2rem;margin-top:.1rem;color:var(--muted);font-size:.75rem}
+.bm-delta{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.bm-spark{display:block;width:100%;height:38px;margin-top:.35rem}
+.bm-spark .bm-line{fill:none;stroke:var(--muted);stroke-width:1.7;
+vector-effect:non-scaling-stroke;stroke-linecap:round;stroke-linejoin:round}
+.bm-one{height:38px;display:flex;align-items:center;color:var(--muted);
+font-size:.75rem}
+.bm-caveat{margin:.8rem 0 0;color:var(--muted);font-size:.76rem;line-height:1.45}
 
 /* medals on leaderboard */
 .rank{display:inline-flex;width:24px;justify-content:center;font-weight:700}
@@ -2621,6 +2678,59 @@ function sparkline(pts){
     <div class="pgrow faint"><span>${mn.toFixed(1)} kg</span><span>latest ${ys[ys.length-1].toFixed(1)} kg</span><span>${mx.toFixed(1)} kg</span></div>`;
 }
 
+function bodyMetricSparkline(points,label){
+  const samples=(points||[]).map(p=>({
+    value:Number(p.value),at:Date.parse(p.at)
+  })).filter(p=>Number.isFinite(p.value));
+  if(samples.length<2)return '<div class="bm-one">One reading on file</div>';
+  const ys=samples.map(p=>p.value),times=samples.map(p=>p.at);
+  const W=240,H=38,pad=3,mn=Math.min(...ys),mx=Math.max(...ys),rng=(mx-mn)||1;
+  const timed=times.every(Number.isFinite)&&Math.max(...times)>Math.min(...times);
+  const firstTime=timed?Math.min(...times):0,timeRange=timed?Math.max(...times)-firstTime:1;
+  // Time-proportional spacing keeps a cluster of same-morning readings close
+  // together instead of giving it the same visual weight as a multi-day gap.
+  const x=(p,i)=>timed
+    ?pad+(p.at-firstTime)*(W-2*pad)/timeRange
+    :pad+i*(W-2*pad)/(samples.length-1);
+  const y=v=>H-pad-((v-mn)/rng)*(H-2*pad);
+  const coords=samples.map((p,i)=>`${x(p,i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" ");
+  return `<svg class="bm-spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+    role="img" aria-label="${esc(label)} trend"><polyline class="bm-line" points="${coords}"/></svg>`;
+}
+
+function bodyMetricCards(metrics){
+  if(!metrics||!metrics.length)return "";
+  const cards=metrics.map(m=>{
+    const raw=(m.points||[]).filter(p=>Number.isFinite(Number(p.value)));
+    if(!raw.length)return "";
+    const newest=raw[raw.length-1],unit=newest.unit||m.unit||"";
+    // A historical unit change must not produce a meaningless cross-unit delta
+    // or line. Values are normally normalized at import; this is a legacy guard.
+    const points=raw.filter(p=>(p.unit||m.unit||"")===unit);
+    const last=points[points.length-1],prev=points.length>1?points[points.length-2]:null;
+    const precision=Math.max(0,Math.min(3,Number(m.precision)||0));
+    const value=Number(last.value);
+    let delta="";
+    if(prev){
+      const rounded=Number((value-Number(prev.value)).toFixed(precision));
+      const sign=rounded>0?"+":rounded<0?"-":"";
+      delta=`<span class="bm-delta">&Delta; ${sign}${Math.abs(rounded).toFixed(precision)}${unit?` ${esc(unit)}`:""} vs previous</span>`;
+    }
+    return `<article class="bm-card">
+      <div class="bm-head"><span aria-hidden="true">${esc(m.emoji||"")}</span>
+        <span title="${esc(m.label)}">${esc(m.label)}</span></div>
+      <div class="bm-value">${value.toFixed(precision)}${unit?` <span class="bm-unit">${esc(unit)}</span>`:""}</div>
+      <div class="bm-meta"><span>${esc(fmtTs(last.at))}</span>${delta}</div>
+      ${bodyMetricSparkline(points,m.label||m.key||"Body composition")}</article>`;
+  }).filter(Boolean);
+  if(!cards.length)return "";
+  return `<div class="box bodycomp"><h3>Body composition</h3>
+    <div class="bm-grid">${cards.join("")}</div>
+    <p class="bm-caveat">Consumer smart-scale body-composition values are estimates
+      and can shift with hydration, meals, exercise, and time of day. Compare
+      longer-term trends under consistent conditions; these are not medical measurements.</p></div>`;
+}
+
 // Newest-first, because a reading you want gone is almost always a recent one —
 // a scale that mis-assigned a measurement or logged a half-finished one. A stray
 // weight is not cosmetic: it moves TDEE, the bodyweight-linked protein target and
@@ -2640,7 +2750,7 @@ function bwList(pts,uid){
 async function delBodyweight(uid,id,kg){
   if(!confirm(`Delete the ${kg} kg weigh-in?\n\nIt won't be re-imported, and any body-composition numbers measured with it go too.`))return;
   const r=await post("/api/bodyweight/delete",{guild,user:uid,id});
-  if(r&&r.ok){toast("Weigh-in deleted");member(uid);}else{toast("Could not delete it");}
+  if(r&&r.ok){toast("Weigh-in deleted");memberView(uid);}else{toast("Could not delete it");}
 }
 
 function toast(m){const t=document.getElementById("toast");t.textContent=m;
@@ -3077,7 +3187,8 @@ async function memberView(uid){
   const v=document.getElementById("view");v.innerHTML=spinner();
   const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
-  const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[];
+  const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[],
+    bodyMetrics=d.body_metrics||[];
   currentFoods=foods;currentNutrition=n;
   v.innerHTML=`<div class="crumb" onclick="go('members')">← Members</div>
     <div class="hero">${avatar(uid,m.display_name,m.avatar,72)}
@@ -3101,6 +3212,7 @@ async function memberView(uid){
       <div class="box"><h3>Bodyweight trend</h3>${sparkline(bw)}
         ${bwList(bw,uid)}</div>
     </div>
+    ${bodyMetricCards(bodyMetrics)}
     <div class="grid2">
       <div class="box"><h3 style="display:flex;justify-content:space-between">Saved foods
         <a class="link" onclick="foodDialog('${uid}')">+ add</a></h3>

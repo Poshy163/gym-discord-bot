@@ -44,6 +44,19 @@ def _user() -> int:
     return next(_next_user)
 
 
+@pytest.fixture(autouse=True)
+def _skip_automatic_bodyweight_chart_render(monkeypatch):
+    """HA sync tests exercise import/announcement semantics, not Matplotlib.
+
+    Dedicated coverage in test_bodyweight_updates.py opts into a fake chart;
+    keeping this best-effort renderer off here makes results independent of
+    whether the test host happens to have the optional chart backend installed.
+    """
+    monkeypatch.setattr(
+        bot_mod, "_updated_bodyweight_chart", AsyncMock(return_value=None),
+    )
+
+
 def _state(entity_id: str, state: str, unit: str = "",
            last_changed: str = "2026-07-30T03:16:06+00:00") -> dict:
     attrs: dict[str, object] = {}
@@ -1348,6 +1361,54 @@ def test_undo_removes_the_weigh_in_and_its_metrics(monkeypatch):
     assert _bot_db.latest_body_metrics(uid) == {}
     # The message is rewritten rather than left showing a weigh-in that is gone.
     assert "Removed 1 weigh-in" in msg.edit.call_args.kwargs["content"]
+    assert msg.edit.call_args.kwargs["attachments"] == []
+
+
+def test_undoing_earlier_batch_message_removes_newest_messages_graph(monkeypatch):
+    uid = _user()
+    older, newer = _at(29), _at(30)
+    _bot_db.ha_link(uid, GUILD, "batch_graph")
+    _ha_import_reading(uid, GUILD, 107.0, older, key="id:batch-older")
+    _ha_import_reading(uid, GUILD, 106.3, newer, key="id:batch-newer")
+    _bot_db.ha_track_reply(
+        9012,
+        uid,
+        GUILD,
+        [bot_mod._ha_stamp(older)],
+        chart_message_id=9013,
+    )
+    _bot_db.ha_track_reply(
+        9013,
+        uid,
+        GUILD,
+        [bot_mod._ha_stamp(newer)],
+        chart_message_id=9013,
+    )
+    older_message = _posted_message(9012)
+    chart_holder = _posted_message(9013)
+    messages = {9012: older_message, 9013: chart_holder}
+    channel = AsyncMock()
+    channel.fetch_message = AsyncMock(side_effect=lambda message_id: messages[message_id])
+
+    class _Bot:
+        user = type("U", (), {"id": 4242})()
+        guilds: list = []
+
+        def get_channel(self, _channel_id):
+            return channel
+
+    monkeypatch.setattr(bot_mod, "bot", _Bot())
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", set())
+
+    handled = asyncio.run(
+        bot_mod._handle_ha_reaction_undo(_Payload(9012, uid)),
+    )
+
+    assert handled is True
+    assert [float(row["weight_kg"]) for row in
+            _bot_db.bodyweight_history(GUILD, uid)] == [106.3]
+    assert older_message.edit.call_args.kwargs["attachments"] == []
+    chart_holder.edit.assert_awaited_once_with(attachments=[])
 
 
 def test_undo_does_not_let_it_come_back(monkeypatch):
@@ -1362,6 +1423,28 @@ def test_undo_does_not_let_it_come_back(monkeypatch):
     assert _bot_db.bodyweight_history(GUILD, uid) == []
     assert _ha_import_reading(uid, GUILD, 106.3, when, key="id:m1") is None
     assert _bot_db.bodyweight_history(GUILD, uid) == []
+
+
+def test_undo_does_not_let_metrics_only_poll_resurrect_composition(monkeypatch):
+    """The import ledger suppresses the weight after undo; its metrics must stay
+    suppressed too when an attribute-history poll revisits the old reading."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "j")
+    when = _at(30)
+    metrics = {"body_fat_pct": {"value": 21.8, "unit": "%"}}
+    _ha_import_reading(
+        uid, GUILD, 106.3, when, metrics, key="id:deleted-reading",
+    )
+    assert _bot_db.latest_body_metrics(uid)
+    _bot_db.delete_weighins_at(uid, [bot_mod._ha_stamp(when)], guild_id=GUILD)
+    assert _bot_db.latest_body_metrics(uid) == {}
+
+    # Same claimed key takes the metrics-only top-up branch.
+    assert _ha_import_reading(
+        uid, GUILD, 106.3, when, metrics, key="id:deleted-reading",
+    ) is None
+    assert _bot_db.bodyweight_history(GUILD, uid) == []
+    assert _bot_db.latest_body_metrics(uid) == {}
 
 
 def test_only_the_member_or_an_admin_can_undo(monkeypatch):
@@ -1408,6 +1491,7 @@ def test_undo_on_a_backfill_summary_removes_the_whole_batch(monkeypatch):
     assert _react(monkeypatch, msg, _Payload(9005, uid)) is True
     assert _bot_db.bodyweight_history(GUILD, uid) == []
     assert "Removed 3 weigh-ins" in msg.edit.call_args.kwargs["content"]
+    assert msg.edit.call_args.kwargs["attachments"] == []
 
 
 def test_undo_declines_a_message_that_is_not_ours(monkeypatch):
@@ -1512,9 +1596,9 @@ def test_ha_body_puts_the_time_in_the_embed_timestamp(monkeypatch):
     there would show UTC to everybody. The embed's own timestamp is localised."""
     uid = _user()
     when = datetime(2026, 7, 30, 4, 47, 39, tzinfo=timezone.utc)
+    _bot_db.set_bodyweight(GUILD, uid, 106.3, recorded_at=when)
     _bot_db.add_body_metrics(GUILD, uid, {"body_fat_pct": (21.8, "%")},
                              recorded_at=when)
-    _bot_db.set_bodyweight(GUILD, uid, 106.3, recorded_at=when)
 
     monkeypatch.setattr(bot_mod, "bot", _StubBot())
     interaction = AsyncMock()
@@ -1523,11 +1607,164 @@ def test_ha_body_puts_the_time_in_the_embed_timestamp(monkeypatch):
     monkeypatch.setattr(bot_mod, "_deny_invisible_target",
                         AsyncMock(return_value=False))
     asyncio.run(bot_mod.ha_body_cmd.callback(interaction))
-    embed = interaction.response.send_message.call_args.kwargs["embed"]
+    interaction.response.defer.assert_awaited_once_with(
+        thinking=True, ephemeral=True,
+    )
+    embed = interaction.followup.send.call_args.kwargs["embed"]
     assert embed.timestamp == when
     # ...and the footer carries no raw timestamp of its own.
     assert "2026-07-30" not in (embed.footer.text or "")
     assert "04:47" not in (embed.footer.text or "")
+
+
+def test_ha_body_uses_one_coherent_scale_snapshot(monkeypatch):
+    """A newer hand-entered weight and an older BMI must not be mixed into the
+    newest scale reading as though all three were measured together."""
+    uid = _user()
+    older = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    scale = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    manual = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    _bot_db.set_bodyweight(GUILD, uid, 108.0, recorded_at=older)
+    _bot_db.add_body_metrics(
+        GUILD, uid, {"bmi": (32.0, "")}, recorded_at=older,
+    )
+    _bot_db.set_bodyweight(GUILD, uid, 106.3, recorded_at=scale)
+    _bot_db.add_body_metrics(
+        GUILD, uid, {"body_fat_pct": (21.8, "%")}, recorded_at=scale,
+    )
+    _bot_db.set_bodyweight(GUILD, uid, 105.0, recorded_at=manual)
+
+    monkeypatch.setattr(bot_mod, "bot", _StubBot())
+    monkeypatch.setattr(
+        bot_mod, "_deny_invisible_target", AsyncMock(return_value=False),
+    )
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    interaction.user.display_name = "Poshy"
+    asyncio.run(bot_mod.ha_body_cmd.callback(interaction))
+    interaction.response.defer.assert_awaited_once_with(
+        thinking=True, ephemeral=True,
+    )
+    embed = interaction.followup.send.call_args.kwargs["embed"]
+    assert "106.30 kg" in embed.description
+    assert "105.00 kg" not in embed.description
+    body = embed.fields[0].value
+    assert "Body fat" in body
+    assert "BMI" not in body
+    assert embed.timestamp == scale
+
+
+def test_ha_graph_plots_a_neutral_private_trend(monkeypatch):
+    uid = _user()
+    for day, value in ((20, 22.0), (30, 21.5)):
+        when = datetime(2026, 7, day, tzinfo=timezone.utc)
+        _bot_db.set_bodyweight(GUILD, uid, 100.0, recorded_at=when)
+        _bot_db.add_body_metrics(
+            GUILD, uid, {"body_fat_pct": (value, "%")}, recorded_at=when,
+        )
+    monkeypatch.setattr(
+        bot_mod, "_deny_invisible_target", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        bot_mod, "_render_trend_chart",
+        lambda *_args, **_kwargs: bot_mod.io.BytesIO(b"not-a-real-png"),
+    )
+    class _PlotModule:
+        @staticmethod
+        def use(_backend):
+            return None
+
+    monkeypatch.setattr(
+        bot_mod.importlib, "import_module", lambda _name: _PlotModule(),
+    )
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    interaction.user.display_name = "Poshy"
+
+    asyncio.run(bot_mod.ha_graph_cmd.callback(
+        interaction, "body_fat_pct",
+    ))
+    sent = interaction.followup.send.call_args.kwargs
+    assert sent["ephemeral"] is True
+    assert "Body fat trend" in sent["embed"].title
+    assert "estimate" in sent["embed"].footer.text
+    # Direction is reported, but never scored as good/bad.
+    assert "▼" in sent["embed"].description
+
+
+def test_ha_graph_defers_before_history_lookup(monkeypatch):
+    uid = _user()
+    monkeypatch.setattr(
+        bot_mod, "_deny_invisible_target", AsyncMock(return_value=False),
+    )
+    interaction = AsyncMock()
+    interaction.user.id = uid
+    interaction.user.display_name = "No Scale Data"
+
+    asyncio.run(bot_mod.ha_graph_cmd.callback(
+        interaction, "body_fat_pct",
+    ))
+
+    interaction.response.defer.assert_awaited_once_with(
+        thinking=True, ephemeral=True,
+    )
+    sent = interaction.followup.send.call_args
+    assert "No body fat history" in sent.args[0]
+    assert sent.kwargs["ephemeral"] is True
+
+
+def test_coach_only_uses_composition_for_self_and_keeps_it_private(monkeypatch):
+    class _Person:
+        def __init__(self, user_id, name):
+            self.id = user_id
+            self.display_name = name
+            self.name = name
+
+    requester = _Person(_user(), "Requester")
+    other = _Person(_user(), "Other")
+    measured = datetime.now(timezone.utc) - timedelta(days=1)
+    for person in (requester, other):
+        _bot_db.set_bodyweight(
+            GUILD, person.id, 80.0, recorded_at=measured,
+        )
+        _bot_db.add_body_metrics(
+            GUILD,
+            person.id,
+            {"body_fat_pct": (21.8, "%")},
+            recorded_at=measured,
+        )
+
+    prompts = []
+
+    def _generate(prompt, **_kwargs):
+        prompts.append(prompt)
+        return "A short report."
+
+    monkeypatch.setattr(
+        bot_mod, "_deny_invisible_target", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(bot_mod.gemini_client, "available", lambda: True)
+    monkeypatch.setattr(bot_mod.gemini_client, "generate", _generate)
+
+    own_interaction = AsyncMock()
+    own_interaction.user = requester
+    own_interaction.guild_id = GUILD
+    asyncio.run(bot_mod.coach_cmd.callback(own_interaction))
+    own_interaction.response.defer.assert_awaited_once_with(
+        thinking=True, ephemeral=True,
+    )
+    assert '"smart_scale_composition": {' in prompts[-1]
+    assert own_interaction.followup.send.call_args.kwargs["ephemeral"] is True
+
+    other_interaction = AsyncMock()
+    other_interaction.user = requester
+    other_interaction.guild_id = GUILD
+    asyncio.run(bot_mod.coach_cmd.callback(other_interaction, other))
+    other_interaction.response.defer.assert_awaited_once_with(
+        thinking=True, ephemeral=False,
+    )
+    assert '"smart_scale_composition": null' in prompts[-1]
+    assert other_interaction.followup.send.call_args.kwargs["ephemeral"] is False
 
 
 def test_ha_status_does_not_print_a_raw_utc_string(monkeypatch):

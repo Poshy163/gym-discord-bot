@@ -6,7 +6,8 @@ reads members' smart-scale weigh-ins straight out of it. A new reading is
 protein targets, `/bodyweight_goal`, `/bodyweight_graph` and the leaderboard's
 true-load lines exactly as a typed `bw 106.3` would — and **announced in the
 channel**. Everything else the scale measures (body fat %, muscle mass, BMI, BMR,
-water %, bone mass, …) is kept alongside it and shown by `/ha_body`.
+water %, bone mass, …) is kept alongside it. `/ha_body` shows the newest
+coherent measurement and `/ha_graph` plots each metric over time.
 
 ```
 member stands on the scale
@@ -19,7 +20,7 @@ member stands on the scale
         │
         ├─▶ db.set_bodyweight()   — dedup on the scale's measurement id
         ├─▶ body_metrics          — the other nine numbers
-        └─▶ embed to the bodyweight-reminder channel
+        └─▶ embed + refreshed graph to the bodyweight-reminder channel
 ```
 
 Every member connects **their own** Home Assistant, the same way Hevy and Strava
@@ -95,6 +96,14 @@ blank and weigh-ins are still recorded, just not announced.
 Nobody is @-mentioned. Announcements are always on — link only sensors you're
 fine broadcasting.
 
+Each announcement batch includes the member's refreshed global bodyweight timeline—the
+same history used by `/bodyweight_graph`, including manual and HA readings across
+shared servers and DMs. A poll that imports several routine readings attaches one
+cumulative graph to its newest announcement; a first-link backfill attaches one
+graph to the batch summary. This is a public snapshot in the configured channel.
+If the bot lacks permission to attach files, it retries the announcement without
+the graph.
+
 ## Member usage
 
 - `/setup_ha url:<address> token:<token>` — connect your Home Assistant. Best run
@@ -109,6 +118,9 @@ fine broadcasting.
 - `/ha_link entity:joshua_s` — claim yours. A full entity id
   (`sensor.joshua_s_weight`) or a friendly name (`Joshua`) works too.
 - `/ha_body [member]` — the latest body-composition numbers on file.
+- `/ha_graph metric:<measurement> [member]` — a private PNG trend chart for one
+  scale metric (body fat, muscle mass, water, BMI, BMR, and so on). At least two
+  different measurement days are required.
 - `/ha_status` — your link, and when it was last checked.
 - `/ha_unlink` — disconnect. Your stored access token is **deleted**. Your
   recorded weight history is kept, and so is the record of which weigh-ins were
@@ -125,6 +137,28 @@ scale and have their weigh-ins imported and announced under the wrong name. An
 admin can reassign a prefix (the previous owner's link is removed, since two
 links to one scale would import every weigh-in twice), which is how a genuine
 mix-up gets fixed.
+
+## Body-composition trends
+
+`/ha_body` deliberately uses one real scale measurement: its weight and only the
+composition values recorded at that exact time. It never combines today's
+hand-entered weight with last week's BMI, or a current body-fat value with an old
+muscle reading and presents them as one snapshot. Where a metric has history,
+the card also shows its neutral net change.
+
+`/ha_graph` collapses multiple readings on one local day to their mean, keeps the
+raw daily points visible, and overlays a trailing three-day trend. The
+response is ephemeral because body composition is more sensitive than a public
+lift chart. The member page in the operator dashboard shows the same histories
+as compact neutral sparklines. When a member runs `/coach` for themselves it
+receives a bounded, explicitly caveated summary and keeps that report private;
+composition is omitted when somebody requests a report for another member.
+
+Consumer bioimpedance scales estimate composition from electrical impedance.
+Hydration, a recent meal, exercise, skin temperature, time of day and foot
+contact can all move an individual result. These views are for consistent,
+multi-reading direction—not diagnosis—and the bot never calls an increase or
+decrease inherently good.
 
 ## How linking works
 

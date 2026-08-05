@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -663,6 +664,7 @@ CREATE TABLE IF NOT EXISTS ha_reply_tracking (
     user_id          INTEGER NOT NULL,
     guild_id         INTEGER NOT NULL,
     recorded_ats     TEXT    NOT NULL,
+    chart_message_id INTEGER,
     created_at       TEXT    NOT NULL
 );
 
@@ -1083,6 +1085,20 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE message_log ADD COLUMN edited_at TEXT"
                 )
+            # Automatic graphs are attached once per Home Assistant import
+            # batch. Every announcement in that batch points at the holder so
+            # undoing an earlier reading can remove the now-stale attachment.
+            ha_reply_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(ha_reply_tracking)"
+                )
+            }
+            if ha_reply_cols and "chart_message_id" not in ha_reply_cols:
+                self._connection.execute(
+                    "ALTER TABLE ha_reply_tracking "
+                    "ADD COLUMN chart_message_id INTEGER"
+                )
             # One-time: older Hevy imports forked a separate machine per
             # equipment qualifier ("Bench Press (Barbell)" -> "bench press
             # barbell"). Now that canonicalize() strips the parenthetical,
@@ -1112,6 +1128,25 @@ class Database:
             # so the backfill has an unambiguous target to copy.
             self._backfill_nutrition_targets()
             self._recanonicalize_equipment()
+            # Older Home Assistant builds could re-add body-composition rows
+            # after their weigh-in had been explicitly deleted: the import
+            # ledger correctly kept the weight suppressed, but a later
+            # metrics-only pass wrote its siblings back.  Composition describes
+            # one concrete weigh-in, so without the matching bodyweights row it
+            # is an orphan and must not surface as somebody's "latest" reading.
+            # The write path below now enforces the same invariant; this
+            # idempotent cleanup repairs databases written before that fix.
+            self._connection.execute(
+                """
+                DELETE FROM body_metrics
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM bodyweights bw
+                        WHERE bw.user_id = body_metrics.user_id
+                          AND bw.recorded_at = body_metrics.recorded_at
+                 )
+                """
+            )
 
     def _backfill_nutrition_targets(self) -> None:
         """Copy legacy ``calorie_goals``/``protein_goals`` into ``nutrition_targets``.
@@ -3364,16 +3399,29 @@ class Database:
         UNIQUE key, so callers don't have to check first. Bodyweight is not
         accepted here — it belongs in ``bodyweights`` via
         :meth:`set_bodyweight`, which is the single choke point the protein link
-        and the TDEE model hang off."""
+        and the TDEE model hang off.
+
+        A composition row is only meaningful alongside the weigh-in it
+        describes.  Requiring that exact row here also makes an undone Home
+        Assistant reading stay undone: a later metrics-only poll cannot
+        resurrect body fat/BMI while the weight remains deleted."""
         ts = _normalize_iso(recorded_at)
         written = 0
         with self._conn() as c:
+            if c.execute(
+                "SELECT 1 FROM bodyweights "
+                "WHERE user_id = ? AND recorded_at = ? LIMIT 1",
+                (user_id, ts),
+            ).fetchone() is None:
+                return 0
             for metric, pair in metrics.items():
                 if metric == "weight":
                     continue
                 try:
                     value = float(pair[0])
                 except (TypeError, ValueError, IndexError):
+                    continue
+                if not math.isfinite(value):
                     continue
                 unit = str(pair[1]) if len(pair) > 1 and pair[1] else None
                 cur = c.execute(
@@ -3391,7 +3439,7 @@ class Database:
 
     def ha_track_reply(
         self, reply_message_id: int, user_id: int, guild_id: int,
-        recorded_ats: "Iterable[str]",
+        recorded_ats: "Iterable[str]", *, chart_message_id: int | None = None,
     ) -> None:
         """Remember which weigh-ins an announcement stands for."""
         stamps = ",".join(str(s) for s in recorded_ats if s)
@@ -3400,10 +3448,11 @@ class Database:
         with self._conn() as c:
             c.execute(
                 "INSERT OR REPLACE INTO ha_reply_tracking "
-                "(reply_message_id, user_id, guild_id, recorded_ats, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(reply_message_id, user_id, guild_id, recorded_ats, "
+                " chart_message_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (reply_message_id, user_id, guild_id, stamps,
-                 _normalize_iso(None)),
+                 chart_message_id, _normalize_iso(None)),
             )
 
     def ha_get_reply(self, reply_message_id: int) -> sqlite3.Row | None:
@@ -3530,10 +3579,19 @@ class Database:
             if row is None:
                 return False
             c.execute("DELETE FROM bodyweights WHERE id = ?", (row_id,))
-            c.execute(
-                "DELETE FROM body_metrics WHERE user_id = ? AND recorded_at = ?",
+            # A duplicate timestamp is unusual but legal in the legacy schema.
+            # Composition belongs to the measurement instant, so keep it while
+            # another parent weigh-in for that user/timestamp still exists.
+            if c.execute(
+                "SELECT 1 FROM bodyweights "
+                "WHERE user_id = ? AND recorded_at = ? LIMIT 1",
                 (row["user_id"], row["recorded_at"]),
-            )
+            ).fetchone() is None:
+                c.execute(
+                    "DELETE FROM body_metrics "
+                    "WHERE user_id = ? AND recorded_at = ?",
+                    (row["user_id"], row["recorded_at"]),
+                )
             self._audit(
                 c, guild_id, "data", "bodyweight_delete",
                 actor_name=actor_name, subject_id=row["user_id"],
@@ -3545,34 +3603,206 @@ class Database:
         """Newest row per metric for this user, as ``{metric: row}``.
 
         Global per user like :meth:`get_latest_bodyweight` — one body, one set of
-        numbers, whichever server the scale reading landed in."""
+        numbers, whichever server the scale reading landed in. Orphaned legacy
+        rows without their matching weigh-in are ignored defensively."""
         with self._conn() as c:
             rows = c.execute(
                 """
-                SELECT metric, value, unit, source, recorded_at
-                  FROM body_metrics
-                 WHERE user_id = ?
-                   AND recorded_at = (
-                       SELECT MAX(recorded_at) FROM body_metrics b2
-                        WHERE b2.user_id = body_metrics.user_id
-                          AND b2.metric = body_metrics.metric
+                SELECT bm.metric, bm.value, bm.unit, bm.source, bm.recorded_at
+                  FROM body_metrics bm
+                 WHERE bm.user_id = ?
+                   AND EXISTS (
+                       SELECT 1 FROM bodyweights bw
+                        WHERE bw.user_id = bm.user_id
+                          AND bw.recorded_at = bm.recorded_at
+                   )
+                   AND bm.recorded_at = (
+                       SELECT MAX(b2.recorded_at) FROM body_metrics b2
+                        WHERE b2.user_id = bm.user_id
+                          AND b2.metric = bm.metric
+                          AND EXISTS (
+                              SELECT 1 FROM bodyweights bw2
+                               WHERE bw2.user_id = b2.user_id
+                                 AND bw2.recorded_at = b2.recorded_at
+                          )
                    )
                 """,
                 (user_id,),
             ).fetchall()
             return {str(r["metric"]): r for r in rows}
 
+    def latest_body_metric_snapshot(self, user_id: int) -> dict | None:
+        """The newest *coherent* smart-scale reading for one user.
+
+        ``latest_body_metrics`` intentionally resolves every metric
+        independently, which is useful for discovery but can combine a current
+        body-fat value with a months-old BMI.  User-facing cards need one actual
+        measurement instead: the weight and only the metrics recorded at that
+        exact timestamp.
+        """
+        with self._conn() as c:
+            head = c.execute(
+                """
+                SELECT bm.recorded_at,
+                       (
+                           SELECT bw.weight_kg
+                             FROM bodyweights bw
+                            WHERE bw.user_id = bm.user_id
+                              AND bw.recorded_at = bm.recorded_at
+                            ORDER BY bw.id DESC
+                            LIMIT 1
+                       ) AS weight_kg
+                  FROM body_metrics bm
+                 WHERE bm.user_id = ?
+                   AND EXISTS (
+                       SELECT 1 FROM bodyweights bw
+                        WHERE bw.user_id = bm.user_id
+                          AND bw.recorded_at = bm.recorded_at
+                   )
+                 ORDER BY bm.recorded_at DESC, bm.id DESC
+                 LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if head is None:
+                return None
+            rows = c.execute(
+                """
+                SELECT metric, value, unit, source, recorded_at
+                  FROM body_metrics
+                 WHERE user_id = ? AND recorded_at = ?
+                 ORDER BY id ASC
+                """,
+                (user_id, head["recorded_at"]),
+            ).fetchall()
+            return {
+                "recorded_at": str(head["recorded_at"]),
+                "weight_kg": float(head["weight_kg"]),
+                "metrics": {str(r["metric"]): r for r in rows},
+            }
+
     def body_metric_history(
         self, user_id: int, metric: str, limit: int = 1000,
     ) -> list[sqlite3.Row]:
-        """One metric's history for this user, oldest-first (plots left to
-        right without an extra reverse, matching :meth:`bodyweight_history`)."""
+        """The newest ``limit`` values for one metric, returned oldest-first.
+
+        The inner-descending/outer-ascending shape is deliberate.  Applying
+        ``LIMIT`` directly to an ascending query returns the user's *oldest*
+        values once a smart scale has more rows than the cap, making every graph
+        and coach payload stale.  Orphaned legacy metrics are excluded too.
+        """
+        return self.body_metric_histories(
+            user_id, (str(metric),), limit_per_metric=limit,
+        ).get(str(metric), [])
+
+    def body_metric_histories(
+        self,
+        user_id: int,
+        metrics: "Iterable[str]",
+        *,
+        limit_per_metric: int = 1000,
+    ) -> dict[str, list[sqlite3.Row]]:
+        """Newest history for several metrics in one transaction.
+
+        The dashboard asks for every scale metric at once. Opening one
+        ``BEGIN IMMEDIATE`` transaction per registry entry needlessly
+        serialises writers even when a member has no composition data, so a
+        partitioned window query applies the cap independently in one read.
+        Each returned series remains oldest-first for plotting.
+        """
+        keys = tuple(dict.fromkeys(str(metric) for metric in metrics if metric))
+        cap = max(0, int(limit_per_metric))
+        if not keys or cap == 0:
+            return {}
+        placeholders = ",".join("?" * len(keys))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT bm.id, bm.metric, bm.value, bm.unit, bm.recorded_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY bm.metric
+                               ORDER BY bm.recorded_at DESC, bm.id DESC
+                           ) AS recency
+                      FROM body_metrics bm
+                     WHERE bm.user_id = ?
+                       AND bm.metric IN ({placeholders})
+                       AND EXISTS (
+                           SELECT 1 FROM bodyweights bw
+                            WHERE bw.user_id = bm.user_id
+                              AND bw.recorded_at = bm.recorded_at
+                       )
+                )
+                SELECT metric, value, unit, recorded_at
+                  FROM ranked
+                 WHERE recency <= ?
+                 ORDER BY metric ASC, recorded_at ASC, id ASC
+                """,
+                (user_id, *keys, cap),
+            ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["metric"]), []).append(row)
+        return grouped
+
+    def body_metric_summaries_between(
+        self,
+        user_id: int,
+        metrics: "Iterable[str]",
+        start_iso: str,
+        end_iso: str,
+    ) -> list[sqlite3.Row]:
+        """First/latest/count summaries inside an exact UTC time window.
+
+        This is the bounded coach read: SQLite aggregates the full requested
+        window without shipping every raw scale row to the model or truncating
+        away the beginning of a long window.
+        """
+        keys = tuple(dict.fromkeys(str(metric) for metric in metrics if metric))
+        if not keys:
+            return []
+        placeholders = ",".join("?" * len(keys))
         with self._conn() as c:
             return c.execute(
-                "SELECT value, unit, recorded_at FROM body_metrics "
-                "WHERE user_id = ? AND metric = ? "
-                "ORDER BY recorded_at ASC, id ASC LIMIT ?",
-                (user_id, str(metric), int(limit)),
+                f"""
+                WITH eligible AS (
+                    SELECT bm.id, bm.metric, bm.value, bm.unit, bm.recorded_at
+                      FROM body_metrics bm
+                     WHERE bm.user_id = ?
+                       AND bm.metric IN ({placeholders})
+                       AND bm.recorded_at >= ?
+                       AND bm.recorded_at <= ?
+                       AND EXISTS (
+                           SELECT 1 FROM bodyweights bw
+                            WHERE bw.user_id = bm.user_id
+                              AND bw.recorded_at = bm.recorded_at
+                       )
+                ),
+                ranked AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY metric
+                               ORDER BY recorded_at ASC, id ASC
+                           ) AS oldest,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY metric
+                               ORDER BY recorded_at DESC, id DESC
+                           ) AS newest,
+                           COUNT(*) OVER (PARTITION BY metric) AS samples
+                      FROM eligible
+                )
+                SELECT metric,
+                       MAX(CASE WHEN oldest = 1 THEN value END) AS first_value,
+                       MAX(CASE WHEN newest = 1 THEN value END) AS latest_value,
+                       MAX(CASE WHEN oldest = 1 THEN recorded_at END) AS first_at,
+                       MAX(CASE WHEN newest = 1 THEN recorded_at END) AS latest_at,
+                       MAX(CASE WHEN newest = 1 THEN unit END) AS latest_unit,
+                       MAX(samples) AS samples
+                  FROM ranked
+                 GROUP BY metric
+                 ORDER BY metric ASC
+                """,
+                (user_id, *keys, str(start_iso), str(end_iso)),
             ).fetchall()
 
     # ------------------------------------------------------------------

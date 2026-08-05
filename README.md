@@ -258,6 +258,10 @@ Logging & editing:
 - `/bodyweight [weight_kg] [user]` — record (or view) your current bodyweight.
   You can also just post `bodyweight 100kg` (or `body weight: 100kg`, or
   `bw 80`) in chat, and `@user bodyweight 100kg` to set someone else's.
+  Every successful manual update replies with the refreshed bodyweight graph,
+  including the very first reading. That chart is the user's global bodyweight
+  timeline (including readings from DMs and other shared servers), so logging in
+  a public channel publishes that snapshot there.
   Once on file, the bot annotates bodyweight-relative lifts with the **true
   load** in inline replies and the leaderboard:
   - assisted pull-up logged as `pull ups 70kg` with bodyweight 100kg →
@@ -396,8 +400,22 @@ If your scale is in [Home Assistant](https://www.home-assistant.io/), the bot
 reads weigh-ins straight out of it — nobody has to type a number into chat. A new
 reading is logged as that member's **bodyweight** (so it feeds TDEE, protein
 targets, goals and the graphs exactly like a typed `bw 106.3`) and announced in
-the bodyweight-reminder channel. Body fat %, muscle mass, BMI, BMR and the rest
-are kept too, and shown by `/ha_body`.
+the bodyweight-reminder channel with the refreshed bodyweight graph. If several
+readings arrive in one poll, the final announcement carries the cumulative
+chart; a first-link history import carries it on the one summary. That public
+chart is the member's global timeline, including manual readings logged in DMs
+or other shared servers. Body fat %,
+muscle mass, BMI, BMR and the rest
+are kept too. `/ha_body` shows the latest **coherent** scale reading (weight and
+composition from the same measurement), while `/ha_graph` plots any composition
+metric over time. The member dashboard carries the same neutral trend cards, and
+`/coach` can use a member's own history as cautiously-labelled context. Self
+reports stay private; reports requested for somebody else omit composition.
+
+Consumer smart-scale composition is an estimate rather than a medical
+measurement: hydration, meals, exercise and time of day can move an individual
+reading. The bot therefore emphasizes multi-reading trends and never labels a
+direction inherently good or bad.
 
 Each member connects **their own** Home Assistant, so people on different servers
 can all use it and no operator holds anyone else's credentials. Nothing to
@@ -417,8 +435,8 @@ dashboard, under **Bodyweight trend**.
 The bot is **read-only**: it only ever GETs states and history, so it cannot
 change anything in anyone's home.
 
-Commands: `/setup_ha`, `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_status`,
-`/ha_unlink`, `/ha_help`.
+Commands: `/setup_ha`, `/ha_link`, `/ha_entities`, `/ha_body`, `/ha_graph`,
+`/ha_status`, `/ha_unlink`, `/ha_help`.
 
 ## Direct messages
 

@@ -43,6 +43,8 @@ from .aliases import (
     normalize_token,
 )
 
+from .bodycomp import daily_mean_points as bodycomp_daily_points
+from .bodycomp import metric_summary as bodycomp_metric_summary
 from .db import KEEP, Database, _normalize_iso as db_normalize_iso
 from .graphing import daily_best_points, running_best_values, trend_values
 from .message_targeting import strip_leading_user_mention
@@ -1496,16 +1498,33 @@ async def _handle_bodyweight_message(
         f"\n🥩 Protein max updated to {protein_grams} g (tied to bodyweight)."
         if protein_grams is not None else ""
     )
+    chart = await _updated_bodyweight_chart(
+        target_id, _display_name(target),
+    )
+    attachment = (
+        {"file": _bodyweight_chart_file(chart)} if chart is not None else {}
+    )
+    reply_text = (
+        f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will "
+        "now show the true load on bodyweight-relative lifts (e.g. "
+        "assisted pull-ups, weighted dips)."
+        f"{protein_line}"
+    )
     try:
         await message.reply(
-            f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will "
-            "now show the true load on bodyweight-relative lifts (e.g. "
-            "assisted pull-ups, weighted dips)."
-            f"{protein_line}",
+            reply_text,
             mention_author=False,
+            **attachment,
         )
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as exc:
+        # Missing Attach Files must not suppress the successful weigh-in
+        # confirmation. Retry only definite file/payload failures, not a
+        # transient server error that could duplicate an accepted message.
+        if chart is not None and _attachment_retryable(exc):
+            try:
+                await message.reply(reply_text, mention_author=False)
+            except discord.HTTPException:
+                pass
     LOG.info(
         "Stored bodyweight %.2fkg for %s in #%s",
         weight_kg, target, message.channel,
@@ -6113,18 +6132,19 @@ async def leaderboard_cmd(
 async def bodyweight_cmd(
     interaction: discord.Interaction,
     weight_kg: float | None = None,
-    user: discord.Member | None = None,
+    user: discord.Member | discord.User | None = None,
 ) -> None:
     guild_id = _ctx_guild_id(interaction)
     target = user or interaction.user
-    if await _deny_invisible_target(interaction, target):
-        return
     # If no value supplied, just report the latest entry. Useful for sanity
     # checking what the bot is using to compute true weights.
     if weight_kg is None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if await _deny_invisible_target(interaction, target):
+            return
         row = db.get_latest_bodyweight(guild_id, target.id)
         if row is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"No bodyweight on file for **{_display_name(target)}** yet. "
                 "Use `/bodyweight weight_kg:<kg>` to record one — it will be "
                 "used to show the true load on pull-ups, dips, and other "
@@ -6132,7 +6152,7 @@ async def bodyweight_cmd(
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"**{_display_name(target)}**'s bodyweight: "
             f"**{float(row['weight_kg']):g}kg** "
             f"(updated {_format_date(row['recorded_at'])}).",
@@ -6140,6 +6160,8 @@ async def bodyweight_cmd(
         )
         return
 
+    # Validate before deferring so obvious input errors remain instant. The
+    # successful path may wait on SQLite and a cold Matplotlib import.
     if weight_kg <= 0:
         await interaction.response.send_message(
             "Bodyweight must be a positive number of kg.", ephemeral=True
@@ -6155,6 +6177,9 @@ async def bodyweight_cmd(
         )
         return
 
+    await interaction.response.defer(thinking=True)
+    if await _deny_invisible_target(interaction, target):
+        return
     protein_grams = db.set_bodyweight(
         guild_id, target.id, weight_kg,
         actor_id=interaction.user.id,
@@ -6165,12 +6190,24 @@ async def bodyweight_cmd(
         f"\n🥩 Protein max updated to {protein_grams} g (tied to bodyweight)."
         if protein_grams is not None else ""
     )
-    await interaction.response.send_message(
+    chart = await _updated_bodyweight_chart(
+        target.id, _display_name(target),
+    )
+    attachment = (
+        {"file": _bodyweight_chart_file(chart)} if chart is not None else {}
+    )
+    reply_text = (
         f"Recorded bodyweight **{weight_kg:g}kg**{suffix}. The bot will now "
         "show your true load on bodyweight-relative lifts (e.g. assisted "
         "pull-ups, weighted dips)."
         f"{protein_line}"
     )
+    try:
+        await interaction.followup.send(reply_text, **attachment)
+    except discord.HTTPException as exc:
+        if chart is None or not _attachment_retryable(exc):
+            raise
+        await interaction.followup.send(reply_text)
 
 
 @bot.tree.command(name="log", description="Manually log a single lift.")
@@ -7837,6 +7874,7 @@ def _help_sections() -> dict[str, discord.Embed]:
                 "`/ha_link` — pick which of its sensors are yours\n"
                 "`/ha_entities` — list the body sensors it can see\n"
                 "`/ha_body [member]` — latest body-composition numbers\n"
+                "`/ha_graph <metric> [member]` — plot a composition trend\n"
                 "`/ha_status` — check your connection\n"
                 "`/ha_unlink` — disconnect and delete your token"
             ),
@@ -9108,6 +9146,29 @@ _CHART_BG = "#2b2d31"
 _CHART_INK = "#dbdee1"
 _CHART_MUTED = "#949ba4"
 _CHART_GRID = "#3f4147"
+# Matplotlib's pyplot state is process-global and not thread-safe. Automatic
+# weigh-in charts render off the Discord event loop, so every chart call site
+# shares this lock rather than letting a message and HA poll draw concurrently.
+_CHART_RENDER_LOCK = threading.RLock()
+
+
+def _run_serialized_matplotlib(renderer, /, *args, **kwargs):
+    """Run any Matplotlib renderer exclusively and clean leaked figures.
+
+    Revo's comparison image composes individual calendar renderers, so the lock
+    is re-entrant. Tracking figure numbers around the whole renderer guarantees
+    cleanup even when older drawing code fails before its explicit ``close``.
+    """
+    with _CHART_RENDER_LOCK:
+        matplotlib = importlib.import_module("matplotlib")
+        matplotlib.use("Agg")
+        plt = importlib.import_module("matplotlib.pyplot")
+        existing = set(plt.get_fignums())
+        try:
+            return renderer(*args, **kwargs)
+        finally:
+            for number in set(plt.get_fignums()) - existing:
+                plt.close(number)
 
 
 def _render_trend_chart(
@@ -9130,73 +9191,208 @@ def _render_trend_chart(
     read as the story. Returns a PNG buffer.
     """
     fig, ax = plt.subplots(figsize=(8.8, 4.4), dpi=150)
-    fig.patch.set_facecolor(_CHART_BG)
-    ax.set_facecolor(_CHART_BG)
+    try:
+        fig.patch.set_facecolor(_CHART_BG)
+        ax.set_facecolor(_CHART_BG)
 
-    ax.plot(
-        xs, ys, marker="o", markersize=4.5, markerfacecolor=_CHART_BG,
-        markeredgewidth=1.4, linewidth=1.1, color=_CHART_MUTED, alpha=0.75,
-        label="logged", zorder=2,
-    )
-    ax.plot(
-        xs, trend, linewidth=3.0, color=trend_colour, label=trend_label,
-        zorder=3, solid_capstyle="round",
-    )
-    floor = min(min(ys), min(trend)) - (max(ys) - min(ys) + 1) * 2
-    ax.fill_between(xs, trend, floor, color=trend_colour, alpha=0.09, zorder=1)
+        ax.plot(
+            xs, ys, marker="o", markersize=4.5, markerfacecolor=_CHART_BG,
+            markeredgewidth=1.4, linewidth=1.1, color=_CHART_MUTED, alpha=0.75,
+            label="logged", zorder=2,
+        )
+        ax.plot(
+            xs, trend, linewidth=3.0, color=trend_colour, label=trend_label,
+            zorder=3, solid_capstyle="round",
+        )
+        floor = min(min(ys), min(trend)) - (max(ys) - min(ys) + 1) * 2
+        ax.fill_between(xs, trend, floor, color=trend_colour, alpha=0.09, zorder=1)
 
-    ax.set_title(title, loc="left", fontsize=15, fontweight="bold",
-                 color=_CHART_INK, pad=20)
-    ax.text(0, 1.02, subtitle, transform=ax.transAxes, fontsize=9,
-            color=_CHART_MUTED, va="bottom")
-    ax.set_ylabel(unit, color=_CHART_MUTED)
+        ax.set_title(title, loc="left", fontsize=15, fontweight="bold",
+                     color=_CHART_INK, pad=20)
+        ax.text(0, 1.02, subtitle, transform=ax.transAxes, fontsize=9,
+                color=_CHART_MUTED, va="bottom")
+        ax.set_ylabel(unit, color=_CHART_MUTED)
 
-    ax.grid(axis="y", color=_CHART_GRID, linewidth=0.8, alpha=0.7)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(_CHART_GRID)
-    ax.tick_params(colors=_CHART_MUTED, labelsize=9)
+        ax.grid(axis="y", color=_CHART_GRID, linewidth=0.8, alpha=0.7)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(_CHART_GRID)
+        ax.tick_params(colors=_CHART_MUTED, labelsize=9)
 
-    lo, hi = min(ys), max(ys)
-    pad = max(0.8, (hi - lo) * 0.18)
-    ax.set_ylim(lo - pad, hi + pad)
-    ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
+        lo, hi = min(ys), max(ys)
+        pad = max(0.8, (hi - lo) * 0.18)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
 
-    if len(xs) > 1:
-        span = max(xs) - min(xs)
-        xpad = timedelta(days=max(1.0, span.days * 0.04))
-        ax.set_xlim(min(xs) - xpad, max(xs) + xpad)
-        locator = mdates.AutoDateLocator(minticks=4, maxticks=7)
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-        # ConciseDateFormatter parks a "2026-Jul" offset in the corner, which
-        # reads as a stray annotation. The span is already in the subtitle.
-        ax.xaxis.get_offset_text().set_visible(False)
-    else:
-        ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
-        ax.xaxis.set_major_locator(mdates.DayLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+        if len(xs) > 1:
+            span = max(xs) - min(xs)
+            xpad = timedelta(days=max(1.0, span.days * 0.04))
+            ax.set_xlim(min(xs) - xpad, max(xs) + xpad)
+            locator = mdates.AutoDateLocator(minticks=4, maxticks=7)
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            # ConciseDateFormatter parks a "2026-Jul" offset in the corner,
+            # which reads as a stray annotation. The span is already in the
+            # subtitle.
+            ax.xaxis.get_offset_text().set_visible(False)
+        else:
+            ax.set_xlim(xs[0] - timedelta(days=1), xs[0] + timedelta(days=1))
+            ax.xaxis.set_major_locator(mdates.DayLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
 
-    # First and last only — enough to anchor the scale without label spaghetti.
-    for idx, va, dy in ((0, "bottom", 10), (len(xs) - 1, "top", -12)):
-        ax.annotate(
-            fmt(ys[idx]), xy=(xs[idx], ys[idx]), xytext=(0, dy),
-            textcoords="offset points", ha="center", va=va,
-            fontsize=9, fontweight="bold", color=_CHART_INK,
+        # First and last only — enough to anchor the scale without label
+        # spaghetti. With one point those are the same anchor, so label it once.
+        anchors = (
+            ((0, "bottom", 10),)
+            if len(xs) == 1 else
+            ((0, "bottom", 10), (len(xs) - 1, "top", -12))
+        )
+        for idx, va, dy in anchors:
+            ax.annotate(
+                fmt(ys[idx]), xy=(xs[idx], ys[idx]), xytext=(0, dy),
+                textcoords="offset points", ha="center", va=va,
+                fontsize=9, fontweight="bold", color=_CHART_INK,
+            )
+
+        legend = ax.legend(loc="best", frameon=False, fontsize=8.5)
+        for text in legend.get_texts():
+            text.set_color(_CHART_MUTED)
+
+        fig.tight_layout(pad=1.1)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        buf.seek(0)
+        return buf
+    finally:
+        # Automatic HA/message charts are unattended. Never leak a pyplot
+        # figure when plotting, layout, encoding or the buffer write fails.
+        plt.close(fig)
+
+
+def _render_trend_chart_threadsafe(
+    xs: list,
+    ys: list[float],
+    trend: list[float],
+    **kwargs,
+) -> "io.BytesIO":
+    """Load and use Matplotlib under its one process-wide rendering lock."""
+    with _CHART_RENDER_LOCK:
+        matplotlib = importlib.import_module("matplotlib")
+        matplotlib.use("Agg")
+        plt = importlib.import_module("matplotlib.pyplot")
+        mdates = importlib.import_module("matplotlib.dates")
+        ticker = importlib.import_module("matplotlib.ticker")
+        return _render_trend_chart(
+            plt, mdates, ticker, xs, ys, trend, **kwargs,
         )
 
-    legend = ax.legend(loc="best", frameon=False, fontsize=8.5)
-    for text in legend.get_texts():
-        text.set_color(_CHART_MUTED)
 
-    fig.tight_layout(pad=1.1)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+class _BodyweightChart(NamedTuple):
+    """A rendered bodyweight graph plus the numbers used in its caption."""
+
+    buffer: io.BytesIO
+    filename: str
+    entries: int
+    days: int
+    first_kg: float
+    latest_kg: float
+    latest_recorded_kg: float
+    delta_kg: float
+
+
+def _build_bodyweight_chart(
+    user_id: int, display_name: str,
+) -> _BodyweightChart | None:
+    """Render the current global bodyweight history for one member.
+
+    This is synchronous so it can be used by ``asyncio.to_thread``. It returns
+    ``None`` only when no usable dated history exists and deliberately lets an
+    ``ImportError`` escape so the explicit graph command can explain a missing
+    Matplotlib install while automatic updates quietly keep their text reply.
+    """
+    rows = db.bodyweight_history(0, user_id, limit=1000)
+    points = bodycomp_daily_points(
+        ((r["recorded_at"], float(r["weight_kg"])) for r in rows),
+        DISPLAY_TZ,
+    )
+    if not points:
+        return None
+
+    xs = [point.when for point in points]
+    ys = [point.value for point in points]
+    trend = trend_values(ys)
+    delta = ys[-1] - ys[0]
+    latest_recorded = float(rows[-1]["weight_kg"])
+    averaged = len(rows) > len(points)
+    sign = "+" if delta >= 0 else ""
+    if len(points) == 1:
+        span = (
+            f"daily mean {ys[-1]:g}kg · latest logged {latest_recorded:g}kg"
+            if averaged else
+            f"latest {latest_recorded:g}kg"
+        )
+    else:
+        prefix = "daily means " if averaged else ""
+        span = f"{prefix}{ys[0]:g}kg → {ys[-1]:g}kg ({sign}{delta:g}kg)"
+        if averaged and latest_recorded != ys[-1]:
+            span += f" · latest logged {latest_recorded:g}kg"
+    subtitle = (
+        f"{_plural(len(rows), 'entry', 'entries')} · "
+        f"{_plural(len(points), 'day')} · {span}"
+    )
+
+    buf = _render_trend_chart_threadsafe(
+        xs, ys, trend,
+        title=f"{_plain_label(display_name, limit=80)} — bodyweight",
+        subtitle=subtitle,
+        trend_label="3-day trend",
+        trend_colour=f"#{ui.score_trend(delta, good='down').value:06x}",
+    )
+
+    safe_name = re.sub(
+        r"[^a-z0-9_-]+", "_", display_name.lower(),
+    ).strip("_") or "member"
+    return _BodyweightChart(
+        buffer=buf,
+        filename=f"bodyweight_{safe_name}.png",
+        entries=len(rows),
+        days=len(points),
+        first_kg=ys[0],
+        latest_kg=ys[-1],
+        latest_recorded_kg=latest_recorded,
+        delta_kg=delta,
+    )
+
+
+async def _updated_bodyweight_chart(
+    user_id: int, display_name: str,
+) -> _BodyweightChart | None:
+    """Best-effort refreshed chart for a successful bodyweight update."""
+    try:
+        return await asyncio.to_thread(
+            _build_bodyweight_chart, user_id, display_name,
+        )
+    except ImportError:
+        LOG.info(
+            "Bodyweight graph skipped for %s: matplotlib is unavailable",
+            user_id,
+        )
+    except Exception:  # pragma: no cover - a chart must not undo a stored weight
+        LOG.exception("Failed to render bodyweight graph for %s", user_id)
+    return None
+
+
+def _bodyweight_chart_file(chart: _BodyweightChart) -> discord.File:
+    """Turn one fresh chart buffer into the single-use Discord attachment."""
+    chart.buffer.seek(0)
+    return discord.File(chart.buffer, filename=chart.filename)
+
+
+def _attachment_retryable(exc: discord.HTTPException) -> bool:
+    """Whether retrying the same message without its file can succeed."""
+    return getattr(exc, "status", None) in {400, 403, 413}
 
 
 @bot.tree.command(
@@ -9212,34 +9408,18 @@ async def graph_cmd(
     equipment: str,
     user: discord.Member | None = None,
 ) -> None:
-    # Lazy import so the bot still boots if matplotlib isn't installed.
-    try:
-        matplotlib = importlib.import_module("matplotlib")
-        matplotlib.use("Agg")
-        plt = importlib.import_module("matplotlib.pyplot")
-        mdates = importlib.import_module("matplotlib.dates")
-        ticker = importlib.import_module("matplotlib.ticker")
-    except ImportError:
-        await interaction.response.send_message(
-            "Graphing isn't available — matplotlib isn't installed. "
-            "Add it to `requirements.txt` and redeploy.",
-            ephemeral=True,
-        )
-        return
-
     target = user or interaction.user
+    await interaction.response.defer(thinking=True)
     if await _deny_invisible_target(interaction, target):
         return
     guild_id = _ctx_guild_id(interaction)
     canon = _resolve(guild_id, equipment)
     rows = db.history(guild_id, target.id, canon, limit=1000)
     if not rows:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"No {canon} history for {target.display_name}.", ephemeral=True
         )
         return
-
-    await interaction.response.defer(thinking=True)
 
     points = daily_best_points(
         ((r["logged_at"], float(r["weight_kg"])) for r in rows),
@@ -9263,13 +9443,22 @@ async def graph_cmd(
     # For a lift the meaningful trend line is the personal best over time, not
     # a rolling mean: a heavy day followed by a deload isn't noise to smooth
     # away, and the number people care about is the best they've hit.
-    buf = _render_trend_chart(
-        plt, mdates, ticker, xs, ys, running_best,
-        title=f"{_display_name(target)} — {canon}",
-        subtitle=subtitle,
-        trend_label="best to date",
-        trend_colour=f"#{ui.score_trend(net).value:06x}",
-    )
+    try:
+        buf = await asyncio.to_thread(
+            _render_trend_chart_threadsafe,
+            xs, ys, running_best,
+            title=f"{_display_name(target)} — {canon}",
+            subtitle=subtitle,
+            trend_label="best to date",
+            trend_colour=f"#{ui.score_trend(net).value:06x}",
+        )
+    except ImportError:
+        await interaction.followup.send(
+            "Graphing isn't available — matplotlib isn't installed. "
+            "Add it to `requirements.txt` and redeploy.",
+            ephemeral=True,
+        )
+        return
     fname = f"{canon.replace(' ', '_')}_{target.display_name}.png"
     file = discord.File(buf, filename=fname)
     collapsed_days = sum(1 for point in points if point.entries > 1)
@@ -9287,17 +9476,6 @@ async def graph_cmd(
 # ---------------------------------------------------------------------------
 # Bodyweight history
 # ---------------------------------------------------------------------------
-
-
-def _parse_iso_to_local_date(iso: str):
-    """Convert a stored ISO timestamp to a DISPLAY_TZ-local ``date``."""
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(DISPLAY_TZ).date()
 
 
 @bot.tree.command(
@@ -9372,80 +9550,62 @@ async def bodyweight_history_cmd(
 @app_commands.describe(user="The user to plot (defaults to you).")
 async def bodyweight_graph_cmd(
     interaction: discord.Interaction,
-    user: discord.Member | None = None,
+    user: discord.Member | discord.User | None = None,
 ) -> None:
-    # Lazy import — same pattern as /graph so the bot still boots without
-    # matplotlib installed.
+    target = user or interaction.user
+    # Visibility, SQLite and the chart backend can all wait; acknowledge before
+    # any of them so this command is safe on a cold process and in DMs.
+    await interaction.response.defer(thinking=True)
+    if await _deny_invisible_target(interaction, target):
+        return
+
     try:
-        matplotlib = importlib.import_module("matplotlib")
-        matplotlib.use("Agg")
-        plt = importlib.import_module("matplotlib.pyplot")
-        mdates = importlib.import_module("matplotlib.dates")
-        ticker = importlib.import_module("matplotlib.ticker")
+        chart = await asyncio.to_thread(
+            _build_bodyweight_chart, target.id, _display_name(target),
+        )
     except ImportError:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Graphing isn't available — matplotlib isn't installed. "
             "Add it to `requirements.txt` and redeploy.",
             ephemeral=True,
         )
         return
-
-    target = user or interaction.user
-    if await _deny_invisible_target(interaction, target):
+    except Exception:  # pragma: no cover - defensive runtime path
+        LOG.exception("Failed to render bodyweight graph for %s", target.id)
+        await interaction.followup.send(
+            "Couldn't render that bodyweight graph right now.",
+            ephemeral=True,
+        )
         return
-    guild_id = _ctx_guild_id(interaction)
-    rows = db.bodyweight_history(guild_id, target.id, limit=1000)
-    if not rows:
-        await interaction.response.send_message(
+    if chart is None:
+        await interaction.followup.send(
             f"No bodyweight entries logged for {target.display_name} yet. "
             "Set one with `/bodyweight <weight_kg>`.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.defer(thinking=True)
-
-    # Collapse multiple same-day measurements to the day's mean — keeps the
-    # line readable when someone weighs in twice on the same morning.
-    by_day: dict = {}
-    for r in rows:
-        d = _parse_iso_to_local_date(r["recorded_at"])
-        if d is None:
-            continue
-        by_day.setdefault(d, []).append(float(r["weight_kg"]))
-    if not by_day:
-        await interaction.followup.send(
-            "Couldn't plot — no datable entries.", ephemeral=True,
+    averaged = chart.entries > chart.days
+    if chart.days == 1:
+        summary = (
+            f"latest logged {chart.latest_recorded_kg:g}kg · "
+            f"day average {chart.latest_kg:g}kg"
+            if averaged else
+            f"latest {chart.latest_recorded_kg:g}kg · first recorded day"
         )
-        return
-
-    xs = sorted(by_day)
-    ys = [sum(by_day[d]) / len(by_day[d]) for d in xs]
-
-    # Bodyweight is genuinely noisy — hydration, time of day, what you last
-    # ate all move it a kilo — so the readings recede and a trailing mean
-    # carries the trajectory. Down is the favourable direction here.
-    trend = trend_values(ys)
-    delta = ys[-1] - ys[0]
-    sign = "+" if delta >= 0 else ""
-    subtitle = (
-        f"{_plural(len(rows), 'entry', 'entries')} · "
-        f"{_plural(len(xs), 'day')} · "
-        f"{ys[0]:g}kg → {ys[-1]:g}kg ({sign}{delta:g}kg)"
-    )
-    buf = _render_trend_chart(
-        plt, mdates, ticker, xs, ys, trend,
-        title=f"{_display_name(target)} — bodyweight",
-        subtitle=subtitle,
-        trend_label="trend",
-        trend_colour=f"#{ui.score_trend(delta, good='down').value:06x}",
-    )
-    fname = f"bodyweight_{target.display_name}.png"
-    file = discord.File(buf, filename=fname)
+    else:
+        sign = "+" if chart.delta_kg >= 0 else ""
+        summary = (
+            f"{'daily means ' if averaged else ''}"
+            f"{chart.first_kg:g}kg → {chart.latest_kg:g}kg, "
+            f"{sign}{chart.delta_kg:g}kg"
+        )
+        if averaged and chart.latest_recorded_kg != chart.latest_kg:
+            summary += f" · latest logged {chart.latest_recorded_kg:g}kg"
     await interaction.followup.send(
         f"⚖️ **{target.display_name} — bodyweight** "
-        f"({ys[0]:g}kg → {ys[-1]:g}kg, {sign}{delta:g}kg)",
-        file=file,
+        f"({summary})",
+        file=_bodyweight_chart_file(chart),
     )
 
 
@@ -11315,7 +11475,8 @@ async def revo_calendar_cmd(
     legend = "🔥 attended · ⬜ missed · ⬛ out of month"
     body = f"{header}\n{streak_line}\n-# {legend}"
     try:
-        image = _render_revo_calendar_image(
+        image = await asyncio.to_thread(
+            _render_revo_calendar_image,
             m,
             y,
             result,
@@ -11450,7 +11611,12 @@ async def revo_calendar_compare_cmd(
 
     if image_entries:
         try:
-            image = _render_revo_calendar_compare_long_image(m, y, image_entries)
+            image = await asyncio.to_thread(
+                _render_revo_calendar_compare_long_image,
+                m,
+                y,
+                image_entries,
+            )
         except ImportError:
             image = None
         except Exception:
@@ -12095,7 +12261,7 @@ def _render_revo_calendar(
     return f"```\n{header}\n{grid}\n```"
 
 
-def _render_revo_calendar_image(
+def _render_revo_calendar_image_unlocked(
     month: int,
     year: int,
     attended: "dict[int, bool]",
@@ -12111,8 +12277,6 @@ def _render_revo_calendar_image(
     image without an X server. Kept lazy-imported like /graph so the bot can
     still boot in environments without matplotlib.
     """
-    matplotlib = importlib.import_module("matplotlib")
-    matplotlib.use("Agg")
     plt = importlib.import_module("matplotlib.pyplot")
     patches = importlib.import_module("matplotlib.patches")
 
@@ -12278,14 +12442,34 @@ def _render_revo_calendar_image(
     return buf
 
 
-def _render_revo_calendar_compare_long_image(
+def _render_revo_calendar_image(
+    month: int,
+    year: int,
+    attended: "dict[int, bool]",
+    *,
+    display: str,
+    attended_count: int,
+    current_streak: int,
+    best_streak: int,
+) -> io.BytesIO:
+    return _run_serialized_matplotlib(
+        _render_revo_calendar_image_unlocked,
+        month,
+        year,
+        attended,
+        display=display,
+        attended_count=attended_count,
+        current_streak=current_streak,
+        best_streak=best_streak,
+    )
+
+
+def _render_revo_calendar_compare_long_image_unlocked(
     month: int,
     year: int,
     entries: "list[tuple[int, str, int, int, int, dict[int, bool]]]",
 ) -> io.BytesIO:
     """Render full-size member calendars stacked vertically in one PNG."""
-    matplotlib = importlib.import_module("matplotlib")
-    matplotlib.use("Agg")
     plt = importlib.import_module("matplotlib.pyplot")
 
     card_images = []
@@ -12334,6 +12518,19 @@ def _render_revo_calendar_compare_long_image(
     plt.close(fig)
     buf.seek(0)
     return buf
+
+
+def _render_revo_calendar_compare_long_image(
+    month: int,
+    year: int,
+    entries: "list[tuple[int, str, int, int, int, dict[int, bool]]]",
+) -> io.BytesIO:
+    return _run_serialized_matplotlib(
+        _render_revo_calendar_compare_long_image_unlocked,
+        month,
+        year,
+        entries,
+    )
 
 
 def _draw_revo_flame(
@@ -12955,7 +13152,7 @@ def _build_strava_embed(
     return embed
 
 
-def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
+def _render_strava_route_png_unlocked(polyline: str) -> "io.BytesIO | None":
     """Render an activity's GPS route as a PNG (Strava-style silhouette).
 
     Returns a seekable buffer, or None when there's no usable route or
@@ -12966,8 +13163,6 @@ def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
     if len(points) < 2:
         return None
     try:
-        matplotlib = importlib.import_module("matplotlib")
-        matplotlib.use("Agg")
         plt = importlib.import_module("matplotlib.pyplot")
     except Exception:  # pragma: no cover - matplotlib not installed
         return None
@@ -13000,8 +13195,21 @@ def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
     return buf
 
 
+def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
+    """Render a route under the shared Matplotlib lock, best effort."""
+    try:
+        return _run_serialized_matplotlib(
+            _render_strava_route_png_unlocked,
+            polyline,
+        )
+    except Exception:  # pragma: no cover - optional backend or drawing failure
+        return None
+
+
 def _strava_embed_and_file(
     activity: "strava_client.StravaActivity", who: str,
+    *,
+    render_route: bool = True,
 ) -> "tuple[discord.Embed, discord.File | None]":
     """Build the activity embed plus an optional attached image.
 
@@ -13023,6 +13231,12 @@ def _strava_embed_and_file(
             if map_url:
                 embed.set_image(url=map_url)
                 return embed, None
+        if not render_route:
+            # Rename updates preserve the original ``route.png`` attachment;
+            # point the replacement embed at it without rendering a throwaway
+            # copy on the event loop.
+            embed.set_image(url="attachment://route.png")
+            return embed, None
         buf = _render_strava_route_png(activity.map_polyline)
         if buf is not None:
             embed.set_image(url="attachment://route.png")
@@ -13197,7 +13411,11 @@ async def _strava_handle_create(row, athlete_id: int, activity_id: int) -> None:
     if channel is None:
         return
     who = f"<@{user_id}>"
-    embed, file = _strava_embed_and_file(activity, who)
+    embed, file = await asyncio.to_thread(
+        _strava_embed_and_file,
+        activity,
+        who,
+    )
     kwargs: dict[str, object] = {
         "content": f"{strava_client.sport_emoji(activity.sport_type)} "
         f"{who} just logged a workout on Strava!",
@@ -13256,7 +13474,11 @@ async def _strava_handle_update(row, activity_id: int) -> None:
             pass
         return
     who = f"<@{int(row['user_id'])}>"
-    embed, _file = _strava_embed_and_file(activity, who)
+    embed, _file = _strava_embed_and_file(
+        activity,
+        who,
+        render_route=False,
+    )
     # Edit the embed only; the original image attachment (if any) is preserved
     # and the route doesn't change on a rename.
     try:
@@ -15343,6 +15565,33 @@ def _ha_backfill_embed(member_name: str, stats: dict) -> discord.Embed:
     return embed
 
 
+async def _ha_send_announcement(
+    channel,
+    embed: discord.Embed,
+    chart: _BodyweightChart | None = None,
+):
+    """Send one HA announcement, retrying text/embed-only if files are blocked."""
+    kwargs = {
+        "embed": embed,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if chart is None:
+        return await channel.send(**kwargs)
+    try:
+        return await channel.send(
+            **kwargs, file=_bodyweight_chart_file(chart),
+        )
+    except discord.HTTPException as exc:
+        if not _attachment_retryable(exc):
+            raise
+        LOG.info(
+            "Home Assistant: chart attachment rejected in channel %s; "
+            "retrying announcement without it",
+            getattr(channel, "id", "?"),
+        )
+        return await channel.send(**kwargs)
+
+
 def _ha_valid_weight(weight_kg: float) -> bool:
     """Reject a weight before it reaches the database.
 
@@ -15708,26 +15957,37 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
     if guild is not None:
         member = guild.get_member(user_id)
     username = _display_name(member) if member else str(user_id)
+    # The whole pending batch is committed now, so one render captures the
+    # actual latest global timeline. Attach it to the summary or newest routine
+    # announcement rather than posting a second standalone message.
+    chart = await _updated_bodyweight_chart(user_id, username)
 
     # A first-time history import gets ONE summary; anything else gets an embed
     # per weigh-in. Gated on `is_first_import` rather than on the count or on
     # `backfill`, because a member who stood on the scale twice between polls
     # is not linking their scale, and must not be publicly told they just did.
+    routine_posts: list[tuple[discord.Message, datetime]] = []
+    routine_chart_message_id: int | None = None
     try:
         if is_first_import and len(imported) > 1:
             weights = [r["weight_kg"] for r in imported]
             times = [r["measured_at"] for r in imported]
-            posted = await channel.send(embed=_ha_backfill_embed(username, {
-                "count": len(imported),
-                "first": min(times), "last": max(times),
-                "min_kg": min(weights), "max_kg": max(weights),
-                "latest_kg": newest["weight_kg"],
-            }))
+            posted = await _ha_send_announcement(
+                channel,
+                _ha_backfill_embed(username, {
+                    "count": len(imported),
+                    "first": min(times), "last": max(times),
+                    "min_kg": min(weights), "max_kg": max(weights),
+                    "latest_kg": newest["weight_kg"],
+                }),
+                chart,
+            )
             # The summary stands for the whole batch, so one ❌ undoes all of it —
             # which is exactly what somebody wants after a bad first import.
             await _ha_offer_undo(
                 posted, user_id, guild_id,
                 [r["measured_at"] for r in imported],
+                chart_message_id=posted.id if chart is not None else None,
             )
         else:
             # Oldest-first, each diffed against the one before it, so two
@@ -15736,7 +15996,7 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
             # dumps a burst can't flood the channel.
             shown = sorted(imported, key=lambda r: r["measured_at"])[-3:]
             running = prev
-            for entry in shown:
+            for index, entry in enumerate(shown):
                 # The reading the import actually used, so the embed's metrics
                 # match the row written rather than the current live state.
                 source = entry.get("reading") or {}
@@ -15751,27 +16011,39 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
                     },
                     running,
                 )
-                posted = await channel.send(
-                    embed=_ha_weighin_embed(
+                posted = await _ha_send_announcement(
+                    channel,
+                    _ha_weighin_embed(
                         username, payload, entry["protein_grams"],
                     ),
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    chart if index == len(shown) - 1 else None,
                 )
-                await _ha_offer_undo(
-                    posted, user_id, guild_id, [entry["measured_at"]],
-                )
+                routine_posts.append((posted, entry["measured_at"]))
+                if index == len(shown) - 1 and chart is not None:
+                    routine_chart_message_id = posted.id
                 running = {
                     "weight_kg": entry["weight_kg"],
                     "recorded_at": entry["measured_at"],
                 }
     except discord.HTTPException:  # pragma: no cover - best effort
         LOG.info("Home Assistant: failed to announce weigh-in for %s", user_id)
+    # Do not expose the undo reaction until the batch's chart holder is known.
+    # If a send failed part-way through, the successfully posted prefix still
+    # gets normal per-message undo tracking, simply without a chart association.
+    for posted, measured_at in routine_posts:
+        await _ha_offer_undo(
+            posted,
+            user_id,
+            guild_id,
+            [measured_at],
+            chart_message_id=routine_chart_message_id,
+        )
     return result
 
 
 async def _ha_offer_undo(
     message: "discord.Message", user_id: int, guild_id: int,
-    measured_ats: list[datetime],
+    measured_ats: list[datetime], *, chart_message_id: int | None = None,
 ) -> None:
     """Record what an announcement covers and add the ❌ affordance.
 
@@ -15782,7 +16054,13 @@ async def _ha_offer_undo(
     if not stamps:
         return
     try:
-        db.ha_track_reply(message.id, user_id, guild_id, stamps)
+        db.ha_track_reply(
+            message.id,
+            user_id,
+            guild_id,
+            stamps,
+            chart_message_id=chart_message_id,
+        )
     except Exception:  # pragma: no cover - defensive
         LOG.exception("Home Assistant: failed to track weigh-in reply")
         return
@@ -15897,6 +16175,12 @@ async def _handle_ha_reaction_undo(payload) -> bool:
         scope = _ha_undo_scope(payload, rec)
         if scope is None:
             return False
+        chart_message_id = (
+            int(rec["chart_message_id"])
+            if "chart_message_id" in rec.keys()
+            and rec["chart_message_id"] is not None
+            else None
+        )
         # Claim it before deleting anything, so two simultaneous reactions can't
         # both run the delete.
         if db.ha_delete_reply(payload.message_id) == 0:
@@ -15907,6 +16191,7 @@ async def _handle_ha_reaction_undo(payload) -> bool:
         if scope is None:
             return False
         guild_id = _msg_guild_id(message)
+        chart_message_id = None
     user_id, stamps = scope
 
     actor_name = None
@@ -15926,8 +16211,21 @@ async def _handle_ha_reaction_undo(payload) -> bool:
         f"It won't be re-imported."
         if removed else "↩️ Nothing to undo (already removed)."
     )
+    if chart_message_id is not None and chart_message_id != payload.message_id:
+        try:
+            holder = await channel.fetch_message(chart_message_id)
+            if holder.author.id == (bot.user.id if bot.user else 0):
+                await holder.edit(attachments=[])
+        except discord.HTTPException:  # pragma: no cover - best effort
+            LOG.info(
+                "Home Assistant: couldn't remove the stale batch graph from %s",
+                chart_message_id,
+            )
     try:
-        await message.edit(content=note, embed=None)
+        # The announcement may carry the automatic history graph. Once its
+        # weigh-in (or whole backfill batch) is gone, keeping that PNG visible
+        # would leave a stale snapshot attached to an "Removed" message.
+        await message.edit(content=note, embed=None, attachments=[])
     except discord.HTTPException:  # pragma: no cover - best effort
         LOG.info("Home Assistant: couldn't edit the undone announcement")
     return True
@@ -16222,6 +16520,12 @@ async def setup_ha_cmd(
             f"bodyweight, so TDEE, protein targets and the graphs follow along"
             + (f", and post to <#{channel_id}>." if channel_id else ".")
         )
+        if channel_id:
+            lines.append(
+                "The attached public graph uses your **global bodyweight "
+                "history**, including manual readings logged in DMs or other "
+                "shared servers."
+            )
         lines.append("`/ha_body` shows your numbers.")
     elif existing is not None:
         lines.append(
@@ -16362,7 +16666,12 @@ async def ha_link_cmd(
         f"tracking `{found['weight_entity']}`.{where}\n"
         f"Weigh-ins sync about every {HA_POLL_MINUTES} min and log as "
         f"bodyweight, so TDEE, protein targets and the graphs all follow along. "
-        f"`/ha_unlink` stops syncing.",
+        + (
+            "The public graph uses the member's **global bodyweight history**, "
+            "including manual readings from DMs or other shared servers. "
+            if channel_id else ""
+        )
+        + "`/ha_unlink` stops syncing.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -16584,23 +16893,27 @@ async def ha_status_cmd(interaction: discord.Interaction) -> None:
 @app_commands.allowed_installs(guilds=True, users=True)
 async def ha_body_cmd(
     interaction: discord.Interaction,
-    member: discord.Member | None = None,
+    member: discord.Member | discord.User | None = None,
 ) -> None:
     target = member or interaction.user
+    # The privacy check can require a live guild-member fetch in DMs and every
+    # database read may briefly wait on the shared SQLite writer. This command
+    # is always private, so defer before either operation.
+    await interaction.response.defer(thinking=True, ephemeral=True)
     if await _deny_invisible_target(interaction, target):
         return
     # Reads what was stored, not Home Assistant, so this keeps working while the
     # server is down or the member has since unlinked.
-    metrics = db.latest_body_metrics(target.id)
+    snapshot = db.latest_body_metric_snapshot(target.id)
     latest = db.get_latest_bodyweight(0, target.id)
-    if not metrics and latest is None:
+    if snapshot is None and latest is None:
         msg = (
             "No body measurements on file yet. Link a smart scale with "
             "`/ha_link`, or log a weight with `/bodyweight`."
             if target.id == interaction.user.id else
             f"No body measurements on file for {target.mention}."
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             msg, ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -16609,8 +16922,16 @@ async def ha_body_cmd(
         title=f"Body composition · {_plain_label(_display_name(target))}",
         colour=ui.HOME_ASSISTANT,
     )
-    if latest is not None:
-        embed.description = f"⚖️ **{float(latest['weight_kg']):.2f} kg**"
+    # A later hand-entered bodyweight must not be combined with an older set of
+    # scale metrics and presented as one reading.  When composition exists, the
+    # snapshot contains the weight measured at that exact timestamp.
+    shown_weight = (
+        float(snapshot["weight_kg"])
+        if snapshot is not None
+        else float(latest["weight_kg"])
+    )
+    embed.description = f"⚖️ **{shown_weight:.2f} kg**"
+    metrics = snapshot["metrics"] if snapshot is not None else {}
     lines: list[str] = []
     for metric in ha_client.METRICS:
         row = metrics.get(metric.key)
@@ -16619,26 +16940,176 @@ async def ha_body_cmd(
         shown = ha_client.format_metric(
             metric.key, float(row["value"]), str(row["unit"] or ""),
         )
-        lines.append(f"{metric.emoji} **{metric.label}** · {shown}")
+        suffix = ""
+        history = db.body_metric_history(target.id, metric.key, limit=180)
+        summary = bodycomp_metric_summary(
+            (r["recorded_at"], float(r["value"])) for r in history
+        )
+        if summary is not None and summary.samples >= 2:
+            if round(summary.change, metric.precision) == 0:
+                suffix = " · → no net change"
+            else:
+                arrow = "▲" if summary.change > 0 else "▼"
+                delta = ha_client.format_metric(
+                    metric.key, abs(summary.change),
+                    str(row["unit"] or metric.unit),
+                )
+                suffix = (
+                    f" · {arrow} {delta} since "
+                    f"<t:{int(summary.first_at.timestamp())}:d>"
+                )
+        lines.append(
+            f"{metric.emoji} **{metric.label}** · {shown}{suffix}"
+        )
     if lines:
         embed.add_field(
-            name="From your scale", value="\n".join(lines)[:1024], inline=False,
+            name="From your scale", value=_clip_field("\n".join(lines)),
+            inline=False,
         )
-    # The newest timestamp across the metrics, not whichever the dict happened to
-    # yield first — metrics are resolved per-metric, so a scale that stopped
-    # reporting one of them leaves an older row in the set.
-    when = max((row["recorded_at"] for row in metrics.values()), default=None)
+    when = (
+        snapshot["recorded_at"]
+        if snapshot is not None else latest["recorded_at"]
+    )
     measured = ha_client.parse_ha_time(when)
     if measured is not None:
         # The embed's own timestamp rather than text in the footer: Discord
         # localises it per reader, and it does NOT render <t:…> markup inside a
         # footer, so spelling the time out there would show UTC to everybody.
         embed.timestamp = measured
-        embed.set_footer(text="Measured")
+        embed.set_footer(
+            text=(
+                "Measured · smart-scale composition is an estimate · "
+                "/ha_graph shows trends"
+                if snapshot is not None else "Weight only · no scale composition"
+            )
+        )
     else:
         embed.set_footer(text="Weight only, no scale linked yet")
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=embed, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="ha_graph",
+    description="Plot one smart-scale body-composition metric over time.",
+)
+@app_commands.describe(
+    metric="The body-composition measurement to plot.",
+    member="Whose measurements to plot. Defaults to you.",
+)
+@app_commands.choices(metric=[
+    app_commands.Choice(name=f"{m.emoji} {m.label}", value=m.key)
+    for m in ha_client.METRICS
+    if m.key != ha_client.WEIGHT_KEY
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def ha_graph_cmd(
+    interaction: discord.Interaction,
+    metric: str,
+    member: discord.Member | discord.User | None = None,
+) -> None:
+    target = member or interaction.user
+    spec = ha_client.METRICS_BY_KEY.get(metric)
+    if spec is None or spec.key == ha_client.WEIGHT_KEY:
+        await interaction.response.send_message(
+            "Pick one of the body-composition metrics shown by Discord. "
+            "For weight itself, use `/bodyweight_graph`.",
+            ephemeral=True,
+        )
+        return
+    # Everything below can wait on a database writer, a DM membership lookup,
+    # or a cold charting import. Acknowledge before any of those operations so
+    # Discord's interaction deadline cannot expire.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if await _deny_invisible_target(interaction, target):
+        return
+    rows = db.body_metric_history(target.id, spec.key, limit=1000)
+    if not rows:
+        await interaction.followup.send(
+            f"No {spec.label.lower()} history is stored for "
+            f"{_plain_label(_display_name(target))} yet.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    points = bodycomp_daily_points(
+        ((r["recorded_at"], float(r["value"])) for r in rows),
+        DISPLAY_TZ,
+    )
+    if len(points) < 2:
+        await interaction.followup.send(
+            f"Need measurements on at least two different days to plot a "
+            f"{spec.label.lower()} trend.",
+            ephemeral=True,
+        )
+        return
+
+    xs = [point.when for point in points]
+    ys = [point.value for point in points]
+    trend = trend_values(ys)
+    delta = ys[-1] - ys[0]
+    first_shown = ha_client.format_metric(spec.key, ys[0], spec.unit)
+    latest_shown = ha_client.format_metric(spec.key, ys[-1], spec.unit)
+    subtitle = (
+        f"{_plural(len(rows), 'measurement')} · "
+        f"{_plural(len(points), 'day')} · "
+        f"{first_shown} → {latest_shown}"
+    )
+    # Load and render off the event loop. Matplotlib keeps process-global
+    # backend/pyplot state, so the worker helper serialises this with automatic
+    # bodyweight charts too.
+    try:
+        buf = await asyncio.to_thread(
+            _render_trend_chart_threadsafe,
+            xs, ys, trend,
+            title=f"{_display_name(target)} — {spec.label}",
+            subtitle=subtitle,
+            trend_label="3-day trend",
+            trend_colour=f"#{ui.HOME_ASSISTANT.value:06x}",
+            unit=spec.unit or spec.label,
+            fmt=lambda value: ha_client.format_metric(
+                spec.key, value, spec.unit,
+            ),
+        )
+    except ImportError:
+        await interaction.followup.send(
+            "Graphing isn't available — matplotlib isn't installed. "
+            "Add it to `requirements.txt` and redeploy.",
+            ephemeral=True,
+        )
+        return
+    safe_member = re.sub(
+        r"[^a-z0-9_-]+", "_", _display_name(target).lower(),
+    ).strip("_") or "member"
+    filename = f"ha_{spec.key}_{safe_member}.png"
+    file = discord.File(buf, filename=filename)
+    arrow = "→" if round(delta, spec.precision) == 0 else (
+        "▲" if delta > 0 else "▼"
+    )
+    change = ha_client.format_metric(spec.key, abs(delta), spec.unit)
+    embed = discord.Embed(
+        title=f"{spec.emoji} {spec.label} trend · "
+              f"{_plain_label(_display_name(target))}",
+        description=(
+            f"Latest **{latest_shown}** · {arrow} {change} across "
+            f"{_plural(len(points), 'day')}"
+        ),
+        colour=ui.HOME_ASSISTANT,
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(
+        text=(
+            "Consumer smart-scale estimate · hydration and timing can move "
+            "individual readings"
+        )
+    )
+    await interaction.followup.send(
+        embed=embed,
+        file=file,
+        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -16670,7 +17141,8 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
             + (f", and gets posted to <#{channel_id}>." if channel_id
                else " (no announcement channel is configured).")
             + "\nEverything else your scale measures — body fat, muscle mass, "
-              "BMI, BMR, water — is kept too; see `/ha_body`."
+              "BMI, BMR, water — is kept too; see `/ha_body` for one coherent "
+              "reading and `/ha_graph` for a trend."
         ),
         inline=False,
     )
@@ -16705,6 +17177,7 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
             "`/ha_entities` — list the body sensors it can see\n"
             "`/ha_link` — pick which sensors are yours\n"
             "`/ha_body` — your latest body-composition numbers\n"
+            "`/ha_graph` — chart one body-composition trend\n"
             "`/ha_status` — connection + link + last check\n"
             "`/ha_unlink` — disconnect and delete your token\n"
             "`/ha_help` — this message"
@@ -16714,9 +17187,11 @@ async def ha_help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Privacy",
         value=(
-            "Weigh-ins are always announced in the channel — link only sensors "
-            "you're fine broadcasting. `/ha_unlink` stops syncing (and "
-            "announcing) altogether."
+            "When an announcement channel is configured, weigh-ins and a "
+            "refreshed graph are public there. The graph is the member's "
+            "**global bodyweight history**, including manual readings logged "
+            "in DMs or other shared servers. Link only sensors you're fine "
+            "broadcasting. `/ha_unlink` stops syncing and announcing."
         ),
         inline=False,
     )
@@ -16818,7 +17293,11 @@ async def strava_latest_cmd(
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
-    embed, file = _strava_embed_and_file(result, target.mention)
+    embed, file = await asyncio.to_thread(
+        _strava_embed_and_file,
+        result,
+        target.mention,
+    )
     kwargs: dict[str, object] = {
         "embed": embed,
         "allowed_mentions": discord.AllowedMentions.none(),
@@ -17976,6 +18455,11 @@ _COACH_SYSTEM = (
     "gently nudge them to log/track, rather than concluding they stopped "
     "training or lost progress. Frame gaps as 'no data logged recently — worth "
     "tracking again', never as a regression.\n\n"
+    "Body-composition values come from a consumer bioimpedance smart scale. "
+    "They are hydration-sensitive estimates, not diagnoses: describe only a "
+    "sustained direction across several readings, call sparse/noisy data "
+    "inconclusive, and never attach a medical judgement to BMI, body-fat, "
+    "muscle, water, metabolic age, or similar values.\n\n"
     "Style: address them by name, lead each section with a bold emoji header "
     "(e.g. '**📊 Overview**'), keep bullets tight (one line each, the specific "
     "number first), and make 'Next steps' genuinely actionable (a weight to "
@@ -18038,7 +18522,12 @@ def _e1rm_progression(rows: list) -> list[dict]:
 
 
 def _build_progress_payload(
-    guild_id: int, user_id: int, name: str, days: int,
+    guild_id: int,
+    user_id: int,
+    name: str,
+    days: int,
+    *,
+    include_body_composition: bool = False,
 ) -> dict:
     """Assemble a compact JSON-able snapshot of everything we track for one
     person: lifting summary/PRs/gains/goals, bodyweight trend, training
@@ -18140,6 +18629,10 @@ def _build_progress_payload(
             "latest_kg": bw[-1]["weight_kg"] if bw else None,
             "change_recent_kg": bw_change_kg,
             "measurements": len(bw),
+            "smart_scale_composition": (
+                _coach_body_composition_block(user_id, days)
+                if include_body_composition else None
+            ),
         },
         "nutrition": {
             "calorie_goal_kcal": (
@@ -18205,6 +18698,65 @@ def _coach_sleep_block(guild_id: int, user_id: int, days: int) -> dict | None:
     }
 
 
+def _coach_body_composition_block(user_id: int, days: int) -> dict | None:
+    """Compact, caveated smart-scale trends for the AI coach.
+
+    Values are filtered to the requested window and kept deliberately
+    pre-analysed: the model receives latest/change/sample count, not hundreds of
+    near-duplicate scale rows.  Direction is neutral because a gain or loss only
+    has meaning in the context of the member's own goal.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(1, int(days)))
+    specs = {
+        metric.key: metric for metric in ha_client.METRICS
+        if metric.key != ha_client.WEIGHT_KEY
+    }
+    trends: list[dict] = []
+    rows = db.body_metric_summaries_between(
+        user_id, specs, cutoff.isoformat(), now.isoformat(),
+    )
+    for row in rows:
+        metric = specs.get(str(row["metric"]))
+        if metric is None:
+            continue
+        first_at = ha_client.parse_ha_time(row["first_at"])
+        latest_at = ha_client.parse_ha_time(row["latest_at"])
+        try:
+            first = float(row["first_value"])
+            latest = float(row["latest_value"])
+            samples = int(row["samples"])
+        except (TypeError, ValueError):
+            continue
+        if (
+            first_at is None or latest_at is None
+            or not math.isfinite(first) or not math.isfinite(latest)
+        ):
+            continue
+        trends.append({
+            "metric": metric.key,
+            "label": metric.label,
+            "unit": metric.unit,
+            "latest": round(latest, metric.precision),
+            "change_in_window": (
+                round(latest - first, metric.precision)
+                if samples >= 2 else None
+            ),
+            "measurements": samples,
+            "first_at": first_at.isoformat(),
+            "latest_at": latest_at.isoformat(),
+        })
+    if not trends:
+        return None
+    return {
+        "source_note": (
+            "Consumer bioimpedance smart-scale estimates; hydration-sensitive. "
+            "Use multi-reading direction only, not medical interpretation."
+        ),
+        "metrics": trends,
+    }
+
+
 def _split_targets_payload(user_id: int) -> dict | None:
     """The user's weekday/weekend targets for AI payloads, or None if they run
     one target every day."""
@@ -18261,9 +18813,20 @@ async def coach_cmd(
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    include_body_composition = target.id == interaction.user.id
+    # Always keep a self-report private. Besides protecting the rest of its
+    # personal nutrition/bodyweight context, this closes the race where a scale
+    # sync lands after a "has composition?" check but before payload assembly.
+    composition_private = include_body_composition
+    await interaction.response.defer(
+        thinking=True, ephemeral=composition_private,
+    )
     payload = _build_progress_payload(
-        guild_id, target.id, _display_name(target), days,
+        guild_id,
+        target.id,
+        _display_name(target),
+        days,
+        include_body_composition=include_body_composition,
     )
     prompt = (
         f"Timezone: {DISPLAY_TZ}. The full tracked dataset for one person "
@@ -18297,7 +18860,9 @@ async def coach_cmd(
         )
     )
     await interaction.followup.send(
-        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        embed=embed,
+        ephemeral=composition_private,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
