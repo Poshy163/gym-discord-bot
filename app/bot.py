@@ -1866,9 +1866,10 @@ async def _handle_calorie_food_message(
     pro_goal = db.protein_goal_get(guild_id, target_id)
     grams = float(food_protein) * servings if food_protein is not None else 0.0
     logged_protein = False
+    protein_id = 0
     if pro_goal is not None and 0 < grams <= _MAX_PROTEIN_ENTRY_G:
         try:
-            db.protein_add(
+            protein_id = db.protein_add(
                 guild_id, target_id, _display_name(target), grams,
                 note=note, raw=raw, logged_at=logged_at, message_id=message.id,
                 actor_id=message.author.id,
@@ -1892,35 +1893,40 @@ async def _handle_calorie_food_message(
         )
         return
 
-    # Combined reply (🍎🥩) — mirrors _handle_combined_nutrition so the shared ❌
+    # Combined card (🍎🥩) — mirrors _handle_combined_nutrition so the shared ❌
     # undo path removes both the calorie and protein entries via the source id.
     window = _day_window_for(logged_at)
     cal_total, _ = db.calorie_total_between(guild_id, target_id, *window)
     pro_total, _ = db.protein_total_between(guild_id, target_id, *window)
-    day_targets = _reply_targets(target_id, logged_at)
-    day_label = _reply_label(
-        day_targets, calories=True, protein=logged_protein,
-    )
     suffix = _target_suffix(message.author, target)
+    status, colour = _combined_status(
+        target_id, cal_total=cal_total, pro_total=pro_total,
+        logged_at=logged_at,
+    )
     try:
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
     try:
         reply = await message.reply(
-            f"{ui.FOOD}{ui.PROTEIN} Logged **{calories.format_kcal(kcal)}** + "
-            f"**{protein_mod.format_grams(grams)}** protein — {note}{suffix}"
-            f"{_backdate_label(logged_at)}\n"
-            + _calorie_status_line(cal_total, day_targets.kcal.value or 0.0)
-            + _streak_suffix(_calorie_streak(target_id))
-            + "\n"
-            + _protein_status_line(
-                pro_total, day_targets.protein.value or 0.0, day_label,
+            # Both macro icons title the card: they mark it as a combined reply
+            # for _is_nutrition_reply, and the streaks already ride on their own
+            # meter lines, so the footer stays the plain ❌ hint.
+            embed=_log_card(
+                f"{ui.FOOD}{ui.PROTEIN}",
+                f"+{calories.format_kcal(kcal)} + "
+                f"{protein_mod.format_grams(grams)} protein"
+                f"{suffix}{_backdate_label(logged_at)}",
+                status, colour,
+                author=target, note=_safe_label(note, limit=64) if note else None,
             ),
             mention_author=False,
         )
     except discord.HTTPException:
         return
+    _remember_reply(
+        reply, target_id, calorie_id=entry_id, protein_id=protein_id,
+    )
     try:
         await reply.add_reaction("❌")
     except discord.HTTPException:
@@ -2741,13 +2747,14 @@ async def _handle_combined_nutrition(
 
     raw = message.content.strip()[:80]
     logged: list[str] = []      # "**500 cal**", "**40 g** protein"
-    status_lines: list[str] = []
     skipped: list[str] = []
     cal_id = pro_id = 0
+    # The day's running total per macro — None for a macro this reply doesn't
+    # show, which is what tells the renderer to leave its meter off entirely.
+    cal_total: float | None = None
+    pro_total: float | None = None
 
     window = _day_window_for(logged_at)
-    day_targets = _reply_targets(target_id, logged_at)
-    showed_calories = showed_protein = False
     if cal_goal is not None:
         if 0 < kcal <= _MAX_ENTRY_KCAL:
             cal_id = db.calorie_add(
@@ -2756,19 +2763,10 @@ async def _handle_combined_nutrition(
                 actor_id=message.author.id,
                 actor_name=_display_name(message.author),
             )
-            total, _n = db.calorie_total_between(
+            cal_total, _n = db.calorie_total_between(
                 guild_id, target_id, *window,
             )
             logged.append(f"**{calories.format_kcal(kcal)}**")
-            # Each macro carries its OWN streak. Picking one streak for the
-            # whole reply appended the calorie streak to the protein line
-            # whenever a message logged both, crediting protein with days it
-            # hadn't earned.
-            status_lines.append(
-                _calorie_status_line(total, day_targets.kcal.value or 0.0)
-                + _streak_suffix(_calorie_streak(target_id))
-            )
-            showed_calories = True
         else:
             skipped.append("calories (looks like a typo)")
     elif kcal > 0:
@@ -2782,27 +2780,14 @@ async def _handle_combined_nutrition(
                 actor_id=message.author.id,
                 actor_name=_display_name(message.author),
             )
-            total, _n = db.protein_total_between(
+            pro_total, _n = db.protein_total_between(
                 guild_id, target_id, *window,
             )
             logged.append(f"**{protein_mod.format_grams(grams)}** protein")
-            status_lines.append(
-                _protein_status_line(total, day_targets.protein.value or 0.0)
-                + _streak_suffix(_protein_streak(target_id))
-            )
-            showed_protein = True
         else:
             skipped.append("protein (looks like a typo)")
     elif grams > 0:
         skipped.append("protein (run `/protein setup`)")
-
-    # One "Using Weekend Targets" note for the whole reply, not one per macro —
-    # and only about the macros this reply actually showed.
-    label = _reply_label(
-        day_targets, calories=showed_calories, protein=showed_protein,
-    )
-    if status_lines and label:
-        status_lines[-1] += _target_label_suffix(label)
 
     if not logged:
         note = ", ".join(skipped) if skipped else "nothing"
@@ -2820,23 +2805,39 @@ async def _handle_combined_nutrition(
         await message.add_reaction("✅")
     except discord.HTTPException:
         pass
-    tail = (
-        f"\n{ui.subtext(f'skipped {chr(44).join(skipped)}')}" if skipped else ""
-    )
-    if basis:
-        tail = f"\n{ui.subtext(basis)}{tail}"
-    # Split out so the same headline and tail can be reused verbatim when an
-    # earlier entry changes and this reply's meters have to be recomputed —
-    # re-deriving them would lose who it was logged for and any backdating.
+    # Notes that ride under the meters: the per-100g basis a `895kj 14.7p 110g`
+    # post scaled by, then anything this message asked for but couldn't log.
+    notes = [
+        n for n in (basis, f"skipped {', '.join(skipped)}" if skipped else "")
+        if n
+    ]
+    tail = "".join(f"\n{ui.subtext(n)}" for n in notes)
+    # Stashed with the reply so a later restate can put the tail back verbatim —
+    # re-deriving it would lose the scaling this particular post applied. The
+    # headline rides along for the plain-text replies still in history; a card
+    # keeps its own title through a restate.
     headline = (
         f"{ui.FOOD}{ui.PROTEIN} Logged {' + '.join(logged)}{suffix}"
         f"{_backdate_label(logged_at)}"
     )
+    # One renderer for the meters, each macro's own streak, and the single
+    # "Using Weekend Targets" caption — shared with the card
+    # _restate_one_reply rewrites when an earlier entry later changes.
+    status, colour = _combined_status(
+        target_id, cal_total=cal_total, pro_total=pro_total,
+        logged_at=logged_at,
+    )
     try:
-        # Both macro icons mark this as a combined reply; the undo handler
-        # removes every nutrition entry tied to the source message.
+        # Both macro icons title the card, marking it a combined reply; the undo
+        # handler removes every nutrition entry tied to the source message.
         reply = await message.reply(
-            headline + "\n" + "\n".join(status_lines) + tail,
+            embed=_log_card(
+                f"{ui.FOOD}{ui.PROTEIN}",
+                f"Logged {' + '.join(logged)}{suffix}"
+                f"{_backdate_label(logged_at)}",
+                status + tail, colour,
+                author=target,
+            ),
             mention_author=False,
         )
     except discord.HTTPException:
@@ -5000,10 +5001,38 @@ def _restated_status_lines(
             + _streak_suffix(_calorie_streak(target_id))
         )
     if pro_total is not None:
-        lines.append(_protein_status_line(
-            pro_total, day_targets.protein.value or 0.0, day_label,
-        ))
+        # Each macro carries its OWN streak: one streak stretched across both
+        # lines would credit protein with days it hadn't earned.
+        lines.append(
+            _protein_status_line(
+                pro_total, day_targets.protein.value or 0.0, day_label,
+            )
+            + _streak_suffix(_protein_streak(target_id))
+        )
     return lines
+
+
+def _combined_status(
+    target_id: int, *, cal_total: float | None, pro_total: float | None,
+    logged_at: datetime | None = None,
+) -> tuple[str, discord.Colour]:
+    """The meter block and card colour for a reply that logged both macros.
+
+    The single renderer for a combined card, shared by the two paths that post
+    one (a `500c and 40p` message and a saved food that carries protein) and by
+    :func:`_restate_one_reply`, so a card can't be rewritten into a different
+    shape than it was posted in.
+    """
+    lines = _restated_status_lines(
+        target_id, cal_total=cal_total, pro_total=pro_total,
+        logged_at=logged_at,
+    )
+    colours: list[discord.Colour] = []
+    if cal_total is not None:
+        colours.append(_calorie_status_pair(target_id, cal_total, logged_at)[1])
+    if pro_total is not None:
+        colours.append(_protein_status_pair(target_id, pro_total, logged_at)[1])
+    return "\n".join(lines), _worst_colour(colours)
 
 
 def _running_totals(rows: "list[sqlite3.Row]", column: str) -> dict[int, float]:
@@ -5108,7 +5137,14 @@ async def _restate_one_reply(
     try:
         if msg.embeds:
             old = msg.embeds[0]
-            if cal_total is not None:
+            if cal_total is not None and pro_total is not None:
+                # A combined card carries two meters; recomputing only one of
+                # them would quietly drop the other off the card.
+                status, colour = _combined_status(
+                    target_id, cal_total=cal_total, pro_total=pro_total,
+                    logged_at=logged_at,
+                )
+            elif cal_total is not None:
                 status, colour = _calorie_status_pair(
                     target_id, cal_total, logged_at,
                 )
@@ -5116,6 +5152,10 @@ async def _restate_one_reply(
                 status, colour = _protein_status_pair(
                     target_id, pro_total or 0.0, logged_at,
                 )
+            # The per-100g basis / "skipped …" subtext sits under the meters and
+            # is still true after a restate, so carry it back over.
+            if row["footnote"]:
+                status += f"\n{row['footnote']}"
             # Rebuild from the live embed so the title, note field, author and
             # milestone banner survive — only the meter and its colour move.
             embed = old.copy()

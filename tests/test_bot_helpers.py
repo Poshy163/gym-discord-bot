@@ -1701,6 +1701,82 @@ def test_log_card_title_carries_a_prefix_the_gate_accepts():
         assert ui.overflows(card) is None
 
 
+def test_log_card_title_accepts_the_combined_macro_prefix():
+    """A message that logs both macros replies with ONE card titled with both
+    icons. It still has to read as a nutrition reply, or ❌ stops undoing the
+    exact replies that have two entries behind them."""
+    import app.bot as bot
+    from app import ui
+
+    card = bot._log_card(
+        f"{ui.FOOD}{ui.PROTEIN}", "Logged **650 cal** + **40 g** protein",
+        "meters", ui.WARNING,
+    )
+    assert bot._is_nutrition_reply(_FakeReply(embeds=[card]))
+    assert ui.overflows(card) is None
+
+
+def _stub_combined(monkeypatch, *, kcal_target=2500.0, protein_max=180.0):
+    """Point the combined-card renderer at fixed targets and streaks."""
+    import app.bot as bot
+    from app import targets as targets_mod
+
+    monkeypatch.setattr(bot, "_calorie_streak", lambda u: 12)
+    monkeypatch.setattr(bot, "_protein_streak", lambda u: 4)
+    monkeypatch.setattr(
+        bot, "_reply_targets",
+        lambda u, at=None: targets_mod.Resolved(
+            day=None,
+            kcal=targets_mod.MacroTarget(kcal_target, None, split=False),
+            protein=targets_mod.MacroTarget(protein_max, None, split=False),
+        ),
+    )
+
+
+def test_combined_status_shows_both_meters_with_their_own_streaks(monkeypatch):
+    """One card, two meters — and each macro's own streak. Stretching the
+    calorie streak across both lines credits protein with days it never
+    earned."""
+    import app.bot as bot
+
+    _stub_combined(monkeypatch)
+    status, _colour = bot._combined_status(
+        1, cal_total=1200.0, pro_total=90.0,
+    )
+
+    # Each meter is two tiers (percentage + bar, then the raw numbers), so the
+    # streak rides on the second line of its own macro's meter.
+    lines = status.split("\n")
+    assert len(lines) == 4
+    assert "left today" in lines[1] and "12 day streak" in lines[1]
+    assert "headroom" in lines[3] and "4 day streak" in lines[3]
+
+
+def test_combined_status_takes_the_more_alarming_colour(monkeypatch):
+    """Calories landing on target while the protein ceiling is breached must
+    not paint the card green — that's the exact day the ceiling exists for."""
+    import app.bot as bot
+    from app import ui
+
+    _stub_combined(monkeypatch)
+    _status, colour = bot._combined_status(
+        1, cal_total=2450.0, pro_total=260.0,   # on target / way over max
+    )
+    assert colour == ui.DANGER
+
+
+def test_combined_status_drops_the_macro_that_was_not_logged(monkeypatch):
+    """`500c and 40p` from someone who only tracks calories gets a one-meter
+    card, not a protein bar reading 0 g / 0 g."""
+    import app.bot as bot
+
+    _stub_combined(monkeypatch)
+    status, _colour = bot._combined_status(1, cal_total=1200.0, pro_total=None)
+    assert "\n" in status          # meter is itself two tiers
+    assert "streak" in status
+    assert "headroom" not in status  # the protein meter's wording
+
+
 def test_log_card_footer_always_advertises_the_reaction():
     import app.bot as bot
     from app import ui
