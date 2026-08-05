@@ -33,6 +33,7 @@ GET  /api/lifts        Lift rows (optionally one user).
 GET  /api/calories     Calorie rows.
 GET  /api/protein      Protein rows.
 GET  /api/activity     Per-tracked-user game/app activity (overlap-aware totals).
+GET  /api/activity/log One member's play sessions (start/end/duration) + rollup.
 GET  /api/sleep        Per-tracked-user nightly sleep sessions from presence.
 POST /api/lifts/delete, /api/lifts/edit, /api/calories/delete,
      /api/protein/delete   Edit endpoints (audited).
@@ -1047,6 +1048,99 @@ def build_app(
             {"users": users, "window_days": days, "leaderboard": leaderboard}
         )
 
+    async def api_activity_log(request: web.Request) -> web.Response:
+        """One member's play sessions — every stretch of a title, newest first.
+
+        The Activity tab's cards answer "what have they played"; this answers
+        "when". ``sessions`` is the raw log, ``games`` the same window rolled up
+        per title (the "most played" view) so the panel needs a single fetch.
+        """
+        _require(request)
+        gid = _guild_id(request)
+        uid = _opt_user(request)
+        if uid is None:
+            return web.json_response(
+                {"ok": False, "error": "a numeric ?user= is required"},
+                status=400,
+            )
+        days = _clamp_int(request.query.get("days"), 7, 1, 90)
+        # Someone who leaves a launcher running racks up a session a day, so a
+        # busy 90-day window can run long; cap the payload and say we did.
+        limit = _clamp_int(request.query.get("limit"), 400, 1, 2000)
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=days)
+
+        member = db.get_member(gid, uid)
+        pres = db.presence_current(gid, uid)
+        imgmap = db.activity_image_map(gid, uid)
+        appidmap = db.activity_appid_map(gid, uid)
+        events = db.activity_sets_for(gid, uid, since=since)
+        sessions = presence.activity_sessions(
+            events, since, now, display_tz=_display_tz(),
+        )
+        # Same source, same window: the per-title totals are exactly the sums of
+        # the sessions above, so the rollup can't disagree with the log.
+        totals = presence.summarize_activity_sets(events, since, now)
+
+        # Resolve art once per title rather than once per session, batching the
+        # app-id lookups the icon map can't answer (same fallback chain as
+        # api_activity: rich-presence image → curated map → app-id RPC).
+        names = {s["name"] for s in sessions} | set(totals)
+        missing_app_ids = {
+            int(appidmap[nm]) for nm in names
+            if appidmap.get(nm) and not _act_icon(nm, imgmap.get(nm))
+        }
+        if missing_app_ids:
+            await game_icons.resolve_app_icons(missing_app_ids)
+        art = {
+            nm: _act_icon(nm, imgmap.get(nm)) or game_icons.app_icon(
+                appidmap.get(nm)
+            )
+            for nm in names
+        }
+
+        playing_now = {
+            d["n"] for d in (db.activity_current_set(gid, uid) or ([], ""))[0]
+        }
+        per_game: dict[str, dict] = {}
+        for s in sessions:
+            g = per_game.setdefault(
+                s["name"], {"sessions": 0, "last": None, "last_local": None},
+            )
+            g["sessions"] += 1
+            g["last"], g["last_local"] = s["end"], s["end_local"]
+        games = [
+            {
+                "name": nm,
+                "image": art.get(nm),
+                "seconds": round(secs),
+                "sessions": per_game.get(nm, {}).get("sessions", 0),
+                "last_played": per_game.get(nm, {}).get("last"),
+                "last_played_local": per_game.get(nm, {}).get("last_local"),
+                "playing_now": nm in playing_now,
+            }
+            for nm, secs in totals.items()
+        ]
+
+        newest_first = sessions[::-1]
+        return web.json_response({
+            "user_id": str(uid),
+            "display_name": member["display_name"] if member else str(uid),
+            "avatar": member["avatar"] if member else None,
+            "status": pres["status"] if pres else None,
+            "status_at": pres["at"] if pres else None,
+            "tracked": db.presence_is_tracked(gid, uid),
+            "window_days": days,
+            "since": since.isoformat(),
+            "until": now.isoformat(),
+            "sessions": [
+                {**s, "image": art.get(s["name"])} for s in newest_first[:limit]
+            ],
+            "session_count": len(sessions),
+            "truncated": len(sessions) > limit,
+            "games": games,
+        })
+
     async def api_sleep(request: web.Request) -> web.Response:
         _require(request)
         gid = _guild_id(request)
@@ -1758,6 +1852,7 @@ def build_app(
         web.get("/api/equipment", api_equipment),
         web.get("/api/leaderboard", api_leaderboard),
         web.get("/api/activity", api_activity),
+        web.get("/api/activity/log", api_activity_log),
         web.get("/api/sleep", api_sleep),
         web.get("/api/messages/channels", api_messages_channels),
         web.get("/api/messages/log", api_messages_log),
@@ -2257,6 +2352,34 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .barfill,.lead-nm .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
 .offline-card{opacity:.6}
 .nowlist{display:flex;flex-direction:column;gap:.4rem}
+/* per-player session log (in the shared dialog) */
+.act-head .act-log-btn{margin-left:auto;flex:none}
+.tg-go{cursor:pointer;border-radius:8px;padding:.15rem .3rem;margin:-.15rem -.3rem}
+.tg-go:hover{background:#ffffff0a}
+.tg-go.on{background:#ffffff12}
+#editDlg .al-sec{font-size:.78rem;color:var(--muted);text-transform:uppercase;
+letter-spacing:.04em;margin:1.1rem 0 .5rem;display:flex;align-items:center;gap:.5rem}
+/* The shared dialog sizes to its content; pin a width here so a long game
+   name can't stretch the panel across the screen. */
+#editDlg .al-list,#editDlg .al-games{width:min(560px,86vw)}
+.al-games{display:flex;flex-direction:column;gap:.45rem;max-height:26vh;overflow:auto}
+.al-games .al-meta{flex:none;font-size:.74rem}
+.al-list{display:flex;flex-direction:column;gap:.15rem;max-height:44vh;overflow:auto}
+.al-day{position:sticky;top:0;background:var(--panel);z-index:1;font-size:.76rem;
+color:var(--muted);padding:.5rem 0 .25rem}
+.al-row{display:flex;align-items:center;gap:.55rem;padding:.28rem .3rem;border-radius:8px}
+.al-row:hover{background:#ffffff08}
+.al-row[data-open]{background:#3ba55d14}
+.al-row .gi{width:24px;height:24px;border-radius:6px;flex:none}
+.al-nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.86rem}
+.al-when{flex:none;font-size:.82rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.al-dur{flex:none;width:64px;text-align:right;font-size:.82rem;font-weight:600;
+font-variant-numeric:tabular-nums}
+.al-next{font-size:.68rem;color:var(--muted);margin-left:.2rem}
+.al-now{color:#3ba55d;font-weight:600}
+.al-clear{cursor:pointer;background:#ffffff10;border:1px solid var(--line);
+border-radius:7px;padding:.1rem .4rem;font-size:.74rem;text-transform:none;letter-spacing:0}
+.al-clear:hover{background:#ffffff1a}
 /* day-window segmented control (Activity + Sleep tabs) */
 .dayseg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .dayseg button{background:var(--panel);border:0;color:var(--muted);cursor:pointer;
@@ -2524,6 +2647,12 @@ function toast(m){const t=document.getElementById("toast");t.textContent=m;
   t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200);}
 function esc(s){return(s==null?"":String(s)).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+// Drop a string into an inline on*="…" handler: JSON-quote it so the JS parser
+// sees one string literal, then HTML-escape so it can't break out of the
+// attribute. Plain esc() is not enough — it renders ' as &#39;, which the HTML
+// parser hands back to JS as a bare quote, and game names really do contain
+// apostrophes ("Tom Clancy's Rainbow Six Siege").
+function jsq(s){return esc(JSON.stringify(s==null?"":String(s)));}
 function fmtTs(s){if(!s)return"";const d=new Date(s);return isNaN(d)?s:
   d.toLocaleString([], {dateStyle:"medium",timeStyle:"short"});}
 function roleColor(c){return c?("#"+(c>>>0).toString(16).padStart(6,"0").slice(-6)):"#8b949e";}
@@ -3363,7 +3492,10 @@ function actCard(u){
       <div class="t">${i===0?"▶ playing now":"＋ also playing"}${g.since?" · since "+fmtTs(g.since):""}</div></div></div>`).join("")}</div>`
     : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
       <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
-  const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg">
+  // Each title opens the log already filtered to it — the usual next question
+  // after "he's played a lot of R6" is "when?".
+  const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg tg-go"
+      onclick="activityLog('${u.user_id}',${jsq(g.name)})" title="Session log for ${esc(g.name)}">
       ${gameTile(g.name,g.image,30,"gi")}
       <div class="nm">${esc(g.name)}<div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
       <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
@@ -3372,12 +3504,103 @@ function actCard(u){
     <div class="act-head">
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
         <span class="dot ${statusClass(u.status)}"></span></span>
-      <div><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
+      <div style="min-width:0"><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
       <div class="act-sub">${statusLabel(u.status)}</div></div>
+      <button class="btn sm act-log-btn" onclick="activityLog('${u.user_id}')"
+        title="When they played what — every session in this window">📜 Log</button>
     </div>
     ${now}
     <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
   </div>`;
+}
+
+/* ---- per-player session log ---------------------------------------------
+   "Most played" answers what; this answers when — every stretch of a title
+   with its clock times, newest first, grouped by the day it started.
+   It lives in the shared dialog rather than in the tab because the Activity
+   grid re-polls on a timer and rewrites #actGrid wholesale — a panel rendered
+   inside it would be yanked out from under whoever was reading it. */
+let ACTLOG=null;        // last payload, kept so the title filter can redraw
+let ACTLOG_GAME=null;   // active title filter, or null for "everything"
+
+async function activityLog(uid,game){
+  const dlg=document.getElementById("editDlg");
+  ACTLOG=null;ACTLOG_GAME=game||null;
+  dlg.innerHTML=`<h2>📜 Activity log</h2>${spinner()}`;
+  dlg.showModal();
+  let d;
+  try{d=await api(`/api/activity/log?guild=${guild}&user=${uid}&days=${WIN_DAYS}`);}
+  catch(e){
+    dlg.innerHTML=`<h2>📜 Activity log</h2>
+      <p class="faint">Couldn't load the log — try again in a moment.</p>
+      <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Close</button></div>`;
+    return;
+  }
+  if(!d)return;  // 401 — api() has already bounced us to the login page
+  ACTLOG=d;drawActLog();
+}
+function actLogFilter(name){
+  // Clicking the active title again clears the filter.
+  ACTLOG_GAME=(name&&name!==ACTLOG_GAME)?name:null;drawActLog();
+}
+// "2026-08-04" (already in the dashboard's display timezone) -> "Tue 4 Aug".
+// Parsed as local midnight so the browser's own zone can't shift the day.
+function actLogDay(d){const dt=new Date(d+"T00:00:00");
+  return isNaN(dt)?d:dt.toLocaleDateString([],{weekday:"short",day:"numeric",month:"short"});}
+function actLogRow(s){
+  const from=s.start_local.slice(11),to=s.end_local.slice(11);
+  // A session that runs past midnight ends on the next date — say so instead
+  // of showing "22:04 → 00:31" as if it were a 22-hour backwards stint.
+  const over=s.end_local.slice(0,10)!==s.start_local.slice(0,10)
+    ?'<span class="al-next">+1d</span>':"";
+  const when=s.open?`${esc(from)} → <span class="al-now">now</span>`
+    :`${esc(from)} → ${esc(to)}${over}`;
+  return `<div class="al-row"${s.open?' data-open="1"':""}>
+    ${gameTile(s.name,s.image,24,"gi")}
+    <div class="al-nm">${esc(s.name)}</div>
+    <div class="al-when">${when}</div>
+    <div class="al-dur">${fmtPlaytime(s.seconds)}</div></div>`;
+}
+function drawActLog(){
+  const d=ACTLOG;if(!d)return;
+  const dlg=document.getElementById("editDlg");
+  const games=d.games||[];
+  const maxSec=Math.max(1,...games.map(g=>g.seconds));
+  const sessions=(d.sessions||[]).filter(s=>!ACTLOG_GAME||s.name===ACTLOG_GAME);
+
+  const chips=games.length?`<div class="al-games">${games.map(g=>`<div
+      class="tg tg-go${g.name===ACTLOG_GAME?" on":""}" onclick="actLogFilter(${jsq(g.name)})">
+      ${gameTile(g.name,g.image,26,"gi")}
+      <div class="nm">${esc(g.name)}${g.playing_now?' <span class="al-now">▶ now</span>':""}
+        <div class="barwrap"><div class="barfill" style="width:${Math.round(g.seconds/maxSec*100)}%"></div></div></div>
+      <div class="al-meta faint">${g.sessions} session${g.sessions===1?"":"s"}</div>
+      <div class="pt">${fmtPlaytime(g.seconds)}</div></div>`).join("")}</div>`
+    : '<div class="faint">Nothing tracked in this window.</div>';
+
+  // Group consecutive sessions by their local start date — the payload is
+  // already newest-first, so a simple run-length walk keeps that order.
+  let rows="",day=null;
+  for(const s of sessions){
+    if(s.date!==day){day=s.date;rows+=`<div class="al-day">${esc(actLogDay(day))}</div>`;}
+    rows+=actLogRow(s);
+  }
+  const note=d.truncated
+    ?`<div class="faint" style="margin-top:.5rem">Showing the ${d.sessions.length}
+       most recent of ${d.session_count} sessions.</div>`:"";
+  const filtered=ACTLOG_GAME
+    ?`<span class="al-clear" onclick="actLogFilter(null)">${esc(ACTLOG_GAME)} ✕</span>`:"";
+
+  dlg.innerHTML=`<h2 style="display:flex;align-items:center;gap:.6rem;margin-bottom:.2rem">
+      ${avatar(d.user_id,d.display_name,d.avatar,30)}${esc(d.display_name)}
+      <span class="faint" style="font-size:.8rem;font-weight:400">last ${d.window_days}d</span></h2>
+    ${d.tracked?"":`<div class="faint" style="font-size:.8rem;margin-bottom:.6rem">
+      Tracking is off for this member — this is the history recorded up to then.</div>`}
+    <div class="al-sec">Most played</div>${chips}
+    <div class="al-sec">Sessions ${filtered}</div>
+    ${sessions.length?`<div class="al-list">${rows}</div>`
+      :'<div class="faint">No sessions in this window.</div>'}
+    ${note}
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Close</button></div>`;
 }
 
 // ---- sleep feed ----------------------------------------------------------

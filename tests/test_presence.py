@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.presence import (
+    activity_sessions,
     format_duration,
     is_online,
     nightly_sleep_sessions,
@@ -223,6 +224,119 @@ def test_summarize_activities_adapter_matches_single_track():
 def test_summarize_activity_sets_empty_window():
     start = datetime(2026, 5, 1, tzinfo=UTC)
     assert summarize_activity_sets([(["X"], _iso(start))], start, start) == {}
+
+
+# --- per-title session log ------------------------------------------------
+
+def test_activity_sessions_splits_overlapping_titles():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    events = [
+        (["tModLoader"], _iso(start)),
+        (["tModLoader", "Excel"], _iso(start + timedelta(minutes=30))),
+        (["tModLoader"], _iso(start + timedelta(minutes=90))),
+    ]
+    sessions = activity_sessions(events, start, end)
+    # One unbroken run of tModLoader, plus Excel's hour inside it. Oldest first.
+    assert [(s["name"], s["seconds"], s["open"]) for s in sessions] == [
+        ("tModLoader", 2 * 3600, True),
+        ("Excel", 3600, False),
+    ]
+    assert sessions[1]["start_local"] == "2026-05-01 12:30"
+    assert sessions[1]["end_local"] == "2026-05-01 13:30"
+
+
+def test_activity_sessions_carry_in_starts_at_the_window_edge():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    events = [
+        (["Rust"], _iso(start - timedelta(hours=1))),   # already playing
+        ([], _iso(start + timedelta(hours=1))),          # stopped at the 1h mark
+    ]
+    (session,) = activity_sessions(events, start, end)
+    # Clamped to the window rather than reaching back to the real start time.
+    assert session["start"] == start.isoformat()
+    assert session["seconds"] == 3600
+    assert session["open"] is False
+
+
+def test_activity_sessions_still_running_is_open_at_the_window_end():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    events = [(["Halo"], _iso(start + timedelta(hours=1)))]
+    (session,) = activity_sessions(events, start, end)
+    assert session["open"] is True
+    assert session["end"] == end.isoformat()
+    assert session["seconds"] == 3600
+
+
+def test_activity_sessions_folds_a_reconnect_blip_into_one_entry():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=3)
+    events = [
+        (["Siege"], _iso(start)),
+        ([], _iso(start + timedelta(hours=1))),             # 60s gateway drop
+        (["Siege"], _iso(start + timedelta(hours=1, seconds=60))),
+        ([], _iso(start + timedelta(hours=2))),
+    ]
+    (session,) = activity_sessions(events, start, end)
+    # One entry spanning the blip — but the 60s gap isn't counted as play.
+    assert session["start_local"] == "2026-05-01 12:00"
+    assert session["end_local"] == "2026-05-01 14:00"
+    assert session["seconds"] == 2 * 3600 - 60
+
+
+def test_activity_sessions_keeps_a_real_break_apart():
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=6)
+    events = [
+        (["Siege"], _iso(start)),
+        ([], _iso(start + timedelta(hours=1))),
+        (["Siege"], _iso(start + timedelta(hours=4))),      # 3h later
+        ([], _iso(start + timedelta(hours=5))),
+    ]
+    sessions = activity_sessions(events, start, end)
+    assert [s["seconds"] for s in sessions] == [3600, 3600]
+
+
+def test_activity_sessions_sum_to_the_totals_they_are_shown_beside():
+    """The log and the "most played" bars read off the same window, so a
+    title's sessions must add up to its total — or the card contradicts
+    itself."""
+    start = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=8)
+    events = [
+        (["Siege", "Steam"], _iso(start - timedelta(minutes=5))),
+        (["Steam"], _iso(start + timedelta(hours=2))),
+        ([], _iso(start + timedelta(hours=2, seconds=30))),   # blip, merged
+        (["Steam"], _iso(start + timedelta(hours=2, seconds=90))),
+        (["Steam", "Siege"], _iso(start + timedelta(hours=5))),
+    ]
+    totals = summarize_activity_sets(events, start, end)
+    summed: dict[str, float] = {}
+    for s in activity_sessions(events, start, end):
+        summed[s["name"]] = summed.get(s["name"], 0.0) + s["seconds"]
+    assert summed == totals
+
+
+def test_activity_sessions_renders_local_times_and_dates():
+    tz = timezone(timedelta(hours=10))   # Australia/Brisbane-ish
+    start = datetime(2026, 5, 1, 11, 0, tzinfo=UTC)   # 21:00 local
+    end = start + timedelta(hours=5)
+    events = [
+        (["Siege"], _iso(start + timedelta(hours=1))),   # 22:00 local
+        ([], _iso(start + timedelta(hours=3, minutes=30))),  # 00:30 next day
+    ]
+    (session,) = activity_sessions(events, start, end, display_tz=tz)
+    assert session["start_local"] == "2026-05-01 22:00"
+    assert session["end_local"] == "2026-05-02 00:30"
+    # Filed under the evening it began, not the small hours it ran into.
+    assert session["date"] == "2026-05-01"
+
+
+def test_activity_sessions_empty_window():
+    start = datetime(2026, 5, 1, tzinfo=UTC)
+    assert activity_sessions([(["X"], _iso(start))], start, start) == []
 
 
 # --- sleep_stats ----------------------------------------------------------

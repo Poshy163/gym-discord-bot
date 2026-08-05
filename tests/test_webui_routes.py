@@ -508,6 +508,126 @@ def test_activity_includes_server_leaderboard(tmp_path):
     _run(go())
 
 
+def test_activity_log_lists_sessions_newest_first_with_a_rollup(tmp_path):
+    """The per-member log answers "when did he play what": one entry per stretch
+    of a title, newest first, alongside the same window's most-played rollup."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        # Siege 4h→2h ago alongside Steam, Steam alone until 1h ago, then
+        # Siege again and still running.
+        db.activity_log_set(1, 100, [("Siege", None), ("Steam", None)],
+                            at=now - timedelta(hours=4))
+        db.activity_log_set(1, 100, [("Steam", None)], at=now - timedelta(hours=2))
+        db.activity_log_set(1, 100, [], at=now - timedelta(hours=1))
+        db.activity_log_set(1, 100, [("Siege", None)],
+                            at=now - timedelta(minutes=30))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get(
+                "/api/activity/log?guild=1&user=100&days=7"
+            )).json()
+            assert d["display_name"] == "Alice"
+            assert d["window_days"] == 7 and d["tracked"] is True
+            assert d["truncated"] is False and d["session_count"] == 3
+
+            # Newest first: Siege's live stint, then the two that opened
+            # together 4h ago (Steam ran on after Siege stopped).
+            starts = [s["start"] for s in d["sessions"]]
+            assert starts == sorted(starts, reverse=True)
+            assert [s["name"] for s in d["sessions"]] == [
+                "Siege", "Steam", "Siege",
+            ]
+            live = d["sessions"][0]
+            assert live["open"] is True                    # still playing
+            assert 1700 <= live["seconds"] <= 1900         # ~30 min
+            assert live["start_local"] < live["end_local"]
+
+            games = {g["name"]: g for g in d["games"]}
+            # Steam (3h) outranks Siege (2h + 30m) and only Siege is live.
+            assert list(games) == ["Steam", "Siege"]
+            assert games["Siege"]["sessions"] == 2
+            assert games["Siege"]["playing_now"] is True
+            assert games["Steam"]["playing_now"] is False
+            # The rollup is the sum of the log — the two are shown side by side.
+            assert games["Siege"]["seconds"] == round(
+                sum(s["seconds"] for s in d["sessions"] if s["name"] == "Siege")
+            )
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_activity_log_rejects_a_missing_user(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/activity/log?guild=1")
+            assert r.status == 400
+            assert (await r.json())["ok"] is False
+            # A non-numeric id is the same mistake, not a 500.
+            assert (await client.get(
+                "/api/activity/log?guild=1&user=alice"
+            )).status == 400
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_activity_log_requires_auth(tmp_path):
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            r = await client.get("/api/activity/log?guild=1&user=100")
+            assert r.status == 401
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_activity_log_reports_history_for_an_untracked_member(tmp_path):
+    """Stopping tracking doesn't erase what was recorded — the log still shows
+    it, flagged so the panel can say the history stops there."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.activity_log_set(1, 100, [("Rust", None)], at=now - timedelta(hours=3))
+        db.activity_log_set(1, 100, [], at=now - timedelta(hours=2))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get(
+                "/api/activity/log?guild=1&user=100"
+            )).json()
+            assert d["tracked"] is False
+            assert [s["name"] for s in d["sessions"]] == ["Rust"]
+            assert d["sessions"][0]["open"] is False
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_overview_live_block(tmp_path):
     """The Overview payload includes a 'live' block: who's online/playing now,
     the day's top games, average sleep, and a 7-day message series."""

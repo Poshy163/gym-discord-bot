@@ -265,6 +265,110 @@ def summarize_activities(
     )
 
 
+def activity_sessions(
+    events: list[tuple[list[str], str]],
+    window_start: "datetime",
+    window_end: "datetime",
+    *,
+    display_tz=timezone.utc,
+    merge_gap_s: float = 120.0,
+) -> list[dict]:
+    """Break the same snapshots :func:`summarize_activity_sets` totals up into
+    individual play sessions — "Rainbow Six Siege, 22:04 → 00:31".
+
+    ``events`` is the ordered ``(active_names, iso_timestamp)`` stream, with the
+    same carry-in convention as :func:`summarize_activity_sets`: a title already
+    running when the window opens starts its session at ``window_start``, and a
+    title still running at the end gets ``open=True`` with the session closed at
+    ``window_end``. Because a user can run several things at once, sessions
+    overlap freely — each title is tracked independently.
+
+    Discord drops a client's activities for a few seconds when it reconnects,
+    which would otherwise saw one evening into a dozen entries. Two sessions of
+    the same title separated by no more than ``merge_gap_s`` are folded into
+    one; the gap itself is *not* counted, so the per-title sum of ``seconds``
+    stays exactly equal to that title's :func:`summarize_activity_sets` total
+    and the log can never contradict the "most played" bars above it.
+
+    Each session is a dict with ISO-8601 UTC ``start``/``end``, the same
+    rendered ``start_local``/``end_local``/``date`` fields as
+    :func:`nightly_sleep_sessions` (in ``display_tz``; ``date`` is the local day
+    the session *started*, so a late-night stint files under the evening it
+    began rather than the small hours it ran into), ``seconds`` of play, and
+    ``open``. The list is ordered oldest-first.
+    """
+    if window_start.tzinfo is None:
+        window_start = window_start.replace(tzinfo=timezone.utc)
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
+    window_start = window_start.astimezone(timezone.utc)
+    window_end = window_end.astimezone(timezone.utc)
+    if window_end <= window_start:
+        return []
+
+    # name -> when its current run started; raw runs before gap-merging.
+    open_at: dict[str, datetime] = {}
+    runs: list[dict] = []
+
+    def _switch(names: list[str], at: datetime) -> None:
+        active = dict.fromkeys(names)  # de-dupe, keep Discord's order
+        for name in [n for n in open_at if n not in active]:
+            start = open_at.pop(name)
+            if at > start:
+                runs.append({"name": name, "start": start, "end": at})
+        for name in active:
+            open_at.setdefault(name, at)
+
+    for names, ts_str in events:
+        ts = _parse_iso(ts_str)
+        if ts < window_start:
+            # Carry-in: whatever was running opens the window already started.
+            # (Nothing is open without one, so a title first seen mid-window
+            # simply starts there — the same "no credit before we knew" rule
+            # summarize_activity_sets applies.)
+            open_at = dict.fromkeys(names, window_start)
+            continue
+        if ts >= window_end:
+            break
+        _switch(list(names), ts)
+
+    still_running = set(open_at)
+    _switch([], window_end)
+
+    # Fold same-title runs separated by a reconnect-sized gap back together.
+    merged: list[dict] = []
+    by_name: dict[str, dict] = {}
+    for run in runs:
+        prev = by_name.get(run["name"])
+        if prev is not None and (
+            (run["start"] - prev["end"]).total_seconds() <= merge_gap_s
+        ):
+            prev["seconds"] += (run["end"] - run["start"]).total_seconds()
+            prev["end"] = run["end"]
+            continue
+        run["seconds"] = (run["end"] - run["start"]).total_seconds()
+        merged.append(run)
+        by_name[run["name"]] = run
+
+    sessions: list[dict] = []
+    for run in sorted(merged, key=lambda r: (r["start"], r["name"])):
+        start_local = run["start"].astimezone(display_tz)
+        end_local = run["end"].astimezone(display_tz)
+        sessions.append({
+            "name": run["name"],
+            "date": start_local.strftime("%Y-%m-%d"),
+            "start": run["start"].isoformat(),
+            "end": run["end"].isoformat(),
+            "start_local": start_local.strftime("%Y-%m-%d %H:%M"),
+            "end_local": end_local.strftime("%Y-%m-%d %H:%M"),
+            "seconds": round(run["seconds"], 3),
+            # Still running when the window closed — the end is "now", not a
+            # moment the user actually stopped.
+            "open": run["name"] in still_running and run["end"] == window_end,
+        })
+    return sessions
+
+
 def estimate_sleep_window(
     by_hour: dict[int, float],
     days: int,
