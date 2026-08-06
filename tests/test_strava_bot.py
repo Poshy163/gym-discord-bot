@@ -114,6 +114,34 @@ def test_parse_strava_activity_reference_accepts_latest_id_and_url():
     )
 
 
+def test_parse_strava_activity_reference_treats_blank_as_latest():
+    for value in (None, "", "   ", "latest", "LATEST", "  Latest  "):
+        assert _parse_strava_activity_reference(value) is None, value
+
+
+def _cardio_command(name):
+    return next(c for c in bot_mod.cardio_group.commands if c.name == name)
+
+
+def test_cardio_strava_commands_leave_activity_optional():
+    """Omitting ``activity`` must be allowed and mean "pick it for me".
+
+    Discord only sends an option the user filled in, so the guarantee has two
+    halves: the option is registered optional, and whatever default lands in
+    its place parses back to ``None`` (the auto-select sentinel).
+    """
+    for name in ("strava_link", "strava_unlink"):
+        params = {p.name: p for p in _cardio_command(name).parameters}
+        assert params["activity"].required is False, name
+        assert _parse_strava_activity_reference(params["activity"].default) is None
+
+
+def test_cardio_strava_link_still_requires_program_and_difficulty():
+    params = {p.name: p for p in _cardio_command("strava_link").parameters}
+    assert params["program"].required is True
+    assert params["difficulty"].required is True
+
+
 def test_parse_strava_activity_reference_rejects_other_text():
     for value in ("my morning run", "https://example.com/videos/123456"):
         try:

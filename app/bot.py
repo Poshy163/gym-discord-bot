@@ -21429,7 +21429,7 @@ async def cardio_complete_cmd(
 @app_commands.describe(
     program="Cardio program completed by this Strava activity.",
     difficulty="How the session felt; this controls adaptive progression.",
-    activity="`latest`, an activity ID, or a Strava activity URL.",
+    activity="Optional — blank picks your latest unlinked activity; or ID/URL.",
 )
 @app_commands.choices(difficulty=_CARDIO_DIFFICULTY_CHOICES)
 @app_commands.autocomplete(program=_cardio_program_autocomplete)
@@ -21520,7 +21520,7 @@ async def cardio_strava_link_cmd(
     description="Detach Strava data from a cardio session but keep its history.",
 )
 @app_commands.describe(
-    activity="`latest`, an activity ID, or a Strava activity URL.",
+    activity="Optional — blank picks your most recent linked activity; or ID/URL.",
 )
 async def cardio_strava_unlink_cmd(
     interaction: discord.Interaction,
