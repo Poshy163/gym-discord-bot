@@ -46,7 +46,13 @@ from .aliases import (
 from .bodycomp import daily_mean_points as bodycomp_daily_points
 from .bodycomp import metric_summary as bodycomp_metric_summary
 from .db import KEEP, Database, _normalize_iso as db_normalize_iso
-from .graphing import daily_best_points, running_best_values, trend_values
+from .graphing import (
+    BodyweightTrend,
+    bodyweight_trend,
+    daily_best_points,
+    running_best_values,
+    trend_values,
+)
 from .message_targeting import strip_leading_user_mention
 from .overview import lift_overview
 from .parser import (
@@ -9142,10 +9148,13 @@ async def overview_cmd(
 # Chart palette. Matches the embed the PNG is attached to — the old cream
 # canvas glared out of a dark card, which is the single loudest thing about
 # the old charts.
-_CHART_BG = "#2b2d31"
-_CHART_INK = "#dbdee1"
-_CHART_MUTED = "#949ba4"
-_CHART_GRID = "#3f4147"
+_CHART_BG = "#202225"
+_CHART_INK = "#e2e4e7"
+_CHART_MUTED = "#9298a1"
+_CHART_GRID = "#33363b"
+_BODYWEIGHT_TREND = "#4ef08a"
+_BODYWEIGHT_GOAL = "#6aa9ff"
+_BODYWEIGHT_WARN = "#f0a04e"
 # Matplotlib's pyplot state is process-global and not thread-safe. Automatic
 # weigh-in charts render off the Discord event loop, so every chart call site
 # shares this lock rather than letting a message and HA poll draw concurrently.
@@ -9183,6 +9192,10 @@ def _render_trend_chart(
     trend_colour: str,
     unit: str = "kg",
     fmt=lambda v: f"{v:g}kg",
+    bodyweight: BodyweightTrend | None = None,
+    entries: int = 0,
+    logged_days: int = 0,
+    latest_recorded_kg: float | None = None,
 ) -> "io.BytesIO":
     """Actual readings in thin grey, one bold trend line over the top.
 
@@ -9190,6 +9203,18 @@ def _render_trend_chart(
     on a noisy series a single spike used to dominate the whole picture and
     read as the story. Returns a PNG buffer.
     """
+    if bodyweight is not None:
+        return _render_bodyweight_dashboard(
+            plt,
+            mdates,
+            ticker,
+            bodyweight,
+            title=title,
+            entries=entries,
+            logged_days=logged_days,
+            latest_recorded_kg=latest_recorded_kg,
+        )
+
     fig, ax = plt.subplots(figsize=(8.8, 4.4), dpi=150)
     try:
         fig.patch.set_facecolor(_CHART_BG)
@@ -9271,6 +9296,443 @@ def _render_trend_chart(
         plt.close(fig)
 
 
+def _render_bodyweight_dashboard(
+    plt,
+    mdates,
+    ticker,
+    series: BodyweightTrend,
+    *,
+    title: str,
+    entries: int,
+    logged_days: int,
+    latest_recorded_kg: float | None,
+) -> "io.BytesIO":
+    """Render the goal-aware bodyweight dashboard used in Discord.
+
+    The composition intentionally follows the supplied reference: history and
+    projection dominate the upper panel, while the smaller lower panel answers
+    the separate question "how quickly is my trend changing right now?".
+    """
+
+    fig, (ax, rate_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(13, 7.5),
+        dpi=140,
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+    )
+    try:
+        fig.patch.set_facecolor(_CHART_BG)
+        for axis in (ax, rate_ax):
+            axis.set_facecolor(_CHART_BG)
+            axis.grid(True, color=_CHART_GRID, linewidth=0.8, alpha=0.7)
+            axis.set_axisbelow(True)
+            axis.tick_params(colors=_CHART_MUTED, labelsize=10)
+            for spine in axis.spines.values():
+                spine.set_visible(False)
+
+        span_days = max(
+            0,
+            (series.logged_when[-1].date() - series.logged_when[0].date()).days,
+        )
+        trend_delta = series.trend_kg[-1] - series.trend_kg[0]
+        trend_week = trend_delta / max(span_days, 1) * 7.0
+        coverage = logged_days / max(span_days, 1)
+        period = (
+            f"{series.logged_when[0]:%d %b}–"
+            f"{series.logged_when[-1]:%d %b %Y}"
+        )
+        subtitle = (
+            f"{entries} "
+            f"{'entry' if entries == 1 else 'entries'} over {span_days} days "
+            f"({logged_days} logged, {coverage:.0%} coverage)  ·  trend "
+            f"{series.trend_kg[0]:.1f} → {series.trend_kg[-1]:.1f}kg "
+            f"({trend_delta:+.1f}kg, {trend_week:+.2f}kg/wk)"
+        )
+        fig.text(
+            0.077,
+            0.955,
+            title,
+            fontsize=19,
+            fontweight="bold",
+            color=_CHART_INK,
+            va="bottom",
+        )
+        fig.text(
+            0.923,
+            0.955,
+            period,
+            fontsize=11,
+            fontweight="bold",
+            color=_CHART_MUTED,
+            ha="right",
+            va="bottom",
+        )
+        fig.text(
+            0.077,
+            0.925,
+            subtitle,
+            fontsize=10.5,
+            color=_CHART_MUTED,
+            va="bottom",
+        )
+
+        if series.goal_kg is not None:
+            goal_text = f"goal {series.goal_kg:g}kg"
+            if series.goal_eta is not None:
+                goal_text += f"  ·  ETA {series.goal_eta:%d %b %Y}"
+            else:
+                goal_text += "  ·  ETA pending"
+            fig.text(
+                0.923,
+                0.925,
+                goal_text,
+                fontsize=11,
+                fontweight="bold",
+                color=_BODYWEIGHT_GOAL,
+                ha="right",
+                va="bottom",
+            )
+        else:
+            fig.text(
+                0.923,
+                0.925,
+                "set a goal with /bodyweight_goal",
+                fontsize=9.5,
+                color=_CHART_MUTED,
+                ha="right",
+                va="bottom",
+            )
+
+        noise = series.noise_sd_kg
+        ax.fill_between(
+            series.trend_when,
+            [value - noise for value in series.trend_kg],
+            [value + noise for value in series.trend_kg],
+            color=_BODYWEIGHT_TREND,
+            alpha=0.13,
+            linewidth=0,
+            label=f"±1 SD noise (±{noise:.1f}kg)",
+        )
+
+        # Connect nearby readings only. Long gaps remain visually honest rather
+        # than implying measurements the member never made.
+        segment_x: list[datetime] = []
+        segment_y: list[float] = []
+        previous: datetime | None = None
+        for when, weight in zip(series.logged_when, series.logged_kg):
+            if previous is not None and (when - previous).days > 2:
+                if len(segment_x) > 1:
+                    ax.plot(
+                        segment_x,
+                        segment_y,
+                        color=_CHART_MUTED,
+                        linewidth=1.0,
+                        alpha=0.55,
+                        zorder=2,
+                    )
+                segment_x, segment_y = [], []
+            segment_x.append(when)
+            segment_y.append(weight)
+            previous = when
+        if len(segment_x) > 1:
+            ax.plot(
+                segment_x,
+                segment_y,
+                color=_CHART_MUTED,
+                linewidth=1.0,
+                alpha=0.55,
+                zorder=2,
+            )
+        ax.plot(
+            series.logged_when,
+            series.logged_kg,
+            linestyle="none",
+            marker="o",
+            markersize=4.5,
+            markerfacecolor=_CHART_BG,
+            markeredgecolor=_CHART_MUTED,
+            markeredgewidth=1.4,
+            zorder=3,
+            label="logged",
+        )
+        ax.plot(
+            series.trend_when,
+            series.trend_kg,
+            color=_BODYWEIGHT_TREND,
+            linewidth=3.0,
+            zorder=4,
+            solid_capstyle="round",
+            label="7-day EWMA trend",
+        )
+        if series.projection_when:
+            ax.plot(
+                series.projection_when,
+                series.projection_kg,
+                color=_BODYWEIGHT_TREND,
+                linewidth=1.8,
+                linestyle=(0, (4, 3)),
+                alpha=0.68,
+                zorder=3,
+                label="projection",
+            )
+
+        right_edge = (
+            series.projection_when[-1]
+            if series.projection_when
+            else series.logged_when[-1]
+        )
+        total_span = max(1, (right_edge - series.logged_when[0]).days)
+        x_pad = timedelta(days=max(2, round(total_span * 0.025)))
+        left_edge = series.logged_when[0] - x_pad
+        right_edge = right_edge + x_pad
+        ax.set_xlim(left_edge, right_edge)
+
+        y_values = [
+            *series.logged_kg,
+            *series.trend_kg,
+            *series.projection_kg,
+        ]
+        if series.goal_kg is not None:
+            y_values.append(series.goal_kg)
+        low, high = min(y_values), max(y_values)
+        y_pad = max(0.8, (high - low) * 0.06)
+        ax.set_ylim(low - y_pad, high + y_pad)
+        if high - low <= 24:
+            ax.yaxis.set_major_locator(ticker.MultipleLocator(2))
+        else:
+            ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=7))
+
+        if series.goal_kg is not None:
+            ax.axhline(
+                series.goal_kg,
+                xmin=0.0,
+                xmax=1.0,
+                color=_BODYWEIGHT_GOAL,
+                linewidth=1.2,
+                linestyle=(0, (2, 3)),
+                alpha=0.9,
+            )
+            ax.text(
+                0.76,
+                series.goal_kg,
+                f"goal {series.goal_kg:g}kg",
+                transform=ax.get_yaxis_transform(),
+                ha="center",
+                va="bottom",
+                fontsize=9.5,
+                color=_BODYWEIGHT_GOAL,
+                bbox={
+                    "boxstyle": "round,pad=0.25",
+                    "facecolor": _CHART_BG,
+                    "edgecolor": "none",
+                    "alpha": 0.92,
+                },
+            )
+
+        ax.plot(
+            series.logged_when,
+            [0.012] * len(series.logged_when),
+            "|",
+            transform=ax.get_xaxis_transform(),
+            color=_CHART_MUTED,
+            markersize=7,
+            alpha=0.8,
+            zorder=2,
+        )
+        ax.annotate(
+            f"{series.trend_kg[-1]:.1f}kg",
+            (series.trend_when[-1], series.trend_kg[-1]),
+            xytext=(10, 23),
+            textcoords="offset points",
+            va="bottom",
+            fontsize=12,
+            fontweight="bold",
+            color=_BODYWEIGHT_TREND,
+        )
+        ax.annotate(
+            f"{series.trend_when[-1]:%d %b %Y}",
+            (series.trend_when[-1], series.trend_kg[-1]),
+            xytext=(10, 7),
+            textcoords="offset points",
+            va="bottom",
+            fontsize=9.5,
+            fontweight="bold",
+            color=_CHART_INK,
+            bbox={
+                "boxstyle": "round,pad=0.22",
+                "facecolor": _CHART_BG,
+                "edgecolor": "none",
+                "alpha": 0.92,
+            },
+        )
+
+        ax.set_ylabel("kg", color=_CHART_MUTED)
+        legend = ax.legend(
+            loc="upper right",
+            frameon=False,
+            fontsize=9.5,
+            labelcolor=_CHART_MUTED,
+        )
+        for text in legend.get_texts():
+            text.set_color(_CHART_MUTED)
+
+        # A 0.5–1.0% weekly change band gives the rate panel practical context.
+        # It follows goal direction, so the same chart remains useful for a
+        # deliberate bulk without labelling all gain as failure.
+        current = series.trend_kg[-1]
+        band_slow = current * 0.5 / 100.0
+        band_fast = current * 1.0 / 100.0
+        if series.goal_kg is not None:
+            direction = -1 if series.goal_kg < current else 1
+        else:
+            direction = -1 if trend_delta <= 0 else 1
+        if direction < 0:
+            band_bottom, band_top = -band_fast, -band_slow
+        else:
+            band_bottom, band_top = band_slow, band_fast
+        rate_ax.fill_between(
+            [left_edge, right_edge],
+            [band_bottom, band_bottom],
+            [band_top, band_top],
+            color=_BODYWEIGHT_TREND,
+            alpha=0.14,
+            linewidth=0,
+        )
+        rate_ax.axhline(0, color=_CHART_MUTED, linewidth=0.9, alpha=0.65)
+
+        rate_values = [
+            float("nan") if value is None else value
+            for value in series.rate_kg_week
+        ]
+        in_band = [
+            value is not None and band_bottom <= value <= band_top
+            for value in series.rate_kg_week
+        ]
+        outside_band = [
+            value is not None and not inside
+            for value, inside in zip(series.rate_kg_week, in_band)
+        ]
+        rate_ax.fill_between(
+            series.trend_when,
+            0,
+            rate_values,
+            where=outside_band,
+            interpolate=True,
+            color=_BODYWEIGHT_WARN,
+            alpha=0.58,
+            linewidth=0,
+        )
+        rate_ax.fill_between(
+            series.trend_when,
+            0,
+            rate_values,
+            where=in_band,
+            interpolate=True,
+            color=_BODYWEIGHT_TREND,
+            alpha=0.58,
+            linewidth=0,
+        )
+        rate_ax.plot(
+            series.trend_when,
+            rate_values,
+            color=_CHART_INK,
+            linewidth=1.5,
+            alpha=0.85,
+        )
+
+        finite_rates = [
+            value for value in series.rate_kg_week if value is not None
+        ]
+        if finite_rates:
+            final_rate = finite_rates[-1]
+            final_ok = band_bottom <= final_rate <= band_top
+            final_colour = (
+                _BODYWEIGHT_TREND if final_ok else _BODYWEIGHT_WARN
+            )
+            rate_ax.plot(
+                [series.trend_when[-1]],
+                [final_rate],
+                "o",
+                markersize=6,
+                color=final_colour,
+                zorder=4,
+            )
+            rate_ax.annotate(
+                f"{final_rate:+.2f}",
+                (series.trend_when[-1], final_rate),
+                xytext=(8, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=10,
+                color=final_colour,
+                fontweight="bold",
+            )
+        rate_lows = [*finite_rates, band_bottom, 0.0]
+        rate_highs = [*finite_rates, band_top, 0.0]
+        rate_ax.set_ylim(min(rate_lows) - 0.15, max(rate_highs) + 0.12)
+        rate_ax.set_ylabel("kg/wk", color=_CHART_MUTED, fontsize=9.5)
+        rate_ax.text(
+            0.996,
+            0.90,
+            "14-day rate  ·  target zone: 0.5–1.0% bodyweight/wk",
+            transform=rate_ax.transAxes,
+            fontsize=9,
+            color=_CHART_MUTED,
+            ha="right",
+            va="top",
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": _CHART_BG,
+                "edgecolor": "none",
+                "alpha": 0.85,
+            },
+        )
+
+        locator = mdates.AutoDateLocator(minticks=5, maxticks=9)
+        rate_ax.xaxis.set_major_locator(locator)
+        rate_ax.xaxis.set_major_formatter(
+            mdates.ConciseDateFormatter(locator),
+        )
+        rate_ax.tick_params(axis="x", labelsize=11, pad=7)
+
+        # Keep the exact latest raw reading available without competing with
+        # the smoother endpoint label; it matters when several readings were
+        # averaged on the final day.
+        if (
+            latest_recorded_kg is not None
+            and abs(latest_recorded_kg - series.logged_kg[-1]) >= 0.05
+        ):
+            ax.text(
+                0.006,
+                0.985,
+                f"latest logged {latest_recorded_kg:g}kg",
+                transform=ax.transAxes,
+                fontsize=8.5,
+                color=_CHART_MUTED,
+                va="top",
+            )
+
+        fig.subplots_adjust(
+            top=0.885,
+            bottom=0.075,
+            left=0.077,
+            right=0.923,
+        )
+        buffer = io.BytesIO()
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=140,
+            facecolor=fig.get_facecolor(),
+        )
+        buffer.seek(0)
+        return buffer
+    finally:
+        plt.close(fig)
+
+
 def _render_trend_chart_threadsafe(
     xs: list,
     ys: list[float],
@@ -9322,7 +9784,6 @@ def _build_bodyweight_chart(
 
     xs = [point.when for point in points]
     ys = [point.value for point in points]
-    trend = trend_values(ys)
     delta = ys[-1] - ys[0]
     latest_recorded = float(rows[-1]["weight_kg"])
     averaged = len(rows) > len(points)
@@ -9343,12 +9804,19 @@ def _build_bodyweight_chart(
         f"{_plural(len(points), 'day')} · {span}"
     )
 
+    goal_row = db.bodyweight_goal_get(user_id)
+    goal_kg = float(goal_row["target_kg"]) if goal_row is not None else None
+    series = bodyweight_trend(xs, ys, goal_kg=goal_kg)
     buf = _render_trend_chart_threadsafe(
-        xs, ys, trend,
+        xs, ys, series.logged_trend_kg,
         title=f"{_plain_label(display_name, limit=80)} — bodyweight",
         subtitle=subtitle,
-        trend_label="3-day trend",
-        trend_colour=f"#{ui.score_trend(delta, good='down').value:06x}",
+        trend_label="7-day EWMA trend",
+        trend_colour=_BODYWEIGHT_TREND,
+        bodyweight=series,
+        entries=len(rows),
+        logged_days=len(points),
+        latest_recorded_kg=latest_recorded,
     )
 
     safe_name = re.sub(
@@ -9614,39 +10082,42 @@ async def bodyweight_graph_cmd(
 _BW_GOAL_MIN_KG = 30.0
 _BW_GOAL_MAX_KG = 300.0
 
-# Only weigh-ins this recent feed the trend used for the goal ETA. Older
-# history describes a different phase (bulk vs cut) and would skew the slope.
-_BW_TREND_WINDOW_DAYS = 90
+# Match the graph's projection fit: an older bulk/cut phase should not steer
+# the ETA for what the member's weight is doing now.
+_BW_TREND_WINDOW_DAYS = 28
 
 
 def _bodyweight_goal_status(user_id: int, display_name: str) -> str:
     """Status + ETA text for a user's bodyweight goal (assumes goal exists)."""
-    from .training_math import project_bodyweight_eta
     goal = db.bodyweight_goal_get(user_id)
     target_kg = float(goal["target_kg"])
-    latest = db.get_latest_bodyweight(0, user_id)
-    if latest is None:
+    rows = db.bodyweight_history(0, user_id)
+    points = bodycomp_daily_points(
+        ((row["recorded_at"], float(row["weight_kg"])) for row in rows),
+        DISPLAY_TZ,
+    )
+    if not points:
         return (
             f"🎯 Goal: **{target_kg:g} kg** — no weigh-ins yet, so no "
             "projection. Log one with `/bodyweight` or `bw 82.4` in chat."
         )
-    latest_kg = float(latest["weight_kg"])
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_BW_TREND_WINDOW_DAYS)
-    history: list[tuple[datetime, float]] = []
-    for row in db.bodyweight_history(0, user_id):
-        dt = datetime.fromisoformat(row["recorded_at"])
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if dt >= cutoff:
-            history.append((dt, float(row["weight_kg"])))
-    rate, eta, reason = project_bodyweight_eta(
-        history, target_kg, datetime.now(DISPLAY_TZ),
+    series = bodyweight_trend(
+        [point.when for point in points],
+        [point.value for point in points],
+        goal_kg=target_kg,
     )
-    to_go = target_kg - latest_kg
+    trend_kg = series.trend_kg[-1]
+    latest_kg = float(rows[-1]["weight_kg"])
+    to_go = target_kg - trend_kg
+    current = f"trend {trend_kg:.1f} kg"
+    if abs(latest_kg - trend_kg) >= 0.05:
+        current += f", latest logged {latest_kg:g} kg"
     head = (
         f"🎯 **{display_name}** — bodyweight goal **{target_kg:g} kg** "
-        f"(currently {latest_kg:g} kg, {to_go:+.1f} kg to go)"
+        f"({current}, {to_go:+.1f} kg to go)"
     )
+    rate = series.projection_rate_kg_week
+    eta = series.goal_eta
     if eta is not None and rate is not None:
         weeks = max(0.0, (eta - datetime.now(DISPLAY_TZ).date()).days / 7.0)
         return (
@@ -9654,9 +10125,23 @@ def _bodyweight_goal_status(user_id: int, display_name: str) -> str:
             f"**{rate:+.2f} kg/week** → on track for about "
             f"**{eta.strftime('%d %b %Y')}** (~{weeks:.0f} weeks)."
         )
-    if rate is not None and reason:
-        return f"{head}\nTrend: {rate:+.2f} kg/week — {reason}."
-    return f"{head}\n{reason.capitalize()}." if reason else head
+    if abs(to_go) < 0.05:
+        return f"{head}\nAlready at target."
+    if rate is None:
+        return (
+            f"{head}\nNeed at least three dated weigh-ins in the last "
+            f"{_BW_TREND_WINDOW_DAYS} days to project an ETA."
+        )
+    direction = "down" if to_go < 0 else "up"
+    if (to_go > 0) != (rate > 0):
+        return (
+            f"{head}\nTrend: **{rate:+.2f} kg/week** — weight isn't trending "
+            f"{direction} yet, so there is no ETA."
+        )
+    return (
+        f"{head}\nTrend: **{rate:+.2f} kg/week** — at the current rate the "
+        "goal is over two years away, so the ETA is too uncertain to show."
+    )
 
 
 @bot.tree.command(

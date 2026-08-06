@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -118,6 +118,45 @@ def test_bodyweight_chart_labels_a_same_day_average_and_latest_reading(
     assert chart.latest_recorded_kg == 82.0
     assert "daily mean 81kg" in captured["kwargs"]["subtitle"]
     assert "latest logged 82kg" in captured["kwargs"]["subtitle"]
+
+
+def test_bodyweight_chart_reads_saved_goal_and_builds_projection(monkeypatch):
+    person = _user("Goal Setter")
+    start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    for day in range(30):
+        bot_mod.db.set_bodyweight(
+            GUILD,
+            person.id,
+            100.0 - day * 0.1,
+            recorded_at=start + timedelta(days=day),
+        )
+    bot_mod.db.bodyweight_goal_set(person.id, person.display_name, 95.0)
+    captured = {}
+
+    class _Matplotlib:
+        @staticmethod
+        def use(_backend):
+            return None
+
+    monkeypatch.setattr(
+        bot_mod.importlib,
+        "import_module",
+        lambda name: _Matplotlib() if name == "matplotlib" else object(),
+    )
+
+    def _render(_plt, _mdates, _ticker, _xs, _ys, _trend, **kwargs):
+        captured.update(kwargs)
+        return io.BytesIO(b"png")
+
+    monkeypatch.setattr(bot_mod, "_render_trend_chart", _render)
+    chart = bot_mod._build_bodyweight_chart(person.id, person.display_name)
+
+    assert chart is not None
+    series = captured["bodyweight"]
+    assert series.goal_kg == 95.0
+    assert series.goal_eta is not None
+    assert series.projection_kg[-1] == 95.0
+    assert captured["trend_label"] == "7-day EWMA trend"
 
 
 def test_trend_chart_always_closes_figure_when_plotting_fails():

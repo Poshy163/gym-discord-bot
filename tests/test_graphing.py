@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.graphing import daily_best_points, running_best_values
+from app.graphing import bodyweight_trend, daily_best_points, running_best_values
 
 
 def test_daily_best_points_collapses_same_local_day():
@@ -76,3 +76,64 @@ def test_trend_values_handles_degenerate_input():
     assert trend_values([]) == []
     assert trend_values([5.0]) == [5.0]
     assert trend_values([5.0, 7.0], window=0) == [5.0, 7.0]   # window clamps to 1
+
+
+# --- bodyweight dashboard maths ---------------------------------------------
+
+
+def _dated_weights(values: list[float], *, spacing_days: int = 1):
+    start = datetime(2026, 5, 1, 12, tzinfo=timezone.utc)
+    whens = [
+        start + timedelta(days=index * spacing_days)
+        for index in range(len(values))
+    ]
+    return whens, values
+
+
+def test_bodyweight_trend_uses_elapsed_time_and_daily_grid():
+    whens, values = _dated_weights([100.0, 98.0, 96.0], spacing_days=7)
+    result = bodyweight_trend(whens, values, half_life_days=7)
+
+    assert len(result.logged_trend_kg) == 3
+    assert len(result.trend_when) == 15
+    assert result.trend_when[0] == whens[0]
+    assert result.trend_when[-1] == whens[-1]
+    assert result.logged_trend_kg[-1] == pytest.approx(
+        (100 * 0.25 + 98 * 0.5 + 96) / 1.75,
+    )
+
+
+def test_bodyweight_trend_projects_toward_a_saved_cutting_goal():
+    whens, values = _dated_weights(
+        [100.0 - index * 0.1 for index in range(30)],
+    )
+    result = bodyweight_trend(whens, values, goal_kg=95.0)
+
+    assert result.goal_eta is not None
+    assert result.projection_rate_kg_week == pytest.approx(-0.7)
+    assert result.projection_when[0] == whens[-1]
+    assert result.projection_kg[0] == pytest.approx(result.trend_kg[-1])
+    assert result.projection_kg[-1] == 95.0
+
+
+def test_bodyweight_trend_does_not_project_in_the_wrong_direction():
+    whens, values = _dated_weights([100.0 + index * 0.1 for index in range(30)])
+    result = bodyweight_trend(whens, values, goal_kg=95.0)
+
+    assert result.goal_kg == 95.0
+    assert result.goal_eta is None
+    assert result.projection_when == []
+    assert result.projection_kg == []
+
+
+def test_bodyweight_trend_rate_is_fourteen_day_change_in_kg_per_week():
+    whens, values = _dated_weights([100.0 - index * 0.1 for index in range(20)])
+    result = bodyweight_trend(
+        whens,
+        values,
+        half_life_days=0.01,
+        rate_window_days=14,
+    )
+
+    assert result.rate_kg_week[:14] == [None] * 14
+    assert result.rate_kg_week[14] == pytest.approx(-0.7, abs=1e-3)
