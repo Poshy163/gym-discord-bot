@@ -50,6 +50,82 @@ from app.bot import (  # noqa: E402
 from app.parser import Lift  # noqa: E402
 
 
+def test_stop_background_loops_cancels_and_drains_schedulers(monkeypatch):
+    from app import bot as bot_mod
+
+    async def scenario():
+        started = asyncio.Event()
+        finalized = asyncio.Event()
+
+        async def worker():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.set()
+
+        task = asyncio.create_task(worker())
+        await started.wait()
+
+        class _Scheduler:
+            def get_task(self):
+                return task
+
+            def cancel(self):
+                task.cancel()
+
+        monkeypatch.setattr(
+            bot_mod, "_BACKGROUND_LOOP_NAMES", ("_shutdown_test_loop",),
+        )
+        monkeypatch.setattr(
+            bot_mod, "_shutdown_test_loop", _Scheduler(), raising=False,
+        )
+
+        await bot_mod._stop_background_loops()
+
+        assert task.cancelled()
+        assert finalized.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_finish_bot_shutdown_awaits_close_and_drains_stragglers(monkeypatch):
+    from app import bot as bot_mod
+
+    loop = asyncio.new_event_loop()
+    close_release = asyncio.Event()
+    close_finished = False
+    stray_finished = False
+
+    async def close():
+        nonlocal close_finished
+        await close_release.wait()
+        close_finished = True
+
+    async def stray():
+        nonlocal stray_finished
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stray_finished = True
+
+    monkeypatch.setattr(bot_mod.bot, "close", close)
+    close_task = loop.create_task(close())
+    stray_task = loop.create_task(stray())
+    loop.run_until_complete(asyncio.sleep(0))
+    assert not close_task.done()
+
+    loop.call_soon(close_release.set)
+    try:
+        bot_mod._finish_bot_shutdown(loop, close_task)
+        assert close_finished is True
+        assert stray_finished is True
+        assert stray_task.cancelled()
+        assert not asyncio.all_tasks(loop)
+    finally:
+        loop.close()
+
+
 def test_looks_like_log_attempt_detects_shortcuts():
     # Each freeform logging shortcut should be recognised as a log attempt.
     assert _looks_like_log_attempt("bodyweight 80kg") is True

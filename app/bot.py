@@ -14338,9 +14338,42 @@ async def setup_hook() -> None:  # pragma: no cover - discord runtime
 # Client.close (discord.py has no dedicated teardown hook).
 _strava_orig_close = bot.close
 
+# Every discord.ext.tasks loop started from on_ready. Client.close shuts down
+# Discord's gateway and HTTP session, but it does not own these module-level
+# loops, so they must be cancelled and awaited before the event loop closes.
+_BACKGROUND_LOOP_NAMES = (
+    "online_heartbeat",
+    "weekly_reminder",
+    "bodyweight_reminder",
+    "streak_saver_loop",
+    "daily_update",
+    "weekly_report",
+    "revo_attendance_poll",
+    "hevy_poll",
+    "ha_poll",
+)
+
+
+async def _stop_background_loops() -> None:
+    """Cancel and drain every scheduler started by :func:`on_ready`."""
+
+    running: list[asyncio.Task] = []
+    for name in _BACKGROUND_LOOP_NAMES:
+        scheduler = globals().get(name)
+        if scheduler is None:
+            continue
+        task = scheduler.get_task()
+        if task is None or task.done():
+            continue
+        scheduler.cancel()
+        running.append(task)
+    if running:
+        await asyncio.gather(*running, return_exceptions=True)
+
 
 async def _close_with_strava() -> None:  # pragma: no cover - discord runtime
     global _strava_runner, _rpc_runner
+    await _stop_background_loops()
     for name, runner in (("Strava", _strava_runner), ("control socket", _rpc_runner)):
         if runner is not None:
             try:
@@ -21452,6 +21485,34 @@ EX_AUTH = 77     # Discord rejected the token
 EX_CONFIG = 78   # nothing to run yet — an idle state, not a failure
 
 
+def _finish_bot_shutdown(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_task: asyncio.Task | None,
+) -> None:
+    """Finish Discord/aiohttp teardown and drain straggling loop tasks."""
+
+    if shutdown_task is None:
+        shutdown_task = loop.create_task(bot.close())
+    with contextlib.suppress(Exception):
+        loop.run_until_complete(shutdown_task)
+
+    # Defensive final sweep for Discord/aiohttp implementation tasks not owned
+    # by Client.close. Cancel and *drain* them so their finally blocks run while
+    # call_soon is still legal.
+    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True),
+            )
+    with contextlib.suppress(Exception):
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    with contextlib.suppress(Exception):
+        loop.run_until_complete(loop.shutdown_default_executor())
+
+
 def main() -> None:
     """Run the bot, mapping fatal startup problems onto explanatory exit codes.
 
@@ -21462,12 +21523,16 @@ def main() -> None:
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    shutdown_task: asyncio.Task | None = None
 
     def _terminate() -> None:
+        nonlocal shutdown_task
         # bot.close is monkeypatched above to also clean up the aiohttp
-        # runners, so scheduling it here is what gives this process a graceful
-        # shutdown path.
-        loop.create_task(bot.close())
+        # runners and scheduled loops. Keep the task so the outer finally block
+        # can await it; bot.start() may return while Client.close is still
+        # draining Discord's aiohttp session.
+        if shutdown_task is None:
+            shutdown_task = loop.create_task(bot.close())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, AttributeError):
@@ -21493,8 +21558,11 @@ def main() -> None:
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         pass
     finally:
-        with contextlib.suppress(Exception):
-            loop.run_until_complete(loop.shutdown_asyncgens())
+        # Whether shutdown came from SIGTERM, Ctrl+C, a startup exception or a
+        # normal gateway return, finish Client.close before closing its loop.
+        # The old fire-and-forget signal task was destroyed mid-await, leaving
+        # the aiohttp session and every discord.ext.tasks loop pending.
+        _finish_bot_shutdown(loop, shutdown_task)
         with contextlib.suppress(Exception):
             db.close()
         loop.close()
