@@ -10,6 +10,7 @@ import inspect
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -48,6 +49,70 @@ from app.bot import (  # noqa: E402
     db as _bot_db,
 )
 from app.parser import Lift  # noqa: E402
+from app.presence import PresenceSummary  # noqa: E402
+
+
+def test_presence_transition_closes_stale_activity_when_offline(monkeypatch):
+    from app import bot as bot_mod
+
+    before = SimpleNamespace(
+        id=100, status=SimpleNamespace(value="offline"),
+    )
+    after = SimpleNamespace(
+        id=100, status=SimpleNamespace(value="offline"),
+    )
+    monkeypatch.setattr(bot_mod, "_get_all_activities_info", lambda _m: [])
+    log_set = MagicMock(return_value=False)
+    monkeypatch.setattr(bot_mod.db, "activity_log_set", log_set)
+
+    bot_mod._record_presence_transition(1, before, after)
+
+    log_set.assert_called_once_with(1, 100, [])
+
+
+def test_presence_transition_forwards_late_activity_metadata(monkeypatch):
+    from app import bot as bot_mod
+
+    before = SimpleNamespace(
+        id=100, status=SimpleNamespace(value="online"),
+    )
+    after = SimpleNamespace(
+        id=100, status=SimpleNamespace(value="online"),
+    )
+    old = [("Rust", None, None)]
+    enriched = [("Rust", "https://cdn/rust.png", 1234)]
+    monkeypatch.setattr(
+        bot_mod, "_get_all_activities_info",
+        lambda member: old if member is before else enriched,
+    )
+    log_set = MagicMock(return_value=False)
+    monkeypatch.setattr(bot_mod.db, "activity_log_set", log_set)
+
+    bot_mod._record_presence_transition(1, before, after)
+
+    log_set.assert_called_once_with(1, 100, enriched)
+
+
+def test_presence_schedule_embed_discloses_partial_coverage():
+    from app import bot as bot_mod
+
+    status_at = datetime(2026, 8, 6, 1, 0, tzinfo=timezone.utc)
+    summary = PresenceSummary(
+        online_seconds=2 * 3600,
+        offline_seconds=4 * 3600,
+        final_status="online",
+        final_status_at=status_at,
+        transitions=3,
+    )
+    user = SimpleNamespace(display_name="Alice")
+
+    embed = bot_mod._render_schedule_embed(user, summary, days=1)
+
+    assert "25% coverage" in embed.description
+    assert "Treat the totals as partial" in embed.description
+    now_field = next(field for field in embed.fields if field.name == "Now")
+    assert str(int(status_at.timestamp())) in now_field.value
+    assert "25% window coverage" in embed.footer.text
 
 
 def test_stop_background_loops_cancels_and_drains_schedulers(monkeypatch):

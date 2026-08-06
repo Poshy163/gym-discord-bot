@@ -70,6 +70,8 @@ def test_carry_in_status_before_window():
     assert s.offline_seconds == 0
     assert s.transitions == 0
     assert s.final_status == "online"
+    assert s.final_status_at == start - timedelta(hours=1)
+    assert s.observed_seconds == 4 * 3600
 
 
 def test_single_transition_in_window():
@@ -85,6 +87,7 @@ def test_single_transition_in_window():
     assert s.online_seconds == 3 * 3600
     assert s.transitions == 1
     assert s.final_status == "online"
+    assert s.final_status_at == start + timedelta(hours=1)
     assert s.last_online_at == start + timedelta(hours=1)
 
 

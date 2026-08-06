@@ -4304,16 +4304,17 @@ class Database:
 
         ``activities`` is an ordered list of ``(name, image_url[, app_id])`` for
         every concurrent activity (empty = stopped everything). De-duplicates
-        against the previous snapshot on the ordered list of names — so a
-        late-arriving image for an unchanged set doesn't spam a new row. The
-        legacy ``activity``/``image_url`` columns mirror the primary (first)
-        entry. Returns True if a row was inserted."""
+        against the previous set of names regardless of Discord's ordering.
+        Late-arriving image/application metadata enriches the existing row in
+        place, preserving the real session start time rather than creating a
+        false transition. The legacy ``activity``/``image_url`` columns mirror
+        the primary (first) entry. Returns True if a row was inserted."""
         ts = _normalize_iso(at)
         parsed = [self._split_activity(a) for a in activities if a and a[0]]
         names = [name for name, _img, _aid in parsed]
         with self._conn() as c:
             last = c.execute(
-                "SELECT activity, image_url, activities FROM activity_events "
+                "SELECT id, activity, image_url, activities FROM activity_events "
                 "WHERE guild_id = ? AND user_id = ? "
                 "ORDER BY at DESC, id DESC LIMIT 1",
                 (guild_id, user_id),
@@ -4321,8 +4322,43 @@ class Database:
             if last is None and not names:
                 return False
             if last is not None:
-                last_names = [d["n"] for d in self._activity_set(last)]
-                if last_names == names:
+                previous = self._activity_set(last)
+                last_names = [d["n"] for d in previous]
+                if set(last_names) == set(names) and len(last_names) == len(names):
+                    # Discord can reorder concurrent activities or deliver rich
+                    # presence art/application ids after the activity name.
+                    # Preserve the original session boundary and order while
+                    # enriching the existing snapshot in place.
+                    incoming = {
+                        name: {"i": img, "a": aid}
+                        for name, img, aid in parsed
+                    }
+                    enriched = [
+                        {
+                            "n": item["n"],
+                            "i": incoming[item["n"]]["i"] or item.get("i"),
+                            "a": incoming[item["n"]]["a"] or item.get("a"),
+                        }
+                        for item in previous
+                    ]
+                    if enriched != previous:
+                        payload = json.dumps([
+                            {
+                                "n": item["n"],
+                                "i": item["i"],
+                                **({"a": item["a"]} if item["a"] else {}),
+                            }
+                            for item in enriched
+                        ]) if enriched else None
+                        c.execute(
+                            "UPDATE activity_events "
+                            "SET image_url = ?, activities = ? WHERE id = ?",
+                            (
+                                enriched[0]["i"] if enriched else None,
+                                payload,
+                                last["id"],
+                            ),
+                        )
                     return False
             primary = names[0] if names else None
             primary_img = parsed[0][1] if names else None
@@ -4393,19 +4429,7 @@ class Database:
         Lets the activity feed show art for games whose current event has none
         but an earlier session captured one. Reads every concurrent activity in
         each snapshot, not just the primary."""
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT activity, image_url, activities FROM activity_events "
-                "WHERE guild_id = ? AND user_id = ? "
-                "ORDER BY at ASC, id ASC",
-                (guild_id, user_id),
-            )
-            out: dict[str, str] = {}
-            for r in rows:
-                for d in self._activity_set(r):
-                    if d["i"]:
-                        out[d["n"]] = d["i"]
-            return out
+        return self.activity_metadata_maps(guild_id, user_id)[0]
 
     def activity_appid_map(
         self, guild_id: int, user_id: int,
@@ -4413,6 +4437,18 @@ class Database:
         """Best-known Discord application id per activity name (most recent
         wins). Lets the dashboard resolve an icon for apps that ship no image
         but expose an application id."""
+        return self.activity_metadata_maps(guild_id, user_id)[1]
+
+    def activity_metadata_maps(
+        self, guild_id: int, user_id: int,
+    ) -> tuple[dict[str, str], dict[str, int]]:
+        """Best-known image and application-id maps from one history scan.
+
+        The live dashboard needs both maps on every refresh. Keeping the
+        combined path avoids reading a growing activity history twice per
+        tracked member while the individual methods remain as compatibility
+        wrappers.
+        """
         with self._conn() as c:
             rows = c.execute(
                 "SELECT activity, image_url, activities FROM activity_events "
@@ -4420,12 +4456,15 @@ class Database:
                 "ORDER BY at ASC, id ASC",
                 (guild_id, user_id),
             )
-            out: dict[str, int] = {}
-            for r in rows:
-                for d in self._activity_set(r):
-                    if d.get("a"):
-                        out[d["n"]] = int(d["a"])
-            return out
+            images: dict[str, str] = {}
+            app_ids: dict[str, int] = {}
+            for row in rows:
+                for item in self._activity_set(row):
+                    if item["i"]:
+                        images[item["n"]] = item["i"]
+                    if item.get("a"):
+                        app_ids[item["n"]] = int(item["a"])
+            return images, app_ids
 
     def activity_events_for(
         self, guild_id: int, user_id: int,

@@ -431,6 +431,47 @@ def test_activity_overlaps_and_resolves_icons(tmp_path):
             assert games["tModLoader"]["image"]
             # Both currently-running games are reported.
             assert {g["name"] for g in u["current_games"]} == {"tModLoader", "Excel"}
+            # Presence stats say how much of the selected window was actually
+            # observed, instead of presenting partial capture as a full 7 days.
+            assert u["presence"]["online_seconds"] >= 3 * 3600 - 10
+            assert 1 < u["presence"]["coverage_percent"] < 2
+            assert u["presence"]["online_percent"] == 100.0
+            assert u["status_for_seconds"] >= 3 * 3600 - 10
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_activity_hides_stale_current_game_when_presence_is_offline(tmp_path):
+    """An explicit offline status wins over a stale Discord activity payload."""
+    async def go():
+        from datetime import datetime, timedelta, timezone
+
+        db = Database(tmp_path / "g.sqlite3")
+        now = datetime.now(timezone.utc)
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.presence_track_add(1, 100, started_by=0)
+        db.presence_log_event(1, 100, "online", at=now - timedelta(hours=3))
+        db.activity_log_set(
+            1, 100, [("Rust", None)], at=now - timedelta(hours=2),
+        )
+        # Simulate an older bot missing the corresponding empty activity event.
+        db.presence_log_event(1, 100, "offline", at=now - timedelta(hours=1))
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            d = await (await client.get("/api/activity?guild=1")).json()
+            u = d["users"][0]
+            assert u["status"] == "offline"
+            assert u["current_games"] == []
+
+            log = await (await client.get(
+                "/api/activity/log?guild=1&user=100"
+            )).json()
+            assert log["games"][0]["playing_now"] is False
         finally:
             await client.close()
             db.close()

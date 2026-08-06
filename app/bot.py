@@ -18068,6 +18068,32 @@ def _seed_presence_snapshot(guild_id: int, member: discord.Member) -> None:
     db.activity_log_set(guild_id, member.id, _get_all_activities_info(member))
 
 
+def _record_presence_transition(
+    guild_id: int, before: discord.Member, after: discord.Member,
+) -> tuple[list[str], list[str]]:
+    """Persist one tracked Discord presence update.
+
+    Discord may send rich-presence metadata after the activity name, or retain
+    an activity in the offline payload. Comparing complete activity tuples lets
+    the DB enrich metadata; forcing an empty set offline closes stale sessions.
+    """
+    before_status = _discord_status_to_str(before.status)
+    after_status = _discord_status_to_str(after.status)
+    if before_status != after_status:
+        db.presence_log_event(guild_id, after.id, after_status)
+
+    before_info = _get_all_activities_info(before)
+    after_info = _get_all_activities_info(after)
+    if not _presence_is_online(after_status):
+        # Always reconcile storage. Discord's before payload can already be
+        # empty while the last persisted snapshot is still a running game.
+        db.activity_log_set(guild_id, after.id, [])
+        after_info = []
+    elif before_info != after_info:
+        db.activity_log_set(guild_id, after.id, after_info)
+    return [a[0] for a in before_info], [a[0] for a in after_info]
+
+
 def _seed_tracked_presence_snapshots() -> None:
     """Refresh current status/activity for tracked users visible in cache."""
     for guild in bot.guilds:
@@ -18096,17 +18122,10 @@ async def on_presence_update(
             return
         if not db.presence_is_tracked(after.guild.id, after.id):
             return
-        # Status tracking
-        if before.status != after.status:
-            status = _discord_status_to_str(after.status)
-            db.presence_log_event(after.guild.id, after.id, status)
-        # Activity tracking — record the full set of concurrent games/apps so
-        # someone running, say, tModLoader and Excel at once shows both.
-        before_acts = [t[0] for t in _get_all_activities_info(before)]
-        after_info = _get_all_activities_info(after)
-        after_acts = [t[0] for t in after_info]
+        before_acts, after_acts = _record_presence_transition(
+            after.guild.id, before, after,
+        )
         if before_acts != after_acts:
-            db.activity_log_set(after.guild.id, after.id, after_info)
             LOG.info(
                 "Activity change for %s in %s: %r -> %r (raw=%s)",
                 after.id, after.guild.id, before_acts, after_acts,
@@ -18386,10 +18405,22 @@ def _render_schedule_embed(
     activity_totals: dict[str, float] | None = None,
 ) -> discord.Embed:
     """Build the /track schedule embed from a PresenceSummary."""
+    expected_seconds = max(1.0, days * 86400.0)
+    coverage = min(1.0, summary.observed_seconds / expected_seconds)
+    recorded = format_duration(summary.observed_seconds)
+    coverage_note = (
+        f"Recorded **{recorded}** of that window "
+        f"(**{coverage * 100:.0f}% coverage**)."
+    )
+    if coverage < 0.75:
+        coverage_note += " Treat the totals as partial."
     embed = discord.Embed(
         title=f"📅 Presence schedule — {user.display_name}",
         colour=EMBED_COLOUR,
-        description=f"Last **{days}** day{'s' if days != 1 else ''} of recorded activity.",
+        description=(
+            f"Last **{days}** day{'s' if days != 1 else ''} of recorded activity.\n"
+            f"{coverage_note}"
+        ),
     )
     online = format_duration(summary.online_seconds)
     offline = format_duration(summary.offline_seconds)
@@ -18397,8 +18428,12 @@ def _render_schedule_embed(
     embed.add_field(name="⚫ Offline", value=offline, inline=True)
     if summary.final_status:
         dot = _status_dot(summary.final_status)
+        since = (
+            f"\nSince <t:{int(summary.final_status_at.timestamp())}:R>"
+            if summary.final_status_at is not None else ""
+        )
         embed.add_field(
-            name="Now", value=f"{dot} {summary.final_status}", inline=True,
+            name="Now", value=f"{dot} {summary.final_status}{since}", inline=True,
         )
     if summary.last_online_at is not None:
         ts = int(summary.last_online_at.timestamp())
@@ -18455,7 +18490,12 @@ def _render_schedule_embed(
         embed.add_field(
             name="Top activities", value="\n".join(act_lines), inline=False,
         )
-    embed.set_footer(text=f"{summary.transitions} status changes recorded")
+    embed.set_footer(
+        text=(
+            f"{summary.transitions} status changes recorded"
+            f" • {coverage * 100:.0f}% window coverage"
+        )
+    )
     return embed
 
 

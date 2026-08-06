@@ -661,10 +661,11 @@ def build_app(
             tracked += 1
             uid = int(row["user_id"])
             pres = db.presence_current(gid, uid)
-            if pres and presence.is_online(pres["status"]):
+            is_online = bool(pres and presence.is_online(pres["status"]))
+            if is_online:
                 online += 1
             cur = db.activity_current_set(gid, uid)
-            if cur and cur[0]:
+            if (pres is None or is_online) and cur and cur[0]:
                 playing += 1
             for nm, secs in presence.summarize_activity_sets(
                 db.activity_sets_for(gid, uid, since=day_since), day_since, now,
@@ -1019,9 +1020,28 @@ def build_app(
             member = db.get_member(gid, uid)
             display = member["display_name"] if member else str(uid)
             pres = db.presence_current(gid, uid)
+            is_online = bool(pres and presence.is_online(pres["status"]))
             cur = db.activity_current_set(gid, uid)
-            imgmap = db.activity_image_map(gid, uid)
-            appidmap = db.activity_appid_map(gid, uid)
+            imgmap, appidmap = db.activity_metadata_maps(gid, uid)
+            presence_events = [
+                (event["status"], event["at"])
+                for event in db.presence_events_for(
+                    gid, uid, since=since, until=now,
+                )
+            ]
+            presence_summary = presence.summarize_presence(
+                presence_events, since, now, display_tz=_display_tz(),
+            )
+            observed = presence_summary.observed_seconds
+            window_seconds = max(1.0, (now - since).total_seconds())
+            status_for = None
+            if pres:
+                status_at = datetime.fromisoformat(pres["at"])
+                if status_at.tzinfo is None:
+                    status_at = status_at.replace(tzinfo=timezone.utc)
+                status_for = max(
+                    0, round((now - status_at.astimezone(timezone.utc)).total_seconds())
+                )
             totals = presence.summarize_activity_sets(
                 db.activity_sets_for(gid, uid, since=since), since, now,
             )
@@ -1040,7 +1060,7 @@ def build_app(
             # Everything the user is running right now (a game plus a launcher,
             # two games, …), all sharing the snapshot's timestamp as "since".
             current_games = []
-            if cur is not None:
+            if (pres is None or is_online) and cur is not None:
                 acts, at = cur
                 current_games = [
                     _game(d["n"], d["i"] or imgmap.get(d["n"]),
@@ -1053,6 +1073,25 @@ def build_app(
                 "avatar": member["avatar"] if member else None,
                 "status": pres["status"] if pres else None,
                 "status_at": pres["at"] if pres else None,
+                "status_for_seconds": status_for,
+                "tracking_since": row["started_at"],
+                "presence": {
+                    "online_seconds": round(presence_summary.online_seconds),
+                    "offline_seconds": round(presence_summary.offline_seconds),
+                    "observed_seconds": round(observed),
+                    "online_percent": (
+                        round(presence_summary.online_seconds / observed * 100, 1)
+                        if observed else None
+                    ),
+                    "coverage_percent": round(
+                        min(1.0, observed / window_seconds) * 100, 1,
+                    ),
+                    "transitions": presence_summary.transitions,
+                    "last_online_at": (
+                        presence_summary.last_online_at.isoformat()
+                        if presence_summary.last_online_at else None
+                    ),
+                },
                 "current_games": current_games,
                 "top_games": top,
             })
@@ -1111,8 +1150,7 @@ def build_app(
 
         member = db.get_member(gid, uid)
         pres = db.presence_current(gid, uid)
-        imgmap = db.activity_image_map(gid, uid)
-        appidmap = db.activity_appid_map(gid, uid)
+        imgmap, appidmap = db.activity_metadata_maps(gid, uid)
         events = db.activity_sets_for(gid, uid, since=since)
         sessions = presence.activity_sessions(
             events, since, now, display_tz=_display_tz(),
@@ -1138,9 +1176,14 @@ def build_app(
             for nm in names
         }
 
-        playing_now = {
-            d["n"] for d in (db.activity_current_set(gid, uid) or ([], ""))[0]
-        }
+        playing_now = (
+            {
+                d["n"]
+                for d in (db.activity_current_set(gid, uid) or ([], ""))[0]
+            }
+            if pres is None or presence.is_online(pres["status"])
+            else set()
+        )
         per_game: dict[str, dict] = {}
         for s in sessions:
             g = per_game.setdefault(
@@ -2407,8 +2450,24 @@ font-weight:700;font-size:1.1rem;text-shadow:0 1px 2px #0006}
 .tg .pt{font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .tg .barwrap,.lead-nm .barwrap{height:5px;background:#0d1117;border-radius:4px;overflow:hidden;margin-top:3px}
 .tg .barfill,.lead-nm .barfill{height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee)}
-.offline-card{opacity:.6}
+.offline-card{border-color:#747f8d55}
+.offline-card .now{opacity:.72}
 .nowlist{display:flex;flex-direction:column;gap:.4rem}
+.act-presence{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem}
+.act-metric{min-width:0;background:#0d111780;border:1px solid var(--line);
+border-radius:9px;padding:.48rem .55rem}
+.act-metric span{display:block;color:var(--muted);font-size:.66rem;text-transform:uppercase;
+letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.act-metric b{display:block;margin-top:.12rem;font-size:.88rem;
+font-variant-numeric:tabular-nums}
+.act-metric.low b{color:#faa61a}
+.act-note{margin-top:-.45rem;color:#faa61a;font-size:.72rem;line-height:1.35}
+.act-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.7rem;
+margin-bottom:1.1rem}
+.act-stat{display:flex;align-items:baseline;gap:.45rem;background:var(--panel);
+border:1px solid var(--line);border-radius:11px;padding:.65rem .8rem}
+.act-stat b{font-size:1.15rem;font-variant-numeric:tabular-nums}
+.act-stat span{font-size:.76rem;color:var(--muted)}
 /* per-player session log (in the shared dialog) */
 .act-head .act-log-btn{margin-left:auto;flex:none}
 .tg-go{cursor:pointer;border-radius:8px;padding:.15rem .3rem;margin:-.15rem -.3rem}
@@ -3530,6 +3589,7 @@ const STATUS_RANK={online:0,idle:1,dnd:2,offline:3};
 function statusClass(s){return "st-"+(["online","idle","dnd"].includes(s)?s:"offline");}
 function statusLabel(s){return s||"unknown";}
 function fmtPlaytime(sec){sec=sec||0;const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);
+  const d=Math.floor(h/24),rh=h%24;if(d>=1)return d+"d "+(rh?rh+"h":"");
   if(h>=1)return h+"h "+(m?m+"m":"");return m>=1?m+"m":"<1m";}
 function gameTile(name,url,size,cls){
   const px=`width:${size}px;height:${size}px`;
@@ -3555,6 +3615,7 @@ async function renderActivity(v){
       <span class="faint" id="actCount"></span></h2>
       <span class="live-dot" title="Live — refreshes automatically"></span>
       <span class="sp" style="flex:1"></span>${daySeg()}${searchBar("Search players or games…")}</div>
+    <div id="actSummary">${actSummaryHTML(d.users)}</div>
     <div id="actLeader">${actLeaderHTML(d.leaderboard)}</div>
     <div class="act-grid" id="actGrid">${actCardsHTML(d.users)}</div>`;
   setActCount(d);
@@ -3567,6 +3628,8 @@ async function liveActivity(){
   if(!d||tab!=="activity")return;
   const grid=document.getElementById("actGrid");if(!grid)return;
   grid.innerHTML=actCardsHTML(d.users);
+  const summary=document.getElementById("actSummary");
+  if(summary)summary.innerHTML=actSummaryHTML(d.users);
   const lead=document.getElementById("actLeader");if(lead)lead.innerHTML=actLeaderHTML(d.leaderboard);
   setActCount(d);
   filterTable(SEARCH);  // reapply the active search to the freshly drawn cards
@@ -3574,6 +3637,18 @@ async function liveActivity(){
 function setActCount(d){const el=document.getElementById("actCount");if(!el)return;
   const online=(d.users||[]).filter(u=>["online","idle","dnd"].includes(u.status)).length;
   el.textContent=`· ${online}/${(d.users||[]).length} online · last ${d.window_days}d`;}
+function actSummaryHTML(users){
+  users=users||[];
+  const online=users.filter(u=>["online","idle","dnd"].includes(u.status)).length;
+  const playing=users.filter(u=>(u.current_games||[]).length).length;
+  const coverage=users.length?Math.round(users.reduce(
+    (n,u)=>n+((u.presence&&u.presence.coverage_percent)||0),0)/users.length):0;
+  return `<div class="act-summary">
+    <div class="act-stat"><b>${online}</b><span>online now</span></div>
+    <div class="act-stat"><b>${playing}</b><span>playing now</span></div>
+    <div class="act-stat" title="Average share of this window with a known status"><b>${coverage}%</b><span>capture coverage</span></div>
+  </div>`;
+}
 function actCardsHTML(users){
   // online first, then by whether currently playing, then name.
   users=users.slice().sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3)
@@ -3596,6 +3671,11 @@ function actLeaderHTML(rows){
 }
 function actCard(u){
   const offline=!["online","idle","dnd"].includes(u.status);
+  const p=u.presence||{};
+  const coverage=p.coverage_percent??0;
+  const onlinePct=p.online_percent==null?"—":Math.round(p.online_percent)+"%";
+  const statusFor=u.status_for_seconds==null?"":" · for "+fmtPlaytime(u.status_for_seconds);
+  const trackingSince=u.tracking_since?" Tracking since "+fmtTs(u.tracking_since)+".":"";
   const maxSec=Math.max(1,...(u.top_games||[]).map(g=>g.seconds));
   const cur=u.current_games||[];
   const now=cur.length?`<div class="nowlist">${cur.map((g,i)=>`<div class="now">
@@ -3603,7 +3683,7 @@ function actCard(u){
       <div class="meta"><div class="g">${esc(g.name)}</div>
       <div class="t">${i===0?"▶ playing now":"＋ also playing"}${g.since?" · since "+fmtTs(g.since):""}</div></div></div>`).join("")}</div>`
     : `<div class="now"><div class="meta"><div class="g faint">Not playing anything</div>
-      <div class="t">${u.status_at?"updated "+fmtTs(u.status_at):""}</div></div></div>`;
+      <div class="t">${u.status_at?"Status since "+fmtTs(u.status_at):"Waiting for a status event"}</div></div></div>`;
   // Each title opens the log already filtered to it — the usual next question
   // after "he's played a lot of R6" is "when?".
   const top=(u.top_games||[]).length?`<div class="top-games">${u.top_games.map(g=>`<div class="tg tg-go"
@@ -3617,11 +3697,17 @@ function actCard(u){
       <span class="act-av">${avatar(u.user_id,u.display_name,u.avatar,44)}
         <span class="dot ${statusClass(u.status)}"></span></span>
       <div style="min-width:0"><div class="act-name"><a class="link" onclick="memberView('${u.user_id}')">${esc(u.display_name)}</a></div>
-      <div class="act-sub">${statusLabel(u.status)}</div></div>
+      <div class="act-sub">${statusLabel(u.status)}${statusFor}</div></div>
       <button class="btn sm act-log-btn" onclick="activityLog('${u.user_id}')"
         title="When they played what — every session in this window">📜 Log</button>
     </div>
     ${now}
+    <div class="act-presence">
+      <div class="act-metric" title="Known time online in this window"><span>Online</span><b>${fmtPlaytime(p.online_seconds)}</b></div>
+      <div class="act-metric" title="Online share of time with a recorded status"><span>Of observed</span><b>${onlinePct}</b></div>
+      <div class="act-metric${coverage<75?' low':''}" title="Share of the selected window with a known status"><span>Coverage</span><b>${Math.round(coverage)}%</b></div>
+    </div>
+    ${coverage<75?`<div class="act-note">Partial capture — totals may understate this window.${trackingSince}</div>`:''}
     <div><div class="act-sub" style="margin-bottom:.4rem">Most played</div>${top}</div>
   </div>`;
 }

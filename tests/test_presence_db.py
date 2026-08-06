@@ -463,11 +463,21 @@ def test_activity_log_set_records_concurrent_games(db):
     assert db.activity_log_set(
         1, 100, [("tModLoader", None), ("Excel", "http://img/xl.png")], at=t0,
     ) is True
-    # Same set of names again is de-duped even though images could differ.
+    # Same set of names again is de-duped, while newly available art enriches
+    # the existing row without resetting the session timestamp.
     assert db.activity_log_set(
-        1, 100, [("tModLoader", "http://img/tml.png"), ("Excel", None)],
+        1, 100, [
+            ("Excel", None),
+            ("tModLoader", "http://img/tml.png", 1234),
+        ],
         at=t0 + timedelta(minutes=5),
     ) is False
+    enriched, enriched_at = db.activity_current_set(1, 100)
+    assert enriched_at == t0.isoformat()
+    assert enriched == [
+        {"n": "tModLoader", "i": "http://img/tml.png", "a": 1234},
+        {"n": "Excel", "i": "http://img/xl.png", "a": None},
+    ]
     # Dropping one game is a change -> new row.
     assert db.activity_log_set(
         1, 100, [("tModLoader", None)], at=t0 + timedelta(minutes=10),

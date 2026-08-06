@@ -36,7 +36,15 @@ class PresenceSummary:
     last_online_at: datetime | None = None
     # Status at the end of the window (after applying all events).
     final_status: str | None = None
+    # Timestamp of the transition into final_status. This may predate the
+    # requested window when the DB supplied a carry-in event.
+    final_status_at: datetime | None = None
     transitions: int = 0
+
+    @property
+    def observed_seconds(self) -> float:
+        """Time for which a known online/offline state was available."""
+        return self.online_seconds + self.offline_seconds
 
 
 def _parse_iso(value: str) -> datetime:
@@ -82,12 +90,14 @@ def summarize_presence(
     # from the previous boundary to the next event boundary.
     current_status: str | None = None
     current_start = window_start
+    current_status_at: datetime | None = None
 
     for status, ts_str in events:
         ts = _parse_iso(ts_str)
         if ts < window_start:
             # Carry-in: just update the starting status.
             current_status = status
+            current_status_at = ts
             continue
         if ts >= window_end:
             break
@@ -104,6 +114,7 @@ def summarize_presence(
             summary.last_online_at = ts
         current_status = status
         current_start = ts
+        current_status_at = ts
 
     # Final tail segment to the end of the window.
     if current_status is not None and window_end > current_start:
@@ -112,6 +123,7 @@ def summarize_presence(
         )
 
     summary.final_status = current_status
+    summary.final_status_at = current_status_at
     if (
         summary.last_online_at is None
         and current_status is not None
