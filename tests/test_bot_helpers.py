@@ -75,6 +75,7 @@ def test_analysis_prompts_are_detailed_grounded_and_contract_specific():
     coach = bot_mod._COACH_SYSTEM
     assert "ANALYSIS WORKFLOW" in coach
     assert "machine-specific settings" in coach
+    assert "apple_health_imports are external workout records" in coach
     assert "split_targets" in coach
     assert "Attendance check-ins" in coach
     assert "**🏃 Cardio**" in coach
@@ -601,6 +602,21 @@ def test_build_progress_payload_is_json_serializable():
         program_id=cardio_program["id"],
         program_name=cardio_program["name"],
     )
+    ended = datetime.now(timezone.utc) - timedelta(hours=1)
+    _bot_db.apple_health_link(7, "test-token-hash")
+    _bot_db.apple_health_add_workout(
+        7,
+        workout_id="coach-apple-workout",
+        activity="HKWorkoutActivityTypeRunning",
+        started_at=ended - timedelta(minutes=30),
+        ended_at=ended,
+        duration_s=1800,
+        active_kcal=320,
+        distance_m=5000,
+        avg_heart_rate=148,
+        effort=7,
+        source_name="Apple Watch",
+    )
 
     payload = _build_progress_payload(
         99, 7, "Sam", 30, include_body_composition=True,
@@ -612,6 +628,11 @@ def test_build_progress_payload_is_json_serializable():
     assert payload["cardio"]["sessions_in_window"] == 1
     assert payload["cardio"]["total_minutes_in_window"] == 35
     assert payload["cardio"]["active_programs"][0]["segments"][0]["level"] == 12
+    apple = payload["cardio"]["apple_health_imports"]
+    assert apple["workouts_in_window"] == 1
+    assert apple["total_minutes_in_window"] == 30
+    assert apple["distance_km_in_window"] == 5
+    assert "must not be double-counted" in apple["note"]
     assert payload["bodyweight"]["latest_kg"] == 84.0
     composition = payload["bodyweight"]["smart_scale_composition"]
     assert composition["metrics"][0]["metric"] == "body_fat_pct"
@@ -1695,6 +1716,19 @@ def test_manual_nick_commands_are_removed():
     assert hasattr(bot, "_bot_name")
     assert hasattr(bot, "_resolve_nickname_target")
     assert bot.bot.tree.get_command("nicks") is not None
+
+
+def test_apple_health_commands_are_grouped_below_discord_global_limit():
+    import app.bot as bot
+
+    group = bot.bot.tree.get_command("cardio")
+    assert group is not None
+    names = {command.name for command in group.commands}
+    assert {
+        "apple_link", "apple_status", "apple_unlink", "apple_recent",
+        "apple_help",
+    } <= names
+    assert len(bot.bot.tree.get_commands()) <= 100
 
 
 def test_no_dangling_set_remove_nick_strings_in_bot_source():

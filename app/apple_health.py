@@ -9,9 +9,9 @@ from __future__ import annotations
 import hashlib
 import math
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
 
 MAX_BATCH_SIZE = 100
 MAX_WORKOUT_SECONDS = 7 * 24 * 60 * 60
@@ -157,7 +157,7 @@ def parse_workout(
     )
     if supplied_id:
         workout_id = hashlib.sha256(
-            f"apple:{supplied_id}".encode("utf-8")
+            f"apple:{supplied_id}".encode()
         ).hexdigest()
     else:
         identity = "|".join(

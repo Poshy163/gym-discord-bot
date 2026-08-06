@@ -15909,8 +15909,14 @@ async def strava_status_cmd(interaction: discord.Interaction) -> None:
 # Apple Health Shortcut commands
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(
-    name="apple_health_link",
+cardio_group = app_commands.Group(
+    name="cardio",
+    description="Cardio programs, sessions, and Apple Health workout imports.",
+)
+
+
+@cardio_group.command(
+    name="apple_link",
     description="Create the private token used by your Apple Health Shortcut.",
 )
 @app_commands.describe(
@@ -15941,7 +15947,7 @@ async def apple_health_link_cmd(
         await interaction.response.send_message(
             "You already have an Apple Health Shortcut token. It cannot be shown "
             "again because only its hash is stored. If you lost it, run "
-            "`/apple_health_link rotate:true` to replace it.",
+            "`/cardio apple_link rotate:true` to replace it.",
             ephemeral=True,
         )
         return
@@ -15956,7 +15962,7 @@ async def apple_health_link_cmd(
         f"**URL:** `{endpoint}`\n"
         f"**Authorization header:** `Bearer {token}`\n\n"
         "The token is shown **once**. Copy it directly into your private "
-        "Shortcut; never post it in a channel. Run `/apple_health_help` for the "
+        "Shortcut; never post it in a channel. Run `/cardio apple_help` for the "
         "Workout End automation and replay setup.\n\n"
         "Minimal JSON body:\n"
         "```json\n"
@@ -15967,8 +15973,8 @@ async def apple_health_link_cmd(
     )
 
 
-@bot.tree.command(
-    name="apple_health_status",
+@cardio_group.command(
+    name="apple_status",
     description="Show your Apple Health Shortcut link and import status.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -15977,7 +15983,7 @@ async def apple_health_status_cmd(interaction: discord.Interaction) -> None:
     row = db.apple_health_get(interaction.user.id)
     if row is None:
         await interaction.response.send_message(
-            "No Apple Health Shortcut linked. Use `/apple_health_link` to start.",
+            "No Apple Health Shortcut linked. Use `/cardio apple_link` to start.",
             ephemeral=True,
         )
         return
@@ -15996,8 +16002,8 @@ async def apple_health_status_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="apple_health_unlink",
+@cardio_group.command(
+    name="apple_unlink",
     description="Disable your Shortcut token and delete imported Apple workouts.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16015,8 +16021,8 @@ async def apple_health_unlink_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="apple_health_recent",
+@cardio_group.command(
+    name="apple_recent",
     description="Show your most recently imported Apple Health workouts.",
 )
 @app_commands.describe(limit="Number of workouts to show (1-10).")
@@ -16053,8 +16059,8 @@ async def apple_health_recent_cmd(
     )
 
 
-@bot.tree.command(
-    name="apple_health_help",
+@cardio_group.command(
+    name="apple_help",
     description="Set up Apple Health Workout End and recovery automations.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16077,7 +16083,7 @@ async def apple_health_help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="1 · Get your private link",
         value=(
-            "Run `/apple_health_link`, then keep the one-time token private. "
+            "Run `/cardio apple_link`, then keep the one-time token private. "
             f"Requests go to {endpoint} with an `Authorization: Bearer …` header."
         ),
         inline=False,
@@ -16117,7 +16123,7 @@ async def apple_health_help_cmd(interaction: discord.Interaction) -> None:
         value=(
             "The token is stored only as a hash. Imported summaries can appear "
             "in the configured public workout feed and are available to Gym "
-            "Bot coaching. `/apple_health_unlink` invalidates the token and "
+            "Bot coaching. `/cardio apple_unlink` invalidates the token and "
             "deletes stored imports; already-sent Discord posts remain."
         ),
         inline=False,
@@ -20795,11 +20801,6 @@ bot.tree.add_command(voice_group)
 # ---------------------------------------------------------------------------
 # Native cardio programs (/cardio)
 # ---------------------------------------------------------------------------
-
-cardio_group = app_commands.Group(
-    name="cardio",
-    description="Create cardio programs, log sessions, and progress them.",
-)
 
 _CARDIO_PACE_LABELS = {
     "gentle": "Gentle",

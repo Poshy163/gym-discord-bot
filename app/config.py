@@ -636,6 +636,7 @@ GROUP_LABELS: dict[str, str] = {
     "backup": "Backups",
     "gemini": "AI (Gemini)",
     "strava": "Strava",
+    "apple_health": "Apple Health",
     "revo": "Revo Fitness",
     "hevy": "Hevy",
     "homeassistant": "Home Assistant",
@@ -652,7 +653,7 @@ GROUP_LABELS: dict[str, str] = {
 #: Render order for the Settings tab -- most-used first.
 GROUP_ORDER: tuple[str, ...] = (
     "discord", "admin", "core", "reminder", "daily", "report",
-    "strava", "revo", "hevy", "homeassistant", "gemini", "messages",
+    "strava", "apple_health", "revo", "hevy", "homeassistant", "gemini", "messages",
     "presence", "voice",
     "moderation", "gameicons", "backup", "webui", "storage", "logging",
 )

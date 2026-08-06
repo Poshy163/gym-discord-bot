@@ -455,6 +455,25 @@ missed feed posts), and owner-only `/strava_subscribe`,
 linked member after an API subscription outage with
 `/strava_backfill all_linked:true`.
 
+## Apple Health / Fitness (no subscription)
+
+Apple Health workouts can reach the bot without Strava or another paid service.
+Each member creates a private iPhone Shortcut: its Apple Watch **Workout End**
+automation sends a small workout summary to the bot's HTTPS endpoint. A second
+daily automation can replay the last 7 days, safely filling gaps because
+workouts are durably deduplicated.
+
+The member runs `/cardio apple_link` to receive a one-time bearer token, stored
+by the bot only as a hash. Imports can post to
+`APPLE_HEALTH_FEED_CHANNEL_ID` (falling back to the Strava feed), appear in
+`/cardio apple_recent`, and provide external workout context to `/coach`.
+`/cardio apple_unlink` invalidates the token and deletes the stored imports.
+
+Set `APPLE_HEALTH_PUBLIC_URL` to the same public HTTPS base used by the
+integration server (or leave it blank to reuse `STRAVA_PUBLIC_URL`). Full
+Shortcut fields, replay setup, privacy behaviour, and troubleshooting are in
+[docs/APPLE_HEALTH.md](docs/APPLE_HEALTH.md).
+
 ## Home Assistant smart-scale sync
 
 If your scale is in [Home Assistant](https://www.home-assistant.io/), the bot

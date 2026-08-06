@@ -20,8 +20,9 @@ GET  /healthz           Liveness probe.
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from aiohttp import web
 
@@ -78,7 +79,7 @@ def build_app(
         # we don't 200 within ~2s. Do the heavy lifting off the request path.
         try:
             payload = await request.json()
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.Response(status=400, text="bad json")
         LOG.info(
             "Strava webhook event: object=%s aspect=%s id=%s owner=%s",
@@ -100,7 +101,7 @@ def build_app(
             )
         try:
             payload = await request.json()
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(
                 {"ok": False, "error": "bad json"}, status=400,
             )
