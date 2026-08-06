@@ -14164,6 +14164,312 @@ async def _strava_fetch_activity(
     return await bot.loop.run_in_executor(None, _fetch)
 
 
+_STRAVA_ACTIVITY_REFERENCE_RE = re.compile(
+    r"^(?:(?:https?://)?(?:www\.)?strava\.com/activities/)?"
+    r"(?P<id>[0-9]{1,20})(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_strava_activity_reference(raw: str | None) -> int | None:
+    """Parse a Strava activity id or URL; ``latest``/blank selects automatically."""
+    text = (raw or "").strip()
+    if not text or text.casefold() == "latest":
+        return None
+    match = _STRAVA_ACTIVITY_REFERENCE_RE.fullmatch(text)
+    if match is None:
+        raise ValueError("Use `latest`, a Strava activity ID, or its activity URL.")
+    return int(match.group("id"))
+
+
+async def _strava_activity_for_cardio(
+    user_id: int,
+    activity_id: int | None,
+) -> strava_client.StravaActivity | str | None:
+    """Fetch an exact activity, or the newest activity not linked to cardio."""
+    row = db.get_strava_account(user_id)
+    if row is None:
+        return "not_linked"
+    if activity_id is not None:
+        return await _strava_fetch_activity(row, activity_id)
+
+    def _latest_unlinked() -> strava_client.StravaActivity | str | None:
+        try:
+            token = _strava_access_token(row)
+            after = int(
+                (datetime.now(timezone.utc) - timedelta(days=365)).timestamp()
+            )
+            summaries = strava_client.get_activities_since(token, after, 100)
+            summary = next(
+                (
+                    item for item in summaries
+                    if db.cardio_session_get_by_strava(user_id, item.id) is None
+                ),
+                None,
+            )
+            return (
+                strava_client.get_activity(token, summary.id)
+                if summary is not None else None
+            )
+        except strava_client.StravaAuthError as exc:
+            return f"auth: {exc}"
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - network
+            return f"error: {exc}"
+
+    return await bot.loop.run_in_executor(None, _latest_unlinked)
+
+
+def _cardio_link_strava_activity(
+    user_id: int,
+    program: dict,
+    difficulty: str,
+    activity: strava_client.StravaActivity,
+) -> cardio.Progression:
+    """Snapshot and progress a program while atomically attaching Strava data."""
+    completed = cardio.segments_from_rows(program["segments"])
+    result = cardio.apply_difficulty(
+        completed,
+        difficulty,
+        str(program["pace"]),
+        int(program["progression_score"]),
+        int(program["progression_cursor"]),
+    )
+    started = strava_client.start_unix(activity)
+    logged_at = (
+        datetime.fromtimestamp(started, timezone.utc)
+        if started is not None else datetime.now(timezone.utc)
+    )
+    db.cardio_session_add(
+        user_id,
+        completed,
+        difficulty,
+        program_id=int(program["id"]),
+        program_name=str(program["name"]),
+        next_segments=result.segments,
+        progression_score=result.score,
+        progression_cursor=result.cursor,
+        logged_at=logged_at,
+        strava_activity_id=int(activity.id),
+        strava_name=activity.name,
+        strava_sport_type=activity.sport_type,
+        strava_distance_m=activity.distance_m,
+        strava_moving_time_s=activity.moving_time_s,
+        strava_average_heartrate=activity.average_heartrate,
+        strava_calories=activity.calories,
+        strava_url=activity.url,
+    )
+    return result
+
+
+def _strava_cardio_link_text(
+    program: dict,
+    difficulty: str,
+    activity: strava_client.StravaActivity,
+    result: cardio.Progression,
+) -> str:
+    actual_seconds = activity.moving_time_s or activity.elapsed_time_s
+    actual = format_duration(actual_seconds) if actual_seconds else "time unavailable"
+    lines = [
+        (
+            f"Linked [**{_safe_label(activity.name, limit=80)}**]({activity.url}) "
+            f"to **{_safe_label(program['name'], limit=60)}**."
+        ),
+        (
+            f"Strava actual: **{actual}** · difficulty: "
+            f"**{_CARDIO_DIFFICULTY_LABELS[difficulty]}**."
+        ),
+    ]
+    if result.before is not None and result.after is not None:
+        verb = "Progressed" if result.direction == "increase" else "Eased back"
+        lines.append(
+            f"{verb} next session: "
+            f"~~{_cardio_display_segment(result.before)}~~ → "
+            f"**{_cardio_display_segment(result.after)}**."
+        )
+    else:
+        lines.append("Saved the result; the program will adapt as ratings accumulate.")
+    return "\n".join(lines)
+
+
+class StravaCardioPickerView(discord.ui.View):
+    """Ephemeral program/difficulty chooser opened from a Strava feed post."""
+
+    def __init__(self, user_id: int, activity_id: int, programs: list[dict]) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.activity_id = activity_id
+        self.program_id = int(programs[0]["id"])
+        self.difficulty = "just_right"
+
+        program_select = discord.ui.Select(
+            placeholder="Choose a cardio program",
+            options=[
+                discord.SelectOption(
+                    label=str(program["name"])[:100],
+                    value=str(program["id"]),
+                    description=(
+                        f"{cardio.format_number(cardio.total_minutes(
+                            cardio.segments_from_rows(program['segments'])
+                        ))} mins · {str(program['pace']).replace('_', ' ')} pace"
+                    )[:100],
+                    default=index == 0,
+                )
+                for index, program in enumerate(programs[:25])
+            ],
+        )
+        program_select.callback = self._program_selected
+        self.add_item(program_select)
+
+        difficulty_select = discord.ui.Select(
+            placeholder="How did it feel?",
+            options=[
+                discord.SelectOption(label="Felt easy", value="easy"),
+                discord.SelectOption(
+                    label="About right", value="just_right", default=True,
+                ),
+                discord.SelectOption(label="Too hard", value="hard"),
+            ],
+        )
+        difficulty_select.callback = self._difficulty_selected
+        self.add_item(difficulty_select)
+
+        confirm = discord.ui.Button(
+            label="Link workout",
+            style=discord.ButtonStyle.success,
+            emoji="🔗",
+        )
+        confirm.callback = self._confirm
+        self.add_item(confirm)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "Only the member who owns this Strava activity can link it.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _program_selected(self, interaction: discord.Interaction) -> None:
+        select = interaction.data or {}
+        self.program_id = int(select.get("values", [self.program_id])[0])
+        await interaction.response.defer()
+
+    async def _difficulty_selected(self, interaction: discord.Interaction) -> None:
+        select = interaction.data or {}
+        self.difficulty = str(select.get("values", [self.difficulty])[0])
+        await interaction.response.defer()
+
+    async def _confirm(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        program = db.cardio_program_get_by_id(self.user_id, self.program_id)
+        if program is None:
+            await interaction.edit_original_response(
+                content="That cardio program no longer exists.", view=None,
+            )
+            return
+        activity = await _strava_activity_for_cardio(
+            self.user_id, self.activity_id,
+        )
+        if not isinstance(activity, strava_client.StravaActivity):
+            LOG.warning(
+                "Strava cardio button fetch failed (user=%s activity=%s): %s",
+                self.user_id, self.activity_id, activity,
+            )
+            await interaction.edit_original_response(
+                content=(
+                    "I couldn't fetch that Strava activity. Reconnect Strava if "
+                    "needed, then use `/cardio strava_link`."
+                ),
+                view=None,
+            )
+            return
+        try:
+            result = _cardio_link_strava_activity(
+                self.user_id, program, self.difficulty, activity,
+            )
+        except sqlite3.IntegrityError:
+            await interaction.edit_original_response(
+                content="That Strava activity is already linked to cardio.",
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(
+            content=_strava_cardio_link_text(
+                program, self.difficulty, activity, result,
+            ),
+            view=None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class StravaCardioLinkButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"strava-cardio:(?P<user_id>[0-9]{1,20}):(?P<activity_id>[0-9]{1,20})",
+):
+    """Persistent link button whose state is encoded in its custom id."""
+
+    def __init__(self, user_id: int, activity_id: int) -> None:
+        self.user_id = user_id
+        self.activity_id = activity_id
+        super().__init__(
+            discord.ui.Button(
+                label="Link to cardio",
+                style=discord.ButtonStyle.secondary,
+                emoji="🏃",
+                custom_id=f"strava-cardio:{user_id}:{activity_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Item,
+        match: re.Match[str],
+    ) -> StravaCardioLinkButton:
+        return cls(int(match["user_id"]), int(match["activity_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the member who owns this Strava activity can link it.",
+                ephemeral=True,
+            )
+            return
+        existing = db.cardio_session_get_by_strava(
+            self.user_id, self.activity_id,
+        )
+        if existing is not None:
+            await interaction.response.send_message(
+                f"Already linked to **{_safe_label(existing['program_name'])}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        programs = db.cardio_program_list(self.user_id)
+        if not programs:
+            await interaction.response.send_message(
+                "Create a reusable routine with `/cardio create` first, then "
+                "press this button again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Choose the program this activity completed and rate how it felt.",
+            view=StravaCardioPickerView(
+                self.user_id, self.activity_id, programs,
+            ),
+            ephemeral=True,
+        )
+
+
+class StravaCardioLinkView(discord.ui.View):
+    def __init__(self, user_id: int, activity_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(StravaCardioLinkButton(user_id, activity_id))
+
+
 async def _strava_announce_activity(
     row,
     activity: strava_client.StravaActivity,
@@ -14218,6 +14524,7 @@ async def _strava_announce_activity(
     }
     if file is not None:
         kwargs["file"] = file
+    kwargs["view"] = StravaCardioLinkView(user_id, activity_id)
     try:
         msg = await channel.send(**kwargs)
     except discord.HTTPException:
@@ -14866,6 +15173,7 @@ def _rpc_status() -> dict:
 @bot.event
 async def setup_hook() -> None:  # pragma: no cover - discord runtime
     """Start the auxiliary servers on the bot's event loop before connecting."""
+    bot.add_dynamic_items(StravaCardioLinkButton)
     await _start_strava_server()
     if os.getenv(workerlink.ROLE_ENV) == "worker":
         sock = os.getenv(workerlink.SOCKET_ENV)
@@ -19993,6 +20301,11 @@ _COACH_SYSTEM = (
     "setting changes together. A rising setting with mostly 'too_hard' ratings "
     "is not automatically improvement; an unchanged setting with easier ratings "
     "can be progress.\n"
+    "- A native cardio recent_session with a strava object is ONE linked workout. "
+    "Use Strava's actual duration, distance, heart rate, and calories as extra "
+    "context for that session; never count it again as a separate workout. "
+    "Configured segment minutes describe the planned routine and can differ from "
+    "Strava's measured moving time.\n"
     "- apple_health_imports are external workout records from the member's "
     "iPhone. They may describe the same session as a native cardio entry or "
     "lifting log. Use them to improve coverage, duration, energy, distance, "
@@ -20283,6 +20596,24 @@ def _build_progress_payload(
                     "program": session["program_name"] or "One-off",
                     "difficulty": session["difficulty"],
                     "logged_at": session["logged_at"],
+                    "strava": (
+                        {
+                            "activity_id": session["strava_activity_id"],
+                            "name": session["strava_name"],
+                            "sport_type": session["strava_sport_type"],
+                            "actual_minutes": round(
+                                session["strava_moving_time_s"] / 60, 1,
+                            ) if session["strava_moving_time_s"] else None,
+                            "distance_km": round(
+                                session["strava_distance_m"] / 1000, 2,
+                            ) if session["strava_distance_m"] else None,
+                            "average_heartrate": (
+                                session["strava_average_heartrate"]
+                            ),
+                            "calories": session["strava_calories"],
+                        }
+                        if session["strava_activity_id"] is not None else None
+                    ),
                     "segments": [
                         {
                             "activity": segment.activity,
@@ -21092,6 +21423,134 @@ async def cardio_complete_cmd(
 
 
 @cardio_group.command(
+    name="strava_link",
+    description="Link a Strava activity to a saved cardio program and adapt it.",
+)
+@app_commands.describe(
+    program="Cardio program completed by this Strava activity.",
+    difficulty="How the session felt; this controls adaptive progression.",
+    activity="`latest`, an activity ID, or a Strava activity URL.",
+)
+@app_commands.choices(difficulty=_CARDIO_DIFFICULTY_CHOICES)
+@app_commands.autocomplete(program=_cardio_program_autocomplete)
+async def cardio_strava_link_cmd(
+    interaction: discord.Interaction,
+    program: str,
+    difficulty: str,
+    activity: str = "latest",
+) -> None:
+    if not _strava_enabled():
+        await interaction.response.send_message(
+            "Strava isn't available right now. Check the integration settings "
+            "or reconnect with `/strava_link`.",
+            ephemeral=True,
+        )
+        return
+    saved = db.cardio_program_get(interaction.user.id, program)
+    if saved is None:
+        await interaction.response.send_message(
+            "I couldn't find that program. Create it with `/cardio create` first.",
+            ephemeral=True,
+        )
+        return
+    try:
+        activity_id = _parse_strava_activity_reference(activity)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    if (
+        activity_id is not None
+        and db.cardio_session_get_by_strava(interaction.user.id, activity_id)
+        is not None
+    ):
+        await interaction.response.send_message(
+            "That Strava activity is already linked to cardio.", ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    fetched = await _strava_activity_for_cardio(interaction.user.id, activity_id)
+    if fetched == "not_linked":
+        await interaction.followup.send(
+            "Link your Strava account with `/strava_link` first.", ephemeral=True,
+        )
+        return
+    if fetched is None:
+        await interaction.followup.send(
+            "I couldn't find an unlinked Strava activity from the last year. "
+            "To link an older one, paste its activity URL or ID into `activity`.",
+            ephemeral=True,
+        )
+        return
+    if isinstance(fetched, str):
+        LOG.warning(
+            "Strava cardio link fetch failed (user=%s activity=%s): %s",
+            interaction.user.id, activity_id or "latest", fetched,
+        )
+        await interaction.followup.send(
+            "I couldn't fetch that activity from Strava. If access expired, "
+            "run `/strava_link` to reconnect and try again.",
+            ephemeral=True,
+        )
+        return
+    try:
+        result = _cardio_link_strava_activity(
+            interaction.user.id, saved, difficulty, fetched,
+        )
+    except sqlite3.IntegrityError:
+        await interaction.followup.send(
+            "That Strava activity is already linked to cardio.", ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="🔗 Strava linked to cardio",
+            description=_strava_cardio_link_text(
+                saved, difficulty, fetched, result,
+            ),
+            colour=EMBED_COLOUR,
+        ),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@cardio_group.command(
+    name="strava_unlink",
+    description="Detach Strava data from a cardio session but keep its history.",
+)
+@app_commands.describe(
+    activity="`latest`, an activity ID, or a Strava activity URL.",
+)
+async def cardio_strava_unlink_cmd(
+    interaction: discord.Interaction,
+    activity: str = "latest",
+) -> None:
+    try:
+        activity_id = _parse_strava_activity_reference(activity)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    if activity_id is None:
+        linked = db.cardio_strava_session_list(interaction.user.id, limit=1)
+        activity_id = (
+            int(linked[0]["strava_activity_id"]) if linked else None
+        )
+    if activity_id is None or not db.cardio_session_unlink_strava(
+        interaction.user.id, activity_id,
+    ):
+        await interaction.response.send_message(
+            "I couldn't find that linked Strava activity.", ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        "Detached that Strava activity. The completed cardio session is still "
+        "in your history; adaptive progression is not rewound.",
+        ephemeral=True,
+    )
+
+
+@cardio_group.command(
     name="log",
     description="Log a one-off cardio session without creating a program.",
 )
@@ -21165,10 +21624,30 @@ async def cardio_history_cmd(
         parts = [_cardio_display_segment(segment) for segment in segments[:3]]
         if len(segments) > 3:
             parts.append(f"+{len(segments) - 3} more")
+        strava_bits = []
+        if row["strava_moving_time_s"]:
+            strava_bits.append(
+                f"actual {format_duration(int(row['strava_moving_time_s']))}"
+            )
+        if row["strava_distance_m"]:
+            strava_bits.append(f"{float(row['strava_distance_m']) / 1000:.2f} km")
+        if row["strava_average_heartrate"]:
+            strava_bits.append(
+                f"{float(row['strava_average_heartrate']):.0f} bpm"
+            )
+        strava_suffix = ""
+        if row["strava_activity_id"]:
+            source = (
+                f"[Strava]({row['strava_url']})"
+                if row["strava_url"] else "Strava"
+            )
+            strava_suffix = f" · {source}"
+            if strava_bits:
+                strava_suffix += f" ({' · '.join(strava_bits)})"
         lines.append(
             f"**{when}** · {_safe_label(program, limit=40)} · "
             f"**{cardio.format_number(cardio.total_minutes(segments))} mins** "
-            f"· {difficulty}\n-# {' · '.join(parts)}"
+            f"· {difficulty}{strava_suffix}\n-# {' · '.join(parts)}"
         )
     shown = list(lines)
     while len("\n".join(shown)) > 3900 and len(shown) > 1:

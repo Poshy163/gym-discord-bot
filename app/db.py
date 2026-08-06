@@ -85,14 +85,22 @@ CREATE TABLE IF NOT EXISTS cardio_program_segments (
 );
 
 CREATE TABLE IF NOT EXISTS cardio_sessions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL,
-    program_id   INTEGER REFERENCES cardio_programs(id) ON DELETE SET NULL,
-    program_name TEXT,
-    difficulty   TEXT    NOT NULL,
-    message_id   INTEGER,
-    channel_id   INTEGER,
-    logged_at    TEXT    NOT NULL
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id                   INTEGER NOT NULL,
+    program_id                INTEGER REFERENCES cardio_programs(id) ON DELETE SET NULL,
+    program_name              TEXT,
+    difficulty                TEXT    NOT NULL,
+    message_id                INTEGER,
+    channel_id                INTEGER,
+    strava_activity_id        INTEGER,
+    strava_name               TEXT,
+    strava_sport_type         TEXT,
+    strava_distance_m         REAL,
+    strava_moving_time_s      INTEGER,
+    strava_average_heartrate  REAL,
+    strava_calories           REAL,
+    strava_url                TEXT,
+    logged_at                 TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_cardio_sessions_user
@@ -1110,10 +1118,31 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE cardio_sessions ADD COLUMN channel_id INTEGER"
                 )
+            strava_cardio_columns = {
+                "strava_activity_id": "INTEGER",
+                "strava_name": "TEXT",
+                "strava_sport_type": "TEXT",
+                "strava_distance_m": "REAL",
+                "strava_moving_time_s": "INTEGER",
+                "strava_average_heartrate": "REAL",
+                "strava_calories": "REAL",
+                "strava_url": "TEXT",
+            }
+            for column, sql_type in strava_cardio_columns.items():
+                if column not in cardio_session_cols:
+                    self._connection.execute(
+                        f"ALTER TABLE cardio_sessions ADD COLUMN {column} {sql_type}"
+                    )
             self._connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "idx_cardio_sessions_message ON cardio_sessions (message_id) "
                 "WHERE message_id IS NOT NULL"
+            )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_cardio_sessions_strava "
+                "ON cardio_sessions (user_id, strava_activity_id) "
+                "WHERE strava_activity_id IS NOT NULL"
             )
             for table in (
                 "cardio_program_segments",
@@ -2912,6 +2941,15 @@ class Database:
                 ).fetchone()
             return self._cardio_program_from_row(c, row) if row else None
 
+    def cardio_program_get_by_id(self, user_id: int, program_id: int) -> dict | None:
+        """Get one program by id, enforcing ownership."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM cardio_programs WHERE user_id = ? AND id = ?",
+                (user_id, program_id),
+            ).fetchone()
+            return self._cardio_program_from_row(c, row) if row else None
+
     def cardio_program_list(self, user_id: int) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
@@ -2944,6 +2982,14 @@ class Database:
         logged_at: datetime | None = None,
         message_id: int | None = None,
         channel_id: int | None = None,
+        strava_activity_id: int | None = None,
+        strava_name: str | None = None,
+        strava_sport_type: str | None = None,
+        strava_distance_m: float | None = None,
+        strava_moving_time_s: int | None = None,
+        strava_average_heartrate: float | None = None,
+        strava_calories: float | None = None,
+        strava_url: str | None = None,
     ) -> int:
         """Snapshot a completed workout and optionally advance its program."""
         if not segments:
@@ -2963,12 +3009,17 @@ class Database:
                 """
                 INSERT INTO cardio_sessions
                 (user_id, program_id, program_name, difficulty,
-                 message_id, channel_id, logged_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                 message_id, channel_id, strava_activity_id, strava_name,
+                 strava_sport_type, strava_distance_m, strava_moving_time_s,
+                 strava_average_heartrate, strava_calories, strava_url,
+                 logged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id, program_id, program_name, difficulty,
-                    message_id, channel_id, ts,
+                    message_id, channel_id, strava_activity_id, strava_name,
+                    strava_sport_type, strava_distance_m, strava_moving_time_s,
+                    strava_average_heartrate, strava_calories, strava_url, ts,
                 ),
             )
             session_id = int(cur.lastrowid)
@@ -3072,6 +3123,47 @@ class Database:
                 "SELECT * FROM cardio_sessions WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
+
+    def cardio_session_get_by_strava(
+        self, user_id: int, activity_id: int,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM cardio_sessions "
+                "WHERE user_id = ? AND strava_activity_id = ?",
+                (user_id, activity_id),
+            ).fetchone()
+
+    def cardio_strava_session_list(
+        self, user_id: int, *, limit: int = 25,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM cardio_sessions "
+                "WHERE user_id = ? AND strava_activity_id IS NOT NULL "
+                "ORDER BY logged_at DESC, id DESC LIMIT ?",
+                (user_id, max(1, min(100, int(limit)))),
+            ).fetchall()
+
+    def cardio_session_unlink_strava(self, user_id: int, activity_id: int) -> bool:
+        """Remove a Strava association while retaining the cardio history row."""
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                UPDATE cardio_sessions
+                SET strava_activity_id = NULL,
+                    strava_name = NULL,
+                    strava_sport_type = NULL,
+                    strava_distance_m = NULL,
+                    strava_moving_time_s = NULL,
+                    strava_average_heartrate = NULL,
+                    strava_calories = NULL,
+                    strava_url = NULL
+                WHERE user_id = ? AND strava_activity_id = ?
+                """,
+                (user_id, activity_id),
+            )
+            return bool(cur.rowcount)
 
     def cardio_session_remove(self, user_id: int, session_id: int) -> bool:
         with self._conn() as c:

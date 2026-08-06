@@ -114,6 +114,26 @@ Other commands:
   backfill themselves; the bot owner can select another member or set
   `all_linked:true`. Re-run it to continue after the limit.
 - `/strava_unlink` — revoke access and delete the stored tokens.
+- `/cardio strava_link <program> <difficulty> [activity]` — link your newest
+  unlinked activity to a saved cardio program. Pass an activity ID or Strava URL
+  instead of `latest` to select an older or backfilled workout.
+- `/cardio strava_unlink [activity]` — remove that association while retaining
+  the native completed-session history. Adaptive progression is not rewound.
+
+### Link a Strava activity to adaptive cardio
+
+New and backfilled feed posts include an owner-only **Link to cardio** button.
+It opens a private picker for the saved program and the session difficulty.
+Linking creates one native cardio session from the program's segment/settings
+snapshot, stores Strava's measured time, distance, heart rate, calories, and
+activity link, then applies the program's normal adaptive progression.
+
+The Strava activity ID is unique per member, so repeated commands, button
+presses, and webhook/backfill overlap cannot count or progress the same workout
+twice. `/cardio history` shows the linked measured stats, and `/coach` treats
+the native session plus its Strava data as one workout rather than adding both.
+Revoking Strava access removes tokens but does not erase completed cardio
+history; use `/cardio strava_unlink` to detach a stored activity snapshot.
 
 ### Recovering after the Strava API app was inactive
 

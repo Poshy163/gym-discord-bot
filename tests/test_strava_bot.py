@@ -18,6 +18,7 @@ import app.bot as bot_mod  # noqa: E402
 from app import strava_client  # noqa: E402
 from app.bot import (  # noqa: E402
     _build_calorie_ai_payload,
+    _parse_strava_activity_reference,
     _strava_announce_activity,
     _strava_backfill_candidates,
     _strava_event_subscription_ok,
@@ -101,6 +102,28 @@ def test_should_post_min_duration(monkeypatch):
     assert _strava_should_post(_act(moving_time=900)) is True
 
 
+def test_parse_strava_activity_reference_accepts_latest_id_and_url():
+    assert _parse_strava_activity_reference(None) is None
+    assert _parse_strava_activity_reference("latest") is None
+    assert _parse_strava_activity_reference("123456789") == 123456789
+    assert (
+        _parse_strava_activity_reference(
+            "https://www.strava.com/activities/987654321?utm_source=share"
+        )
+        == 987654321
+    )
+
+
+def test_parse_strava_activity_reference_rejects_other_text():
+    for value in ("my morning run", "https://example.com/videos/123456"):
+        try:
+            _parse_strava_activity_reference(value)
+        except ValueError as exc:
+            assert "activity ID" in str(exc)
+        else:
+            raise AssertionError("expected invalid Strava reference to fail")
+
+
 def test_backfill_candidates_resume_oldest_first():
     activities = [
         _act(id=104, start_date="2026-08-04T10:00:00Z"),
@@ -162,6 +185,7 @@ def test_webhook_and_backfill_share_durable_dedupe(monkeypatch):
         assert first == "posted"
         assert second == "duplicate"
         assert len(sent) == 1
+        assert isinstance(sent[0]["view"], bot_mod.StravaCardioLinkView)
         imported = db.get_strava_activity_import(user_id, 7654321)
         assert imported["message_id"] == 444
         assert imported["channel_id"] == 333

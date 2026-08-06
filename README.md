@@ -114,6 +114,14 @@ optional machine settings:
   felt **easy**, **about right**, or **too hard**.
 - `/cardio log <workout> [difficulty]` — track a one-off session without making
   a program.
+- `/cardio strava_link <program> <difficulty> [activity]` — attach your latest
+  unlinked Strava activity to a saved program, snapshot Strava's actual
+  time/distance/heart-rate/calories, and apply the same adaptive progression as
+  `/cardio complete`. Paste an activity ID or URL to link an older/backfilled
+  workout.
+- `/cardio strava_unlink [activity]` — detach the latest (or specified) Strava
+  activity while retaining the completed cardio history. Progression is not
+  rewound.
 - `/cardio history [user] [limit]` — recent sessions, duration, and difficulty.
 - `/cardio remove <name>` — remove the saved routine while keeping its completed
   session history.
@@ -128,7 +136,9 @@ program improve without increasing every machine in the same session.
 
 Cardio programs and history are global per user, so they follow you across
 servers and DMs. `/coach` also includes cardio consistency, machine levels, and
-difficulty feedback in its progress report.
+difficulty feedback in its progress report. Strava feed posts include a
+**Link to cardio** button; only the activity owner can use it, and repeated
+link attempts cannot create duplicate sessions.
 
 Lifts, PRs and goals are **global per user** — everything you log follows you
 across every server the bot is in (and DMs): your bests, history, tonnage,
@@ -454,6 +464,11 @@ missed feed posts), and owner-only `/strava_subscribe`,
 `/strava_subscription`, `/strava_unsubscribe`. The owner can backfill every
 linked member after an API subscription outage with
 `/strava_backfill all_linked:true`.
+
+Every new or backfilled feed post also has a **Link to cardio** button. It opens
+a private saved-program and difficulty picker, then records one native cardio
+session with Strava's measured stats. The equivalent slash command is
+`/cardio strava_link`; use it with an activity URL or ID for older posts.
 
 ## Apple Health / Fitness (no subscription)
 

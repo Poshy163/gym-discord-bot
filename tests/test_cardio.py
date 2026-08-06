@@ -254,6 +254,57 @@ def test_removing_program_keeps_session_history(db):
     assert history[0]["program_name"] == "Intervals"
 
 
+def test_strava_link_snapshot_dedupes_and_can_detach(db):
+    program = db.cardio_program_set(
+        7, "Sam", "Morning Cardio", "standard",
+        [Segment("elliptical", 15, 12)],
+    )
+    session_id = db.cardio_session_add(
+        7,
+        [Segment("elliptical", 15, 12)],
+        "just_right",
+        program_id=program["id"],
+        program_name=program["name"],
+        strava_activity_id=987654321,
+        strava_name="Morning Elliptical",
+        strava_sport_type="Elliptical",
+        strava_distance_m=4200,
+        strava_moving_time_s=901,
+        strava_average_heartrate=144.5,
+        strava_calories=260,
+        strava_url="https://www.strava.com/activities/987654321",
+    )
+
+    linked = db.cardio_session_get_by_strava(7, 987654321)
+    assert linked is not None and linked["id"] == session_id
+    history = db.cardio_session_list(7)
+    assert history[0]["strava_name"] == "Morning Elliptical"
+    assert history[0]["strava_moving_time_s"] == 901
+    assert history[0]["strava_average_heartrate"] == 144.5
+    with pytest.raises(sqlite3.IntegrityError):
+        db.cardio_session_add(
+            7,
+            [Segment("elliptical", 15, 12)],
+            "just_right",
+            strava_activity_id=987654321,
+        )
+
+    assert db.cardio_session_unlink_strava(7, 987654321) is True
+    assert db.cardio_session_get_by_strava(7, 987654321) is None
+    retained = db.cardio_session_list(7)[0]
+    assert retained["id"] == session_id
+    assert retained["segments"][0]["level"] == 12
+    assert retained["strava_name"] is None
+
+
+def test_cardio_program_get_by_id_enforces_owner(db):
+    program = db.cardio_program_set(
+        7, "Sam", "Intervals", "standard", [Segment("bike", 20, 5)],
+    )
+    assert db.cardio_program_get_by_id(7, program["id"])["name"] == "Intervals"
+    assert db.cardio_program_get_by_id(8, program["id"]) is None
+
+
 def test_migration_adds_chat_and_machine_setting_columns(tmp_path):
     path = tmp_path / "old-cardio.sqlite3"
     conn = sqlite3.connect(path)
@@ -313,6 +364,17 @@ def test_migration_adds_chat_and_machine_setting_columns(tmp_path):
         session_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(cardio_sessions)")
         }
-        assert {"message_id", "channel_id"} <= session_columns
+        assert {
+            "message_id",
+            "channel_id",
+            "strava_activity_id",
+            "strava_name",
+            "strava_sport_type",
+            "strava_distance_m",
+            "strava_moving_time_s",
+            "strava_average_heartrate",
+            "strava_calories",
+            "strava_url",
+        } <= session_columns
     finally:
         conn.close()
