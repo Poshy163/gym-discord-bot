@@ -75,6 +75,7 @@ from .presence import (
 from .voicetime import summarize_voice
 from . import __version__
 from . import ai_food
+from . import apple_health
 from . import calories
 from . import cardio
 from . import config as config_mod
@@ -265,6 +266,11 @@ def _bind_config(cfg: config_mod.Config) -> None:
     g["STRAVA_MIN_DURATION_S"] = cfg["STRAVA_MIN_DURATION_S"]
     g["STRAVA_IMPERIAL"] = cfg["STRAVA_IMPERIAL"]
     g["STRAVA_AUTO_SUBSCRIBE"] = cfg["STRAVA_AUTO_SUBSCRIBE"]
+
+    # -- Apple Health -----------------------------------------------------
+    g["APPLE_HEALTH_DISABLED"] = cfg["APPLE_HEALTH_DISABLED"]
+    g["APPLE_HEALTH_PUBLIC_URL"] = cfg["APPLE_HEALTH_PUBLIC_URL"]
+    g["APPLE_HEALTH_FEED_CHANNEL_ID"] = cfg["APPLE_HEALTH_FEED_CHANNEL_ID"]
 
     # -- Hevy -------------------------------------------------------------
     g["HEVY_DISABLED"] = cfg["HEVY_DISABLED"]
@@ -13603,6 +13609,8 @@ async def _before_revo_poll() -> None:  # pragma: no cover - discord runtime
 # the resolved values into this process's environment.
 
 STRAVA_COLOUR = discord.Colour.from_str("#fc4c02")  # Strava brand orange
+APPLE_HEALTH_COLOUR = discord.Colour.from_str("#ff375f")
+APPLE_HEALTH_COLOUR = discord.Colour.from_str("#ff375f")
 # Hevy's own dark brand tone (#1d2330) sits at roughly 1.1:1 contrast against
 # Discord's dark background (#313338) — an invisible rail on what is, by volume,
 # the most-posted embed in the bot. Their brand blue reads in both themes.
@@ -13635,6 +13643,36 @@ def _strava_enabled() -> bool:
         and strava_client.available()
         and _strava_cfg().configured
     )
+
+
+def _apple_health_public_url() -> str:
+    """Public base shared with Strava unless Apple Health overrides it."""
+    return (
+        APPLE_HEALTH_PUBLIC_URL
+        or os.environ.get("STRAVA_PUBLIC_URL", "").strip().rstrip("/")
+    )
+
+
+def _apple_health_enabled() -> bool:
+    return not APPLE_HEALTH_DISABLED and bool(_apple_health_public_url())
+
+
+def _apple_health_feed_channel_id() -> int | None:
+    return APPLE_HEALTH_FEED_CHANNEL_ID or STRAVA_FEED_CHANNEL_ID
+
+
+async def _apple_health_feed_channel():
+    channel_id = _apple_health_feed_channel_id()
+    if channel_id is None:
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            LOG.warning("Apple Health: cannot reach feed channel %s", channel_id)
+            return None
+    return channel
 
 
 def _hevy_enabled() -> bool:
@@ -14579,10 +14617,142 @@ async def _strava_autosubscribe_startup() -> None:  # pragma: no cover - runtime
     )
 
 
+def _apple_health_activity_name(value: str) -> str:
+    value = value.removeprefix("HKWorkoutActivityType")
+    value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+    return value.replace("_", " ").strip().title() or "Workout"
+
+
+def _apple_health_embed(
+    user_id: int, workout: "apple_health.Workout",
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Apple Health · {_apple_health_activity_name(workout.activity)}",
+        description=f"<@{user_id}> completed a workout.",
+        colour=APPLE_HEALTH_COLOUR,
+        timestamp=workout.ended_at,
+    )
+    embed.add_field(
+        name="Duration", value=format_duration(workout.duration_s), inline=True,
+    )
+    if workout.active_kcal is not None:
+        embed.add_field(
+            name="Active energy",
+            value=f"{workout.active_kcal:,.0f} kcal",
+            inline=True,
+        )
+    if workout.distance_m is not None:
+        embed.add_field(
+            name="Distance",
+            value=f"{workout.distance_m / 1000:,.2f} km",
+            inline=True,
+        )
+    if workout.avg_heart_rate is not None:
+        embed.add_field(
+            name="Avg heart rate",
+            value=f"{workout.avg_heart_rate:,.0f} bpm",
+            inline=True,
+        )
+    if workout.elevation_m is not None:
+        embed.add_field(
+            name="Elevation", value=f"{workout.elevation_m:,.0f} m", inline=True,
+        )
+    if workout.effort is not None:
+        embed.add_field(
+            name="Effort", value=f"{workout.effort:g}/10", inline=True,
+        )
+    local_start = workout.started_at.astimezone(DISPLAY_TZ)
+    source = workout.source_name or "Apple Health"
+    embed.set_footer(text=f"{source} · started {local_start:%Y-%m-%d %H:%M}")
+    return embed
+
+
+async def _apple_health_post_workout(
+    user_id: int, workout: "apple_health.Workout",
+) -> None:
+    channel = await _apple_health_feed_channel()
+    if channel is None:
+        return
+    try:
+        message = await channel.send(embed=_apple_health_embed(user_id, workout))
+    except discord.HTTPException:
+        LOG.exception(
+            "Apple Health: failed to post workout %s for user %s",
+            workout.workout_id[:12], user_id,
+        )
+        return
+    db.apple_health_set_message(
+        user_id, workout.workout_id, message.id, channel.id,
+    )
+
+
+async def _apple_health_on_request(
+    token: str, payload: object,
+) -> tuple[int, dict[str, object]]:
+    """Authenticate and synchronously store a Shortcut workout/replay batch."""
+    account = db.apple_health_get_by_token_hash(apple_health.token_hash(token))
+    if account is None:
+        LOG.warning("Apple Health webhook rejected an invalid bearer token")
+        return 401, {"ok": False, "error": "invalid bearer token"}
+    user_id = int(account["user_id"])
+    try:
+        items = apple_health.payload_items(payload)
+    except apple_health.WorkoutValidationError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+
+    accepted: list[apple_health.Workout] = []
+    duplicates = 0
+    rejected: list[dict[str, object]] = []
+    for index, item in enumerate(items):
+        try:
+            workout = apple_health.parse_workout(item)
+        except apple_health.WorkoutValidationError as exc:
+            rejected.append({"index": index, "error": str(exc)})
+            continue
+        inserted = db.apple_health_add_workout(
+            user_id,
+            workout_id=workout.workout_id,
+            activity=workout.activity,
+            started_at=workout.started_at,
+            ended_at=workout.ended_at,
+            duration_s=workout.duration_s,
+            active_kcal=workout.active_kcal,
+            distance_m=workout.distance_m,
+            avg_heart_rate=workout.avg_heart_rate,
+            elevation_m=workout.elevation_m,
+            effort=workout.effort,
+            source_name=workout.source_name,
+        )
+        if inserted:
+            accepted.append(workout)
+        else:
+            duplicates += 1
+
+    if not accepted and rejected and not duplicates:
+        return 400, {
+            "ok": False, "accepted": 0, "duplicates": 0,
+            "rejected": rejected,
+        }
+    for workout in accepted:
+        bot.loop.create_task(_apple_health_post_workout(user_id, workout))
+    LOG.info(
+        "Apple Health import user=%s accepted=%d duplicates=%d rejected=%d",
+        user_id, len(accepted), duplicates, len(rejected),
+    )
+    return 200, {
+        "ok": True,
+        "accepted": len(accepted),
+        "duplicates": duplicates,
+        "rejected": rejected,
+    }
+
+
 async def _start_strava_server() -> None:  # pragma: no cover - discord runtime
-    """Start the Strava OAuth/webhook web server (no-op when disabled)."""
+    """Start the shared Strava/Apple Health integration web server."""
     global _strava_runner
-    if not _strava_enabled():
+    strava_enabled = _strava_enabled()
+    apple_enabled = _apple_health_enabled()
+    if not strava_enabled and not apple_enabled:
         if not STRAVA_DISABLED and strava_client.available() and not _strava_cfg().configured:
             LOG.info(
                 "Strava idle — open the dashboard's Settings tab and fill in "
@@ -14596,24 +14766,37 @@ async def _start_strava_server() -> None:  # pragma: no cover - discord runtime
         on_callback=_strava_on_callback,
         on_event=_strava_on_event,
         schedule=lambda coro: bot.loop.create_task(coro),
+        on_apple_health=_apple_health_on_request if apple_enabled else None,
     )
     try:
         _strava_runner = await strava_web.start_server(
             app, STRAVA_BIND_HOST, STRAVA_PORT,
         )
-        LOG.info(
+        if strava_enabled:
+            LOG.info(
             "Strava enabled — feed channel=%s callback=%s",
             STRAVA_FEED_CHANNEL_ID, cfg.redirect_uri,
-        )
-        if STRAVA_FEED_CHANNEL_ID is None:
+            )
+        if strava_enabled and STRAVA_FEED_CHANNEL_ID is None:
             LOG.warning(
                 "STRAVA_FEED_CHANNEL_ID is unset — workouts will be received "
                 "but not posted anywhere."
             )
-        if STRAVA_AUTO_SUBSCRIBE:
+        if strava_enabled and STRAVA_AUTO_SUBSCRIBE:
             bot.loop.create_task(_strava_autosubscribe_startup())
+        if apple_enabled:
+            LOG.info(
+                "Apple Health enabled: endpoint=%s/apple-health/workouts "
+                "feed_channel=%s",
+                _apple_health_public_url(), _apple_health_feed_channel_id(),
+            )
+            if _apple_health_feed_channel_id() is None:
+                LOG.warning(
+                    "Apple Health feed channel is unset; workouts will be "
+                    "stored for coaching but not posted anywhere."
+                )
     except Exception:
-        LOG.exception("Failed to start Strava web server")
+        LOG.exception("Failed to start integration web server")
 
 
 # The operator dashboard used to be started here. It now lives in the
@@ -15720,6 +15903,226 @@ async def strava_status_cmd(interaction: discord.Interaction) -> None:
         f"✅ Linked as **{name}** (athlete id `{row['athlete_id']}`).{feed}",
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Apple Health Shortcut commands
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="apple_health_link",
+    description="Create the private token used by your Apple Health Shortcut.",
+)
+@app_commands.describe(
+    rotate="Replace your existing token (your old Shortcut will stop working).",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def apple_health_link_cmd(
+    interaction: discord.Interaction, rotate: bool = False,
+) -> None:
+    if APPLE_HEALTH_DISABLED:
+        await interaction.response.send_message(
+            "Apple Health integration is disabled by the bot owner.",
+            ephemeral=True,
+        )
+        return
+    public_url = _apple_health_public_url()
+    if not public_url:
+        await interaction.response.send_message(
+            "Apple Health isn't configured on the host yet. The bot owner needs "
+            "to set `APPLE_HEALTH_PUBLIC_URL` (or `STRAVA_PUBLIC_URL`) to the "
+            "public HTTPS address.",
+            ephemeral=True,
+        )
+        return
+    existing = db.apple_health_get(interaction.user.id)
+    if existing is not None and not rotate:
+        await interaction.response.send_message(
+            "You already have an Apple Health Shortcut token. It cannot be shown "
+            "again because only its hash is stored. If you lost it, run "
+            "`/apple_health_link rotate:true` to replace it.",
+            ephemeral=True,
+        )
+        return
+
+    token = apple_health.new_token()
+    db.apple_health_link(interaction.user.id, apple_health.token_hash(token))
+    endpoint = f"{public_url}/apple-health/workouts"
+    rotated = " Your previous token is now invalid." if existing else ""
+    await interaction.response.send_message(
+        "🍎 **Apple Health Shortcut link created**\n"
+        f"{rotated}\n"
+        f"**URL:** `{endpoint}`\n"
+        f"**Authorization header:** `Bearer {token}`\n\n"
+        "The token is shown **once**. Copy it directly into your private "
+        "Shortcut; never post it in a channel. Run `/apple_health_help` for the "
+        "Workout End automation and replay setup.\n\n"
+        "Minimal JSON body:\n"
+        "```json\n"
+        '{"activity":"Running","started_at":"2026-08-06T07:00:00+09:30",'
+        '"ended_at":"2026-08-06T07:30:00+09:30","active_kcal":300}\n'
+        "```",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="apple_health_status",
+    description="Show your Apple Health Shortcut link and import status.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def apple_health_status_cmd(interaction: discord.Interaction) -> None:
+    row = db.apple_health_get(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "No Apple Health Shortcut linked. Use `/apple_health_link` to start.",
+            ephemeral=True,
+        )
+        return
+    count = db.apple_health_count(interaction.user.id)
+    last = row["last_received_at"] or "waiting for the first workout"
+    feed_id = _apple_health_feed_channel_id()
+    feed = (
+        f"New imports also post to <#{feed_id}>."
+        if feed_id else
+        "Imports are stored for history and coaching; no feed channel is set."
+    )
+    await interaction.response.send_message(
+        f"✅ Apple Health linked · **{count}** workout"
+        f"{'s' if count != 1 else ''} stored.\nLast received: `{last}`\n{feed}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="apple_health_unlink",
+    description="Disable your Shortcut token and delete imported Apple workouts.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def apple_health_unlink_cmd(interaction: discord.Interaction) -> None:
+    removed = db.apple_health_unlink(interaction.user.id)
+    await interaction.response.send_message(
+        (
+            "🗑️ Apple Health unlinked. The token and imported workout history "
+            "were deleted. Existing Discord feed messages cannot be recalled."
+        )
+        if removed else
+        "You don't have a linked Apple Health Shortcut.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="apple_health_recent",
+    description="Show your most recently imported Apple Health workouts.",
+)
+@app_commands.describe(limit="Number of workouts to show (1-10).")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def apple_health_recent_cmd(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 10] = 5,
+) -> None:
+    rows = db.apple_health_recent(interaction.user.id, limit)
+    if not rows:
+        await interaction.response.send_message(
+            "No Apple Health workouts imported yet.", ephemeral=True,
+        )
+        return
+    lines = []
+    for row in rows:
+        started = datetime.fromisoformat(row["started_at"]).astimezone(DISPLAY_TZ)
+        details = [format_duration(row["duration_s"])]
+        if row["distance_m"] is not None:
+            details.append(f"{row['distance_m'] / 1000:.2f} km")
+        if row["active_kcal"] is not None:
+            details.append(f"{row['active_kcal']:.0f} kcal")
+        if row["effort"] is not None:
+            details.append(f"effort {row['effort']:g}/10")
+        lines.append(
+            f"• `{started:%Y-%m-%d}` **"
+            f"{_apple_health_activity_name(row['activity'])}** · "
+            + " · ".join(details)
+        )
+    await interaction.response.send_message(
+        "🍎 **Recent Apple Health workouts**\n" + "\n".join(lines),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="apple_health_help",
+    description="Set up Apple Health Workout End and recovery automations.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def apple_health_help_cmd(interaction: discord.Interaction) -> None:
+    endpoint = (
+        f"`{_apple_health_public_url()}/apple-health/workouts`"
+        if _apple_health_public_url() else
+        "the host's Apple Health endpoint"
+    )
+    embed = discord.Embed(
+        title="🍎 Apple Health → Gym Bot",
+        colour=APPLE_HEALTH_COLOUR,
+        description=(
+            "This is free and runs from your iPhone: a personal Shortcut sends "
+            "only workout summaries you choose. The bot cannot read your entire "
+            "Health database."
+        ),
+    )
+    embed.add_field(
+        name="1 · Get your private link",
+        value=(
+            "Run `/apple_health_link`, then keep the one-time token private. "
+            f"Requests go to {endpoint} with an `Authorization: Bearer …` header."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="2 · Workout End automation",
+        value=(
+            "Shortcuts → Automation → Apple Watch Workout → **Ends** → Run "
+            "Immediately. Add **Get Details of Health Sample** for activity, "
+            "start, end, duration, energy, distance and heart rate; build a "
+            "Dictionary using the field names below; then **Get Contents of "
+            "URL** using POST, JSON, and your Authorization header."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Accepted fields",
+        value=(
+            "`id`, `activity`, `started_at`, `ended_at`, `duration_minutes`, "
+            "`active_kcal`, `distance_m`, `avg_heart_rate`, `elevation_m`, "
+            "`effort` (1–10), `source_name`. Dates must include a timezone."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="3 · Automatic gap recovery",
+        value=(
+            "Make a second daily personal automation. Use **Find Health "
+            "Samples** for workouts in the last 7 days, turn each result into "
+            "the same dictionary, collect them under a `workouts` list, and "
+            "POST it to the same URL. Replays are safe: duplicates are ignored."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Privacy and control",
+        value=(
+            "The token is stored only as a hash. Imported summaries can appear "
+            "in the configured public workout feed and are available to Gym "
+            "Bot coaching. `/apple_health_unlink` invalidates the token and "
+            "deletes stored imports; already-sent Discord posts remain."
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -19584,6 +19987,11 @@ _COACH_SYSTEM = (
     "setting changes together. A rising setting with mostly 'too_hard' ratings "
     "is not automatically improvement; an unchanged setting with easier ratings "
     "can be progress.\n"
+    "- apple_health_imports are external workout records from the member's "
+    "iPhone. They may describe the same session as a native cardio entry or "
+    "lifting log. Use them to improve coverage, duration, energy, distance, "
+    "heart-rate, and effort context, but never add overlapping records together "
+    "as if they were separate workouts.\n"
     "- Nutrition totals cover only logged days. Compare an average derived from "
     "the total only across calorie_days_logged_window or "
     "protein_days_logged_window, never across every calendar day. If "
@@ -19740,6 +20148,24 @@ def _build_progress_payload(
     cardio_sessions = db.cardio_session_list(
         user_id, limit=1000, start_iso=start_iso, end_iso=end_iso,
     )
+    apple_workouts = db.apple_health_workouts_since(
+        user_id, now - timedelta(days=days),
+    )
+    apple_activity: dict[str, dict[str, float | str | int]] = {}
+    for workout in apple_workouts:
+        key = str(workout["activity"]).casefold()
+        aggregate = apple_activity.setdefault(
+            key,
+            {
+                "activity": _apple_health_activity_name(workout["activity"]),
+                "workouts": 0,
+                "minutes": 0.0,
+            },
+        )
+        aggregate["workouts"] = int(aggregate["workouts"]) + 1
+        aggregate["minutes"] = (
+            float(aggregate["minutes"]) + workout["duration_s"] / 60
+        )
     cardio_activity: dict[str, dict[str, float | str | int]] = {}
     cardio_total_minutes = 0.0
     cardio_difficulty = {key: 0 for key in _CARDIO_DIFFICULTY_LABELS}
@@ -19783,6 +20209,7 @@ def _build_progress_payload(
             "has_cardio_program_or_sessions": bool(
                 cardio_programs or cardio_sessions
             ),
+            "has_apple_health_workouts": bool(apple_workouts),
             "days_since_last_lift": _days_since(last_lift_at),
             "days_since_bodyweight": _days_since(last_bw_at),
             "nutrition_days_logged_in_window": {
@@ -19865,6 +20292,42 @@ def _build_progress_payload(
                 }
                 for session in cardio_sessions[:12]
             ],
+            "apple_health_imports": {
+                "note": (
+                    "External workout records; they may overlap native cardio "
+                    "sessions or lifting logs and must not be double-counted."
+                ),
+                "workouts_in_window": len(apple_workouts),
+                "total_minutes_in_window": round(
+                    sum(row["duration_s"] for row in apple_workouts) / 60, 1,
+                ),
+                "active_kcal_in_window": round(sum(
+                    float(row["active_kcal"] or 0) for row in apple_workouts
+                )),
+                "distance_km_in_window": round(sum(
+                    float(row["distance_m"] or 0) for row in apple_workouts
+                ) / 1000, 2),
+                "by_activity": sorted(
+                    apple_activity.values(),
+                    key=lambda item: float(item["minutes"]),
+                    reverse=True,
+                ),
+                "recent_workouts": [
+                    {
+                        "activity": _apple_health_activity_name(row["activity"]),
+                        "started_at": row["started_at"],
+                        "duration_minutes": round(row["duration_s"] / 60, 1),
+                        "active_kcal": row["active_kcal"],
+                        "distance_km": (
+                            round(row["distance_m"] / 1000, 2)
+                            if row["distance_m"] is not None else None
+                        ),
+                        "avg_heart_rate": row["avg_heart_rate"],
+                        "effort": row["effort"],
+                    }
+                    for row in apple_workouts[-12:]
+                ],
+            },
         },
         "bodyweight": {
             "recent": [

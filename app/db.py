@@ -630,6 +630,38 @@ CREATE TABLE IF NOT EXISTS strava_pending_auth (
     created_at TEXT    NOT NULL
 );
 
+-- Apple Health has no cloud API for this bot to poll. Each member installs an
+-- iPhone Shortcut which POSTs workout summaries using a bearer token. Only the
+-- SHA-256 token hash is stored; the plaintext exists only in their Shortcut.
+CREATE TABLE IF NOT EXISTS apple_health_account (
+    user_id          INTEGER PRIMARY KEY,
+    token_hash       TEXT    NOT NULL UNIQUE,
+    linked_at        TEXT    NOT NULL,
+    last_received_at TEXT
+);
+
+-- Replay-safe ledger shared by Workout End automations and recovery batches.
+CREATE TABLE IF NOT EXISTS apple_health_workout (
+    user_id         INTEGER NOT NULL,
+    workout_id      TEXT    NOT NULL,
+    activity        TEXT    NOT NULL,
+    started_at      TEXT    NOT NULL,
+    ended_at        TEXT    NOT NULL,
+    duration_s      INTEGER NOT NULL,
+    active_kcal     REAL,
+    distance_m      REAL,
+    avg_heart_rate  REAL,
+    elevation_m     REAL,
+    effort          REAL,
+    source_name     TEXT,
+    message_id      INTEGER,
+    channel_id      INTEGER,
+    received_at     TEXT    NOT NULL,
+    PRIMARY KEY (user_id, workout_id)
+);
+CREATE INDEX IF NOT EXISTS idx_apple_health_workout_user_started
+    ON apple_health_workout (user_id, started_at);
+
 -- Linked Hevy (hevyapp.com) accounts. Hevy uses a per-user API key (no OAuth),
 -- stored Fernet-encrypted in ``api_key_enc`` — plaintext is never persisted.
 -- ``guild_id`` is where polled workouts are imported as lifts and where the feed
@@ -3647,6 +3679,155 @@ class Database:
     def list_strava_accounts(self) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute("SELECT * FROM strava_account"))
+
+    # ------------------------------------------------------------------
+    # Apple Health Shortcut imports
+    # ------------------------------------------------------------------
+
+    def apple_health_link(self, user_id: int, token_hash: str) -> None:
+        """Create or rotate a member's hashed Shortcut bearer token."""
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO apple_health_account (
+                    user_id, token_hash, linked_at, last_received_at
+                ) VALUES (?, ?, ?, NULL)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    token_hash = excluded.token_hash,
+                    linked_at = excluded.linked_at
+                """,
+                (user_id, token_hash, _normalize_iso(None)),
+            )
+
+    def apple_health_get(self, user_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM apple_health_account WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+    def apple_health_get_by_token_hash(
+        self, token_hash: str,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM apple_health_account WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+
+    def apple_health_unlink(self, user_id: int) -> bool:
+        """Remove the Shortcut token and all imported Apple workout history."""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM apple_health_workout WHERE user_id = ?", (user_id,)
+            )
+            cur = c.execute(
+                "DELETE FROM apple_health_account WHERE user_id = ?", (user_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def apple_health_add_workout(
+        self,
+        user_id: int,
+        *,
+        workout_id: str,
+        activity: str,
+        started_at: datetime,
+        ended_at: datetime,
+        duration_s: int,
+        active_kcal: float | None = None,
+        distance_m: float | None = None,
+        avg_heart_rate: float | None = None,
+        elevation_m: float | None = None,
+        effort: float | None = None,
+        source_name: str | None = None,
+    ) -> bool:
+        """Insert one workout, returning False for an already-imported replay."""
+        received_at = _normalize_iso(None)
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT OR IGNORE INTO apple_health_workout (
+                    user_id, workout_id, activity, started_at, ended_at,
+                    duration_s, active_kcal, distance_m, avg_heart_rate,
+                    elevation_m, effort, source_name, message_id, channel_id,
+                    received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    user_id, workout_id, activity,
+                    _normalize_iso(started_at), _normalize_iso(ended_at),
+                    duration_s, active_kcal, distance_m, avg_heart_rate,
+                    elevation_m, effort, source_name, received_at,
+                ),
+            )
+            c.execute(
+                """
+                UPDATE apple_health_account
+                   SET last_received_at = ?
+                 WHERE user_id = ?
+                """,
+                (received_at, user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def apple_health_set_message(
+        self,
+        user_id: int,
+        workout_id: str,
+        message_id: int,
+        channel_id: int,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE apple_health_workout
+                   SET message_id = ?, channel_id = ?
+                 WHERE user_id = ? AND workout_id = ?
+                """,
+                (message_id, channel_id, user_id, workout_id),
+            )
+
+    def apple_health_recent(
+        self, user_id: int, limit: int = 10,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT *
+                  FROM apple_health_workout
+                 WHERE user_id = ?
+                 ORDER BY started_at DESC
+                 LIMIT ?
+                """,
+                (user_id, max(1, min(int(limit), 100))),
+            ))
+
+    def apple_health_workouts_since(
+        self, user_id: int, since: datetime,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT *
+                  FROM apple_health_workout
+                 WHERE user_id = ? AND started_at >= ?
+                 ORDER BY started_at ASC
+                """,
+                (user_id, _normalize_iso(since)),
+            ))
+
+    def apple_health_count(self, user_id: int) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COUNT(*) AS n
+                  FROM apple_health_workout
+                 WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            return int(row["n"])
 
     # ------------------------------------------------------------------
     # Hevy (hevyapp.com) linked accounts

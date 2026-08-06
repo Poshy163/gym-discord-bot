@@ -1,4 +1,4 @@
-"""Tiny aiohttp web surface for the Strava integration.
+"""Tiny aiohttp web surface for Strava and Apple Health integrations.
 
 The bot is otherwise a pure gateway client with no HTTP server. Strava's OAuth
 redirect and its webhook push both need a publicly reachable URL, so we run a
@@ -14,6 +14,8 @@ Routes
 GET  /strava/callback   OAuth redirect target — exchanges ?code for tokens.
 GET  /strava/webhook    Strava subscription validation handshake.
 POST /strava/webhook    Strava event push (activity created/updated/deleted).
+POST /apple-health/workouts
+                        Authenticated iPhone Shortcut workout import.
 GET  /healthz           Liveness probe.
 """
 from __future__ import annotations
@@ -30,6 +32,9 @@ LOG = logging.getLogger("gymbot.strava.web")
 #   on_event(payload: dict)         -> None  (process a webhook event)
 CallbackHandler = Callable[[str | None, str | None, str | None], Awaitable[str]]
 EventHandler = Callable[[dict], Awaitable[None]]
+AppleHealthHandler = Callable[
+    [str, object], Awaitable[tuple[int, dict[str, object]]]
+]
 
 
 def build_app(
@@ -38,6 +43,7 @@ def build_app(
     on_callback: CallbackHandler,
     on_event: EventHandler,
     schedule: Callable[[Awaitable[None]], None],
+    on_apple_health: AppleHealthHandler | None = None,
 ) -> web.Application:
     """Construct the aiohttp application.
 
@@ -85,15 +91,38 @@ def build_app(
     async def health(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
-    app = web.Application()
-    app.add_routes(
-        [
-            web.get("/strava/callback", callback),
-            web.get("/strava/webhook", webhook_verify),
-            web.post("/strava/webhook", webhook_event),
-            web.get("/healthz", health),
-        ]
-    )
+    async def apple_health_workouts(request: web.Request) -> web.Response:
+        auth = request.headers.get("Authorization", "")
+        scheme, _, token = auth.partition(" ")
+        if scheme.casefold() != "bearer" or not token.strip():
+            return web.json_response(
+                {"ok": False, "error": "missing bearer token"}, status=401,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad json"}, status=400,
+            )
+        try:
+            status, result = await on_apple_health(token.strip(), payload)  # type: ignore[misc]
+        except Exception:
+            LOG.exception("Apple Health webhook processing failed")
+            return web.json_response(
+                {"ok": False, "error": "internal error"}, status=500,
+            )
+        return web.json_response(result, status=status)
+
+    routes = [
+        web.get("/strava/callback", callback),
+        web.get("/strava/webhook", webhook_verify),
+        web.post("/strava/webhook", webhook_event),
+        web.get("/healthz", health),
+    ]
+    if on_apple_health is not None:
+        routes.append(web.post("/apple-health/workouts", apple_health_workouts))
+    app = web.Application(client_max_size=1024 * 1024)
+    app.add_routes(routes)
     return app
 
 
@@ -105,7 +134,7 @@ async def start_server(
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
-    LOG.info("Strava web server listening on %s:%d", host, port)
+    LOG.info("Integration web server listening on %s:%d", host, port)
     return runner
 
 

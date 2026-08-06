@@ -414,6 +414,21 @@ _SETTINGS: tuple[Setting, ...] = (
        help="Container-internal. Must match the compose port mapping, so it "
             "is not editable here."),
 
+    # ---- Apple Health ----------------------------------------------------
+    # Apple exposes HealthKit only on the member's device, so an iPhone
+    # Shortcut sends summaries to the same tiny HTTPS server used by Strava.
+    _S("APPLE_HEALTH_DISABLED", "bool", "0", "apple_health", _bool,
+       apply="worker", label="Disable Apple Health entirely"),
+    _S("APPLE_HEALTH_PUBLIC_URL", "str", "", "apple_health", _rstrip_slash,
+       apply="worker", label="Public base URL",
+       help="Externally reachable HTTPS base for the iPhone Shortcut. Blank "
+            "reuses the Strava public URL."),
+    _S("APPLE_HEALTH_FEED_CHANNEL_ID", "id", "", "apple_health",
+       _snowflake_signed, apply="worker", label="Feed channel",
+       help="Where imported Apple Health workouts post. Blank reuses the "
+            "Strava feed channel.",
+       restart_note="Setting this for the first time needs a restart."),
+
     # ---- Revo ------------------------------------------------------------
     _S("REVO_DISABLED", "bool", "0", "revo", _bool,
        apply="worker", label="Disable Revo entirely"),

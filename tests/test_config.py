@@ -109,6 +109,10 @@ PRE_REFACTOR_DEFAULTS = {
     "STRAVA_AUTO_SUBSCRIBE": True,
     "STRAVA_BIND_HOST": "0.0.0.0",
     "STRAVA_PORT": 8080,
+    # apple health
+    "APPLE_HEALTH_DISABLED": False,
+    "APPLE_HEALTH_PUBLIC_URL": "",
+    "APPLE_HEALTH_FEED_CHANNEL_ID": None,
     # revo
     "REVO_DISABLED": False,
     "REVO_NOTIFY_CHANNEL_ID": None,
