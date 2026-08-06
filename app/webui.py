@@ -2414,6 +2414,27 @@ box-shadow:0 0 0 3px #6366f133}
 .setnote{grid-column:1/-1;font-size:.82rem;margin:.35rem 0 0}
 .setnote.warn{color:#e3b341}
 .pin{background:#e3b34118;border-color:#e3b34155;color:#e3b341}
+.admin-picker{display:flex;flex:1 1 18rem;gap:.55rem;align-items:center;
+flex-wrap:wrap;min-width:0}
+.admin-summary{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;min-width:0}
+.admin-chip{display:inline-flex;align-items:center;gap:.38rem;padding:.22rem .48rem;
+border:1px solid var(--line);border-radius:999px;background:#0d1117;
+font-size:.78rem;max-width:15rem}
+.admin-chip .av{flex:none}
+.admin-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.admin-list{display:grid;gap:.42rem;margin-top:.8rem;max-height:48vh;overflow:auto}
+.admin-option{display:flex;align-items:center;gap:.65rem;padding:.55rem .65rem;
+border:1px solid var(--line);border-radius:10px;background:#0d1117;cursor:pointer}
+.admin-option:hover{border-color:#6366f188;background:#121824}
+.admin-option input{width:auto;flex:none;margin:0}
+.admin-option .av{flex:none}
+.admin-option-main{min-width:0;flex:1}
+.admin-option-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.admin-option-meta{font-size:.72rem;color:var(--muted);overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.admin-manual{display:flex;gap:.5rem;margin-top:.8rem;align-items:center}
+.admin-manual input{flex:1;min-width:0}
 .wlog{background:#0d1117;border:1px solid var(--line);border-radius:10px;
 padding:.7rem .9rem;overflow:auto;max-height:22rem;font-size:.8rem;
 white-space:pre-wrap;word-break:break-word;margin:.8rem 0 0}
@@ -2716,6 +2737,8 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
   .act-metric span{font-size:.6rem}
   .row-actions{flex-wrap:wrap}
   .pgrow{gap:.5rem;align-items:flex-start}
+  .admin-manual{flex-wrap:wrap}
+  .admin-manual input{flex-basis:100%}
   dialog{padding:1rem}
 }
 @media (hover:none){
@@ -3244,6 +3267,27 @@ function groupBox(g){
     <div class="setform">${g.items.map(settingRow).join("")}</div></div>`;
 }
 
+function adminIds(value){
+  return [...new Set(String(value||"").split(",").map(x=>x.trim())
+    .filter(x=>/^\d+$/.test(x)))];
+}
+function adminSummary(value){
+  const ids=adminIds(value);
+  if(!ids.length)return '<span class="faint">No administrators selected</span>';
+  return ids.map(uid=>{
+    const p=AV[uid],name=p&&p.name?p.name:uid;
+    return `<span class="admin-chip">${avatar(uid,name,p&&p.avatar,22)}
+      <span title="${esc(uid)}">${esc(name)}</span></span>`;
+  }).join("");
+}
+function adminUserControl(s,id,dis){
+  return `<input type="hidden" id="${id}" value="${esc(s.value)}">
+    <div class="admin-picker">
+      <div class="admin-summary">${adminSummary(s.value)}</div>
+      <button class="btn sm" onclick="openAdminPicker()"${dis}>Select profiles</button>
+    </div>`;
+}
+
 function settingRow(s){
   const id="set_"+s.key;
   const chip=s.pinned
@@ -3256,7 +3300,9 @@ function settingRow(s){
 
   let control;
   const dis=s.editable?"":" disabled";
-  if(s.kind==="bool"){
+  if(s.key==="ADMIN_USER_IDS"){
+    control=adminUserControl(s,id,dis);
+  }else if(s.kind==="bool"){
     const on=String(s.value).toLowerCase();
     const isOn=["1","true","yes","y","on"].includes(on);
     control=`<div class="seg" id="${id}" data-val="${isOn}">
@@ -3284,6 +3330,89 @@ function settingRow(s){
     <div><div class="lbl">${esc(s.label)} ${chip}${derived}${lock}</div>
       ${s.help?`<div class="hlp">${esc(s.help)}</div>`:""}</div>
     <div class="ctl">${control}</div>${note}${stored}</div>`;
+}
+
+let ADMIN_PICKER_MEMBERS=[];
+function adminOption(m,checked,unavailable){
+  const uid=String(m.user_id),name=m.display_name||m.username||uid;
+  const meta=unavailable
+    ?"Not found in the selected server · "+uid
+    :[m.username&&"@"+m.username,uid,!m.present&&"not currently present"]
+      .filter(Boolean).join(" · ");
+  return `<label class="admin-option" data-admin-search="${esc(
+      (name+" "+(m.username||"")+" "+uid).toLowerCase())}">
+    <input type="checkbox" name="admin_profile" value="${esc(uid)}"
+      ${checked?" checked":""}>
+    ${avatar(uid,name,m.avatar,36)}
+    <span class="admin-option-main"><span class="admin-option-name">${esc(name)}</span>
+      <span class="admin-option-meta">${esc(meta)}</span></span>
+  </label>`;
+}
+async function openAdminPicker(){
+  const setting=findSetting("ADMIN_USER_IDS");
+  const input=document.getElementById("set_ADMIN_USER_IDS");
+  const selected=new Set(adminIds(input?input.value:(setting&&setting.value)));
+  let members=[];
+  if(guild){
+    try{
+      const d=await api(`/api/members?guild=${guild}`);
+      members=((d&&d.members)||[]).filter(m=>!m.is_bot);
+    }catch(e){}
+  }
+  const known=new Set(members.map(m=>String(m.user_id)));
+  const unavailable=[...selected].filter(uid=>!known.has(uid)).map(uid=>({
+    user_id:uid,display_name:(AV[uid]&&AV[uid].name)||uid,
+    avatar:AV[uid]&&AV[uid].avatar,username:"",present:false
+  }));
+  members.sort((a,b)=>(Number(b.present)-Number(a.present))
+    ||String(a.display_name||a.username).localeCompare(String(b.display_name||b.username)));
+  ADMIN_PICKER_MEMBERS=[...unavailable,...members];
+  const rows=ADMIN_PICKER_MEMBERS.map(m=>
+    adminOption(m,selected.has(String(m.user_id)),!known.has(String(m.user_id)))).join("");
+  const dlg=document.getElementById("editDlg");
+  dlg.innerHTML=`<h2>Select bot administrators</h2>
+    <p class="faint">Choose trusted Discord profiles. Administrators can run
+    owner-only maintenance commands and act on other members' tracked data.</p>
+    <input class="search" type="search" aria-label="Search profiles"
+      placeholder="Search profiles" oninput="filterAdminPicker(this.value)">
+    <div class="admin-list" id="adminList">${rows||
+      '<div class="state-card"><p>No member profiles are available yet. Sync the server or add an ID below.</p></div>'}</div>
+    <div class="admin-manual"><input type="text" id="adminManualId"
+      inputmode="numeric" placeholder="Discord user ID not listed">
+      <button class="btn sm" onclick="addManualAdmin()">Add ID</button></div>
+    <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
+      <button class="btn primary" onclick="saveAdminPicker()">Save administrators</button></div>`;
+  dlg.showModal();
+}
+function filterAdminPicker(term){
+  term=String(term||"").toLowerCase();
+  document.querySelectorAll("#adminList [data-admin-search]").forEach(row=>{
+    row.style.display=row.dataset.adminSearch.includes(term)?"":"none";
+  });
+}
+function addManualAdmin(){
+  const input=document.getElementById("adminManualId");
+  const uid=String(input&&input.value||"").trim();
+  if(!/^\d+$/.test(uid))return toast("Enter a numeric Discord user ID","error");
+  const existing=[...document.querySelectorAll(
+    '#adminList input[name="admin_profile"]')].find(el=>el.value===uid);
+  if(existing){existing.checked=true;input.value="";return;}
+  const list=document.getElementById("adminList");
+  if(list.querySelector(".state-card"))list.innerHTML="";
+  list.insertAdjacentHTML("afterbegin",adminOption({
+    user_id:uid,display_name:uid,avatar:null,username:"",present:false
+  },true,true));
+  input.value="";
+}
+async function saveAdminPicker(){
+  const ids=[...document.querySelectorAll(
+    '#adminList input[name="admin_profile"]:checked')].map(el=>el.value);
+  const r=await post("/api/settings",{key:"ADMIN_USER_IDS",value:ids.join(",")});
+  if(!r||!r.ok)return toast((r&&r.error)||"Save failed","error");
+  document.getElementById("editDlg").close();
+  toast(r.effective?"Administrators saved ✓":
+    "Saved, but your compose file still overrides it");
+  render();
 }
 
 async function saveSetting(key,valueOverride){

@@ -201,10 +201,11 @@ _SETTINGS: tuple[Setting, ...] = (
 
     # ---- Admins ----------------------------------------------------------
     _S("ADMIN_USER_IDS", "ids", "", "admin", _csv_ids,
-       apply="hot", label="Admin user IDs",
-       help="Comma-separated Discord user IDs allowed to undo any tracked "
-            "reply and run /purge and cross-user /rename. Empty means nobody, "
-            "so a fresh deployment grants no implicit admin."),
+       apply="hot", label="Bot administrators",
+       help="Select trusted member profiles allowed to run owner-only commands, "
+            "undo any tracked reply, and manage other members' data. Environment "
+            "configuration still accepts comma-separated Discord user IDs. "
+            "Empty means nobody."),
 
     # ---- Core parsing ----------------------------------------------------
     _S("MIN_LIFTS_FOR_AUTO", "int", "2", "core", _int,

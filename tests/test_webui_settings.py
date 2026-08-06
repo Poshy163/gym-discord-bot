@@ -208,6 +208,51 @@ def test_settings_round_trip(tmp_path):
     _run(go())
 
 
+def test_admin_profile_picker_round_trip_and_dashboard_contract(tmp_path):
+    """The profile picker stores the same CSV contract used by .env.
+
+    Snowflakes stay strings in the browser and the hot setting resolves to a
+    Python set in the worker configuration.
+    """
+    async def go():
+        db, _a, settings, client = await _claimed_client(tmp_path)
+        try:
+            db.upsert_member(
+                1, 100, "alice", "Alice",
+                avatar="https://cdn.example/alice.png",
+            )
+            db.upsert_member(1, 200, "bob", "Bob")
+            saved = await client.post(
+                "/api/settings",
+                json={"key": "ADMIN_USER_IDS", "value": "100,200"},
+            )
+            result = await saved.json()
+            assert saved.status == 200
+            assert result["ok"] and result["needs_restart"] is False
+
+            payload = await (await client.get("/api/settings")).json()
+            field = _find(payload, "ADMIN_USER_IDS")
+            assert field["value"] == "100,200"
+            assert settings.current()["ADMIN_USER_IDS"] == {100, 200}
+
+            members = await (
+                await client.get("/api/members?guild=1")
+            ).json()
+            alice = next(m for m in members["members"] if m["user_id"] == "100")
+            assert alice["display_name"] == "Alice"
+            assert alice["avatar"] == "https://cdn.example/alice.png"
+
+            shell = await (await client.get("/")).text()
+            assert 's.key==="ADMIN_USER_IDS"' in shell
+            assert "Select bot administrators" in shell
+            assert "saveAdminPicker" in shell
+            assert "/api/members?guild=${guild}" in shell
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_invalid_value_is_rejected_with_a_field_message(tmp_path):
     async def go():
         db, _a, _s, client = await _claimed_client(tmp_path)
