@@ -603,6 +603,24 @@ CREATE TABLE IF NOT EXISTS strava_account (
     linked_at          TEXT    NOT NULL
 );
 
+-- Durable activity ledger for webhook/backfill de-duplication. ``pending``
+-- rows are short-lived claims that stop a webhook and a manual backfill from
+-- posting the same activity concurrently; stale claims can be reclaimed after
+-- a process crash. Completed rows also retain the Discord message location so
+-- rename/delete webhooks can update older backfilled posts.
+CREATE TABLE IF NOT EXISTS strava_activity_import (
+    user_id       INTEGER NOT NULL,
+    activity_id   INTEGER NOT NULL,
+    status        TEXT    NOT NULL,
+    source        TEXT    NOT NULL,
+    message_id    INTEGER,
+    channel_id    INTEGER,
+    processed_at  TEXT    NOT NULL,
+    PRIMARY KEY (user_id, activity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_strava_activity_import_status
+    ON strava_activity_import (user_id, status, processed_at);
+
 -- Pending OAuth handshakes: maps the opaque ``state`` we embed in the authorize
 -- URL back to the Discord user who ran /strava_link, so the browser redirect
 -- can be attributed to them. Rows are consumed on callback and swept by age.
@@ -3497,13 +3515,115 @@ class Database:
                        last_message_id  = ?,
                        last_channel_id  = ?
                  WHERE user_id = ?
+                   AND (
+                       last_activity_id IS NULL
+                       OR last_activity_id < ?
+                   )
                 """,
-                (activity_id, message_id, channel_id, user_id),
+                (activity_id, message_id, channel_id, user_id, activity_id),
             )
+
+    def claim_strava_activity(
+        self,
+        user_id: int,
+        activity_id: int,
+        source: str,
+        *,
+        stale_after_minutes: int = 15,
+    ) -> bool:
+        """Atomically claim an activity for posting/processing.
+
+        Returns ``False`` when another worker already completed it or owns a
+        fresh claim. A stale pending claim is reclaimed, allowing a backfill to
+        recover after the bot stopped between claiming and posting.
+        """
+        now = datetime.now(timezone.utc)
+        stale_before = _normalize_iso(now - timedelta(minutes=stale_after_minutes))
+        processed_at = _normalize_iso(now)
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT OR IGNORE INTO strava_activity_import (
+                    user_id, activity_id, status, source, processed_at
+                ) VALUES (?, ?, 'pending', ?, ?)
+                """,
+                (user_id, activity_id, source, processed_at),
+            )
+            if (cur.rowcount or 0) > 0:
+                return True
+            cur = c.execute(
+                """
+                UPDATE strava_activity_import
+                   SET source = ?,
+                       processed_at = ?
+                 WHERE user_id = ?
+                   AND activity_id = ?
+                   AND status = 'pending'
+                   AND processed_at < ?
+                """,
+                (source, processed_at, user_id, activity_id, stale_before),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def finish_strava_activity(
+        self,
+        user_id: int,
+        activity_id: int,
+        *,
+        message_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> None:
+        """Complete a claimed activity, optionally attaching its feed post."""
+        with self._conn() as c:
+            c.execute(
+                """
+                UPDATE strava_activity_import
+                   SET status = 'complete',
+                       message_id = ?,
+                       channel_id = ?,
+                       processed_at = ?
+                 WHERE user_id = ?
+                   AND activity_id = ?
+                   AND status = 'pending'
+                """,
+                (
+                    message_id, channel_id, _normalize_iso(None),
+                    user_id, activity_id,
+                ),
+            )
+
+    def release_strava_activity(self, user_id: int, activity_id: int) -> None:
+        """Release an unfinished claim so a later webhook/backfill can retry."""
+        with self._conn() as c:
+            c.execute(
+                """
+                DELETE FROM strava_activity_import
+                 WHERE user_id = ?
+                   AND activity_id = ?
+                   AND status = 'pending'
+                """,
+                (user_id, activity_id),
+            )
+
+    def get_strava_activity_import(
+        self, user_id: int, activity_id: int,
+    ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """
+                SELECT *
+                  FROM strava_activity_import
+                 WHERE user_id = ? AND activity_id = ?
+                """,
+                (user_id, activity_id),
+            ).fetchone()
 
     def unlink_strava_account(self, user_id: int) -> bool:
         """Remove a user's Strava link. Returns True if a row existed."""
         with self._conn() as c:
+            c.execute(
+                "DELETE FROM strava_activity_import WHERE user_id = ?", (user_id,)
+            )
             cur = c.execute(
                 "DELETE FROM strava_account WHERE user_id = ?", (user_id,)
             )

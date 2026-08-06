@@ -357,6 +357,18 @@ def test_update_tokens_and_last_activity(db):
     assert row["last_activity_id"] == 555
 
 
+def test_last_activity_cursor_never_moves_backwards(db):
+    db.link_strava_account(
+        user_id=7, athlete_id=42, access_token_enc="a", refresh_token_enc="r",
+        expires_at=1, scope=None, athlete_name=None,
+    )
+    db.update_strava_last_activity(7, 1002, message_id=20, channel_id=30)
+    db.update_strava_last_activity(7, 1001, message_id=10, channel_id=30)
+    row = db.get_strava_account(7)
+    assert row["last_activity_id"] == 1002
+    assert row["last_message_id"] == 20
+
+
 def test_relink_preserves_last_activity(db):
     db.link_strava_account(
         user_id=7, athlete_id=42, access_token_enc="a", refresh_token_enc="r",
@@ -390,6 +402,67 @@ def test_list_strava_accounts(db):
         expires_at=1, scope=None, athlete_name=None,
     )
     assert {r["user_id"] for r in db.list_strava_accounts()} == {1, 2}
+
+
+def test_strava_activity_claim_finish_and_release(db):
+    db.link_strava_account(
+        user_id=7, athlete_id=42, access_token_enc="a", refresh_token_enc="r",
+        expires_at=1, scope=None, athlete_name=None,
+    )
+    assert db.claim_strava_activity(7, 1001, "webhook") is True
+    assert db.claim_strava_activity(7, 1001, "backfill") is False
+
+    db.release_strava_activity(7, 1001)
+    assert db.claim_strava_activity(7, 1001, "backfill") is True
+    db.finish_strava_activity(7, 1001, message_id=55, channel_id=66)
+    row = db.get_strava_activity_import(7, 1001)
+    assert row["status"] == "complete"
+    assert row["source"] == "backfill"
+    assert row["message_id"] == 55
+    assert db.claim_strava_activity(7, 1001, "webhook") is False
+
+    # Explicit unlink removes tokens and the import ledger.
+    assert db.unlink_strava_account(7) is True
+    assert db.get_strava_activity_import(7, 1001) is None
+
+
+def test_get_all_activities_since_paginates(monkeypatch):
+    calls = []
+    pages = {
+        1: [{"id": 3}, {"id": 2}],
+        2: [{"id": 1}],
+    }
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    class _Requests:
+        @staticmethod
+        def get(url, headers=None, params=None, timeout=None):
+            calls.append(dict(params))
+            return _Resp(pages.get(params["page"], []))
+
+    monkeypatch.setattr(strava_client, "requests", _Requests)
+    activities = strava_client.get_all_activities_since(
+        "token",
+        123,
+        per_page=2,
+        max_pages=5,
+    )
+    assert [activity.id for activity in activities] == [3, 2, 1]
+    assert calls == [
+        {"after": 123, "per_page": 2, "page": 1},
+        {"after": 123, "per_page": 2, "page": 2},
+    ]
 
 
 # ---------------------------------------------------------------------------

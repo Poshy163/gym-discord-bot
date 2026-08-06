@@ -506,8 +506,12 @@ def get_latest_activity(access_token: str) -> "StravaActivity | None":
 
 
 def get_activities_since(
-    access_token: str, after_epoch: int, per_page: int = 100,
-) -> list["StravaActivity"]:
+    access_token: str,
+    after_epoch: int,
+    per_page: int = 100,
+    *,
+    page: int = 1,
+) -> list[StravaActivity]:
     """List the athlete's activities started after ``after_epoch`` (one page).
 
     Used for the weekly recap. ``per_page`` caps the count — a week of training
@@ -520,7 +524,11 @@ def get_activities_since(
             "Authorization": f"Bearer {access_token}",
             "User-Agent": USER_AGENT,
         },
-        params={"after": int(after_epoch), "per_page": per_page},
+        params={
+            "after": int(after_epoch),
+            "per_page": max(1, min(int(per_page), 100)),
+            "page": max(1, int(page)),
+        },
         timeout=REQUEST_TIMEOUT,
     )
     if r.status_code == 401:
@@ -530,6 +538,34 @@ def get_activities_since(
     if not isinstance(data, list):
         return []
     return [parse_activity(d) for d in data]
+
+
+def get_all_activities_since(
+    access_token: str,
+    after_epoch: int,
+    *,
+    per_page: int = 100,
+    max_pages: int = 10,
+) -> list[StravaActivity]:
+    """Fetch all activities in a bounded window using Strava pagination.
+
+    Results retain Strava's newest-first ordering. The page cap prevents an
+    accidentally broad backfill from consuming unbounded API quota.
+    """
+    page_size = max(1, min(int(per_page), 100))
+    page_cap = max(1, int(max_pages))
+    activities: list[StravaActivity] = []
+    for page in range(1, page_cap + 1):
+        batch = get_activities_since(
+            access_token,
+            after_epoch,
+            page_size,
+            page=page,
+        )
+        activities.extend(batch)
+        if len(batch) < page_size:
+            break
+    return activities
 
 
 def get_athlete(access_token: str) -> dict[str, Any]:

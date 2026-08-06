@@ -431,8 +431,11 @@ walkthrough — including the reverse-proxy setup — is in
 [docs/STRAVA.md](docs/STRAVA.md). Set `STRAVA_DISABLED=1` to turn it off.
 
 Commands: `/strava_link`, `/strava_unlink`, `/strava_status`, `/strava_latest`
-(show the most recent activity on demand), and owner-only `/strava_subscribe`,
-`/strava_subscription`, `/strava_unsubscribe`.
+(show the most recent activity on demand), `/strava_backfill` (resume-safe recovery of
+missed feed posts), and owner-only `/strava_subscribe`,
+`/strava_subscription`, `/strava_unsubscribe`. The owner can backfill every
+linked member after an API subscription outage with
+`/strava_backfill all_linked:true`.
 
 ## Home Assistant smart-scale sync
 

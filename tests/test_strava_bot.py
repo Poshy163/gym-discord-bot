@@ -18,6 +18,8 @@ import app.bot as bot_mod  # noqa: E402
 from app import strava_client  # noqa: E402
 from app.bot import (  # noqa: E402
     _build_calorie_ai_payload,
+    _strava_announce_activity,
+    _strava_backfill_candidates,
     _strava_event_subscription_ok,
     _strava_handle_deauth,
     _strava_should_post,
@@ -97,6 +99,74 @@ def test_should_post_min_duration(monkeypatch):
     monkeypatch.setattr(bot_mod, "STRAVA_MIN_DURATION_S", 600)
     assert _strava_should_post(_act(moving_time=300, elapsed_time=300)) is False
     assert _strava_should_post(_act(moving_time=900)) is True
+
+
+def test_backfill_candidates_resume_oldest_first():
+    activities = [
+        _act(id=104, start_date="2026-08-04T10:00:00Z"),
+        _act(id=103, start_date="2026-08-03T10:00:00Z"),
+        _act(id=102, start_date="2026-08-02T10:00:00Z"),
+        _act(id=101, start_date="2026-08-01T10:00:00Z"),
+    ]
+    assert [
+        activity.id
+        for activity in _strava_backfill_candidates(activities, 101)
+    ] == [102, 103, 104]
+
+
+def test_backfill_candidates_uses_id_when_cursor_outside_window():
+    activities = [_act(id=205), _act(id=204), _act(id=203)]
+    assert [
+        activity.id
+        for activity in _strava_backfill_candidates(activities, 202)
+    ] == [203, 204, 205]
+    # A newer cursor means this whole window is already historic.
+    assert _strava_backfill_candidates(activities, 300) == []
+
+
+def test_webhook_and_backfill_share_durable_dedupe(monkeypatch):
+    user_id = 987654
+    _link(user_id=user_id, athlete_id=876543)
+    row = db.get_strava_account(user_id)
+    sent = []
+
+    class _Message:
+        id = 444
+
+    class _Channel:
+        id = 333
+
+        async def send(self, **kwargs):
+            sent.append(kwargs)
+            return _Message()
+
+    async def _channel():
+        return _Channel()
+
+    monkeypatch.setattr(bot_mod, "_strava_feed_channel", _channel)
+    monkeypatch.setattr(
+        bot_mod,
+        "_strava_embed_and_file",
+        lambda activity, who: (object(), None),
+    )
+    monkeypatch.setattr(bot_mod, "STRAVA_SPORT_ALLOW", set())
+    monkeypatch.setattr(bot_mod, "STRAVA_MIN_DISTANCE_M", 0.0)
+    monkeypatch.setattr(bot_mod, "STRAVA_MIN_DURATION_S", 0)
+    try:
+        first = asyncio.run(
+            _strava_announce_activity(row, _act(id=7654321), source="webhook")
+        )
+        second = asyncio.run(
+            _strava_announce_activity(row, _act(id=7654321), source="backfill")
+        )
+        assert first == "posted"
+        assert second == "duplicate"
+        assert len(sent) == 1
+        imported = db.get_strava_activity_import(user_id, 7654321)
+        assert imported["message_id"] == 444
+        assert imported["channel_id"] == 333
+    finally:
+        db.unlink_strava_account(user_id)
 
 
 # ---------------------------------------------------------------------------

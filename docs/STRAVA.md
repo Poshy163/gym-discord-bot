@@ -108,7 +108,26 @@ Other commands:
 - `/strava_status` — check whether you're linked.
 - `/strava_latest [member]` — post the most recent activity on demand (yours by
   default, or another linked member's).
+- `/strava_backfill [days] [limit] [member] [all_linked]` — recover activities
+  missed while the API app, webhook subscription, bot, or feed was unavailable.
+  It defaults to your last 30 days and at most 25 feed posts. Members can
+  backfill themselves; the bot owner can select another member or set
+  `all_linked:true`. Re-run it to continue after the limit.
 - `/strava_unlink` — revoke access and delete the stored tokens.
+
+### Recovering after the Strava API app was inactive
+
+Once API access is active again, make sure the webhook exists with
+`/strava_subscription` (run `/strava_subscribe` if it does not), then run:
+
+```text
+/strava_backfill days:30 all_linked:true
+```
+
+The backfill is resumable and safe to repeat: it walks forward from each
+athlete's last handled activity, posts oldest-first, and keeps a durable
+per-activity ledger so a webhook arriving at the same time cannot double-post.
+If the result says activities are still queued, run the command again.
 
 ## 5a. Route maps (optional Mapbox basemap)
 
@@ -157,13 +176,15 @@ STRAVA_MAP_STYLE=satellite-streets-v12   # or streets-v12, outdoors-v12
   posted** (we respect the privacy flag).
 - **Live edits:** when you **rename** an activity, the posted embed is edited to
   match; if you flip it to **private** or **delete** it, the post is removed.
-  (Only the most recently posted activity per athlete is tracked.)
+  New and backfilled posts are tracked individually; the latest legacy post
+  remains supported for databases upgraded from an older bot release.
 - **Create events** are what trigger a new post; `update`/`delete` drive the
   edits above.
 - **Deauthorization:** revoking the bot in Strava settings auto-unlinks you and
   deletes the stored tokens.
-- **De-dupe:** the last announced activity id is stored per user, so Strava's
-  retry deliveries don't double-post.
+- **De-dupe/recovery:** the continuation cursor and a durable per-activity
+  ledger stop webhook retries or overlapping backfills from double-posting.
+  Failed feed sends release their claim, so the next backfill can retry them.
 - **Token refresh:** access tokens (~6h) are refreshed on demand via the stored
   refresh token (serialised per user); Strava rotates refresh tokens, and the
   new pair is persisted.

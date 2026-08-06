@@ -13953,42 +13953,55 @@ async def _strava_fetch_activity(
     return await bot.loop.run_in_executor(None, _fetch)
 
 
-async def _strava_handle_create(row, athlete_id: int, activity_id: int) -> None:
+async def _strava_announce_activity(
+    row,
+    activity: strava_client.StravaActivity,
+    *,
+    source: str,
+) -> str:
+    """Process and optionally announce one activity exactly once.
+
+    The durable claim is shared by webhooks and manual backfills, preventing a
+    race from producing two feed posts. Returns a compact status for backfill
+    summaries; the webhook path only logs failures.
+    """
     user_id = int(row["user_id"])
-    if (
-        row["last_activity_id"] is not None
-        and int(row["last_activity_id"]) == activity_id
-    ):
-        return  # duplicate webhook delivery
-    result = await _strava_fetch_activity(row, activity_id)
-    if isinstance(result, str):
-        LOG.warning(
-            "Strava activity fetch failed (athlete=%s activity=%s): %s",
-            athlete_id, activity_id, result,
-        )
-        return
-    activity = result
-    # Advance the de-dupe cursor first (no message yet) so a private/filtered
-    # activity isn't re-evaluated on a retry.
-    db.update_strava_last_activity(user_id, activity_id)
+    activity_id = int(activity.id)
+    if not db.claim_strava_activity(user_id, activity_id, source):
+        return "duplicate"
+
     if activity.private:
+        db.finish_strava_activity(user_id, activity_id)
+        db.update_strava_last_activity(user_id, activity_id)
         LOG.info("Strava activity %s is private — not posting", activity_id)
-        return
+        return "private"
     if not _strava_should_post(activity):
+        db.finish_strava_activity(user_id, activity_id)
+        db.update_strava_last_activity(user_id, activity_id)
         LOG.info("Strava activity %s filtered out — not posting", activity_id)
-        return
+        return "filtered"
+
     channel = await _strava_feed_channel()
     if channel is None:
-        return
+        db.release_strava_activity(user_id, activity_id)
+        return "no_channel"
+
     who = f"<@{user_id}>"
-    embed, file = await asyncio.to_thread(
-        _strava_embed_and_file,
-        activity,
-        who,
-    )
+    try:
+        embed, file = await asyncio.to_thread(
+            _strava_embed_and_file,
+            activity,
+            who,
+        )
+    except Exception:
+        db.release_strava_activity(user_id, activity_id)
+        LOG.exception("Strava: failed to render activity %s", activity_id)
+        return "error"
+
+    verb = "backfilled" if source == "backfill" else "just logged"
     kwargs: dict[str, object] = {
         "content": f"{strava_client.sport_emoji(activity.sport_type)} "
-        f"{who} just logged a workout on Strava!",
+        f"{who} {verb} a workout on Strava!",
         "embed": embed,
         "allowed_mentions": discord.AllowedMentions(users=True),
     }
@@ -13997,21 +14010,114 @@ async def _strava_handle_create(row, athlete_id: int, activity_id: int) -> None:
     try:
         msg = await channel.send(**kwargs)
     except discord.HTTPException:
+        db.release_strava_activity(user_id, activity_id)
         LOG.exception("Strava: failed to post activity %s", activity_id)
-        return
-    # Remember where we posted so a later rename/delete can edit/remove it.
+        return "error"
+    db.finish_strava_activity(
+        user_id,
+        activity_id,
+        message_id=msg.id,
+        channel_id=channel.id,
+    )
     db.update_strava_last_activity(user_id, activity_id, msg.id, channel.id)
+    return "posted"
+
+
+async def _strava_handle_create(row, athlete_id: int, activity_id: int) -> None:
+    if (
+        row["last_activity_id"] is not None
+        and int(row["last_activity_id"]) == activity_id
+    ):
+        return  # duplicate webhook delivery from a pre-ledger install
+    result = await _strava_fetch_activity(row, activity_id)
+    if isinstance(result, str):
+        LOG.warning(
+            "Strava activity fetch failed (athlete=%s activity=%s): %s",
+            athlete_id, activity_id, result,
+        )
+        return
+    status = await _strava_announce_activity(row, result, source="webhook")
+    if status in {"error", "no_channel"}:
+        LOG.warning(
+            "Strava activity was not announced (athlete=%s activity=%s status=%s)",
+            athlete_id, activity_id, status,
+        )
+
+
+def _strava_backfill_candidates(
+    activities: Sequence[strava_client.StravaActivity],
+    last_activity_id: int | None,
+) -> list[strava_client.StravaActivity]:
+    """Return missed activities oldest-first, using the saved cursor.
+
+    Strava lists newest-first. If the exact cursor has fallen outside the
+    requested date window, activity ids provide a conservative continuation:
+    Strava ids increase as activities are created, so older history is not
+    replayed.
+    """
+    newest_first = sorted(
+        {activity.id: activity for activity in activities}.values(),
+        key=lambda activity: (
+            strava_client.start_unix(activity) or 0,
+            activity.id,
+        ),
+        reverse=True,
+    )
+    if last_activity_id is None:
+        missed = newest_first
+    else:
+        cursor_index = next(
+            (
+                index
+                for index, activity in enumerate(newest_first)
+                if activity.id == last_activity_id
+            ),
+            None,
+        )
+        if cursor_index is not None:
+            missed = newest_first[:cursor_index]
+        else:
+            missed = [
+                activity
+                for activity in newest_first
+                if activity.id > last_activity_id
+            ]
+    return list(reversed(missed))
+
+
+async def _strava_fetch_backfill_summaries(
+    row,
+    after_epoch: int,
+) -> list[strava_client.StravaActivity] | str:
+    def _fetch() -> list[strava_client.StravaActivity] | str:
+        try:
+            token = _strava_access_token(row)
+            return strava_client.get_all_activities_since(token, after_epoch)
+        except strava_client.StravaAuthError as exc:
+            return f"auth: {exc}"
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - network
+            return f"error: {exc}"
+
+    return await bot.loop.run_in_executor(None, _fetch)
 
 
 async def _strava_posted_message(row, activity_id: int):
     """Return the Discord Message we posted for *activity_id*, or None.
 
-    Only the most-recently-announced activity is tracked, so edits/deletes to
-    older posts are ignored (best-effort, keeps state tiny).
+    New posts are tracked in the durable per-activity ledger. The account-level
+    fields remain as a fallback for announcements made before that ledger was
+    introduced.
     """
-    if row["last_activity_id"] is None or int(row["last_activity_id"]) != activity_id:
+    imported = db.get_strava_activity_import(int(row["user_id"]), activity_id)
+    if imported is not None and imported["status"] == "complete":
+        msg_id, ch_id = imported["message_id"], imported["channel_id"]
+    elif (
+        row["last_activity_id"] is not None
+        and int(row["last_activity_id"]) == activity_id
+    ):
+        msg_id, ch_id = row["last_message_id"], row["last_channel_id"]
+    else:
         return None
-    msg_id, ch_id = row["last_message_id"], row["last_channel_id"]
     if not msg_id or not ch_id:
         return None
     channel = bot.get_channel(int(ch_id))
@@ -17908,6 +18014,189 @@ async def strava_latest_cmd(
     if file is not None:
         kwargs["file"] = file
     await interaction.followup.send(**kwargs)
+
+
+@bot.tree.command(
+    name="strava_backfill",
+    description="Post Strava activities missed while the integration was offline.",
+)
+@app_commands.describe(
+    days="How far back to check (default 30, maximum 365).",
+    limit="Maximum feed posts this run (default 25, maximum 100).",
+    member="Whose missed activities to recover. Defaults to you.",
+    all_linked="Owner only: recover missed activities for every linked member.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def strava_backfill_cmd(
+    interaction: discord.Interaction,
+    days: app_commands.Range[int, 1, 365] = 30,
+    limit: app_commands.Range[int, 1, 100] = 25,
+    member: discord.Member | None = None,
+    all_linked: bool = False,
+) -> None:
+    """Recover feed posts after an API/subscription outage.
+
+    Activities are posted oldest-first and the durable per-activity ledger
+    makes repeated runs safe. On a partial failure we stop advancing that
+    athlete, so the next run resumes at the failed item instead of jumping it.
+    """
+    if not _strava_enabled():
+        await interaction.response.send_message(
+            "Strava isn't available right now. If the API app was inactive, "
+            "restore its subscription/configuration first.",
+            ephemeral=True,
+        )
+        return
+    if STRAVA_FEED_CHANNEL_ID is None:
+        await interaction.response.send_message(
+            "No Strava feed channel is configured, so there is nowhere to "
+            "post recovered activities.",
+            ephemeral=True,
+        )
+        return
+    if member is not None and all_linked:
+        await interaction.response.send_message(
+            "Choose either one member or `all_linked`, not both.",
+            ephemeral=True,
+        )
+        return
+
+    owner = _is_owner(interaction.user.id)
+    if all_linked and not owner:
+        await interaction.response.send_message(
+            embed=ui.denied("Owner only — recovering every linked member."),
+            ephemeral=True,
+        )
+        return
+    target = member or interaction.user
+    if member is not None and target.id != interaction.user.id and not owner:
+        await interaction.response.send_message(
+            embed=ui.denied("You can backfill your own Strava activities."),
+            ephemeral=True,
+        )
+        return
+
+    if all_linked:
+        accounts = db.list_strava_accounts()
+    else:
+        row = db.get_strava_account(target.id)
+        accounts = [row] if row is not None else []
+    if not accounts:
+        await interaction.response.send_message(
+            (
+                "No linked Strava accounts found."
+                if all_linked
+                else "That member hasn't linked Strava. Use `/strava_link` first."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if await _strava_feed_channel() is None:
+        await interaction.followup.send(
+            "I can't access the configured Strava feed channel. Fix the "
+            "channel/permissions and run this again.",
+            ephemeral=True,
+        )
+        return
+
+    after_epoch = int(
+        (datetime.now(timezone.utc) - timedelta(days=int(days))).timestamp()
+    )
+    jobs: list[
+        tuple[
+            int,
+            sqlite3.Row,
+            strava_client.StravaActivity,
+        ]
+    ] = []
+    fetch_errors: list[int] = []
+    for account in accounts:
+        summaries = await _strava_fetch_backfill_summaries(account, after_epoch)
+        if isinstance(summaries, str):
+            LOG.warning(
+                "Strava backfill list failed for user %s: %s",
+                account["user_id"], summaries,
+            )
+            fetch_errors.append(int(account["user_id"]))
+            continue
+        last_id = (
+            int(account["last_activity_id"])
+            if account["last_activity_id"] is not None
+            else None
+        )
+        for summary in _strava_backfill_candidates(summaries, last_id):
+            jobs.append((
+                strava_client.start_unix(summary) or 0,
+                account,
+                summary,
+            ))
+
+    # Advancing oldest-first is important: if the command hits its limit, the
+    # saved cursor leaves the remaining newer activities ready for the next run.
+    jobs.sort(key=lambda item: (item[0], item[2].id))
+    selected = jobs[:int(limit)]
+    posted = already_done = hidden = failed = 0
+    deferred_after_failure = 0
+    blocked_users: set[int] = set()
+    for _started, account, summary in selected:
+        user_id = int(account["user_id"])
+        if user_id in blocked_users:
+            deferred_after_failure += 1
+            continue
+        detailed = await _strava_fetch_activity(account, summary.id)
+        if isinstance(detailed, str):
+            failed += 1
+            blocked_users.add(user_id)
+            LOG.warning(
+                "Strava backfill activity fetch failed (user=%s activity=%s): %s",
+                user_id, summary.id, detailed,
+            )
+            continue
+        status = await _strava_announce_activity(
+            account,
+            detailed,
+            source="backfill",
+        )
+        if status == "posted":
+            posted += 1
+        elif status == "duplicate":
+            # A completed ledger row can be ahead of the legacy cursor if the
+            # process stopped immediately after recording the post.
+            db.update_strava_last_activity(user_id, summary.id)
+            already_done += 1
+        elif status in {"private", "filtered"}:
+            hidden += 1
+        else:
+            failed += 1
+            blocked_users.add(user_id)
+
+    remaining = max(0, len(jobs) - len(selected)) + deferred_after_failure
+    lines = [
+        (
+            f"✅ Strava backfill checked **{len(accounts)}** linked account"
+            f"{'' if len(accounts) == 1 else 's'} over the last "
+            f"**{int(days)} days**."
+        ),
+        f"• Posted: **{posted}**",
+        f"• Already handled: **{already_done}**",
+        f"• Private/filtered: **{hidden}**",
+    ]
+    if fetch_errors or failed:
+        lines.append(
+            f"• Could not finish: **{len(fetch_errors) + failed}** "
+            "(later activities were left queued for a safe retry)"
+        )
+    if remaining:
+        lines.append(
+            f"• Still queued: **{remaining}** — run `/strava_backfill` again "
+            "to continue."
+        )
+    elif not jobs and not fetch_errors:
+        lines.append("Everything in that window was already up to date.")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 # ---- owner-only webhook subscription management ---------------------------
