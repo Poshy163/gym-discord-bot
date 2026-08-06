@@ -89,6 +89,46 @@ Goals:
 When a logged lift reaches a goal, the bot celebrates with 🎯 in its reply and
 clears the goal automatically.
 
+### Cardio programs
+
+Cardio is tracked separately from weighted lifts, with reusable routines and
+optional machine settings:
+
+```
+15 mins elliptical lv12, 30mins on stair master lv10,
+15mins on treadmill 10 degrees 10 speed
+```
+
+- **Just post that text in chat** to log a one-off cardio session. The entire
+  message must be a structured cardio list, which keeps ordinary conversation
+  such as “wait 15 minutes” from being logged. The bot reacts ✅, replies with
+  what it understood, and lets the logger react ❌ to undo it.
+- `/cardio create <name> <workout> [progression]` — save or replace a named
+  routine. Separate parts with commas, semicolons, or new lines. `15 mins
+  elliptical` and the shorter `15 on elliptical` both work. Machine settings
+  accept `level 12`, `lv12`, `10 degrees`/`incline 10`, and
+  `10 speed`/`speed 10`.
+- `/cardio view [name]` — show the next version of a saved routine.
+- `/cardio complete <difficulty> [name]` — log the routine and say whether it
+  felt **easy**, **about right**, or **too hard**.
+- `/cardio log <workout> [difficulty]` — track a one-off session without making
+  a program.
+- `/cardio history [user] [limit]` — recent sessions, duration, and difficulty.
+- `/cardio remove <name>` — remove the saved routine while keeping its completed
+  session history.
+
+The progression setting controls how quickly feedback changes the routine:
+**gentle**, **standard**, or **aggressive**. Positive feedback builds toward one
+change at a time, rotating through the routine. A part with a level goes up one
+level; otherwise a part with speed gains 0.5, one with incline gains one degree,
+and a part without a machine setting gains five minutes. Repeated **too hard**
+ratings can ease the most recently progressed part back down. This lets the
+program improve without increasing every machine in the same session.
+
+Cardio programs and history are global per user, so they follow you across
+servers and DMs. `/coach` also includes cardio consistency, machine levels, and
+difficulty feedback in its progress report.
+
 Lifts, PRs and goals are **global per user** — everything you log follows you
 across every server the bot is in (and DMs): your bests, history, tonnage,
 streaks, `/progress`, `/coach`, goals and `/stats` all aggregate every server.

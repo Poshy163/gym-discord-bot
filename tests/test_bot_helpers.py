@@ -197,12 +197,59 @@ def test_looks_like_log_attempt_detects_shortcuts():
     assert _looks_like_log_attempt("650kcal") is True
     assert _looks_like_log_attempt("40g protein") is True
     assert _looks_like_log_attempt("bench 100kg") is True
+    assert _looks_like_log_attempt(
+        "15 mins elliptical lv12, 30mins on stair master lv10"
+    ) is True
 
 
 def test_looks_like_log_attempt_ignores_casual_text():
     assert _looks_like_log_attempt("") is False
     assert _looks_like_log_attempt("hey how's it going") is False
     assert _looks_like_log_attempt("gym was good today") is False
+    assert _looks_like_log_attempt("15 minutes until dinner") is False
+
+
+def test_passive_cardio_handler_logs_once_and_tracks_undo(monkeypatch):
+    from app import bot as bot_mod
+    from app.cardio import parse_chat_message
+
+    user = SimpleNamespace(id=770_001, display_name="Runner")
+    channel = SimpleNamespace(id=880_001)
+    reply = SimpleNamespace(
+        id=990_001,
+        channel=channel,
+        add_reaction=AsyncMock(),
+    )
+    message = SimpleNamespace(
+        id=660_001,
+        author=user,
+        channel=channel,
+        created_at=datetime.now(timezone.utc),
+        add_reaction=AsyncMock(),
+        reply=AsyncMock(return_value=reply),
+    )
+    segments = parse_chat_message(
+        "15 mins elliptical lv12, "
+        "15mins on treadmill 10 degrees 10 speed"
+    )
+    assert segments is not None
+
+    async def scenario():
+        await bot_mod._handle_cardio_message(message, user, segments)
+        await bot_mod._handle_cardio_message(message, user, segments)
+
+    asyncio.run(scenario())
+
+    session = _bot_db.cardio_session_get_by_message(message.id)
+    assert session is not None
+    assert float(
+        _bot_db.cardio_session_list(user.id)[0]["segments"][1]["speed"]
+    ) == 10
+    tracked = _bot_db.cardio_get_reply(reply.id)
+    assert tracked is not None
+    assert tracked["session_id"] == session["id"]
+    message.reply.assert_awaited_once()
+    message.add_reaction.assert_awaited_once_with("✅")
 
 
 def test_safe_label_escapes_mentions():
@@ -422,6 +469,21 @@ def test_build_progress_payload_is_json_serializable():
         99, 7, {"body_fat_pct": (21.8, "%")}, recorded_at=measured,
     )
     _bot_db.goal_set(99, 7, "bench", 120, False)
+    from app.cardio import Segment as _CardioSegment
+    cardio_segments = [
+        _CardioSegment("elliptical", 15, 12),
+        _CardioSegment("treadmill", 20),
+    ]
+    cardio_program = _bot_db.cardio_program_set(
+        7, "Sam", "Cardio Day", "standard", cardio_segments,
+    )
+    _bot_db.cardio_session_add(
+        7,
+        cardio_segments,
+        "just_right",
+        program_id=cardio_program["id"],
+        program_name=cardio_program["name"],
+    )
 
     payload = _build_progress_payload(
         99, 7, "Sam", 30, include_body_composition=True,
@@ -430,6 +492,9 @@ def test_build_progress_payload_is_json_serializable():
     blob = json.dumps(payload, default=str)
     assert "lifting" in payload and "nutrition" in payload
     assert payload["nutrition"]["calorie_goal_kcal"] == 2400
+    assert payload["cardio"]["sessions_in_window"] == 1
+    assert payload["cardio"]["total_minutes_in_window"] == 35
+    assert payload["cardio"]["active_programs"][0]["segments"][0]["level"] == 12
     assert payload["bodyweight"]["latest_kg"] == 84.0
     composition = payload["bodyweight"]["smart_scale_composition"]
     assert composition["metrics"][0]["metric"] == "body_fat_pct"

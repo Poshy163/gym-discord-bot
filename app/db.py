@@ -55,6 +55,70 @@ CREATE TABLE IF NOT EXISTS goals (
     PRIMARY KEY (guild_id, user_id, equipment)
 );
 
+-- Native cardio tracking. Programs and sessions are global per user, matching
+-- lifts/nutrition: a routine created in a server is still available in DMs and
+-- every other shared server. Session segments are snapshots, so later adaptive
+-- changes to a program never rewrite what the user actually completed.
+CREATE TABLE IF NOT EXISTS cardio_programs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL,
+    username          TEXT    NOT NULL,
+    name_key          TEXT    NOT NULL,
+    name              TEXT    NOT NULL,
+    pace              TEXT    NOT NULL DEFAULT 'standard',
+    progression_score INTEGER NOT NULL DEFAULT 0,
+    progression_cursor INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL,
+    UNIQUE (user_id, name_key)
+);
+
+CREATE TABLE IF NOT EXISTS cardio_program_segments (
+    program_id     INTEGER NOT NULL REFERENCES cardio_programs(id) ON DELETE CASCADE,
+    position       INTEGER NOT NULL,
+    activity       TEXT    NOT NULL,
+    minutes        REAL    NOT NULL,
+    level          REAL,
+    incline_degrees REAL,
+    speed          REAL,
+    PRIMARY KEY (program_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS cardio_sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL,
+    program_id   INTEGER REFERENCES cardio_programs(id) ON DELETE SET NULL,
+    program_name TEXT,
+    difficulty   TEXT    NOT NULL,
+    message_id   INTEGER,
+    channel_id   INTEGER,
+    logged_at    TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cardio_sessions_user
+    ON cardio_sessions (user_id, logged_at);
+
+CREATE TABLE IF NOT EXISTS cardio_session_segments (
+    session_id      INTEGER NOT NULL REFERENCES cardio_sessions(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    activity        TEXT    NOT NULL,
+    minutes         REAL    NOT NULL,
+    level           REAL,
+    incline_degrees REAL,
+    speed           REAL,
+    PRIMARY KEY (session_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS cardio_reply_tracking (
+    reply_message_id   INTEGER PRIMARY KEY,
+    logger_user_id     INTEGER NOT NULL,
+    target_user_id     INTEGER NOT NULL,
+    session_id         INTEGER NOT NULL REFERENCES cardio_sessions(id) ON DELETE CASCADE,
+    original_message_id INTEGER,
+    channel_id         INTEGER,
+    created_at         TEXT    NOT NULL
+);
+
 -- Server-local alias table: lets users teach the bot nicknames the built-in
 -- table doesn't know (e.g. "hack sled" -> "leg press").
 CREATE TABLE IF NOT EXISTS custom_aliases (
@@ -978,6 +1042,47 @@ class Database:
                     "UPDATE reply_tracking SET target_user_id = user_id "
                     "WHERE target_user_id IS NULL"
                 )
+            # Native cardio chat logging grew machine-specific incline/speed
+            # settings and source-message dedupe after the first program schema
+            # landed. Add those columns before building the partial index so an
+            # in-place upgrade from that version is safe.
+            cardio_session_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(cardio_sessions)"
+                )
+            }
+            if "message_id" not in cardio_session_cols:
+                self._connection.execute(
+                    "ALTER TABLE cardio_sessions ADD COLUMN message_id INTEGER"
+                )
+            if "channel_id" not in cardio_session_cols:
+                self._connection.execute(
+                    "ALTER TABLE cardio_sessions ADD COLUMN channel_id INTEGER"
+                )
+            self._connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_cardio_sessions_message ON cardio_sessions (message_id) "
+                "WHERE message_id IS NOT NULL"
+            )
+            for table in (
+                "cardio_program_segments",
+                "cardio_session_segments",
+            ):
+                segment_cols = {
+                    row["name"]
+                    for row in self._connection.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
+                if "incline_degrees" not in segment_cols:
+                    self._connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN incline_degrees REAL"
+                    )
+                if "speed" not in segment_cols:
+                    self._connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN speed REAL"
+                    )
             # Calorie chat-logging dedupe: older DBs created calorie_entries
             # without message_id. Add it, then build the partial unique index
             # here (it can't live in SCHEMA because executescript runs before
@@ -2624,6 +2729,346 @@ class Database:
                 """,
                 (user_id,),
             ))
+
+    # ---- cardio programs + sessions -------------------------------------
+
+    @staticmethod
+    def _cardio_name_key(name: str) -> str:
+        return " ".join(str(name).strip().casefold().split())
+
+    @staticmethod
+    def _cardio_segment_values(
+        segment,
+    ) -> tuple[
+        str, float, float | None, float | None, float | None,
+    ]:
+        def field(key: str):
+            if isinstance(segment, dict):
+                return segment[key]
+            return getattr(segment, key)
+
+        level = field("level")
+        incline = field("incline_degrees")
+        speed = field("speed")
+        return (
+            str(field("activity")).strip(),
+            float(field("minutes")),
+            float(level) if level is not None else None,
+            float(incline) if incline is not None else None,
+            float(speed) if speed is not None else None,
+        )
+
+    def _cardio_program_from_row(
+        self, conn: sqlite3.Connection, row: sqlite3.Row,
+    ) -> dict:
+        program = dict(row)
+        program["segments"] = [
+            dict(segment)
+            for segment in conn.execute(
+                "SELECT position, activity, minutes, level, "
+                "incline_degrees, speed "
+                "FROM cardio_program_segments WHERE program_id = ? "
+                "ORDER BY position",
+                (row["id"],),
+            ).fetchall()
+        ]
+        return program
+
+    def cardio_program_set(
+        self,
+        user_id: int,
+        username: str,
+        name: str,
+        pace: str,
+        segments: list,
+    ) -> dict:
+        """Create or fully replace one named cardio program."""
+        key = self._cardio_name_key(name)
+        if not key:
+            raise ValueError("cardio program name cannot be empty")
+        if not segments:
+            raise ValueError("cardio program cannot be empty")
+        ts = _normalize_iso(None)
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id FROM cardio_programs "
+                "WHERE user_id = ? AND name_key = ?",
+                (user_id, key),
+            ).fetchone()
+            if row is None:
+                cur = c.execute(
+                    """
+                    INSERT INTO cardio_programs
+                    (user_id, username, name_key, name, pace,
+                     progression_score, progression_cursor, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+                    """,
+                    (user_id, username, key, name.strip(), pace, ts, ts),
+                )
+                program_id = int(cur.lastrowid)
+            else:
+                program_id = int(row["id"])
+                c.execute(
+                    """
+                    UPDATE cardio_programs
+                    SET username = ?, name = ?, pace = ?,
+                        progression_score = 0, progression_cursor = 0,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (username, name.strip(), pace, ts, program_id),
+                )
+                c.execute(
+                    "DELETE FROM cardio_program_segments WHERE program_id = ?",
+                    (program_id,),
+                )
+            for position, segment in enumerate(segments):
+                activity, minutes, level, incline, speed = (
+                    self._cardio_segment_values(segment)
+                )
+                c.execute(
+                    """
+                    INSERT INTO cardio_program_segments
+                    (program_id, position, activity, minutes, level,
+                     incline_degrees, speed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        program_id, position, activity, minutes, level,
+                        incline, speed,
+                    ),
+                )
+            saved = c.execute(
+                "SELECT * FROM cardio_programs WHERE id = ?", (program_id,),
+            ).fetchone()
+            return self._cardio_program_from_row(c, saved)
+
+    def cardio_program_get(
+        self, user_id: int, name: str | None = None,
+    ) -> dict | None:
+        """Get a named program, or the most recently used/edited one."""
+        with self._conn() as c:
+            if name is None:
+                row = c.execute(
+                    "SELECT * FROM cardio_programs WHERE user_id = ? "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM cardio_programs "
+                    "WHERE user_id = ? AND name_key = ?",
+                    (user_id, self._cardio_name_key(name)),
+                ).fetchone()
+            return self._cardio_program_from_row(c, row) if row else None
+
+    def cardio_program_list(self, user_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM cardio_programs WHERE user_id = ? "
+                "ORDER BY updated_at DESC, name_key",
+                (user_id,),
+            ).fetchall()
+            return [self._cardio_program_from_row(c, row) for row in rows]
+
+    def cardio_program_remove(self, user_id: int, name: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM cardio_programs "
+                "WHERE user_id = ? AND name_key = ?",
+                (user_id, self._cardio_name_key(name)),
+            )
+            return bool(cur.rowcount)
+
+    def cardio_session_add(
+        self,
+        user_id: int,
+        segments: list,
+        difficulty: str,
+        *,
+        program_id: int | None = None,
+        program_name: str | None = None,
+        next_segments: list | None = None,
+        progression_score: int | None = None,
+        progression_cursor: int | None = None,
+        logged_at: datetime | None = None,
+        message_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> int:
+        """Snapshot a completed workout and optionally advance its program."""
+        if not segments:
+            raise ValueError("cardio session cannot be empty")
+        ts = _normalize_iso(logged_at)
+        with self._conn() as c:
+            if program_id is not None:
+                owner = c.execute(
+                    "SELECT user_id, name FROM cardio_programs WHERE id = ?",
+                    (program_id,),
+                ).fetchone()
+                if owner is None or int(owner["user_id"]) != user_id:
+                    raise ValueError("cardio program does not belong to user")
+                if program_name is None:
+                    program_name = str(owner["name"])
+            cur = c.execute(
+                """
+                INSERT INTO cardio_sessions
+                (user_id, program_id, program_name, difficulty,
+                 message_id, channel_id, logged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, program_id, program_name, difficulty,
+                    message_id, channel_id, ts,
+                ),
+            )
+            session_id = int(cur.lastrowid)
+            for position, segment in enumerate(segments):
+                activity, minutes, level, incline, speed = (
+                    self._cardio_segment_values(segment)
+                )
+                c.execute(
+                    """
+                    INSERT INTO cardio_session_segments
+                    (session_id, position, activity, minutes, level,
+                     incline_degrees, speed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id, position, activity, minutes, level,
+                        incline, speed,
+                    ),
+                )
+
+            if program_id is not None and next_segments is not None:
+                c.execute(
+                    "DELETE FROM cardio_program_segments WHERE program_id = ?",
+                    (program_id,),
+                )
+                for position, segment in enumerate(next_segments):
+                    activity, minutes, level, incline, speed = (
+                        self._cardio_segment_values(segment)
+                    )
+                    c.execute(
+                        """
+                        INSERT INTO cardio_program_segments
+                        (program_id, position, activity, minutes, level,
+                         incline_degrees, speed)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            program_id, position, activity, minutes, level,
+                            incline, speed,
+                        ),
+                    )
+                c.execute(
+                    """
+                    UPDATE cardio_programs
+                    SET progression_score = ?, progression_cursor = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        int(progression_score or 0),
+                        int(progression_cursor or 0),
+                        ts,
+                        program_id,
+                    ),
+                )
+            return session_id
+
+    def cardio_session_list(
+        self,
+        user_id: int,
+        *,
+        limit: int = 10,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> list[dict]:
+        clauses = ["user_id = ?"]
+        params: list[object] = [user_id]
+        if start_iso is not None:
+            clauses.append("logged_at >= ?")
+            params.append(start_iso)
+        if end_iso is not None:
+            clauses.append("logged_at < ?")
+            params.append(end_iso)
+        params.append(max(1, min(1000, int(limit))))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM cardio_sessions WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY logged_at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+            sessions: list[dict] = []
+            for row in rows:
+                session = dict(row)
+                session["segments"] = [
+                    dict(segment)
+                    for segment in c.execute(
+                        "SELECT position, activity, minutes, level, "
+                        "incline_degrees, speed "
+                        "FROM cardio_session_segments WHERE session_id = ? "
+                        "ORDER BY position",
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                sessions.append(session)
+            return sessions
+
+    def cardio_session_get_by_message(self, message_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM cardio_sessions WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+
+    def cardio_session_remove(self, user_id: int, session_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM cardio_sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            return bool(cur.rowcount)
+
+    def cardio_track_reply(
+        self,
+        reply_message_id: int,
+        logger_user_id: int,
+        target_user_id: int,
+        session_id: int,
+        *,
+        original_message_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO cardio_reply_tracking
+                (reply_message_id, logger_user_id, target_user_id, session_id,
+                 original_message_id, channel_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reply_message_id, logger_user_id, target_user_id, session_id,
+                    original_message_id, channel_id, _normalize_iso(None),
+                ),
+            )
+
+    def cardio_get_reply(self, reply_message_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM cardio_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            ).fetchone()
+
+    def cardio_delete_reply(self, reply_message_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM cardio_reply_tracking WHERE reply_message_id = ?",
+                (reply_message_id,),
+            )
+            return bool(cur.rowcount)
 
     # ---- custom aliases --------------------------------------------------
 

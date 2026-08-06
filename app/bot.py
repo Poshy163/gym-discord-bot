@@ -75,6 +75,7 @@ from .voicetime import summarize_voice
 from . import __version__
 from . import ai_food
 from . import calories
+from . import cardio
 from . import config as config_mod
 from . import dayspans
 from . import food_lookup
@@ -4501,6 +4502,8 @@ def _looks_like_log_attempt(text: str) -> bool:
         return True
     if nutrition.parse_combined(text) is not None:
         return True
+    if cardio.parse_chat_message(text) is not None:
+        return True
     lifts, _ = _split_reasonable_lifts(parse_message(text))
     return bool(lifts and _should_auto_store(lifts))
 
@@ -4817,6 +4820,19 @@ async def on_message(message: discord.Message) -> None:
         await _handle_combined_nutrition(
             message, target, *combined, logged_at=nut_dt,
             basis=nutrition.chat_scale_note(nut_content),
+        )
+        await bot.process_commands(message)
+        return
+
+    # Native cardio shortcut: the whole message must be a structured list of
+    # recognised cardio activities, so normal chat that merely mentions
+    # "15 minutes" is ignored. Examples:
+    #   15 mins elliptical lv12, 30mins on stair master lv10
+    #   15mins on treadmill 10 degrees 10 speed
+    cardio_segments = cardio.parse_chat_message(nut_content)
+    if cardio_segments is not None:
+        await _handle_cardio_message(
+            message, target, cardio_segments, logged_at=nut_dt,
         )
         await bot.process_commands(message)
         return
@@ -5800,6 +5816,56 @@ async def on_raw_bulk_message_delete(
             LOG.exception("Failed to flag bulk-deleted message in log")
 
 
+async def _handle_cardio_reaction_undo(
+    payload: discord.RawReactionActionEvent,
+) -> bool:
+    """Undo a passively logged cardio session from its confirmation reply."""
+    rec = db.cardio_get_reply(payload.message_id)
+    if rec is None:
+        return False
+    target_user_id = int(rec["target_user_id"])
+    allowed = {
+        int(rec["logger_user_id"]), target_user_id,
+    } | ADMIN_USER_IDS
+    if payload.user_id not in allowed:
+        return True
+    if not db.cardio_delete_reply(payload.message_id):
+        return True
+    removed = db.cardio_session_remove(
+        target_user_id, int(rec["session_id"]),
+    )
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except discord.HTTPException:
+            return True
+    try:
+        reply = await channel.fetch_message(payload.message_id)
+        await reply.edit(
+            content=None,
+            embed=ui.card(
+                "🏃 Cardio removed",
+                description=(
+                    "The tracked session was removed."
+                    if removed else "That session was already removed."
+                ),
+                colour=ui.NEUTRAL,
+            ),
+        )
+        await reply.clear_reaction("❌")
+    except discord.HTTPException:
+        pass
+    original_id = rec["original_message_id"]
+    if original_id is not None:
+        try:
+            original = await channel.fetch_message(int(original_id))
+            await original.remove_reaction("✅", bot.user)  # type: ignore[arg-type]
+        except discord.HTTPException:
+            pass
+    return True
+
+
 @bot.event
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
@@ -5811,7 +5877,10 @@ async def on_raw_reaction_add(
         return
     rec = db.get_reply(payload.message_id)
     if rec is None:
-        # Not a lift reply — maybe a Home Assistant weigh-in, or a calorie reply.
+        # Not a lift reply — maybe cardio, a Home Assistant weigh-in, or a
+        # calorie reply.
+        if await _handle_cardio_reaction_undo(payload):
+            return
         # Weigh-ins go first because they are identified by a tracking row or by
         # their own embed footer, so they can decline cleanly; the nutrition
         # handler resolves via the reply's *referenced* message and has no such
@@ -7723,6 +7792,22 @@ def _help_sections() -> dict[str, discord.Embed]:
             "`/goals [user]` — progress bars\n"
             "`/goal_remove <equipment>`"
         ),
+    )
+    section(
+        "Cardio", "🏃 Cardio programs",
+        (
+            "`/cardio create <name> <workout> [progression]` — save a routine\n"
+            "`/cardio view [name]` — show the next version of a routine\n"
+            "`/cardio complete <difficulty> [name]` — log + adapt it\n"
+            "`/cardio log <workout> [difficulty]` — track a one-off session\n"
+            "`/cardio history [user]` — recent sessions\n"
+            "`/cardio remove <name>` — remove a routine (history stays)\n\n"
+            "Or post the workout directly in chat: `15 mins elliptical lv12, "
+            "30mins on stair master lv10, 15mins on treadmill 10 degrees "
+            "10 speed`. Level, incline and speed are optional. Easy/right/hard "
+            "ratings adjust one part at a time."
+        ),
+        footer="Cardio programs and history follow you across servers and DMs.",
     )
     section(
         "Calories", f"{ui.FOOD} Calories",
@@ -18990,15 +19075,18 @@ async def track_analyze_cmd(
 # ---------------------------------------------------------------------------
 
 _COACH_SYSTEM = (
-    "You are an experienced, encouraging strength & nutrition coach. You are "
-    "given ONE person's raw training and nutrition data as JSON (weights in kg; "
+    "You are an experienced, encouraging strength, cardio & nutrition coach. "
+    "You are given ONE person's raw training and nutrition data as JSON (weights in kg; "
     "'bw' true means the weight is added to bodyweight, e.g. weighted dips). "
     "Write a concise, personalised progress report with short sections: "
     "**Overview**, **What's going well**, **Where you're lagging / plateauing**, "
     "**Nutrition**, and **Next steps** (2-4 concrete, specific actions). "
     "Reference actual lifts and numbers from the data, call out plateaus, "
-    "muscle-group imbalances, training frequency (avg_sessions_per_week), and "
-    "goal progress. Use 'estimated_1rm_progression' to spot strength gains even "
+    "muscle-group imbalances, training frequency (avg_sessions_per_week), "
+    "cardio consistency/difficulty, and goal progress. Cardio levels and speed "
+    "are machine-specific settings (speed has no assumed unit), not comparable "
+    "between machines. "
+    "Use 'estimated_1rm_progression' to spot strength gains even "
     "when top-set weight is flat — e.g. more reps at the same load is real "
     "progress (cite the e1RM gain in kg). Be motivating but honest. Use short "
     "bullet points. Keep the whole reply under 1800 characters for a Discord "
@@ -19089,7 +19177,7 @@ def _build_progress_payload(
 ) -> dict:
     """Assemble a compact JSON-able snapshot of everything we track for one
     person: lifting summary/PRs/gains/goals, bodyweight trend, training
-    frequency, and calorie/protein goals + window totals."""
+    frequency, cardio programs/sessions, and calorie/protein goals + totals."""
     now = datetime.now(timezone.utc)
     start_iso = (now - timedelta(days=days)).isoformat()
     end_iso = now.isoformat()
@@ -19124,6 +19212,28 @@ def _build_progress_payload(
     # tell "0 because untracked" from "0 because genuinely fasted".
     cal_days = len(db.calorie_logged_days(guild_id, user_id, start_iso, end_iso))
     pro_days = len(db.protein_logged_days(guild_id, user_id, start_iso, end_iso))
+    cardio_programs = db.cardio_program_list(user_id)
+    cardio_sessions = db.cardio_session_list(
+        user_id, limit=1000, start_iso=start_iso, end_iso=end_iso,
+    )
+    cardio_activity: dict[str, dict[str, float | str | int]] = {}
+    cardio_total_minutes = 0.0
+    cardio_difficulty = {key: 0 for key in _CARDIO_DIFFICULTY_LABELS}
+    for session in cardio_sessions:
+        cardio_difficulty.setdefault(str(session["difficulty"]), 0)
+        cardio_difficulty[str(session["difficulty"])] += 1
+        session_activities: set[str] = set()
+        for segment in cardio.segments_from_rows(session["segments"]):
+            cardio_total_minutes += segment.minutes
+            key = segment.activity.casefold()
+            aggregate = cardio_activity.setdefault(
+                key,
+                {"activity": segment.activity, "minutes": 0.0, "sessions": 0},
+            )
+            aggregate["minutes"] = float(aggregate["minutes"]) + segment.minutes
+            if key not in session_activities:
+                aggregate["sessions"] = int(aggregate["sessions"]) + 1
+                session_activities.add(key)
 
     # Derived signals the model would otherwise have to (badly) infer.
     window_cutoff = (now - timedelta(days=days)).date().isoformat()
@@ -19146,6 +19256,9 @@ def _build_progress_payload(
             "calorie_tracking_active": cal_goal is not None,
             "protein_tracking_active": pro_goal is not None,
             "has_any_lifts": summary is not None,
+            "has_cardio_program_or_sessions": bool(
+                cardio_programs or cardio_sessions
+            ),
             "days_since_last_lift": _days_since(last_lift_at),
             "days_since_bodyweight": _days_since(last_bw_at),
             "nutrition_days_logged_in_window": {
@@ -19179,6 +19292,55 @@ def _build_progress_payload(
                 db.user_rep_sets(guild_id, user_id)
             ),
             "last_lift_at": last_lift_at,
+        },
+        "cardio": {
+            "active_programs": [
+                {
+                    "name": program["name"],
+                    "progression_pace": program["pace"],
+                    "progression_score": program["progression_score"],
+                    "segments": [
+                        {
+                            "activity": segment.activity,
+                            "minutes": segment.minutes,
+                            "level": segment.level,
+                            "incline_degrees": segment.incline_degrees,
+                            "speed": segment.speed,
+                        }
+                        for segment in cardio.segments_from_rows(program["segments"])
+                    ],
+                }
+                for program in cardio_programs
+            ],
+            "sessions_in_window": len(cardio_sessions),
+            "total_minutes_in_window": round(cardio_total_minutes, 1),
+            "avg_sessions_per_week": round(len(cardio_sessions) / weeks, 1),
+            "difficulty_ratings": cardio_difficulty,
+            "by_activity": sorted(
+                cardio_activity.values(),
+                key=lambda item: float(item["minutes"]),
+                reverse=True,
+            ),
+            "recent_sessions": [
+                {
+                    "program": session["program_name"] or "One-off",
+                    "difficulty": session["difficulty"],
+                    "logged_at": session["logged_at"],
+                    "segments": [
+                        {
+                            "activity": segment.activity,
+                            "minutes": segment.minutes,
+                            "level": segment.level,
+                            "incline_degrees": segment.incline_degrees,
+                            "speed": segment.speed,
+                        }
+                        for segment in cardio.segments_from_rows(
+                            session["segments"]
+                        )
+                    ],
+                }
+                for session in cardio_sessions[:12]
+            ],
         },
         "bodyweight": {
             "recent": [
@@ -19361,11 +19523,13 @@ async def coach_cmd(
         or db.calorie_goal_get(guild_id, target.id) is not None
         or db.protein_goal_get(guild_id, target.id) is not None
         or bool(db.bodyweight_history(guild_id, target.id, limit=1))
+        or bool(db.cardio_program_list(target.id))
+        or bool(db.cardio_session_list(target.id, limit=1))
     )
     if not has_data:
         await interaction.response.send_message(
-            f"{target.display_name} has no tracked data yet — log some lifts or "
-            "set up calorie/protein tracking first.",
+            f"{target.display_name} has no tracked data yet — log some lifts, "
+            "cardio, or set up calorie/protein tracking first.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -19414,7 +19578,8 @@ async def coach_cmd(
     )
     embed.set_footer(
         text=(
-            f"all-time lifts · {days}d nutrition · {gemini_client.model_name()}"
+            f"all-time lifts · {days}d cardio + nutrition · "
+            f"{gemini_client.model_name()}"
         )
     )
     await interaction.followup.send(
@@ -19628,6 +19793,425 @@ async def voice_stats_cmd(
 
 
 bot.tree.add_command(voice_group)
+
+
+# ---------------------------------------------------------------------------
+# Native cardio programs (/cardio)
+# ---------------------------------------------------------------------------
+
+cardio_group = app_commands.Group(
+    name="cardio",
+    description="Create cardio programs, log sessions, and progress them.",
+)
+
+_CARDIO_PACE_LABELS = {
+    "gentle": "Gentle",
+    "standard": "Standard",
+    "aggressive": "Aggressive",
+}
+_CARDIO_DIFFICULTY_LABELS = {
+    "easy": "Felt easy",
+    "just_right": "About right",
+    "hard": "Too hard",
+    "unrated": "Not rated",
+}
+_CARDIO_PACE_CHOICES = [
+    app_commands.Choice(name="Gentle — slower increases", value="gentle"),
+    app_commands.Choice(name="Standard — balanced progression", value="standard"),
+    app_commands.Choice(name="Aggressive — faster increases", value="aggressive"),
+]
+_CARDIO_DIFFICULTY_CHOICES = [
+    app_commands.Choice(name="Easy — ready to progress", value="easy"),
+    app_commands.Choice(name="About right", value="just_right"),
+    app_commands.Choice(name="Too hard — may ease the next session back", value="hard"),
+]
+
+
+def _cardio_display_segment(segment: cardio.Segment) -> str:
+    safe = cardio.Segment(
+        _safe_label(segment.activity, limit=80),
+        segment.minutes,
+        segment.level,
+        segment.incline_degrees,
+        segment.speed,
+    )
+    return cardio.format_segment(safe)
+
+
+async def _handle_cardio_message(
+    message: discord.Message,
+    target: object,
+    segments: list[cardio.Segment],
+    *,
+    logged_at: datetime | None = None,
+) -> None:
+    """Store and confirm one strict whole-message cardio log."""
+    if db.cardio_session_get_by_message(message.id) is not None:
+        return
+    target_id = int(getattr(target, "id"))
+    try:
+        session_id = db.cardio_session_add(
+            target_id,
+            segments,
+            "unrated",
+            logged_at=logged_at or message.created_at.astimezone(timezone.utc),
+            message_id=message.id,
+            channel_id=message.channel.id,
+        )
+    except sqlite3.IntegrityError:
+        # A duplicate gateway dispatch raced the read above; the unique
+        # source-message index already preserved the correct single session.
+        return
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    details = "\n".join(
+        f"`{index}.` {_cardio_display_segment(segment)}"
+        for index, segment in enumerate(segments, 1)
+    )
+    total = cardio.format_number(cardio.total_minutes(segments))
+    backdate = _backdate_label(logged_at)
+    suffix = _target_suffix(message.author, target)
+    target_line = f"Logged{suffix}:\n" if suffix else ""
+    embed = discord.Embed(
+        title=f"🏃 Cardio logged — {total} mins",
+        description=(
+            f"{target_line}{details}{backdate}\n\n"
+            "-# React ❌ to remove this session · use `/cardio create` to "
+            "turn it into an adaptive program"
+        ),
+        colour=EMBED_COLOUR,
+    )
+    try:
+        reply = await message.reply(embed=embed, mention_author=False)
+    except discord.HTTPException:
+        return
+    try:
+        db.cardio_track_reply(
+            reply.id,
+            message.author.id,
+            target_id,
+            session_id,
+            original_message_id=message.id,
+            channel_id=message.channel.id,
+        )
+    except Exception:  # pragma: no cover - log is saved; undo is best effort
+        LOG.exception("Couldn't remember cardio reply %s", reply.id)
+        return
+    try:
+        await reply.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+
+
+def _cardio_program_embed(program: dict) -> discord.Embed:
+    segments = cardio.segments_from_rows(program["segments"])
+    lines = [
+        f"`{index}.` {_cardio_display_segment(segment)}"
+        for index, segment in enumerate(segments, 1)
+    ]
+    pace = str(program["pace"])
+    threshold = cardio.PACE_THRESHOLDS[pace]
+    score = int(program["progression_score"])
+    if score > 0:
+        progress = f"progress score **{score}/{threshold}**"
+    elif score < 0:
+        progress = f"recovery score **{abs(score)}/{threshold}**"
+    else:
+        progress = "progress score **0**"
+    embed = discord.Embed(
+        title=f"🏃 Cardio program — {_safe_label(program['name'], limit=80)}",
+        description="\n".join(lines),
+        colour=EMBED_COLOUR,
+    )
+    embed.add_field(
+        name="Session",
+        value=f"**{cardio.format_number(cardio.total_minutes(segments))} mins**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Progression",
+        value=f"**{_CARDIO_PACE_LABELS[pace]}** · {progress}",
+        inline=True,
+    )
+    embed.set_footer(
+        text="Complete it with /cardio complete and rate how it felt.",
+    )
+    return embed
+
+
+async def _cardio_program_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    needle = current.casefold().strip()
+    return [
+        app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
+        for row in db.cardio_program_list(interaction.user.id)
+        if not needle or needle in row["name"].casefold()
+    ][:25]
+
+
+def _cardio_parse_or_error(raw: str) -> tuple[list[cardio.Segment] | None, str | None]:
+    try:
+        return cardio.parse_program(raw), None
+    except cardio.CardioParseError as exc:
+        return None, str(exc)
+
+
+@cardio_group.command(
+    name="create",
+    description="Create or replace a reusable cardio program.",
+)
+@app_commands.describe(
+    name='Program name, e.g. "Cardio Day".',
+    workout="Parts like: 15 mins elliptical lv12, 15 mins treadmill speed 10.",
+    progression="How quickly easy/completed sessions should increase the program.",
+)
+@app_commands.choices(progression=_CARDIO_PACE_CHOICES)
+async def cardio_create_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    workout: str,
+    progression: str = "standard",
+) -> None:
+    clean_name = " ".join(name.split())
+    if not clean_name or len(clean_name) > 60:
+        await interaction.response.send_message(
+            "Use a program name between 1 and 60 characters.", ephemeral=True,
+        )
+        return
+    segments, error = _cardio_parse_or_error(workout)
+    if segments is None:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    program = db.cardio_program_set(
+        interaction.user.id,
+        _display_name(interaction.user),
+        clean_name,
+        progression,
+        segments,
+    )
+    await interaction.response.send_message(embed=_cardio_program_embed(program))
+
+
+@cardio_group.command(
+    name="view",
+    description="Show a cardio program (defaults to your most recent one).",
+)
+@app_commands.describe(name="Program name; leave blank for your most recent.")
+@app_commands.autocomplete(name=_cardio_program_autocomplete)
+async def cardio_view_cmd(
+    interaction: discord.Interaction, name: str | None = None,
+) -> None:
+    program = db.cardio_program_get(interaction.user.id, name)
+    if program is None:
+        suffix = f" named **{_safe_label(name)}**" if name else ""
+        await interaction.response.send_message(
+            f"You don't have a cardio program{suffix}. Create one with "
+            "`/cardio create`.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    await interaction.response.send_message(embed=_cardio_program_embed(program))
+
+
+@cardio_group.command(
+    name="complete",
+    description="Log a saved program and adapt the next session from its difficulty.",
+)
+@app_commands.describe(
+    difficulty="How the whole session felt.",
+    name="Program name; leave blank for your most recent.",
+)
+@app_commands.choices(difficulty=_CARDIO_DIFFICULTY_CHOICES)
+@app_commands.autocomplete(name=_cardio_program_autocomplete)
+async def cardio_complete_cmd(
+    interaction: discord.Interaction,
+    difficulty: str,
+    name: str | None = None,
+) -> None:
+    program = db.cardio_program_get(interaction.user.id, name)
+    if program is None:
+        await interaction.response.send_message(
+            "I couldn't find that program. Use `/cardio create` first.",
+            ephemeral=True,
+        )
+        return
+    completed = cardio.segments_from_rows(program["segments"])
+    result = cardio.apply_difficulty(
+        completed,
+        difficulty,
+        str(program["pace"]),
+        int(program["progression_score"]),
+        int(program["progression_cursor"]),
+    )
+    db.cardio_session_add(
+        interaction.user.id,
+        completed,
+        difficulty,
+        program_id=int(program["id"]),
+        program_name=str(program["name"]),
+        next_segments=result.segments,
+        progression_score=result.score,
+        progression_cursor=result.cursor,
+    )
+
+    total = cardio.format_number(cardio.total_minutes(completed))
+    lines = [
+        f"Logged **{total} mins** from **{_safe_label(program['name'])}**.",
+        f"Difficulty: **{_CARDIO_DIFFICULTY_LABELS[difficulty]}**.",
+    ]
+    if result.before is not None and result.after is not None:
+        verb = "Progressed" if result.direction == "increase" else "Eased back"
+        lines.append(
+            f"{verb} next session: "
+            f"~~{_cardio_display_segment(result.before)}~~ → "
+            f"**{_cardio_display_segment(result.after)}**."
+        )
+    else:
+        threshold = cardio.PACE_THRESHOLDS[str(program["pace"])]
+        if result.score > 0:
+            lines.append(
+                f"Building toward the next increase: **{result.score}/{threshold}**."
+            )
+        elif result.score < 0:
+            lines.append(
+                "Holding the routine while you recover "
+                f"(**{abs(result.score)}/{threshold}** toward a small deload)."
+            )
+        else:
+            lines.append("Routine held steady for next time.")
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="✅ Cardio complete",
+            description="\n".join(lines),
+            colour=EMBED_COLOUR,
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@cardio_group.command(
+    name="log",
+    description="Log a one-off cardio session without creating a program.",
+)
+@app_commands.describe(
+    workout="Parts like: 15 mins elliptical lv12, 15 mins treadmill speed 10.",
+    difficulty="How the whole session felt.",
+)
+@app_commands.choices(difficulty=_CARDIO_DIFFICULTY_CHOICES)
+async def cardio_log_cmd(
+    interaction: discord.Interaction,
+    workout: str,
+    difficulty: str = "just_right",
+) -> None:
+    segments, error = _cardio_parse_or_error(workout)
+    if segments is None:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    db.cardio_session_add(interaction.user.id, segments, difficulty)
+    details = "\n".join(
+        f"`{index}.` {_cardio_display_segment(segment)}"
+        for index, segment in enumerate(segments, 1)
+    )
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=(
+                "✅ Cardio logged — "
+                f"{cardio.format_number(cardio.total_minutes(segments))} mins"
+            ),
+            description=(
+                f"{details}\n\nDifficulty: "
+                f"**{_CARDIO_DIFFICULTY_LABELS[difficulty]}**"
+            ),
+            colour=EMBED_COLOUR,
+        )
+    )
+
+
+@cardio_group.command(
+    name="history",
+    description="Show recent tracked cardio sessions.",
+)
+@app_commands.describe(
+    user="The member to look up (defaults to you).",
+    limit="Number of sessions to show, 1-20.",
+)
+async def cardio_history_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    limit: int = 10,
+) -> None:
+    target = user or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
+    if await _deny_channel_outsider(interaction, target):
+        return
+    rows = db.cardio_session_list(target.id, limit=max(1, min(20, limit)))
+    if not rows:
+        await interaction.response.send_message(
+            f"{target.display_name} hasn't logged any cardio yet.",
+            ephemeral=True,
+        )
+        return
+    lines = []
+    for row in rows:
+        segments = cardio.segments_from_rows(row["segments"])
+        when = _format_date(row["logged_at"])
+        program = row["program_name"] or "One-off"
+        difficulty = _CARDIO_DIFFICULTY_LABELS.get(
+            row["difficulty"], str(row["difficulty"]),
+        )
+        parts = [_cardio_display_segment(segment) for segment in segments[:3]]
+        if len(segments) > 3:
+            parts.append(f"+{len(segments) - 3} more")
+        lines.append(
+            f"**{when}** · {_safe_label(program, limit=40)} · "
+            f"**{cardio.format_number(cardio.total_minutes(segments))} mins** "
+            f"· {difficulty}\n-# {' · '.join(parts)}"
+        )
+    shown = list(lines)
+    while len("\n".join(shown)) > 3900 and len(shown) > 1:
+        shown.pop()
+    omitted = len(lines) - len(shown)
+    if omitted:
+        shown.append(f"-# …and {omitted} older session{'s' if omitted != 1 else ''}.")
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"🏃 Cardio history — {target.display_name}",
+            description="\n".join(shown),
+            colour=EMBED_COLOUR,
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@cardio_group.command(
+    name="remove",
+    description="Delete a saved cardio program (completed history is kept).",
+)
+@app_commands.describe(name="Program to delete.")
+@app_commands.autocomplete(name=_cardio_program_autocomplete)
+async def cardio_remove_cmd(
+    interaction: discord.Interaction, name: str,
+) -> None:
+    removed = db.cardio_program_remove(interaction.user.id, name)
+    if not removed:
+        await interaction.response.send_message(
+            "I couldn't find that program.", ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"Removed **{_safe_label(name)}**. Your completed cardio history is "
+        "still kept.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+bot.tree.add_command(cardio_group)
 
 
 # ---------------------------------------------------------------------------
