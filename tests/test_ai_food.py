@@ -2,12 +2,34 @@
 from __future__ import annotations
 
 from app.ai_food import (
+    ESTIMATE_SYSTEM,
     LabelInfo,
     MealEstimate,
+    PHOTO_SYSTEM,
     parse_estimate,
     parse_photo,
     repair_unterminated_json,
 )
+
+
+def test_estimate_prompt_has_method_confidence_and_strict_contract():
+    assert "untrusted meal data" in ESTIMATE_SYSTEM
+    assert "Australian product or menu value" in ESTIMATE_SYSTEM
+    assert "without double-counting" in ESTIMATE_SYSTEM
+    assert "Confidence calibration" in ESTIMATE_SYSTEM
+    assert "exactly these keys" in ESTIMATE_SYSTEM
+    assert '"confidence": "high|medium|low"' in ESTIMATE_SYSTEM
+
+
+def test_photo_prompt_separates_label_transcription_from_meal_estimation():
+    assert "LABEL PATH" in PHOTO_SYSTEM
+    assert "MEAL PATH" in PHOTO_SYSTEM
+    assert "PER 100 g column" in PHOTO_SYSTEM
+    assert "do not put a converted value" in PHOTO_SYSTEM
+    assert "never reconstruct unreadable digits" in PHOTO_SYSTEM
+    assert "untrusted context" in PHOTO_SYSTEM
+    assert '"kind": "label"' in PHOTO_SYSTEM
+    assert '"kind": "meal"' in PHOTO_SYSTEM
 
 
 # ---- parse_estimate ---------------------------------------------------------

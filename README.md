@@ -56,12 +56,13 @@ Stats & progress:
   current weekly streak).
 - `/coach [user] [days]` — an AI progress report built from **all** of a
   member's tracked data (lifting summary, PRs, biggest gains, goals, training
-  frequency, bodyweight trend, and calorie/protein goals + recent totals). The
-  whole dataset is handed to Gemini, which writes a personalised strength +
-  nutrition breakdown with concrete next steps. It's told that missing/zero
-  values mean "not logged" (a tracking gap to nudge about), not real zeros — so
-  it won't claim you ate 0 calories or lost progress just because data is
-  absent. Requires `GEMINI_API_KEY`.
+  frequency, cardio settings/difficulty, attendance, approximate sleep,
+  bodyweight trend, and calorie/protein goals + recent totals). Gemini evaluates
+  data coverage first, separates PRs from sustained trends, compares cardio
+  settings only within the same machine context, and writes a personalised
+  report with measurable next steps. Missing/zero values mean "not logged", not
+  real zeros, so sparse data lowers confidence instead of becoming an invented
+  regression. Requires `GEMINI_API_KEY`.
 - `/overview <equipment> [user]` — consistency overview for one lift: logs,
   active weeks, streak, spacing, current weight, and best.
 - `/checkin [user]` — copy/paste stat template prefilled with current bests.
@@ -289,7 +290,11 @@ You don't tell it which kind of photo you're sending; it works that out, and
 prefers transcribing a panel over guessing whenever one is legible. In chat the
 same thing is `~` — `~large big mac meal`, or a bare `~` with a photo attached
 (`~110g` with a panel photo logs it at that serving). Every estimate carries the
-usual ❌ to remove it, and `/calories edit` corrects the amount.
+usual ❌ to remove it, and `/calories edit` corrects the amount. Estimates use
+Australian portions/menu items, include stated sides and sauces without
+inventing extras, and calibrate confidence from exact branded quantities down
+to ambiguous visual portions. Label photos keep per-serving and per-100 g
+columns separate and never guess unreadable digits.
 
 Logging & editing:
 
@@ -362,13 +367,25 @@ Presence & sleep (requires `ENABLE_PRESENCE_TRACKING=true`):
   sleep data. `fmt=csv` gives a nightly sleep table (bedtime, wake, hours);
   `fmt=json` gives the full raw presence dump plus sessions.
 - `/track analyze <user> [days]` — send the derived sleep sessions to
-  Google's Gemini API and get back plain-language trends (anyone can run it on
-  a tracked member). Requires
+  Google's Gemini API and get back a coverage-aware analysis of schedule,
+  consistency, weekday/weekend differences, drift, and one or two practical
+  experiments (anyone can run it on a tracked member). Requires
   `GEMINI_API_KEY` (see `.env.example`); `GEMINI_MODEL` defaults to
   `gemini-2.5-flash`.
 
 Sleep data here is *inferred* from Discord presence (long offline stretches),
 not a real sleep tracker — treat it as an approximation.
+
+### AI request diagnostics
+
+Every Gemini operation logs a privacy-safe lifecycle line when it starts and
+when it completes or fails. The log includes a short request id, feature
+(`progress_coach`, `sleep_analysis`, `weekly_calorie_recap`, `meal_estimate`, or
+`food_photo`), actor/subject/guild ids, primary and backup models, request size,
+elapsed time, and structured failure fields. For example, depleted Gemini
+prepayment credits appear as `status=RESOURCE_EXHAUSTED code=429
+category=quota_or_billing`. Prompts, responses, member names, API keys, meal
+descriptions, and image bytes are never written to these lifecycle logs.
 
 ## Weekly check-in reminder
 
@@ -400,7 +417,8 @@ Defaults are **08:00** in `DISPLAY_TIMEZONE`. Tune with `DAILY_UPDATE_HOUR` and
 Every Sunday evening the bot posts a 7-day recap: total lifts, PRs, most
 active members, popular lifts — plus a **🍎 weekly calorie check-in** with a
 short Gemini-written summary for each member tracking via `/calories`
-(adherence to target, consistency, one encouraging note) and a **🥩 weekly
+(coverage, per-day adherence, weekday/weekend shape, meaningful week-over-week
+change, and one tailored action) and a **🥩 weekly
 protein check-in** (days logged, average vs max, and how often they went over).
 Without `GEMINI_API_KEY` the calorie section falls back to plain stats lines;
 the protein section is always plain stats.
