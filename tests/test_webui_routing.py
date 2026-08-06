@@ -212,3 +212,23 @@ def test_tab_list_is_injected_into_the_page(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+def test_dashboard_shell_has_responsive_accessible_navigation(tmp_path):
+    """The shared shell should stay operable on phones and by keyboard."""
+    async def go():
+        db, client = await _logged_in(tmp_path)
+        try:
+            body = await (await client.get("/overview")).text()
+            assert 'class="skip-link" href="#view"' in body
+            assert 'aria-label="Dashboard sections"' in body
+            assert 'aria-label="Discord server"' in body
+            assert 'id="toast" role="status" aria-live="polite"' in body
+            assert "aria-current=\"page\"" in body
+            assert "@media (max-width:720px)" in body
+            assert "prefers-reduced-motion:reduce" in body
+            assert 'event.key!=="/"' in body
+        finally:
+            await client.close()
+            db.close()
+    _run(go())

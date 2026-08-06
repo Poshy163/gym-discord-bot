@@ -441,7 +441,7 @@ def build_app(
 
         if error:
             body = SETUP_HTML.replace(
-                "<!--ERR-->", f'<p class="err">{_esc(error)}</p>',
+                "<!--ERR-->", f'<p class="err" role="alert">{_esc(error)}</p>',
             )
             return web.Response(text=body, content_type="text/html", status=400)
 
@@ -470,7 +470,7 @@ def build_app(
             LOG.warning("Dashboard login blocked (locked out) from %s", ip)
             body = _login_page(
                 request,
-                f'<p class="err">Too many attempts. Try again in ~{mins} min.</p>',
+                f'<p class="err" role="alert">Too many attempts. Try again in ~{mins} min.</p>',
             )
             return web.Response(
                 text=body, content_type="text/html", status=429,
@@ -495,7 +495,9 @@ def build_app(
             return resp
         login_throttle.record_failure(ip)
         LOG.warning("Failed dashboard login from %s", ip)
-        body = _login_page(request, '<p class="err">Wrong password.</p>')
+        body = _login_page(
+            request, '<p class="err" role="alert">Wrong password.</p>',
+        )
         return web.Response(text=body, content_type="text/html", status=401)
 
     async def logout_post(request: web.Request) -> web.Response:
@@ -2123,12 +2125,13 @@ LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;height:100vh;
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;min-height:100dvh;
 display:flex;align-items:center;justify-content:center;color:#e6edf3;
 background:radial-gradient(1200px 600px at 50% -10%,#1b2540 0%,#0b0e14 55%)}
 .card{background:rgba(22,27,34,.7);backdrop-filter:blur(12px);
 border:1px solid rgba(255,255,255,.08);border-radius:18px;
-padding:2.5rem 2.25rem;width:340px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+padding:2.5rem 2.25rem;width:min(340px,calc(100vw - 2rem));
+box-shadow:0 24px 60px rgba(0,0,0,.5)}
 .brand{display:flex;align-items:center;gap:.7rem;margin-bottom:1.75rem}
 .brand img{width:44px;height:44px}
 .brand b{font-size:1.25rem;background:linear-gradient(90deg,#a5b4fc,#67e8f9);
@@ -2141,13 +2144,14 @@ button{width:100%;padding:.75rem;border:0;border-radius:10px;font-size:1rem;
 font-weight:600;cursor:pointer;color:#fff;
 background:linear-gradient(90deg,#6366f1,#22d3ee)}
 button:hover{filter:brightness(1.08)}
+button:focus-visible,input:focus-visible{outline:2px solid #67e8f9;outline-offset:2px}
 .err{color:#f85149;margin:0 0 .75rem;font-size:.88rem}
 .sub{color:#6e7681;font-size:.78rem;margin-top:1.25rem;text-align:center}
 </style></head><body>
 <form class="card" method="post" action="/login">
 <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
-<label>Password</label>
-<input type="password" name="password" autofocus autocomplete="current-password">
+<label for="password">Password</label>
+<input id="password" type="password" name="password" autofocus autocomplete="current-password" required>
 <!--ERR-->
 <button type="submit">Sign in</button>
 <p class="sub">Operator access only</p>
@@ -2162,8 +2166,8 @@ SETUP_HTML = LOGIN_HTML.replace(
 ).replace(
     """<form class="card" method="post" action="/login">
 <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
-<label>Password</label>
-<input type="password" name="password" autofocus autocomplete="current-password">
+<label for="password">Password</label>
+<input id="password" type="password" name="password" autofocus autocomplete="current-password" required>
 <!--ERR-->
 <button type="submit">Sign in</button>
 <p class="sub">Operator access only</p>
@@ -2173,12 +2177,12 @@ SETUP_HTML = LOGIN_HTML.replace(
 <p class="sub" style="margin:0 0 1.25rem;text-align:left;color:#8b949e">
 Choose a password to secure this dashboard. You'll use it every time you sign
 in.</p>
-<label>New password</label>
-<input type="password" name="password" autofocus autocomplete="new-password"
- minlength="12">
-<label>Confirm password</label>
-<input type="password" name="password2" autocomplete="new-password"
- minlength="12">
+<label for="password">New password</label>
+<input id="password" type="password" name="password" autofocus autocomplete="new-password"
+ minlength="12" required>
+<label for="password2">Confirm password</label>
+<input id="password2" type="password" name="password2" autocomplete="new-password"
+ minlength="12" required>
 <!--ERR-->
 <button type="submit">Set password</button>
 <p class="sub">At least 12 characters. Until this is set, anyone who can reach
@@ -2197,20 +2201,31 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   --bg:#0b0e14; --panel:#161b22; --panel2:#1c222c; --line:#262d38;
   --text:#e6edf3; --muted:#8b949e; --faint:#6e7681;
   --indigo:#818cf8; --cyan:#22d3ee; --accent:linear-gradient(90deg,#6366f1,#22d3ee);
+  --header-h:112px;
 }
 *{box-sizing:border-box}
 body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;color:var(--text);
 background:radial-gradient(1100px 520px at 100% -5%,#172036 0%,rgba(11,14,20,0) 60%),
           radial-gradient(900px 500px at -5% 0%,#16242b 0%,rgba(11,14,20,0) 55%),var(--bg);
-min-height:100vh}
+min-height:100vh;line-height:1.45}
 a{color:inherit}
+button,input,select{font:inherit}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,
+summary:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+.sr-only{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;
+overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.skip-link{position:fixed;left:1rem;top:.5rem;z-index:100;transform:translateY(-160%);
+background:#fff;color:#0b0e14;border-radius:8px;padding:.45rem .75rem;font-weight:700;
+text-decoration:none;transition:transform .15s}
+.skip-link:focus{transform:none}
 ::-webkit-scrollbar{height:10px;width:10px}
 ::-webkit-scrollbar-thumb{background:#2a313c;border-radius:6px}
 
 /* header */
+.chrome{position:sticky;top:0;z-index:20;background:rgba(13,17,23,.82);
+backdrop-filter:blur(14px);box-shadow:0 8px 24px #0003}
 header{display:flex;align-items:center;gap:.85rem;padding:.7rem 1.4rem;
-background:rgba(13,17,23,.72);backdrop-filter:blur(12px);
-border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+border-bottom:1px solid var(--line)}
 .brand{display:flex;align-items:center;gap:.6rem}
 .brand img{width:30px;height:30px}
 .brand b{font-size:1.05rem;background:var(--accent);-webkit-background-clip:text;
@@ -2221,6 +2236,7 @@ select,.btn{font:inherit;color:var(--text);background:var(--panel);
 border:1px solid var(--line);border-radius:10px;padding:.45rem .7rem;cursor:pointer}
 select:hover,.btn:hover{border-color:#3a4350;background:var(--panel2)}
 .btn{display:inline-flex;align-items:center;gap:.4rem}
+.btn:disabled{opacity:.55;cursor:not-allowed}
 .btn.primary{background:var(--accent);border:0;color:#fff;font-weight:600}
 .btn.primary:hover{filter:brightness(1.08)}
 .btn.danger{color:#ff9a96;border-color:#5c2b2b}
@@ -2233,21 +2249,27 @@ td.right{text-align:right}
 form.inline{margin:0}
 
 /* nav */
-nav{display:flex;gap:.3rem;padding:.6rem 1.4rem;flex-wrap:wrap;
-border-bottom:1px solid var(--line);background:rgba(13,17,23,.4)}
+nav{display:flex;gap:.3rem;padding:.55rem 1.4rem;flex-wrap:nowrap;overflow-x:auto;
+overscroll-behavior-x:contain;scrollbar-width:thin;border-bottom:1px solid var(--line);
+background:rgba(13,17,23,.35)}
 /* text-decoration:none is load-bearing: these carry real href attributes (so
    middle-click opens a new tab), which means the browser's default link
    underline applies unless it is turned off here. */
 nav a{display:flex;align-items:center;gap:.4rem;padding:.4rem .85rem;border-radius:9px;
 cursor:pointer;color:var(--muted);font-size:.92rem;font-weight:500;transition:.15s;
-text-decoration:none}
+text-decoration:none;white-space:nowrap;flex:none}
 nav a:hover{color:var(--text);background:#ffffff0a;text-decoration:none}
 nav a.active{color:#fff;background:linear-gradient(90deg,#6366f133,#22d3ee22);
 box-shadow:inset 0 0 0 1px #6366f155}
 
-main{padding:1.5rem;max-width:1240px;margin:0 auto}
+main{padding:1.5rem;max-width:1240px;margin:0 auto;min-height:calc(100vh - var(--header-h))}
+main:focus{outline:none}
+h1{font-size:1.45rem;margin:0;font-weight:700;letter-spacing:-.02em}
 h2{font-size:1.15rem;margin:.2rem 0 1.1rem;font-weight:650}
 .muted{color:var(--muted)}.faint{color:var(--faint)}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;
+margin:.1rem 0 1.25rem}
+.page-sub{color:var(--muted);font-size:.84rem;margin-top:.2rem}
 
 /* stat cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
@@ -2275,7 +2297,8 @@ border:1px solid var(--line);border-radius:999px;padding:.2rem .55rem;font-size:
 
 /* table card */
 .tcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
-overflow:hidden}
+overflow-x:auto;overscroll-behavior-x:contain}
+.tcard>table{min-width:620px}
 table{width:100%;border-collapse:collapse;font-size:.9rem}
 thead th{position:sticky;top:0;background:#1a212c;color:var(--muted);
 font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
@@ -2327,7 +2350,8 @@ cursor:pointer;margin-bottom:.6rem;font-size:.88rem}
 .chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.3rem 0}
 
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);
-border-radius:16px;padding:1.5rem;min-width:340px;box-shadow:0 30px 80px #000a}
+border-radius:16px;padding:1.5rem;width:min(620px,calc(100vw - 2rem));max-height:calc(100vh - 2rem);
+overflow:auto;box-shadow:0 30px 80px #000a}
 dialog::backdrop{background:#0009;backdrop-filter:blur(2px)}
 dialog h2{margin-top:0}
 dialog label{display:block;font-size:.74rem;color:var(--muted);
@@ -2363,12 +2387,21 @@ white-space:pre-wrap;word-break:break-word;margin:.8rem 0 0}
 
 .toast{position:fixed;bottom:1.4rem;right:1.4rem;padding:.7rem 1.1rem;border-radius:11px;
 background:var(--panel2);border:1px solid var(--line);box-shadow:0 12px 30px #0007;
-opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none;z-index:50}
+opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none;z-index:50;
+max-width:min(420px,calc(100vw - 2rem))}
 .toast.show{opacity:1;transform:none}
+.toast.error{border-color:#f8514966;color:#ffb4b0}
 .spin{display:inline-block;width:34px;height:34px;border:3px solid #2a313c;
 border-top-color:var(--indigo);border-radius:50%;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-.center{display:flex;justify-content:center;padding:3rem}
+.center{display:flex;align-items:center;justify-content:center;gap:.7rem;padding:3rem;
+color:var(--muted);font-size:.84rem}
+.state-card{max-width:620px;margin:2.5rem auto;padding:1.4rem;text-align:center;
+background:var(--panel);border:1px solid var(--line);border-radius:14px}
+.state-card .state-icon{font-size:1.6rem;margin-bottom:.4rem}
+.state-card h2{margin:0 0 .35rem}
+.state-card p{color:var(--muted);margin:.2rem 0 1rem;overflow-wrap:anywhere}
+.state-card p:last-child{margin-bottom:0}
 
 /* search */
 .search{background:var(--panel);border:1px solid var(--line);border-radius:10px;
@@ -2603,18 +2636,78 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
 .vc-ev-act{flex:1;color:var(--muted)}
 .vc-ch{color:#7aa2f7}
 .vc-ev-ts{font-size:.72rem;color:var(--muted);font-variant-numeric:tabular-nums;flex:none}
+
+@media (max-width:720px){
+  :root{--header-h:105px}
+  header{padding:.6rem .75rem;gap:.5rem}
+  .brand b{display:none}
+  .gselect{flex:1;min-width:0}
+  .gselect select{width:100%;min-width:0}
+  header .sp{display:none}
+  .header-action .btn-label{display:none}
+  .header-action{padding:.45rem .58rem}
+  nav{padding:.45rem .65rem}
+  nav a{padding:.4rem .68rem;font-size:.86rem}
+  main{padding:1rem .75rem 4rem}
+  .cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem}
+  .stat{padding:.9rem}
+  .stat .n{font-size:1.5rem}
+  .filters{align-items:stretch}
+  .filters h2{flex:1;align-self:center}
+  .filters .sp{display:none}
+  .filters .search{flex:1 1 100%;width:100%;min-width:0}
+  .setrow{grid-template-columns:1fr;gap:.6rem}
+  .setrow .ctl{grid-column:1}
+  .page-head{align-items:flex-start;flex-direction:column}
+  .hero{align-items:flex-start}
+  .act-grid{grid-template-columns:1fr}
+  .lead-who{display:none}
+  .dc{height:auto;min-height:0;flex-direction:column}
+  .dc-side{width:100%;max-height:210px;border-right:0;border-bottom:1px solid var(--line)}
+  .dc-main{height:60vh;min-height:380px}
+  .dc-att{max-width:min(260px,100%)}
+  .vc-ev{flex-wrap:wrap}
+  .vc-ev-who{min-width:0}
+  .vc-ev-ts{width:100%;padding-left:30px}
+  .toast{right:1rem;bottom:1rem}
+}
+@media (max-width:430px){
+  .cards{grid-template-columns:1fr 1fr}
+  .ov-live,.grid2{grid-template-columns:1fr}
+  .act-presence{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .act-metric{padding:.42rem}
+  .act-metric span{font-size:.6rem}
+  .row-actions{flex-wrap:wrap}
+  .pgrow{gap:.5rem;align-items:flex-start}
+  dialog{padding:1rem}
+}
+@media (hover:none){
+  .dc-bl{opacity:.55}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;
+  animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
 </style></head><body>
+<a class="skip-link" href="#view">Skip to content</a>
+<div class="chrome">
 <header>
   <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
-  <div class="gselect"><select id="guild" onchange="onGuild()"></select></div>
+  <div class="gselect"><label class="sr-only" for="guild">Discord server</label>
+    <select id="guild" onchange="onGuild()" aria-label="Discord server"></select></div>
   <span class="sp"></span>
-  <button class="btn" onclick="resync()" title="Re-pull members & roles from Discord">↻ Sync</button>
-  <form class="inline" method="post" action="/logout"><button class="btn">Logout</button></form>
+  <button class="btn header-action" id="syncBtn" onclick="resync()"
+    title="Re-pull members and roles from Discord"><span aria-hidden="true">↻</span>
+    <span class="btn-label">Sync</span></button>
+  <form class="inline" method="post" action="/logout"><button class="btn header-action"
+    title="Sign out"><span aria-hidden="true">↪</span><span class="btn-label">Logout</span></button></form>
 </header>
-<nav id="nav"></nav>
-<main id="view"><div class="center"><div class="spin"></div></div></main>
+<nav id="nav" aria-label="Dashboard sections"></nav>
+</div>
+<main id="view" tabindex="-1"><div class="center" role="status">
+  <div class="spin" aria-hidden="true"></div><span>Loading dashboard…</span></div></main>
 <dialog id="editDlg"></dialog>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <script>
 // Injected from DASHBOARD_TABS in app/webui.py so the nav and the server-side
 // routes cannot drift apart — every slug here must have a matching GET route
@@ -2645,7 +2738,11 @@ let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMembe
 // Current search term, persisted across live re-renders so typing isn't lost.
 let SEARCH="";
 
-function searchBar(ph){return `<input class="search" placeholder="${ph||'Search…'}" value="${esc(SEARCH)}" oninput="filterTable(this.value)">`;}
+function searchBar(ph){
+  const label=ph||"Search";
+  return `<input class="search" type="search" aria-label="${esc(label)}"
+    placeholder="${esc(label)}" value="${esc(SEARCH)}" oninput="filterTable(this.value)">`;
+}
 // Filters both data tables and card grids: table rows by text, cards by their
 // explicit data-search key (so we match the player/game name, not icon alt-text).
 function filterTable(term){SEARCH=term=(term||"").toLowerCase();
@@ -2812,8 +2909,13 @@ async function delBodyweight(uid,id,kg){
   if(r&&r.ok){toast("Weigh-in deleted");memberView(uid);}else{toast("Could not delete it");}
 }
 
-function toast(m){const t=document.getElementById("toast");t.textContent=m;
-  t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200);}
+let TOAST_TIMER=null;
+function toast(m,kind){
+  const t=document.getElementById("toast");if(!t)return;
+  t.textContent=m;t.classList.toggle("error",kind==="error");
+  t.classList.add("show");clearTimeout(TOAST_TIMER);
+  TOAST_TIMER=setTimeout(()=>t.classList.remove("show"),2600);
+}
 function esc(s){return(s==null?"":String(s)).replace(/[&<>"']/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 // Drop a string into an inline on*="…" handler: JSON-quote it so the JS parser
@@ -2841,11 +2943,34 @@ function toLogin(){
   location.href="/login?next="+encodeURIComponent(location.pathname+location.search);
 }
 async function api(p){const r=await fetch(p);if(r.status===401){toLogin();return null;}
-  if(!r.ok)throw new Error(await r.text());return r.json();}
-async function post(p,b){const r=await fetch(p,{method:"POST",
-  headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
-  if(r.status===401){toLogin();return null;}return r.json();}
-function spinner(){return '<div class="center"><div class="spin"></div></div>';}
+  if(!r.ok)throw new Error((await r.text())||`Request failed (${r.status})`);
+  return r.json();}
+async function post(p,b){
+  let r;
+  try{r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(b)});}
+  catch(e){return {ok:false,error:"Dashboard service is unreachable."};}
+  if(r.status===401){toLogin();return null;}
+  const text=await r.text();let data={};
+  try{data=text?JSON.parse(text):{};}catch(e){data={error:text};}
+  if(!r.ok)return {ok:false,error:data.error||text||`Request failed (${r.status})`};
+  return data;
+}
+function spinner(){return '<div class="center" role="status"><div class="spin" aria-hidden="true"></div><span>Loading…</span></div>';}
+function errorState(error,retry){
+  const message=error&&error.message?error.message:String(error||"Unknown error");
+  return `<div class="state-card" role="alert"><div class="state-icon" aria-hidden="true">⚠️</div>
+    <h2>Couldn’t load this page</h2><p>${esc(message)}</p>
+    <button class="btn" onclick="${retry||'render()'}">Try again</button></div>`;
+}
+function emptyState(icon,title,detail,actions){
+  return `<div class="state-card"><div class="state-icon" aria-hidden="true">${icon||"—"}</div>
+    <h2>${esc(title)}</h2>${detail?`<p>${esc(detail)}</p>`:""}${actions||""}</div>`;
+}
+function pageHead(title,subtitle,actions){
+  return `<div class="page-head"><div><h1>${esc(title)}</h1>
+    ${subtitle?`<div class="page-sub">${esc(subtitle)}</div>`:""}</div>${actions||""}</div>`;
+}
 
 /* ---- routing ------------------------------------------------------------
    Every view has a real URL: /overview, /members, /members/<id>. Back then
@@ -2854,6 +2979,7 @@ function spinner(){return '<div class="center"><div class="spin"></div></div>';}
    The guild rides along as ?guild=<id> so a shared link resolves to the same
    server rather than whichever one happens to sort first. */
 const TAB_SLUGS=TABS.map(([t])=>t);
+function tabLabel(t){return t?t[0].toUpperCase()+t.slice(1):"Dashboard";}
 
 function tabPath(t,uid){
   const base=(t==="members"&&uid)?`/members/${encodeURIComponent(uid)}`:`/${t}`;
@@ -2881,6 +3007,7 @@ function parsePath(){
 }
 function applyRoute(t,uid){
   tab=t;dataUserFilter=null;SEARCH="";currentMember=uid||null;
+  document.title=`${uid?"Member":tabLabel(t)} · Gym Dashboard`;
   // memberView() bypasses render(), which is what normally stops the previous
   // tab's auto-refresh. Without this, going Back from Settings into a member
   // view leaves pollWorker hitting /api/worker every 15s for the life of the
@@ -2910,15 +3037,25 @@ window.addEventListener("popstate",async()=>{
   finally{inPop=false;}
 });
 
-function renderNav(){document.getElementById("nav").innerHTML=
-  TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}" href="${tabPath(t)}" onclick="return navClick(event,'${t}')">${ic} ${t[0].toUpperCase()+t.slice(1)}</a>`).join("");}
+function renderNav(){
+  const nav=document.getElementById("nav");
+  nav.innerHTML=TABS.map(([t,ic])=>`<a class="${t===tab?'active':''}"
+    ${t===tab?'aria-current="page"':''} href="${tabPath(t)}"
+    onclick="return navClick(event,'${t}')"><span aria-hidden="true">${ic}</span>
+    <span>${tabLabel(t)}</span></a>`).join("");
+  const active=nav.querySelector("a.active");
+  if(active)requestAnimationFrame(()=>active.scrollIntoView({block:"nearest",inline:"nearest"}));
+}
 function navClick(e,t){
   // Real hrefs, so middle-click and ctrl-click open a new tab natively. Only
   // plain left-clicks are intercepted for client-side navigation.
   if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0)return true;
   e.preventDefault();go(t);return false;
 }
-function go(t){pushPath(t);applyRoute(t,null);}
+function go(t){
+  pushPath(t);applyRoute(t,null);
+  requestAnimationFrame(()=>document.getElementById("view").focus({preventScroll:true}));
+}
 async function onGuild(){guild=document.getElementById("guild").value;
   // A member id is scoped to one server, so it cannot survive a server switch —
   // keeping it would leave the address bar pointing at a member page while the
@@ -2956,6 +3093,7 @@ async function boot(){
   guild=(route.guild&&ids.includes(route.guild))?route.guild:String(g.guilds[0].id);
   sel.value=guild;
   tab=route.tab||"overview";
+  document.title=`${route.uid?"Member":tabLabel(tab)} · Gym Dashboard`;
   currentMember=route.uid||null;
   renderNav();
   await loadAvatars();await loadRoles();
@@ -2965,13 +3103,25 @@ async function boot(){
   if(currentMember)return memberView(currentMember);
   render();
 }
-async function resync(){if(!guild)return;toast("Syncing…");
-  const r=await post("/api/resync",{guild});await loadAvatars();
-  toast(r&&r.ok?"Synced ✓":"Sync unavailable");render();}
+async function resync(){
+  if(!guild)return;
+  const btn=document.getElementById("syncBtn");
+  if(btn&&btn.disabled)return;
+  if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");}
+  toast("Syncing…");
+  try{
+    const r=await post("/api/resync",{guild});
+    if(r&&r.ok){await loadAvatars();toast("Synced ✓");render();}
+    else toast((r&&r.error)||"Sync unavailable","error");
+  }finally{
+    if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");}
+  }
+}
 
 async function render(){
   const v=document.getElementById("view");
   clearLive();  // stop any prior tab's auto-refresh before drawing the new one
+  v.setAttribute("aria-busy","true");
   // Settings are global, so they must be reachable before any guild exists —
   // this check has to come BEFORE the "Pick a guild" bail-out below. It needs
   // its own try/catch too: it sits outside the one below, so an error here
@@ -2980,22 +3130,27 @@ async function render(){
   if(tab==="settings"){
     v.innerHTML=spinner();
     try{return await renderSettings(v);}
-    catch(e){v.innerHTML='<div class="empty">Settings unavailable: '+esc(e.message)+'</div>';return;}
+    catch(e){v.innerHTML=errorState(e);return;}
+    finally{v.removeAttribute("aria-busy");}
   }
-  if(!guild){v.innerHTML='<div class="empty">Pick a guild.</div>';return;}
+  if(!guild){
+    v.innerHTML='<div class="state-card"><h2>Pick a server</h2><p>Select a Discord server above to continue.</p></div>';
+    v.removeAttribute("aria-busy");return;
+  }
   v.innerHTML=spinner();
   try{
-    if(tab==="overview")return renderOverview(v);
-    if(tab==="members")return renderMembers(v);
-    if(tab==="activity")return renderActivity(v);
-    if(tab==="sleep")return renderSleep(v);
-    if(tab==="messages")return renderMessages(v);
-    if(tab==="voice")return renderVoice(v);
-    if(tab==="roles")return renderRoles(v);
-    if(tab==="leaderboard")return renderLeaderboard(v);
-    if(tab==="audit")return renderAudit(v);
-    if(["lifts","calories","protein"].includes(tab))return renderData(v,tab);
-  }catch(e){v.innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+    if(tab==="overview")await renderOverview(v);
+    else if(tab==="members")await renderMembers(v);
+    else if(tab==="activity")await renderActivity(v);
+    else if(tab==="sleep")await renderSleep(v);
+    else if(tab==="messages")await renderMessages(v);
+    else if(tab==="voice")await renderVoice(v);
+    else if(tab==="roles")await renderRoles(v);
+    else if(tab==="leaderboard")await renderLeaderboard(v);
+    else if(tab==="audit")await renderAudit(v);
+    else if(["lifts","calories","protein"].includes(tab))await renderData(v,tab);
+  }catch(e){v.innerHTML=errorState(e);}
+  finally{v.removeAttribute("aria-busy");}
 }
 /* ---- settings ---------------------------------------------------------- */
 let SETTINGS=null;
@@ -3005,7 +3160,8 @@ const WDOT={running:"ok",starting:"warn",restarting:"warn",
 async function renderSettings(v){
   const d=await api("/api/settings");if(!d)return;
   SETTINGS=d;
-  v.innerHTML=workerCard(d.worker)+cryptoCard(d.crypto)+pendingCard(d)
+  v.innerHTML=pageHead("Settings","Bot configuration, service health and dashboard security")
+    +workerCard(d.worker)+cryptoCard(d.crypto)+pendingCard(d)
     +d.groups.map(groupBox).join("")+accountBox()+historyBox(d.history);
   // Keep the bot-status card honest without hammering the API.
   setLive(pollWorker);
@@ -3207,7 +3363,7 @@ async function renderOverview(v){
   const topToday=(L.top_today||[]).length?`<div class="ov-games">${L.top_today.map(g=>`<span class="ov-game">
       ${gameTile(g.name,g.image,18,"ovgi")}${esc(g.name)}</span>`).join("")}</div>`
     :'<span class="faint">nobody playing today</span>';
-  v.innerHTML=`<div class="cards">
+  v.innerHTML=`${pageHead("Overview","Live server health, tracking and recent changes")}<div class="cards">
     ${stat(d.member_count,"Members")}${stat(d.role_count,"Roles")}
     ${stat(t.total_lifts||0,"Lifts")}${stat(t.lifters||0,"Lifters")}
     ${stat(t.unique_equip||0,"Exercises")}</div>
@@ -3224,7 +3380,13 @@ async function renderOverview(v){
 
 async function renderMembers(v){
   const d=await api(`/api/members?guild=${guild}`);if(!d)return;
-  if(!d.members.length){v.innerHTML='<div class="empty">No members synced yet. Hit ↻ Sync.</div>';return;}
+  if(!d.members.length){
+    v.innerHTML=pageHead("Members","People mirrored from this Discord server")
+      +emptyState("👥","No members synced yet",
+        "Synchronize with Discord to populate members and roles.",
+        '<button class="btn" onclick="resync()">↻ Sync now</button>');
+    return;
+  }
   v.innerHTML=`<div class="filters"><h2 style="margin:0">Members
       <span class="faint">· ${d.members.length}</span></h2><span class="sp" style="flex:1"></span>
       <button class="btn" onclick="inviteDialog()">➕ Invite by ID</button>
@@ -3244,7 +3406,12 @@ async function memberView(uid){
   // (rename, role change, timeout removal) doesn't stack history entries.
   pushPath("members",uid);
   const v=document.getElementById("view");v.innerHTML=spinner();
-  const d=await api(`/api/member?guild=${guild}&user=${uid}`);if(!d)return;
+  v.setAttribute("aria-busy","true");
+  let d;
+  try{d=await api(`/api/member?guild=${guild}&user=${uid}`);}
+  catch(e){v.innerHTML=errorState(e,`memberView('${uid}')`);return;}
+  finally{v.removeAttribute("aria-busy");}
+  if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
   const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[],
     bodyMetrics=d.body_metrics||[];
@@ -3468,7 +3635,12 @@ async function sendInvite(){
 async function renderLeaderboard(v){
   const eq=await api(`/api/equipment?guild=${guild}`);if(!eq)return;
   const list=eq.equipment||[];
-  if(!list.length){v.innerHTML='<div class="empty">No lifts logged yet.</div>';return;}
+  if(!list.length){
+    v.innerHTML=pageHead("Leaderboard","Best recorded lift for each exercise")
+      +emptyState("🏆","No leaderboard yet",
+        "Logged lifts will appear here once members start training.");
+    return;
+  }
   if(!lbEquip||!list.includes(lbEquip))lbEquip=list[0];
   const d=await api(`/api/leaderboard?guild=${guild}&equipment=${encodeURIComponent(lbEquip)}`);if(!d)return;
   const medal=["🥇","🥈","🥉"];
@@ -3490,7 +3662,13 @@ function go2(t,uid){
 
 async function renderRoles(v){
   const d=await api(`/api/roles?guild=${guild}`);if(!d)return;
-  if(!d.roles.length){v.innerHTML='<div class="empty">No roles synced yet. Hit ↻ Sync.</div>';return;}
+  if(!d.roles.length){
+    v.innerHTML=pageHead("Roles","Discord roles and their current membership")
+      +emptyState("🛡️","No roles synced yet",
+        "Synchronize with Discord to populate the role directory.",
+        '<button class="btn" onclick="resync()">↻ Sync now</button>');
+    return;
+  }
   v.innerHTML=`<h2>Roles <span class="faint">· ${d.roles.length}</span></h2>
     <div class="tcard"><table><thead><tr><th>Role</th><th>Members</th><th>Position</th></tr></thead>
     <tbody>${d.roles.map(r=>`<tr>
@@ -3515,7 +3693,8 @@ async function renderAudit(v){auditOffset=0;auditRows=[];await loadAuditPage(v);
 async function loadAuditPage(v){
   const d=await api(`/api/audit?guild=${guild}&limit=100&offset=${auditOffset}${auditCat?'&category='+auditCat:''}`);if(!d)return;
   auditRows=auditRows.concat(d.audit);auditOffset+=d.audit.length;
-  v.innerHTML=`<div class="filters"><div class="seg">${["","role","member","data"].map(c=>
+  v.innerHTML=`${pageHead("Audit log","Who changed what across Discord and tracked data")}
+    <div class="filters"><div class="seg" aria-label="Audit category">${["","role","member","data"].map(c=>
       `<button class="${c===auditCat?'on':''}" onclick="auditCat='${c}';render()">${c||"all"}</button>`).join("")}</div>
       <span class="sp" style="flex:1"></span>${searchBar("Search audit…")}
       <span class="faint">${auditRows.length} / ${d.total}</span></div>${auditTable(auditRows)}
@@ -3608,9 +3787,12 @@ function daySeg(){return `<span class="dayseg">`+
 
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;
-  if(!(d.users||[]).length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
-    <span class="faint">Open a member and hit <b>Start tracking</b>, or use <code>/track start</code>.
-    Needs <code>ENABLE_PRESENCE_TRACKING=true</code> + the Presence intent.</span></div>`;return;}
+  if(!(d.users||[]).length){
+    v.innerHTML=pageHead("Activity","Live Discord presence and game history")
+      +emptyState("🎮","No tracked members yet",
+        "Open a member and choose Start tracking, or use /track start in Discord.");
+    return;
+  }
   v.innerHTML=`<div class="filters"><h2 style="margin:0">🎮 Activity
       <span class="faint" id="actCount"></span></h2>
       <span class="live-dot" title="Live — refreshes automatically"></span>
@@ -3819,9 +4001,12 @@ function sleepBar(s){
 async function renderSleep(v){
   const d=await api(`/api/sleep?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;
   const users=d.users||[];
-  if(!users.length){v.innerHTML=`<div class="empty">No tracked users yet.<br>
-    <span class="faint">Sleep is estimated from recorded online/offline presence —
-    open a member and hit <b>Start tracking</b> or use <code>/track start</code>.</span></div>`;return;}
+  if(!users.length){
+    v.innerHTML=pageHead("Sleep","Overnight offline periods estimated from presence")
+      +emptyState("💤","No sleep estimates yet",
+        "Start presence tracking from a member page or with /track start in Discord.");
+    return;
+  }
   // Most data first: nights tracked, then name.
   users.sort((a,b)=>(b.nights-a.nights)||a.display_name.localeCompare(b.display_name));
   v.innerHTML=`<div class="filters"><h2 style="margin:0">💤 Sleep
@@ -3943,7 +4128,9 @@ async function openChan(cid){
     b.classList.toggle("active",on);if(on)name=b.dataset.cn||"";});
   const head=document.getElementById("dcHead");if(head)head.innerHTML=`<span class="dc-hash">#</span>${esc(name)}`;
   const chat=document.getElementById("dcChat");if(chat)chat.innerHTML=spinner();
-  const d=await api(`/api/messages/log?guild=${guild}&channel=${cid}`);
+  let d;
+  try{d=await api(`/api/messages/log?guild=${guild}&channel=${cid}`);}
+  catch(e){if(chat)chat.innerHTML=errorState(e,`openChan('${cid}')`);return;}
   if(!d||!chat)return;
   chat.innerHTML=renderChat(d.messages);chat.scrollTop=chat.scrollHeight;
 }
@@ -3951,12 +4138,15 @@ async function renderMessages(v){
   const d=await api(`/api/messages/channels?guild=${guild}`);if(!d)return;
   const chans=d.channels||[];BLACKLIST=d.blacklist||[];
   MSG_CHANS={};chans.forEach(c=>{MSG_CHANS[c.channel_id]=c.channel_name;});
-  if(!chans.length){v.innerHTML=`<div class="empty">No messages logged yet.<br>
-    <span class="faint">Messages are logged for every member once they chat
-    (<code>ENABLE_MESSAGE_LOGGING</code>, on by default); the bot also back-scans recent history on startup.</span>
-    <div style="margin-top:1rem">${blButton()}</div></div>`;return;}
+  if(!chans.length){
+    v.innerHTML=pageHead("Messages","Logged Discord history by channel")
+      +emptyState("💬","No messages logged yet",
+        "Messages appear after someone chats; recent history is also scanned when the bot starts.",
+        blButton());
+    return;
+  }
   const sel=chans.find(c=>c.channel_id===msgChannel)||chans[0];msgChannel=sel.channel_id;
-  v.innerHTML=`<div class="dc">
+  v.innerHTML=`${pageHead("Messages","Logged Discord history by channel")}<div class="dc">
     <div class="dc-side">
       <div class="dc-side-h"><span>Channels</span>${blButton()}</div>
       <div class="dc-chans">${chans.map(c=>`<button class="dc-chan${c.channel_id===msgChannel?' active':''}"
@@ -4060,7 +4250,20 @@ function voiceBodyHTML(d){
     <div class="vc-log">${logHtml}</div>`;
 }
 
-boot();
+// "/" jumps to the current page's search box, matching the convention used by
+// Discord and many admin tools. Never steal the key while someone is typing.
+window.addEventListener("keydown",event=>{
+  if(event.key!=="/"||event.ctrlKey||event.metaKey||event.altKey)return;
+  const tag=(document.activeElement&&document.activeElement.tagName)||"";
+  if(["INPUT","TEXTAREA","SELECT"].includes(tag))return;
+  const search=document.querySelector("#view .search");
+  if(search){event.preventDefault();search.focus();search.select();}
+});
+
+boot().catch(error=>{
+  const view=document.getElementById("view");
+  if(view)view.innerHTML=errorState(error,"location.reload()");
+});
 </script></body></html>"""
 
 
