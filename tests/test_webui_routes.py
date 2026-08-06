@@ -10,12 +10,19 @@ an action isn't wired up.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import sqlite3
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 
 from aiohttp.test_utils import TestClient, TestServer
 
 from app.db import Database
-from app.webui import build_app
+from app.webui import (
+    REMEMBER_SESSION_TTL_SECONDS,
+    SESSION_COOKIE,
+    build_app,
+)
 
 
 def _run(coro):
@@ -31,6 +38,12 @@ async def _client(app):
     client = TestClient(TestServer(app))
     await client.start_server()
     return client
+
+
+def _session_token(response) -> str:
+    cookies = SimpleCookie()
+    cookies.load(response.headers["Set-Cookie"])
+    return cookies[SESSION_COOKIE].value
 
 
 def test_login_locks_out_after_repeated_failures(tmp_path):
@@ -63,6 +76,115 @@ def test_responses_carry_security_headers(tmp_path):
             r = await client.get("/login")
             assert r.headers.get("X-Frame-Options") == "DENY"
             assert r.headers.get("X-Content-Type-Options") == "nosniff"
+            assert r.headers.get("Cache-Control") == "no-store"
+            assert "Keep me signed in for 30 days" in await r.text()
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_remembered_login_survives_restart_and_logout_revokes_it(tmp_path):
+    async def go():
+        path = tmp_path / "remember.sqlite3"
+        db = Database(path)
+        client = await _client(build_app(db=db, password="secret"))
+        try:
+            r = await client.post(
+                "/login",
+                data={"password": "secret", "remember": "1"},
+                allow_redirects=False,
+            )
+            assert r.status == 302
+            assert f"Max-Age={REMEMBER_SESSION_TTL_SECONDS}" in r.headers["Set-Cookie"]
+            assert "HttpOnly" in r.headers["Set-Cookie"]
+            assert "SameSite=Lax" in r.headers["Set-Cookie"]
+            token = _session_token(r)
+        finally:
+            await client.close()
+            db.close()
+
+        # A database copy cannot be turned directly into a login: it contains
+        # only the digest, while the browser owns the random bearer token.
+        with sqlite3.connect(path) as conn:
+            row = conn.execute(
+                "SELECT token_hash FROM web_sessions",
+            ).fetchone()
+        assert row == (hashlib.sha256(token.encode()).hexdigest(),)
+        assert token not in row
+
+        # Rebuilding both Database and aiohttp app simulates a full
+        # supervisor/container restart, not merely a Discord-worker restart.
+        db = Database(path)
+        client = await _client(build_app(db=db, password="secret"))
+        cookie = {"Cookie": f"{SESSION_COOKIE}={token}"}
+        try:
+            assert (await client.get("/api/guilds", headers=cookie)).status == 200
+            r = await client.post(
+                "/logout", headers=cookie, allow_redirects=False,
+            )
+            assert r.status == 302
+        finally:
+            await client.close()
+            db.close()
+
+        db = Database(path)
+        client = await _client(build_app(db=db, password="secret"))
+        try:
+            assert (await client.get("/api/guilds", headers=cookie)).status == 401
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_ordinary_login_is_not_persisted_across_restart(tmp_path):
+    async def go():
+        path = tmp_path / "ordinary.sqlite3"
+        db = Database(path)
+        client = await _client(build_app(db=db, password="secret"))
+        try:
+            r = await client.post(
+                "/login", data={"password": "secret"}, allow_redirects=False,
+            )
+            assert r.status == 302
+            assert "Max-Age" not in r.headers["Set-Cookie"]
+            token = _session_token(r)
+        finally:
+            await client.close()
+            db.close()
+
+        db = Database(path)
+        client = await _client(build_app(db=db, password="secret"))
+        try:
+            r = await client.get(
+                "/api/guilds",
+                headers={"Cookie": f"{SESSION_COOKIE}={token}"},
+            )
+            assert r.status == 401
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
+def test_expired_remembered_login_is_pruned(tmp_path):
+    async def go():
+        path = tmp_path / "expired.sqlite3"
+        token = "expired-browser-token"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        db = Database(path)
+        db.web_session_add(
+            digest, datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        client = await _client(build_app(db=db, password="secret"))
+        try:
+            r = await client.get(
+                "/api/guilds",
+                headers={"Cookie": f"{SESSION_COOKIE}={token}"},
+            )
+            assert r.status == 401
+            assert not db.web_session_valid(digest)
         finally:
             await client.close()
             db.close()

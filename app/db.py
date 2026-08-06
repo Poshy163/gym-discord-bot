@@ -812,6 +812,19 @@ CREATE TABLE IF NOT EXISTS app_settings_history (
 
 CREATE INDEX IF NOT EXISTS idx_app_settings_history_rev
     ON app_settings_history (rev DESC, id DESC);
+
+-- Optional long-lived dashboard logins. The browser owns the random bearer
+-- token; SQLite stores only its SHA-256 digest so a database read cannot be
+-- turned directly into a valid login cookie. Rows are global because the
+-- dashboard itself has one shared operator account, not per-guild accounts.
+CREATE TABLE IF NOT EXISTS web_sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_sessions_expiry
+    ON web_sessions (expires_at);
 """
 
 
@@ -6435,6 +6448,64 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    # ---- remembered web-dashboard sessions -----------------------------
+
+    def web_session_add(
+        self, token_hash: str, expires_at: datetime,
+    ) -> None:
+        """Persist a remembered dashboard token digest and absolute expiry."""
+        now = _normalize_iso(None)
+        expiry = _normalize_iso(expires_at)
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO web_sessions "
+                "(token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                (str(token_hash), now, expiry),
+            )
+            c.execute(
+                "DELETE FROM web_sessions WHERE expires_at <= ?", (now,),
+            )
+
+    def web_session_valid(
+        self, token_hash: str, *, now: datetime | None = None,
+    ) -> bool:
+        """Whether a remembered token digest exists and has not expired."""
+        now_iso = _normalize_iso(now)
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM web_sessions WHERE expires_at <= ?", (now_iso,),
+            )
+            row = c.execute(
+                "SELECT 1 FROM web_sessions "
+                "WHERE token_hash = ? AND expires_at > ?",
+                (str(token_hash), now_iso),
+            ).fetchone()
+            return row is not None
+
+    def web_session_remove(self, token_hash: str) -> bool:
+        """Revoke one remembered token digest."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM web_sessions WHERE token_hash = ?",
+                (str(token_hash),),
+            )
+            return bool(cur.rowcount)
+
+    def web_sessions_clear(self) -> int:
+        """Revoke every remembered login, used during password rotation."""
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM web_sessions")
+            return int(cur.rowcount or 0)
+
+    def web_sessions_prune(self, *, now: datetime | None = None) -> int:
+        """Remove expired remembered logins and return the number deleted."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM web_sessions WHERE expires_at <= ?",
+                (_normalize_iso(now),),
+            )
+            return int(cur.rowcount or 0)
 
     # ---- operator settings ----------------------------------------------
     #

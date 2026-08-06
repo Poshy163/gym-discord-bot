@@ -82,7 +82,9 @@ depend on the bot being configured. There is nothing to set up in advance.
    host 8099 to the container's 8081).
 
 2. **Set a password.** The first visit shows a setup page; choose a password of
-   at least 12 characters. From then on it's the normal login page.
+   at least 12 characters. From then on it's the normal login page. Select
+   **Keep me signed in for 30 days** only on a trusted device if you want the
+   login to survive browser, supervisor, container, or host restarts.
 
    > **The claim window is open until you do this.** Anyone who can reach the
    > port can set that password and take control of the bot. Keep it on a LAN or
@@ -123,8 +125,13 @@ Lost it? `docker compose exec gym-bot python -m app.supervisor reset-password`.
 - The login form is rate limited: five wrong passwords from one IP triggers a
   15-minute lockout. Note the client IP is taken from `X-Forwarded-For`, so the
   limit is only as trustworthy as your proxy.
-- Sessions live in memory, so a restart of the *supervisor* logs everyone out.
-  A bot restart does not.
+- An ordinary login uses a browser-session cookie and an in-memory server
+  session (with a seven-day maximum). It survives a Discord bot-worker restart,
+  but closing the browser or restarting the supervisor/container signs it out.
+- **Keep me signed in for 30 days** creates a fixed-expiry remembered session
+  that survives supervisor/container restarts. SQLite stores only a SHA-256
+  digest of its random token, never the reusable browser token. Logging out or
+  changing the dashboard password revokes it immediately.
 
 ## How the data stays in sync
 

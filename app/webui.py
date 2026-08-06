@@ -12,8 +12,9 @@ mirrored into SQLite by ``bot.py`` so the dashboard keeps working even while the
 gateway is reconnecting.
 
 Auth is a single shared password (``WEBUI_PASSWORD``). On success we mint an
-opaque session token held in-process and set it as an HttpOnly cookie; sessions
-evaporate on restart, which is fine for an operator tool. There is no per-user
+opaque session token and set it as an HttpOnly cookie. Normal sessions remain
+in-process; an explicitly remembered login stores only the token's SHA-256
+digest in SQLite so it can survive supervisor restarts. There is no per-user
 identity — dashboard edits are audited under the label ``web:<ip>``.
 
 Routes
@@ -41,6 +42,7 @@ GET  /healthz          Liveness probe (no auth).
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
@@ -52,9 +54,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
-from yarl import URL  # already a hard dependency of aiohttp
-
 from aiohttp import web
+from yarl import URL  # already a hard dependency of aiohttp
 
 from . import game_icons, ha_client, presence, targets
 from .voicetime import summarize_voice
@@ -63,6 +64,7 @@ LOG = logging.getLogger("gymbot.webui")
 
 SESSION_COOKIE = "gymdash_session"
 SESSION_TTL_SECONDS = 7 * 24 * 3600  # a week
+REMEMBER_SESSION_TTL_SECONDS = 30 * 24 * 3600
 
 # Typo guards on the nutrition-target form, mirroring the bot's slash commands
 # (app.bot._MAX_TARGET_KCAL / _MAX_PROTEIN_TARGET_G).
@@ -185,7 +187,9 @@ async def _json_body(request: "web.Request") -> dict:
     return body
 
 
-def _set_session_cookie(request: "web.Request", resp, token: str) -> None:
+def _set_session_cookie(
+    request: "web.Request", resp, token: str, *, remember: bool = False,
+) -> None:
     """Set the session cookie, adding Secure only when the request arrived
     over HTTPS.
 
@@ -200,39 +204,54 @@ def _set_session_cookie(request: "web.Request", resp, token: str) -> None:
     )
     resp.set_cookie(
         SESSION_COOKIE, token, httponly=True, samesite="Lax",
-        max_age=SESSION_TTL_SECONDS, secure=https,
+        max_age=REMEMBER_SESSION_TTL_SECONDS if remember else None,
+        secure=https, path="/",
     )
 
 
 class _Sessions:
-    """Tiny in-process session store: token -> expiry epoch."""
+    """Short in-memory sessions plus hashed 30-day remembered sessions."""
 
-    def __init__(self) -> None:
+    def __init__(self, db) -> None:
+        self._db = db
         self._store: dict[str, float] = {}
+        self._db.web_sessions_prune()
 
-    def create(self) -> str:
+    @staticmethod
+    def _digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def create(self, *, remember: bool = False) -> str:
         token = secrets.token_urlsafe(32)
-        self._store[token] = time.time() + SESSION_TTL_SECONDS
+        if remember:
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=REMEMBER_SESSION_TTL_SECONDS,
+            )
+            self._db.web_session_add(self._digest(token), expires_at)
+        else:
+            self._store[token] = time.time() + SESSION_TTL_SECONDS
         return token
 
     def valid(self, token: str | None) -> bool:
         if not token:
             return False
         exp = self._store.get(token)
-        if exp is None:
-            return False
-        if exp < time.time():
+        if exp is not None and exp < time.time():
             self._store.pop(token, None)
-            return False
-        return True
+            exp = None
+        if exp is not None:
+            return True
+        return self._db.web_session_valid(self._digest(token))
 
     def drop(self, token: str | None) -> None:
         if token:
             self._store.pop(token, None)
+            self._db.web_session_remove(self._digest(token))
 
     def clear(self) -> None:
         """Invalidate every live session (used when the password is rotated)."""
         self._store.clear()
+        self._db.web_sessions_clear()
 
 
 # Login brute-force guard: after this many wrong passwords from one IP within
@@ -328,7 +347,7 @@ def build_app(
     (defaults to UTC); pass the bot's display timezone so wake-up dates match
     the operator's local sense of time.
     """
-    sessions = _Sessions()
+    sessions = _Sessions(db)
     login_throttle = _LoginThrottle()
 
     def _today() -> tuple[str, str]:
@@ -432,6 +451,9 @@ def build_app(
         data = await request.post()
         password = str(data.get("password", ""))
         confirm = str(data.get("password2", ""))
+        remember = str(data.get("remember", "")).lower() in {
+            "1", "true", "on", "yes",
+        }
 
         error = None
         if password != confirm:
@@ -456,9 +478,9 @@ def build_app(
         except Exception:  # noqa: BLE001 - never block setup on the audit write
             LOG.warning("Could not audit the dashboard claim", exc_info=True)
 
-        token = sessions.create()
+        token = sessions.create(remember=remember)
         resp = web.HTTPFound("/")
-        _set_session_cookie(request, resp, token)
+        _set_session_cookie(request, resp, token, remember=remember)
         LOG.warning("Dashboard claimed from %s.", ip)
         return resp
 
@@ -478,6 +500,9 @@ def build_app(
             )
         data = await request.post()
         supplied = str(data.get("password", ""))
+        remember = str(data.get("remember", "")).lower() in {
+            "1", "true", "on", "yes",
+        }
         # Constant-time compare so the form can't be used as a timing oracle.
         # ``auth`` (when injected) checks the stored PBKDF2 hash and the legacy
         # environment pin; without it we fall back to the static comparison the
@@ -488,9 +513,9 @@ def build_app(
             ok = bool(password) and hmac.compare_digest(supplied, password)
         if ok:
             login_throttle.record_success(ip)
-            token = sessions.create()
+            token = sessions.create(remember=remember)
             resp = web.HTTPFound(_safe_next(request.query.get("next")))
-            _set_session_cookie(request, resp, token)
+            _set_session_cookie(request, resp, token, remember=remember)
             LOG.info("Dashboard login from %s", _actor(request))
             return resp
         login_throttle.record_failure(ip)
@@ -503,7 +528,7 @@ def build_app(
     async def logout_post(request: web.Request) -> web.Response:
         sessions.drop(request.cookies.get(SESSION_COOKIE))
         resp = web.HTTPFound("/login")
-        resp.del_cookie(SESSION_COOKIE)
+        resp.del_cookie(SESSION_COOKIE, path="/")
         return resp
 
     async def index(request: web.Request) -> web.Response:
@@ -629,8 +654,8 @@ def build_app(
         if error:
             return web.json_response({"ok": False, "error": error}, status=400)
         # Rotating the password must invalidate existing cookies — otherwise a
-        # 7-day session minted with the OLD password keeps working, which is
-        # exactly what you are trying to stop when you rotate it.
+        # remembered session minted with the OLD password keeps working, which
+        # is exactly what you are trying to stop when you rotate it.
         sessions.clear()
         LOG.warning("Dashboard password changed by %s.", _actor(request))
         return web.json_response({"ok": True})
@@ -1871,6 +1896,8 @@ def build_app(
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("Referrer-Policy", "same-origin")
+        if request.path != "/logo.svg" and not request.path.startswith("/media/"):
+            resp.headers.setdefault("Cache-Control", "no-store")
         return resp
 
     @web.middleware
@@ -2140,6 +2167,10 @@ label{font-size:.78rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05
 input{width:100%;padding:.7rem .8rem;margin:.4rem 0 1.1rem;font-size:1rem;
 background:#0d1117;border:1px solid #30363d;border-radius:10px;color:#e6edf3}
 input:focus{outline:none;border-color:#6366f1;box-shadow:0 0 0 3px #6366f133}
+.remember{display:flex;align-items:flex-start;gap:.65rem;margin:-.15rem 0 1.1rem;
+font-size:.82rem;line-height:1.3;color:#c9d1d9;text-transform:none;letter-spacing:0}
+.remember input{width:auto;margin:.05rem 0 0;accent-color:#818cf8;flex:0 0 auto}
+.remember small{display:block;margin-top:.15rem;color:#6e7681;font-size:.72rem}
 button{width:100%;padding:.75rem;border:0;border-radius:10px;font-size:1rem;
 font-weight:600;cursor:pointer;color:#fff;
 background:linear-gradient(90deg,#6366f1,#22d3ee)}
@@ -2152,6 +2183,8 @@ button:focus-visible,input:focus-visible{outline:2px solid #67e8f9;outline-offse
 <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
 <label for="password">Password</label>
 <input id="password" type="password" name="password" autofocus autocomplete="current-password" required>
+<label class="remember"><input type="checkbox" name="remember" value="1">
+<span>Keep me signed in for 30 days<small>Use only on a trusted device</small></span></label>
 <!--ERR-->
 <button type="submit">Sign in</button>
 <p class="sub">Operator access only</p>
@@ -2168,6 +2201,8 @@ SETUP_HTML = LOGIN_HTML.replace(
 <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
 <label for="password">Password</label>
 <input id="password" type="password" name="password" autofocus autocomplete="current-password" required>
+<label class="remember"><input type="checkbox" name="remember" value="1">
+<span>Keep me signed in for 30 days<small>Use only on a trusted device</small></span></label>
 <!--ERR-->
 <button type="submit">Sign in</button>
 <p class="sub">Operator access only</p>
@@ -2183,6 +2218,8 @@ in.</p>
 <label for="password2">Confirm password</label>
 <input id="password2" type="password" name="password2" autocomplete="new-password"
  minlength="12" required>
+<label class="remember"><input type="checkbox" name="remember" value="1">
+<span>Keep me signed in for 30 days<small>Use only on a trusted device</small></span></label>
 <!--ERR-->
 <button type="submit">Set password</button>
 <p class="sub">At least 12 characters. Until this is set, anyone who can reach

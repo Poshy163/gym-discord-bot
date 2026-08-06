@@ -7,6 +7,8 @@ aiohttp's built-in test client.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from http.cookies import SimpleCookie
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -14,7 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from app.db import Database
 from app.secretbox import SecretBox
 from app.settings_service import DbAuth, SettingsService
-from app.webui import build_app
+from app.webui import SESSION_COOKIE, build_app
 
 PASSWORD = "correct-horse-battery"
 
@@ -74,7 +76,9 @@ def test_unclaimed_instance_redirects_to_setup(tmp_path):
             assert r.status == 302 and r.headers["Location"] == "/setup"
             r = await client.get("/setup")
             assert r.status == 200
-            assert "Set password" in await r.text()
+            body = await r.text()
+            assert "Set password" in body
+            assert "Keep me signed in for 30 days" in body
         finally:
             await client.close()
             db.close()
@@ -318,9 +322,22 @@ def test_password_change_requires_the_old_one_and_clears_sessions(tmp_path):
     async def go():
         db, _a, _s, client = await _claimed_client(tmp_path)
         try:
+            await client.post("/logout")
+            login = await client.post(
+                "/login",
+                data={"password": PASSWORD, "remember": "1"},
+                allow_redirects=False,
+            )
+            cookies = SimpleCookie()
+            cookies.load(login.headers["Set-Cookie"])
+            token = cookies[SESSION_COOKIE].value
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            assert db.web_session_valid(digest)
+
             r = await client.post("/api/password",
                                   json={"old": "wrong", "new": "a-new-long-password"})
             assert r.status == 400
+            assert db.web_session_valid(digest)
 
             r = await client.post(
                 "/api/password",
@@ -328,8 +345,9 @@ def test_password_change_requires_the_old_one_and_clears_sessions(tmp_path):
             )
             assert r.status == 200
             # The old session must stop working -- otherwise rotating the
-            # password leaves a 7-day cookie minted under the old one alive.
+            # password leaves a remembered cookie minted under the old one alive.
             assert (await client.get("/api/settings")).status == 401
+            assert not db.web_session_valid(digest)
         finally:
             await client.close()
             db.close()
