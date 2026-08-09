@@ -2298,6 +2298,70 @@ def test_today_survives_a_heavy_day_on_both_macros(monkeypatch):
     assert ui.overflows(embed) is None
 
 
+def _entry_rows(embed, icon):
+    """Every table row across one macro's entry fields, in card order."""
+    from app import ui
+
+    rows, collecting = [], False
+    for field in embed.fields:
+        if field.name == f"{icon} Entries":
+            collecting = True
+        elif field.name != ui.BLANK:
+            collecting = False
+        if collecting:
+            rows += [
+                ln for ln in field.value.splitlines()
+                if ln and not ln.startswith(("```", "-#"))
+            ]
+    return rows
+
+
+def test_today_lists_a_long_day_in_full_across_several_fields(monkeypatch):
+    """The reported bug: a day past one field's worth of entries kept the
+    *first* 20 rows and dropped the rest behind a "… N more", so the meals you
+    logged most recently — the ones you opened the card to check — were exactly
+    the ones missing. Long days spill into another field instead."""
+    from app import ui
+
+    cal = [
+        _entry("kcal", 100.0 + i, f"meal {i:02d} with a note")
+        for i in range(34)
+    ]
+    embed = _run_today(
+        monkeypatch, cal_goal=_CAL_GOAL, pro_goal=None, cal=cal,
+    )["embed"]
+
+    rows = _entry_rows(embed, ui.FOOD)
+    assert len(rows) == 34
+    assert "meal 00" in rows[0] and "meal 33" in rows[-1]
+    assert ui.overflows(embed) is None
+    # Continuations carry on under a blank heading rather than repeating one.
+    assert [f.name for f in embed.fields].count(f"{ui.FOOD} Entries") == 1
+
+
+def test_today_drops_the_oldest_entries_when_a_day_runs_past_the_ceiling(
+    monkeypatch,
+):
+    """Something has to give on an absurd day — the embed cap is a 400 at send
+    time, not a truncation. What gives is the *morning*, and the card says so."""
+    import app.bot as bot
+    from app import ui
+
+    n = bot._TODAY_MAX_ROWS + 7
+    cal = [_entry("kcal", 100.0, f"meal {i:02d}") for i in range(n)]
+    embed = _run_today(
+        monkeypatch, cal_goal=_CAL_GOAL, pro_goal=_PRO_GOAL, cal=cal,
+        pro=[_entry("grams", 20.0, f"meal {i:02d}") for i in range(n)],
+    )["embed"]
+
+    rows = _entry_rows(embed, ui.FOOD)
+    assert len(rows) == bot._TODAY_MAX_ROWS
+    assert "meal 07" in rows[0]          # the first seven are the ones gone
+    assert f"meal {n - 1:02d}" in rows[-1]
+    assert "7 earlier entries not shown" in embed.fields[1].value
+    assert ui.overflows(embed) is None
+
+
 # ---- /estimate: one AI entry point for words and photos ----------------------
 #
 # /calories estimate and /calories label used to split this job by input type,

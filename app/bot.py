@@ -23471,13 +23471,32 @@ def _nutrition_not_set_embed(name: str | None = None) -> discord.Embed:
     )
 
 
-def _today_entry_table(entries: Sequence[sqlite3.Row], column: str, fmt) -> str:
-    """The day's entries as one fence so times and amounts line up. The heaviest
-    logger here averages 11 entries a day and peaks at 17, so this list is
-    routinely long enough for alignment to matter.
+#: Widest a column of the entries table is allowed to get. Matches ``ui.table``'s
+#: own per-cell cap, so the widths measured here are the widths it renders.
+_TODAY_COL_CAP = 20
+#: Characters a single entries fence may occupy. Under the 1024-char field limit
+#: with room to spare for the "… earlier" subtext line the first fence can carry.
+_TODAY_FIELD_BUDGET = 960
+#: Ceiling on entry rows shown per macro, across every field. Well past the
+#: heaviest real day (17), and low enough that both macros together stay inside
+#: the 6 000-char embed cap — which is a 400 at send time, not a truncation.
+_TODAY_MAX_ROWS = 40
+
+
+def _today_entry_fences(
+    entries: Sequence[sqlite3.Row], column: str, fmt,
+) -> list[str]:
+    """The day's entries as fences so times and amounts line up — one per field.
 
     One fence per macro, never a merged one: the amounts are in different units,
     so a shared table would need a unit column on every row.
+
+    The heaviest logger here averages 11 entries a day and peaks at 17, so this
+    list is routinely long enough for alignment to matter — and long enough to
+    outgrow one field. A field holds 1024 characters, so a long day spills into
+    another rather than being cut off: a single ``ui.table`` call keeps its
+    *first* rows and drops the rest, which on this card hides the meal you just
+    logged and leaves the list looking like the tracker missed it.
     """
     rows = []
     for r in entries:
@@ -23487,9 +23506,38 @@ def _today_entry_table(entries: Sequence[sqlite3.Row], column: str, fmt) -> str:
         rows.append([
             dt.astimezone(DISPLAY_TZ).strftime("%H:%M"),
             fmt(float(r[column])),
-            _safe_label(r["note"] or "", limit=24) if r["note"] else "",
+            # Truncate to the same width ui.table caps cells at, so an over-long
+            # note keeps the "…" that says it was shortened.
+            _safe_label(r["note"] or "", limit=_TODAY_COL_CAP) if r["note"] else "",
         ])
-    return ui.table(rows, align="<>", max_rows=20)
+    if not rows:
+        return []
+    # Only past the ceiling does anything go, and then it's the *oldest* entries:
+    # "how's my day going" is answered by the part of the day still in play.
+    dropped, rows = max(0, len(rows) - _TODAY_MAX_ROWS), rows[-_TODAY_MAX_ROWS:]
+
+    # Pad against the whole day rather than per fence. ui.table measures each
+    # call on its own, so without this the columns would step sideways where one
+    # field hands over to the next — and the row width couldn't be known here.
+    widths = [
+        min(_TODAY_COL_CAP, max(len(r[i]) for r in rows))
+        for i in range(len(rows[0]))
+    ]
+    for r in rows:
+        for i, w in enumerate(widths):
+            r[i] = r[i][:w].rjust(w) if i == 1 else r[i][:w].ljust(w)
+
+    # 2 chars per gutter, 1 per newline, 8 for the fence itself.
+    row_len = sum(widths) + 2 * (len(widths) - 1) + 1
+    per_field = max(1, (_TODAY_FIELD_BUDGET - 8) // row_len)
+    fences = [
+        ui.table(rows[i:i + per_field], align="<>", max_rows=per_field)
+        for i in range(0, len(rows), per_field)
+    ]
+    if dropped:
+        noun = "entry" if dropped == 1 else "entries"
+        fences[0] = f"-# … {dropped} earlier {noun} not shown\n{fences[0]}"
+    return fences
 
 
 @bot.tree.command(
@@ -23524,7 +23572,7 @@ async def today_cmd(
     # contributes nothing at all — a half-card reading "0 g / 0 g" looks like a
     # broken tracker rather than an optional feature left switched off, and
     # protein being off is the common case.
-    sections: list[tuple[str, str, str, str]] = []
+    sections: list[tuple[str, str, str, list[str]]] = []
     colours: list[discord.Colour] = []
     streaks: list[tuple[str, int]] = []
 
@@ -23539,7 +23587,7 @@ async def today_cmd(
         colours.append(colour)
         sections.append((
             ui.FOOD, "Calories", status,
-            _today_entry_table(entries, "kcal", calories.format_kcal),
+            _today_entry_fences(entries, "kcal", calories.format_kcal),
         ))
         streaks.append(("calorie", _calorie_streak(target_user.id)))
 
@@ -23554,7 +23602,7 @@ async def today_cmd(
         colours.append(colour)
         sections.append((
             ui.PROTEIN, "Protein", status,
-            _today_entry_table(entries, "grams", protein_mod.format_grams),
+            _today_entry_fences(entries, "grams", protein_mod.format_grams),
         ))
         streaks.append(("protein", _protein_streak(target_user.id)))
 
@@ -23575,17 +23623,17 @@ async def today_cmd(
         member=target_user,
         footer=footer or None,
     )
-    for icon, heading, status, entry_table in sections:
+    for icon, heading, status, fences in sections:
         ui.block(embed, f"{icon} {heading}", status)
         # Meter and entries stay in separate fields: together they can pass the
         # 1024-char field limit, and ui.fit would then clip mid-fence and leave
         # an unclosed ``` that eats the rest of the card. The icon repeats on
         # the entries heading because with both macros on, four stacked fields
-        # make "Entries" alone ambiguous about which list it belongs to.
-        ui.block(
-            embed, f"{icon} Entries",
-            entry_table or "Nothing logged yet today.",
-        )
+        # make "Entries" alone ambiguous about which list it belongs to; a day
+        # that spills past one field carries on under a blank heading, which
+        # reads as the same list continuing rather than a second one starting.
+        for i, fence in enumerate(fences or ["Nothing logged yet today."]):
+            ui.block(embed, f"{icon} Entries" if i == 0 else ui.BLANK, fence)
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
