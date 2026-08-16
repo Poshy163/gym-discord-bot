@@ -85,7 +85,8 @@ Goals:
 
 - `/goal_set <equipment> <target_kg> [bodyweight]` — set a personal goal.
 - `/goals [user]` — show active goals with percentage progress bars.
-- `/goal_remove <equipment>` — remove one of your goals.
+- `/goal_remove <equipment>` — remove one of your goals (the picker offers only
+  lifts you've actually set a goal on).
 
 When a logged lift reaches a goal, the bot celebrates with 🎯 in its reply and
 clears the goal automatically.
@@ -121,7 +122,8 @@ optional machine settings:
   workout.
 - `/cardio strava_unlink [activity]` — detach the latest (or specified) Strava
   activity while retaining the completed cardio history. Progression is not
-  rewound.
+  rewound. The `activity` field autocompletes to your linked activities by
+  name and date, so you never have to go and find an ID.
 - `/cardio history [user] [limit]` — recent sessions, duration, and difficulty.
 - `/cardio remove <name>` — remove the saved routine while keeping its completed
   session history.
@@ -237,7 +239,9 @@ Saved foods (personal name → calorie shortcuts):
   protein value and you're protein-tracking, it logs both at once (one ❌ undoes
   both). `/calories add coffee` works too.
 - `/calories food_list` — show your saved foods (with protein where set).
-- `/calories food_remove <name>` — delete one.
+- `/calories food_remove <name>` — delete one; the name field autocompletes to
+  your saved foods with their calories/protein, so you pick instead of recall.
+  Saved meals work the same way in `/calories meal_remove`.
 
 Saved foods are per-user, so your `coffee` and someone else's can be different
 amounts. Chat shortcuts only fire on an exact full-message match of a food
@@ -328,7 +332,9 @@ Logging & editing:
 - **React ❌ on the bot's reply** to undo the specific lifts that reply stored.
   The logger and target lifter can do this; other users' reactions are ignored.
 - `/parse <message_id>` — re-parse a specific message in the current channel.
-- `/delete_entry <equipment> <date>` — remove one day's entries.
+- `/delete_entry <equipment> <date>` — remove one day's entries. `date`
+  autocompletes to the days that actually hold entries for that lift, each
+  labelled with the weight logged, so a typo can't quietly delete nothing.
 - `/change_weight <equipment> <weight_kg> [user] [date]` — change the latest
   matching entry's weight for you or another user.
 - `/swap_weights <first_equipment> <second_equipment> [user] [date]` — swap
@@ -354,7 +360,8 @@ Maintenance (available to everyone):
 - `/alias_add <phrase> <equipment>` — teach the bot a server-specific alias
   (e.g. "hack sled" → "leg press"). Custom aliases apply to both
   slash-command inputs and auto-parsed chat messages.
-- `/alias_remove <phrase>` · `/alias_list`
+- `/alias_remove <phrase>` · `/alias_list` — the remove picker lists this
+  server's aliases as `phrase → lift`, searchable from either side.
 
 Auto-parsing also celebrates PRs: when a stored lift beats your previous best
 for that equipment, the bot's reply tags it with 🎉 and shows the old → new

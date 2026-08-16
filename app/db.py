@@ -2125,6 +2125,28 @@ class Database:
                 (guild_id, user_id, equipment, limit),
             ))
 
+    def recent_entries(
+        self, user_id: int, equipment: str, limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        """Newest-first entries for one user/equipment.
+
+        Feeds the ``/delete_entry`` date picker, which can only offer days that
+        actually hold entries. Scoped per-user and global — the same rows
+        :meth:`delete_entry_between` deletes, so nothing is suggested that the
+        delete wouldn't find.
+        """
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT weight_kg, bodyweight_add AS bw, logged_at
+                FROM lifts
+                WHERE user_id = ? AND equipment = ?
+                ORDER BY logged_at DESC
+                LIMIT ?
+                """,
+                (user_id, equipment, max(1, min(500, int(limit)))),
+            ))
+
     def total_tonnage(
         self,
         guild_id: int,

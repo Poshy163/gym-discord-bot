@@ -10524,10 +10524,108 @@ swap_weights_cmd.autocomplete("second_equipment")(_equipment_autocomplete)
 compare_cmd.autocomplete("equipment")(_equipment_autocomplete)
 aliases_cmd.autocomplete("equipment")(_equipment_autocomplete)
 goal_set_cmd.autocomplete("equipment")(_equipment_autocomplete)
-goal_remove_cmd.autocomplete("equipment")(_equipment_autocomplete)
+# goal_remove gets its own picker below — only the goals you actually have.
 overview_cmd.autocomplete("equipment")(_equipment_autocomplete)
 graph_cmd.autocomplete("equipment")(_equipment_autocomplete)
 alias_add_cmd.autocomplete("equipment")(_equipment_autocomplete)
+
+
+# ---- autocomplete for the removal commands ---------------------------------
+#
+# A command that deletes something should offer the things it can delete. The
+# general equipment picker is the wrong list for those: it suggests every lift
+# the server knows, nearly all of which are dead ends for a *remove*. These
+# narrow it to what the invoker actually has.
+
+
+async def _user_goal_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest only the lifts the invoker has an active goal on.
+
+    /goal_remove shared the general equipment picker, so it offered hundreds of
+    lifts with no goal set — every one of them a no-op removal.
+    """
+    cur = current.lower().strip()
+    out: list[app_commands.Choice[str]] = []
+    for r in db.goal_list(_ctx_guild_id(interaction), interaction.user.id):
+        name = str(r["equipment"])
+        if cur and cur not in name.lower():
+            continue
+        target = _format_weight(float(r["target_kg"] or 0), bool(r["bw"]))
+        out.append(app_commands.Choice(
+            name=f"{name} — goal {target}"[:100], value=name[:100],
+        ))
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def _custom_alias_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest this server's custom aliases, shown with what they map to.
+
+    The stored key is the *normalized* phrase, which is what /alias_remove
+    deletes by — so the value is that key rather than the spelling typed when
+    the alias was added.
+    """
+    cur = normalize_token(current) or current.lower().strip()
+    out: list[app_commands.Choice[str]] = []
+    for r in db.alias_list(_ctx_guild_id(interaction)):
+        phrase = str(r["alias_normalized"])
+        canon = str(r["canonical"])
+        if cur and cur not in phrase.lower() and cur not in canon.lower():
+            continue
+        out.append(app_commands.Choice(
+            name=f"{phrase} → {canon}"[:100], value=phrase[:100],
+        ))
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def _entry_date_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest the days that actually hold entries for the chosen lift.
+
+    /delete_entry takes an exact YYYY-MM-DD, and a date with nothing on it
+    deletes 0 rows and reports it as a success. Reading the sibling options off
+    ``interaction.namespace`` lets the picker list real days — with the weight
+    logged on each, so you can tell two sessions apart before deleting one.
+    """
+    ns = interaction.namespace
+    equipment = getattr(ns, "equipment", None)
+    if not equipment:
+        return []
+    guild_id = _ctx_guild_id(interaction)
+    target = getattr(ns, "user", None) or interaction.user
+    if target.id != interaction.user.id and interaction.user.id not in ADMIN_USER_IDS:
+        return []  # the command refuses this delete, so don't preview its data
+    canon = _resolve(guild_id, str(equipment))
+    if not canon:
+        return []
+    cur = current.strip()
+    seen: dict[str, str] = {}
+    for r in db.recent_entries(int(target.id), canon):
+        day = _format_date(r["logged_at"])
+        if cur and not day.startswith(cur):
+            continue
+        if day in seen:
+            continue  # one choice per day — the delete takes the whole day
+        seen[day] = _format_weight(float(r["weight_kg"]), bool(r["bw"]))
+        if len(seen) >= 25:
+            break
+    return [
+        app_commands.Choice(name=f"{day} — {weight}"[:100], value=day)
+        for day, weight in seen.items()
+    ]
+
+
+goal_remove_cmd.autocomplete("equipment")(_user_goal_autocomplete)
+alias_remove_cmd.autocomplete("phrase")(_custom_alias_autocomplete)
+delete_entry_cmd.autocomplete("date")(_entry_date_autocomplete)
 
 
 # ---------------------------------------------------------------------------
@@ -21294,6 +21392,31 @@ async def _cardio_program_autocomplete(
     ][:25]
 
 
+async def _cardio_linked_activity_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Pick-list of the invoker's Strava-linked cardio sessions.
+
+    ``/cardio strava_unlink`` otherwise wants an activity ID or URL — numbers
+    nobody has to hand — so the value here is the bare ID that
+    :func:`_parse_strava_activity_reference` already accepts.
+    """
+    needle = current.casefold().strip()
+    out: list[app_commands.Choice[str]] = []
+    for row in db.cardio_strava_session_list(interaction.user.id, limit=25):
+        activity_id = str(row["strava_activity_id"] or "")
+        if not activity_id:
+            continue
+        title = str(row["strava_name"] or "Strava activity")
+        label = f"{title} — {_format_date(row['logged_at'])}"
+        if needle and needle not in label.casefold() and needle not in activity_id:
+            continue
+        out.append(app_commands.Choice(name=label[:100], value=activity_id[:100]))
+        if len(out) >= 25:
+            break
+    return out
+
+
 def _cardio_parse_or_error(raw: str) -> tuple[list[cardio.Segment] | None, str | None]:
     try:
         return cardio.parse_program(raw), None
@@ -21535,6 +21658,7 @@ async def cardio_strava_link_cmd(
 @app_commands.describe(
     activity="Optional — blank picks your most recent linked activity; or ID/URL.",
 )
+@app_commands.autocomplete(activity=_cardio_linked_activity_autocomplete)
 async def cardio_strava_unlink_cmd(
     interaction: discord.Interaction,
     activity: str = "latest",
@@ -21712,6 +21836,64 @@ calories_group = app_commands.Group(
     name="calories",
     description="Track daily calorie intake against a personal target.",
 )
+
+
+async def _saved_food_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Pick-list of the invoker's saved foods, labelled with their values.
+
+    Removing a saved food meant remembering exactly what you'd called it — and
+    a near miss just reported "no saved food called that". The calories (and
+    protein, where set) ride along in the label so two similar shortcuts are
+    told apart before one of them is deleted.
+    """
+    needle = calories.normalize_food(current)
+    out: list[app_commands.Choice[str]] = []
+    rows = db.calorie_food_list(_ctx_guild_id(interaction), interaction.user.id)
+    for r in rows:
+        if needle and needle not in str(r["name"]):
+            continue
+        label = f"{r['display']} — {calories.format_kcal(float(r['kcal']))}"
+        protein = r["protein_g"] if "protein_g" in r.keys() else None
+        if protein:
+            label += f" · {protein_mod.format_grams(float(protein))} protein"
+        out.append(app_commands.Choice(
+            name=label[:100], value=str(r["display"])[:100],
+        ))
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def _saved_meal_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Pick-list of the invoker's saved meals, labelled with their size.
+
+    The foods are counted straight off the stored JSON rather than resolved
+    against the food table — autocomplete answers within ~3s and a meal's real
+    calorie total would cost one lookup per item, per meal, per keystroke.
+    """
+    needle = calories.normalize_food(current)
+    out: list[app_commands.Choice[str]] = []
+    for r in db.calorie_meal_list(interaction.user.id):
+        if needle and needle not in str(r["name"]):
+            continue
+        label = str(r["display"])
+        try:
+            n = len(json.loads(r["items"]))
+        except (ValueError, TypeError):
+            n = 0
+        if n:
+            label += f" — {n} food{'s' if n != 1 else ''}"
+        out.append(app_commands.Choice(
+            name=label[:100], value=str(r["display"])[:100],
+        ))
+        if len(out) >= 25:
+            break
+    return out
+
 
 # Sanity caps so a fat-fingered "25000" target or "65000kj" entry doesn't
 # wreck someone's stats. Entries are per-item, targets are per-day.
@@ -22450,7 +22632,8 @@ async def calories_food_list_cmd(interaction: discord.Interaction) -> None:
 @calories_group.command(
     name="food_remove", description="Delete one of your saved food shortcuts.",
 )
-@app_commands.describe(name="The saved food to remove.")
+@app_commands.describe(name="The saved food to remove (pick from the list).")
+@app_commands.autocomplete(name=_saved_food_autocomplete)
 async def calories_food_remove_cmd(
     interaction: discord.Interaction, name: str,
 ) -> None:
@@ -22996,7 +23179,8 @@ async def calories_meal_list_cmd(interaction: discord.Interaction) -> None:
 @calories_group.command(
     name="meal_remove", description="Delete one of your saved meals.",
 )
-@app_commands.describe(name="The saved meal to remove.")
+@app_commands.describe(name="The saved meal to remove (pick from the list).")
+@app_commands.autocomplete(name=_saved_meal_autocomplete)
 async def calories_meal_remove_cmd(
     interaction: discord.Interaction, name: str,
 ) -> None:

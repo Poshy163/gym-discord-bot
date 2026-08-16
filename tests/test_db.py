@@ -648,6 +648,23 @@ def test_history_returns_the_newest_entries_not_the_oldest(db):
     assert weights == sorted(weights)
 
 
+def test_recent_entries_spans_servers_like_the_delete_it_feeds(db):
+    """The /delete_entry date picker must offer exactly what the delete can
+    remove — and a per-user delete is global, so a lift logged in another
+    server has to show up here too."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _add(db, 1, 100, "bench press", 80, msg_id=1, logged_at=base)
+    _add(db, 2, 100, "bench press", 85, msg_id=2,
+         logged_at=base + timedelta(days=1))     # another server
+    _add(db, 1, 200, "bench press", 90, msg_id=3,
+         logged_at=base + timedelta(days=2))     # another user
+    _add(db, 1, 100, "squat", 100, msg_id=4,
+         logged_at=base + timedelta(days=3))     # another lift
+
+    rows = db.recent_entries(100, "bench press")
+    assert [r["weight_kg"] for r in rows] == [85.0, 80.0]  # newest first
+
+
 def test_machine_history_returns_the_newest_entries_not_the_oldest(db):
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(40):

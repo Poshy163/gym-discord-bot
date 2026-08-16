@@ -3342,3 +3342,166 @@ def test_club_detail_pin_prefers_the_precise_coordinate():
     # Falls back to the PerfectGym coordinate when Netpulse has no row.
     without = bot._format_revo_club_detail(entry, [], [], None)
     assert "-33.8788,151.2072" in without
+
+
+# ---- removal pick-lists -----------------------------------------------------
+#
+# Every one of these backs a command that *deletes* something. The list it
+# offers has to be the list the command can act on: a suggestion that resolves
+# to nothing is worse than no suggestion, because it reads as confirmation.
+
+
+def _ac_interaction(user_id=100, guild_id=1, **namespace):
+    """Minimal stand-in for the autocomplete interaction: a guild, an invoking
+    user, and whichever sibling options the callback reads."""
+    return SimpleNamespace(
+        guild_id=guild_id,
+        extras={},
+        user=SimpleNamespace(id=user_id),
+        namespace=SimpleNamespace(**namespace),
+    )
+
+
+def test_saved_food_autocomplete_labels_choices_with_their_values(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "calorie_food_list", lambda gid, uid: [
+        {"name": "coffee", "display": "Coffee", "kcal": 5.0, "protein_g": None},
+        {"name": "protein shake", "display": "Protein Shake",
+         "kcal": 250.0, "protein_g": 30.0},
+    ])
+    out = asyncio.run(bot._saved_food_autocomplete(_ac_interaction(), ""))
+
+    assert [c.value for c in out] == ["Coffee", "Protein Shake"]
+    assert out[0].name == "Coffee — 5 cal"
+    # Protein rides along so two similar shortcuts are told apart before one
+    # of them is deleted.
+    assert out[1].name == "Protein Shake — 250 cal · 30 g protein"
+
+
+def test_saved_food_autocomplete_filters_on_what_was_typed(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "calorie_food_list", lambda gid, uid: [
+        {"name": "coffee", "display": "Coffee", "kcal": 5.0, "protein_g": None},
+        {"name": "protein shake", "display": "Protein Shake",
+         "kcal": 250.0, "protein_g": 30.0},
+    ])
+    # Matching runs on the normalized key, so case and spacing don't matter.
+    out = asyncio.run(bot._saved_food_autocomplete(_ac_interaction(), "  SHAKE"))
+    assert [c.value for c in out] == ["Protein Shake"]
+
+
+def test_saved_meal_autocomplete_counts_its_foods(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "calorie_meal_list", lambda uid: [
+        {"name": "breakfast", "display": "Breakfast",
+         "items": '[[1, "coffee"], [2, "oats"]]'},
+        {"name": "snack", "display": "Snack", "items": "not json"},
+    ])
+    out = asyncio.run(bot._saved_meal_autocomplete(_ac_interaction(), ""))
+
+    assert [c.value for c in out] == ["Breakfast", "Snack"]
+    assert out[0].name == "Breakfast — 2 foods"
+    # A meal whose items row can't be read is still offered — it's precisely
+    # the kind of row you'd want to delete.
+    assert out[1].name == "Snack"
+
+
+def test_goal_autocomplete_offers_only_goals_you_actually_have(monkeypatch):
+    """/goal_remove used to share the general equipment picker, so it listed
+    hundreds of lifts with no goal set — every one a no-op removal."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "goal_list", lambda gid, uid: [
+        {"equipment": "bench press", "target_kg": 100.0, "bw": 0},
+        {"equipment": "dips", "target_kg": 20.0, "bw": 1},
+    ])
+    out = asyncio.run(bot._user_goal_autocomplete(_ac_interaction(), ""))
+
+    assert [c.value for c in out] == ["bench press", "dips"]
+    assert out[0].name.startswith("bench press — goal 100kg")
+    assert out[1].name.startswith("dips — goal BW+20kg")
+
+
+def test_alias_autocomplete_shows_what_each_phrase_maps_to(monkeypatch):
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "alias_list", lambda gid: [
+        {"alias_normalized": "hack sled", "canonical": "hack squat"},
+        {"alias_normalized": "pec deck", "canonical": "chest fly"},
+    ])
+    out = asyncio.run(bot._custom_alias_autocomplete(_ac_interaction(), ""))
+    assert [c.value for c in out] == ["hack sled", "pec deck"]
+    assert out[0].name == "hack sled → hack squat"
+
+    # The canonical side is searchable too — you rarely remember the alias.
+    hit = asyncio.run(bot._custom_alias_autocomplete(_ac_interaction(), "chest"))
+    assert [c.value for c in hit] == ["pec deck"]
+
+
+def test_entry_date_autocomplete_offers_days_that_hold_entries(monkeypatch):
+    """A date with nothing on it deletes 0 rows and still reports success, so
+    the picker lists real days — one per day, with the weight logged on it."""
+    import app.bot as bot
+
+    day = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(bot.db, "alias_resolve", lambda gid, key: None)
+    monkeypatch.setattr(bot.db, "recent_entries", lambda uid, eq, limit=100: [
+        {"weight_kg": 82.5, "bw": 0, "logged_at": day.isoformat()},
+        {"weight_kg": 80.0, "bw": 0,
+         "logged_at": (day - timedelta(hours=2)).isoformat()},   # same day
+        {"weight_kg": 77.5, "bw": 0,
+         "logged_at": (day - timedelta(days=3)).isoformat()},
+    ])
+    interaction = _ac_interaction(equipment="bench press", user=None)
+    out = asyncio.run(bot._entry_date_autocomplete(interaction, ""))
+
+    assert [c.value for c in out] == ["2026-05-01", "2026-04-28"]
+    assert out[0].name == "2026-05-01 — 82.5kg"
+
+
+def test_entry_date_autocomplete_waits_for_the_equipment(monkeypatch):
+    """Without the sibling option there's no list to draw from — suggesting
+    every date the user has ever logged would be a lie about this lift."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "recent_entries", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not query without an equipment"),
+    ))
+    interaction = _ac_interaction(equipment=None, user=None)
+    assert asyncio.run(bot._entry_date_autocomplete(interaction, "")) == []
+
+
+def test_cardio_activity_autocomplete_hands_back_the_bare_id(monkeypatch):
+    """/cardio strava_unlink parses an ID or a URL; the picker supplies the ID
+    so nobody has to go and find one."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "cardio_strava_session_list", lambda uid, limit=25: [
+        {"strava_activity_id": 991, "strava_name": "Morning Run",
+         "logged_at": "2026-05-01T06:30:00+00:00"},
+        {"strava_activity_id": None, "strava_name": None,
+         "logged_at": "2026-04-30T06:30:00+00:00"},
+    ])
+    out = asyncio.run(
+        bot._cardio_linked_activity_autocomplete(_ac_interaction(), "")
+    )
+    assert [c.value for c in out] == ["991"]
+    assert out[0].name.startswith("Morning Run — 2026-05-01")
+    assert bot._parse_strava_activity_reference(out[0].value) == 991
+
+
+def test_entry_date_autocomplete_stays_quiet_for_a_delete_you_cant_do(monkeypatch):
+    """Deleting someone else's entries is admin-only — so the picker must not
+    preview their training days to a non-admin either."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot.db, "recent_entries", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not query another member's entries"),
+    ))
+    interaction = _ac_interaction(
+        user_id=100, equipment="bench press", user=SimpleNamespace(id=999),
+    )
+    assert asyncio.run(bot._entry_date_autocomplete(interaction, "")) == []
