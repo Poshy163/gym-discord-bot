@@ -469,9 +469,9 @@ CREATE INDEX IF NOT EXISTS idx_calorie_food_aliases_name
 
 -- Saved meals: a named bundle of saved foods ("breakfast" = coffee + oats)
 -- logged in one go. ``items`` is a JSON array of [servings, food_name] pairs
--- resolved against calorie_foods at log time, so editing a food updates every
--- meal that includes it. Per-user and global (shared across servers + DMs),
--- matching saved foods.
+-- (servings may be fractional, e.g. 0.5) resolved against calorie_foods at log
+-- time, so editing a food updates every meal that includes it. Per-user and
+-- global (shared across servers + DMs), matching saved foods.
 CREATE TABLE IF NOT EXISTS calorie_meals (
     user_id INTEGER NOT NULL,
     name    TEXT    NOT NULL,
@@ -6985,11 +6985,13 @@ class Database:
 
     def calorie_meal_set(
         self, user_id: int, name: str, display: str,
-        items: list[tuple[int, str]],
+        items: list[tuple[float, str]],
     ) -> None:
         """Create or update a saved meal. ``name`` must already be normalized;
         ``items`` is [(servings, normalized_food_name), ...] — validated by
-        the caller against the user's saved foods. Global per user."""
+        the caller against the user's saved foods. Servings may be fractional
+        ("0.5 milk"); whole counts are stored as ints so the JSON stays the
+        shape older rows already have. Global per user."""
         with self._conn() as c:
             c.execute(
                 "INSERT INTO calorie_meals (user_id, name, display, items, set_at) "
@@ -6999,14 +7001,17 @@ class Database:
                 "set_at = excluded.set_at",
                 (
                     user_id, name, display,
-                    json.dumps([[int(n), s] for n, s in items]),
+                    json.dumps([
+                        [int(n) if float(n).is_integer() else float(n), s]
+                        for n, s in items
+                    ]),
                     _normalize_iso(None),
                 ),
             )
 
     def calorie_meal_get(
         self, user_id: int, name: str,
-    ) -> tuple[str, list[tuple[int, str]]] | None:
+    ) -> tuple[str, list[tuple[float, str]]] | None:
         """Return ``(display, items)`` for a saved meal, or None. Items whose
         JSON doesn't decode cleanly are dropped rather than crashing the
         caller (the row can only get that way via manual DB edits)."""
@@ -7021,7 +7026,7 @@ class Database:
         try:
             raw = json.loads(row["items"])
             items = [
-                (int(pair[0]), str(pair[1]))
+                (float(pair[0]), str(pair[1]))
                 for pair in raw
                 if isinstance(pair, (list, tuple)) and len(pair) == 2
             ]

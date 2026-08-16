@@ -10,6 +10,7 @@ import pytest
 from app import targets
 from app.calories import (
     format_kcal,
+    format_servings,
     kcal_to_kj,
     kj_to_kcal,
     normalize_food,
@@ -221,13 +222,49 @@ def test_parse_food_phrase_clamps_servings():
     assert parse_food_phrase("999 coffee") == (50, "coffee")
 
 
+# Part of a serving is an ordinary thing to eat — half a glass of milk should
+# not need the kcal worked out by hand.
+@pytest.mark.parametrize("text,servings,name", [
+    ("0.5 milk", 0.5, "milk"),
+    ("0.5x milk", 0.5, "milk"),
+    ("0.5 x milk", 0.5, "milk"),
+    (".5 milk", 0.5, "milk"),
+    ("milk x0.5", 0.5, "milk"),
+    ("milk x .5", 0.5, "milk"),
+    ("1.5 protein shake", 1.5, "protein shake"),
+    ("0.25 peanut butter", 0.25, "peanut butter"),
+    ("999.5 coffee", 50.0, "coffee"),       # still capped
+])
+def test_parse_food_phrase_accepts_fractions(text, servings, name):
+    assert parse_food_phrase(text) == (servings, name)
+
+
+def test_parse_food_phrase_keeps_decimal_names_intact():
+    # A count needs whitespace after it, so a food whose *name* starts with a
+    # number ("1.5l water") is still looked up whole. Same for more decimals
+    # than a serving count ever carries — that's a name, not a quantity, and
+    # the caller's lookup is what rejects it.
+    assert parse_food_phrase("1.5l water") == (1, "1.5l water")
+    assert parse_food_phrase("0.0001 coffee") == (1, "0.0001 coffee")
+
+
 @pytest.mark.parametrize("text", [
     "",
     "coffee\nbench press 80kg",   # multi-line never a food shortcut
     "x" * 65,                      # too long
+    "0 coffee",                    # zero servings isn't one serving
+    "0.000 coffee",                # rounds away to nothing
+    "coffee x0",
 ])
 def test_parse_food_phrase_rejects(text):
     assert parse_food_phrase(text) is None
+
+
+@pytest.mark.parametrize("servings,expected", [
+    (1, "1"), (2.0, "2"), (0.5, "0.5"), (1.25, "1.25"), (0.001, "0.001"),
+])
+def test_format_servings(servings, expected):
+    assert format_servings(servings) == expected
 
 
 def test_normalize_food():
@@ -841,6 +878,15 @@ def test_parse_meal_items_merges_duplicates():
     assert parse_meal_items("2 coffee, coffee x3") == [(5, "coffee")]
 
 
+def test_parse_meal_items_accepts_fractions():
+    from app.calories import parse_meal_items
+    assert parse_meal_items("0.5 milk, 2x oats") == [
+        (0.5, "milk"), (2, "oats"),
+    ]
+    # Fractions merge like whole counts do.
+    assert parse_meal_items("0.5 milk, milk x0.25") == [(0.75, "milk")]
+
+
 def test_parse_meal_items_rejects_bad_input():
     from app.calories import parse_meal_items
     assert parse_meal_items("") is None
@@ -865,6 +911,12 @@ def test_calorie_meal_set_get_roundtrip(db):
     assert db.calorie_meal_get(100, "breakfast") == ("breakfast", [(1, "coffee")])
     # Scoped per user.
     assert db.calorie_meal_get(999, "breakfast") is None
+
+
+def test_calorie_meal_set_get_keeps_fractional_servings(db):
+    db.calorie_meal_set(100, "brekky", "Brekky", [(0.5, "milk"), (2, "oats")])
+    got = db.calorie_meal_get(100, "brekky")
+    assert got == ("Brekky", [(0.5, "milk"), (2, "oats")])
 
 
 def test_calorie_meal_list_and_remove(db):

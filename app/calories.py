@@ -147,25 +147,38 @@ def normalize_food(name: str) -> str:
 # trailing "x2") wrapped around a name. The name itself is matched loosely —
 # the caller decides whether it's a *defined* food via a DB lookup, so this
 # only needs to extract the count and the candidate name.
+#
+# Counts may be fractional (``0.5 milk``, ``.5 milk``, ``milk x1.5``): half a
+# serving is an ordinary thing to eat, and without it the only way to log one
+# was to do the arithmetic by hand and type the kcal.
+_QTY = r"\d{1,3}(?:\.\d{1,3})?|\.\d{1,3}"
 _FOOD_PHRASE_RE = re.compile(
-    r"""
+    rf"""
     ^\s*
-    (?:(?P<lead>\d{1,3})\s*[x*×]?\s+)?
+    (?:(?P<lead>{_QTY})\s*[x*×]?\s+)?
     (?P<name>.+?)
-    (?:\s*[x*×]\s*(?P<trail>\d{1,3}))?
+    (?:\s*[x*×]\s*(?P<trail>{_QTY}))?
     \s*$
     """,
     re.VERBOSE,
 )
 
+# Ceiling on one shortcut's servings — anything beyond this is a typo, not a
+# meal. There's no floor beyond "more than nothing": a count that rounds away
+# to zero is rejected outright rather than quietly logged as one serving.
+_MAX_SERVINGS = 50.0
+_SERVING_DECIMALS = 3
 
-def parse_food_phrase(text: str) -> tuple[int, str] | None:
+
+def parse_food_phrase(text: str) -> tuple[float, str] | None:
     """Split a food shortcut into ``(servings, normalized_name)``.
 
-    Handles ``coffee``, ``2 coffee``, ``2x coffee`` and ``coffee x2``.
-    Returns None for multi-line or over-long text (never a food shortcut).
-    Servings are clamped to 1..50. The name is *not* validated here — callers
-    must confirm it's a saved food.
+    Handles ``coffee``, ``2 coffee``, ``2x coffee``, ``coffee x2`` and
+    fractional counts (``0.5 milk``, ``milk x1.5``). Returns None for
+    multi-line or over-long text (never a food shortcut), and for a count of
+    zero — ``0 coffee`` is not one coffee. Servings are capped at 50 and
+    rounded to 3 decimals. The name is *not* validated here — callers must
+    confirm it's a saved food.
     """
     if not text or "\n" in text or len(text) > 64:
         return None
@@ -176,8 +189,22 @@ def parse_food_phrase(text: str) -> tuple[int, str] | None:
     if not name:
         return None
     qty_raw = m.group("lead") or m.group("trail")
-    servings = int(qty_raw) if qty_raw else 1
-    return max(1, min(servings, 50)), name
+    if qty_raw is None:
+        return 1.0, name
+    servings = round(float(qty_raw), _SERVING_DECIMALS)
+    if servings <= 0:
+        return None
+    return min(servings, _MAX_SERVINGS), name
+
+
+def format_servings(servings: float) -> str:
+    """Render a serving count for display: ``2``, ``0.5``, ``1.25``.
+
+    Whole counts lose the decimal point — a saved food logged twice should read
+    ``coffee ×2``, not ``coffee ×2.0``.
+    """
+    n = float(servings)
+    return str(int(n)) if n.is_integer() else f"{n:g}"
 
 
 # Meals: a named bundle of saved foods ("breakfast" = coffee + oats + shake)
@@ -186,17 +213,18 @@ def parse_food_phrase(text: str) -> tuple[int, str] | None:
 _MEAL_MAX_ITEMS = 12
 
 
-def parse_meal_items(text: str) -> list[tuple[int, str]] | None:
+def parse_meal_items(text: str) -> list[tuple[float, str]] | None:
     """Split a meal definition into ``[(servings, normalized_name), ...]``.
 
-    Accepts "coffee, 2x oats, protein shake" or "coffee + oats". Names are
-    normalized but NOT validated — callers must check each against the user's
-    saved foods. Returns None for empty input or over 12 items. Duplicate
-    names merge by summing servings so "coffee, coffee" is ``[(2, "coffee")]``.
+    Accepts "coffee, 2x oats, protein shake" or "coffee + oats", with the same
+    fractional counts as a food shortcut ("0.5 milk"). Names are normalized but
+    NOT validated — callers must check each against the user's saved foods.
+    Returns None for empty input or over 12 items. Duplicate names merge by
+    summing servings so "coffee, coffee" is ``[(2, "coffee")]``.
     """
     if not text or "\n" in text:
         return None
-    merged: dict[str, int] = {}
+    merged: dict[str, float] = {}
     for piece in re.split(r"[,+]", text):
         piece = piece.strip()
         if not piece:
@@ -205,7 +233,10 @@ def parse_meal_items(text: str) -> list[tuple[int, str]] | None:
         if parsed is None:
             return None
         servings, name = parsed
-        merged[name] = min(merged.get(name, 0) + servings, 50)
+        merged[name] = min(
+            round(merged.get(name, 0.0) + servings, _SERVING_DECIMALS),
+            _MAX_SERVINGS,
+        )
     if not merged or len(merged) > _MEAL_MAX_ITEMS:
         return None
     return [(count, name) for name, count in merged.items()]

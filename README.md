@@ -232,7 +232,8 @@ Saved foods (personal name → calorie shortcuts):
   food — handy for shakes, chicken, etc. Re-running `food_set` with just a new
   calorie amount updates the calories and **keeps** the saved protein.
 - Then log it by **just typing the name** in chat — `coffee`, or `2 coffee` /
-  `coffee x2` for multiple servings — and the bot reacts ✅. If the food has a
+  `coffee x2` for multiple servings, `0.5 coffee` / `coffee x0.5` for part of
+  one (up to 3 decimals, capped at 50) — and the bot reacts ✅. If the food has a
   protein value and you're protein-tracking, it logs both at once (one ❌ undoes
   both). `/calories add coffee` works too.
 - `/calories food_list` — show your saved foods (with protein where set).

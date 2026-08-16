@@ -1834,11 +1834,11 @@ async def _handle_calorie_message(
 
 def _match_calorie_food(
     message: discord.Message, target: object, content: str,
-) -> tuple[sqlite3.Row, int] | None:
+) -> tuple[sqlite3.Row, float] | None:
     """If ``content`` is exactly one of ``target``'s saved foods (optionally
-    with a serving count), return ``(food_row, servings)``. Requires the user
-    to be calorie-tracking; returns None otherwise so the message falls
-    through to the lift parser."""
+    with a serving count, whole or fractional), return ``(food_row, servings)``.
+    Requires the user to be calorie-tracking; returns None otherwise so the
+    message falls through to the lift parser."""
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     if db.calorie_goal_get(guild_id, target_id) is None:
@@ -1855,10 +1855,10 @@ def _match_calorie_food(
 
 async def _handle_calorie_food_message(
     message: discord.Message, target: object,
-    food_row: sqlite3.Row, servings: int,
+    food_row: sqlite3.Row, servings: float,
     *, logged_at: datetime | None = None,
 ) -> None:
-    """Log a saved-food chat shortcut (`coffee`, `2 protein shake`).
+    """Log a saved-food chat shortcut (`coffee`, `2 protein shake`, `0.5 milk`).
 
     Always logs the food's calories. If the food was saved with a protein value
     and the user is protein-tracking, the protein is logged too and a combined
@@ -1867,7 +1867,18 @@ async def _handle_calorie_food_message(
     guild_id = _msg_guild_id(message)
     target_id = int(getattr(target, "id"))
     kcal = float(food_row["kcal"]) * servings
-    if kcal <= 0 or _rounds_to_zero_kcal(kcal) or kcal > _MAX_ENTRY_KCAL:
+    if kcal <= 0 or _rounds_to_zero_kcal(kcal):
+        # Reachable via a tiny fractional serving of a low-calorie food
+        # (`0.01 celery`) — say so rather than blaming the per-entry cap.
+        try:
+            await message.reply(
+                "That serving works out to under 1 cal — nothing logged.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if kcal > _MAX_ENTRY_KCAL:
         try:
             await message.reply(
                 f"That's over {_MAX_ENTRY_KCAL:,} cal in one entry — skipped.",
@@ -1877,7 +1888,8 @@ async def _handle_calorie_food_message(
             pass
         return
     display = food_row["display"]
-    note = display if servings == 1 else f"{display} ×{servings}"
+    servings_label = calories.format_servings(servings)
+    note = display if servings == 1 else f"{display} ×{servings_label}"
     goal = db.calorie_goal_get(guild_id, target_id)
     if goal is None:  # pragma: no cover - _match_calorie_food already checked
         return
@@ -1913,8 +1925,8 @@ async def _handle_calorie_food_message(
             LOG.exception("Failed to store food protein for user %s", target_id)
 
     LOG.info(
-        "Stored food '%s' ×%d (%.0f kcal%s) for %s in #%s",
-        display, servings, kcal,
+        "Stored food '%s' ×%s (%.0f kcal%s) for %s in #%s",
+        display, servings_label, kcal,
         f", {grams:.0f}g protein" if logged_protein else "",
         target, message.channel,
     )
@@ -1968,7 +1980,7 @@ async def _handle_calorie_food_message(
 
 def _match_calorie_meal(
     message: discord.Message, target: object, content: str,
-) -> tuple[str, list[tuple[int, sqlite3.Row]], list[str]] | None:
+) -> tuple[str, list[tuple[float, sqlite3.Row]], list[str]] | None:
     """If ``content`` is exactly one of ``target``'s saved meals, return
     ``(display, [(servings, food_row), ...], missing_names)``. Requires the
     user to be calorie-tracking. Foods deleted since the meal was saved end
@@ -1988,7 +2000,7 @@ def _match_calorie_meal(
     if meal is None:
         return None
     display, items = meal
-    resolved: list[tuple[int, sqlite3.Row]] = []
+    resolved: list[tuple[float, sqlite3.Row]] = []
     missing: list[str] = []
     for servings, food_name in items:
         row = db.calorie_food_get(guild_id, target_id, food_name)
@@ -2002,7 +2014,7 @@ def _match_calorie_meal(
 
 
 def _meal_totals(
-    items: list[tuple[int, sqlite3.Row]],
+    items: list[tuple[float, sqlite3.Row]],
 ) -> tuple[float, float]:
     """Sum ``(kcal, protein_g)`` across resolved meal items."""
     kcal = sum(float(row["kcal"]) * n for n, row in items)
@@ -2016,7 +2028,7 @@ def _meal_totals(
 
 async def _handle_calorie_meal_message(
     message: discord.Message, target: object,
-    display: str, items: list[tuple[int, sqlite3.Row]], missing: list[str],
+    display: str, items: list[tuple[float, sqlite3.Row]], missing: list[str],
     *, logged_at: datetime | None = None,
 ) -> None:
     """Log a saved-meal chat shortcut ("breakfast") as ONE calorie entry (plus
@@ -8016,7 +8028,8 @@ def _help_sections() -> dict[str, discord.Embed]:
         "Smart food logging", f"{ui.FOOD} Smart food logging",
         (
             "`/calories food_set <name> <amount> [protein]` — save a food "
-            "shortcut, then log it by typing `coffee` or `2 coffee` in chat\n"
+            "shortcut, then log it by typing `coffee`, `2 coffee` or "
+            "`0.5 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
             "`/calories meal_set <name> <foods>` — bundle saved foods "
             "(`breakfast` = `coffee, 2x oats`); log it with one word\n"
@@ -22021,7 +22034,7 @@ async def calories_targets_cmd(
     description="Log calories you just ate — kcal or kJ, I'll convert.",
 )
 @app_commands.describe(
-    amount='Energy ("650", "650c", "2700kj") or a saved food ("coffee", "2 coffee").',
+    amount='Energy ("650", "2700kj") or a saved food ("coffee", "2 coffee", "0.5 coffee").',
     note="What it was (optional, shows in /today).",
     day='Backdate it: "yesterday", "monday", "3 days ago", or "2026-06-28".',
 )
@@ -22065,7 +22078,10 @@ async def calories_add_cmd(
         servings = food[0]
         kcal = float(row["kcal"]) * servings
         base = row["display"]
-        logged_label = base if servings == 1 else f"{base} ×{servings}"
+        logged_label = (
+            base if servings == 1
+            else f"{base} ×{calories.format_servings(servings)}"
+        )
         converted = f" = {calories.format_kcal(kcal)}"
         if note is None:
             note = logged_label
@@ -22898,7 +22914,7 @@ async def calories_meal_set_cmd(
             "`coffee, 2x oats, protein shake` (max 12).", ephemeral=True,
         )
         return
-    resolved: list[tuple[int, sqlite3.Row]] = []
+    resolved: list[tuple[float, sqlite3.Row]] = []
     unknown: list[str] = []
     for servings, food_name in items:
         row = db.calorie_food_get(guild_id, interaction.user.id, food_name)
@@ -22919,7 +22935,8 @@ async def calories_meal_set_cmd(
     if grams > 0:
         macro += f" + {protein_mod.format_grams(grams)} protein"
     pieces = ", ".join(
-        (f"{n}× " if n > 1 else "") + row["display"] for n, row in resolved
+        (f"{calories.format_servings(n)}× " if n != 1 else "") + row["display"]
+        for n, row in resolved
     )
     await interaction.response.send_message(
         f"{ui.OK} Saved meal **{name.strip()}** = {pieces} ({macro} right now — "
@@ -22959,7 +22976,8 @@ async def calories_meal_list_cmd(interaction: discord.Interaction) -> None:
         if grams > 0:
             macro += f" · {protein_mod.format_grams(grams)} protein"
         pieces = ", ".join(
-            (f"{n}× " if n > 1 else "") + food["display"]
+            (f"{calories.format_servings(n)}× " if n != 1 else "")
+            + food["display"]
             for n, food in resolved
         )
         line = f"• **{r['display']}** — {pieces} ({macro})"
