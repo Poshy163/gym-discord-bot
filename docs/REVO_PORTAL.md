@@ -54,6 +54,30 @@ Verified by re-testing every gated route with a confirmed L2 cookie (and various
 > to ticket-tally, and `revo_client.is_access_guarded()` / `RevoAccessGuarded`
 > for how the code now distinguishes this from an auth/parse failure.
 
+> 🧪 **"Just emulate the app" was tried (2026-08) and does NOT work — don't
+> re-run it.** 24 variants against `streaks.php`: mobile WebView User-Agents
+> (Android `; wv`, iOS WKWebView, app-suffixed UAs), the **Android package name in
+> `X-Requested-With`** (`com.netpulse.mobile.revofitness` — the classic app-webview
+> tell, and the one gap the earlier probe left, since it only tried the
+> `XMLHttpRequest` value), and hybrid-app origins/referers (`https://localhost`,
+> `http://localhost`, `capacitor://localhost`, `ionic://localhost`, `file://`,
+> `:8080`) — plus every combination. **All 24 returned the identical 17 bytes.**
+> The `https://localhost/portal/...` link hard-coded in the rewards landing HTML
+> looks like a webview breadcrumb, but faking that origin changes nothing.
+>
+> **This proves the gate is on the source IP, not the request.** On one and the
+> same authenticated session the rewards landing renders (17 KB) while
+> `streaks.php` dies (17 bytes); the only variable is which PHP script runs, and
+> since *no* header/UA/origin alters `streaks.php`, its check must read
+> `REMOTE_ADDR` (not spoofable — this server ignores `X-Forwarded-For`). So the app
+> works because its requests reach these pages from an **allowlisted network**
+> (in-club kiosk, or Revo's own server relaying the page to the app), **not**
+> because it sends a magic header. Emulating that from a scraper is impossible by
+> request-shaping. The only way to learn what the app actually does is to
+> **intercept the app's own TLS traffic on-device** (mitmproxy/Charles + the phone
+> + its CA cert) — which may well show it hitting a *different* backend, not
+> `streaks.php` at all. Nothing header-shaped will get past this.
+
 `club-counter.php` and `massage-chair.php` — the *only* two pages that
 server-rendered dynamic in-club blobs (live occupancy + the access QR) — now
 return **HTTP 200, `Content-Type: text/html`, Content-Length 17, body exactly
