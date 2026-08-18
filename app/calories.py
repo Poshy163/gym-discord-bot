@@ -7,6 +7,7 @@ Australian food labels print kJ, hence the converter).
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from . import scaling
 
@@ -205,6 +206,116 @@ def format_servings(servings: float) -> str:
     """
     n = float(servings)
     return str(int(n)) if n.is_integer() else f"{n:g}"
+
+
+# ---------------------------------------------------------------------------
+# Reading a stored note back into the food it came from
+# ---------------------------------------------------------------------------
+
+# ``calorie_entries`` has no food id — the only link between an entry and what
+# was eaten is the free-text ``note`` the logger wrote. Tallying per food means
+# reading that link back out. The shapes that carry an identity, all built in
+# app/bot.py:
+#
+#   saved food, one serving   "Flat White"
+#   saved food, N servings    "Flat White ×2"
+#   saved meal                "Breakfast (meal)"
+#   AI estimate               "Big Mac Meal (AI estimate)", "Weet-Bix (110 g, label)"
+#
+# and one that does not: the scaling footnote the bot adds to a plain
+# ``895kj 110g`` post ("scaled ×1.1", "110 g of the per-100 g values"). That is
+# the bot's own arithmetic showing its work, not a thing anyone ate, so it is
+# dropped — and dropped *before* the serving suffix is read, because
+# "scaled ×1.1" would otherwise tally as 1.1 servings of a food called "scaled".
+
+#: Suffixes bot.py appends to mark what produced an entry.
+MEAL_SUFFIX = " (meal)"
+AI_SUFFIX = " (AI estimate)"
+
+#: What bot.py writes in place of a name the model didn't supply — "label" for
+#: an unreadable nutrition panel, "AI estimate" for an unnamed guess. They name
+#: no food, and treating them as one fuses unrelated meals into a single row
+#: called "label". Counted as unnamed instead.
+_AI_PLACEHOLDERS = {"label", "ai estimate"}
+
+#: Grams are unbounded here (a label serving can exceed 999), so this is looser
+#: than ``_QTY`` — it only has to recognise text the bot itself wrote.
+_NUM = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?"
+
+_SCALE_NOTE_RE = re.compile(
+    rf"^(?:scaled\s*[x*×]\s*(?:{_NUM})"
+    rf"|(?:{_NUM})\s*g of the per-100 g values)$",
+    re.IGNORECASE,
+)
+_AI_LABEL_RE = re.compile(
+    rf"\s*\((?:{_NUM})\s*g,\s*label\)$", re.IGNORECASE,
+)
+# The written form is always U+00D7, but x and * are accepted for the same
+# reason ``_FOOD_PHRASE_RE`` accepts them: a hand-typed note should read too.
+# The lookbehind is what keeps that lenience honest — without it the final
+# letter of "trail mix 2" or "Twix 2" reads as the sign, and the tally grows a
+# food called "trail mi" that was apparently had twice.
+_NOTE_SERVINGS_RE = re.compile(
+    rf"(?<![^\W\d_])\s*[x*×]\s*(?P<n>{_QTY})$",
+)
+
+
+class EntryLabel(NamedTuple):
+    """What one stored note says was eaten.
+
+    ``key`` is the :func:`normalize_food` grouping key — entries are folded on
+    it, never on the raw note, so ``"Coffee"`` and ``"coffee ×2"`` land in the
+    same bucket. ``display`` keeps the casing as it was logged, which is what a
+    food renamed since is still labelled with when nothing better is known.
+    """
+
+    key: str
+    display: str
+    servings: float
+    kind: str
+
+
+def parse_entry_note(note: str | None) -> EntryLabel | None:
+    """Read a ``calorie_entries.note`` back into the food it identifies.
+
+    Returns None when the note names nothing edible — it is empty, or it is
+    one of the bot's own scaling footnotes. ``kind`` is ``"food"``,
+    ``"meal"`` or ``"ai"``; only a plain saved food carries a serving count,
+    since meals are always logged whole and an AI label is model prose where a
+    trailing "x2" would be words rather than a quantity.
+    """
+    if not note:
+        return None
+    text = " ".join(note.split())
+    if not text or _SCALE_NOTE_RE.match(text):
+        return None
+
+    kind = "food"
+    lowered = text.lower()
+    if lowered.endswith(MEAL_SUFFIX):
+        kind, text = "meal", text[: -len(MEAL_SUFFIX)].rstrip()
+    elif lowered.endswith(AI_SUFFIX.lower()):
+        kind, text = "ai", text[: -len(AI_SUFFIX)].rstrip()
+    else:
+        without = _AI_LABEL_RE.sub("", text)
+        if without != text:
+            kind, text = "ai", without.rstrip()
+
+    servings = 1.0
+    if kind == "food":
+        m = _NOTE_SERVINGS_RE.search(text)
+        # A note that is *only* a count ("×2") has no food in it to strip the
+        # count off, so it is left whole rather than reduced to nothing.
+        if m is not None and text[: m.start()].rstrip():
+            servings = round(float(m.group("n")), _SERVING_DECIMALS)
+            text = text[: m.start()].rstrip()
+
+    key = normalize_food(text)
+    if not key or servings <= 0:
+        return None
+    if kind == "ai" and key in _AI_PLACEHOLDERS:
+        return None
+    return EntryLabel(key, text, servings, kind)
 
 
 # Meals: a named bundle of saved foods ("breakfast" = coffee + oats + shake)

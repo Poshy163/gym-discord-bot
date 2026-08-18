@@ -16,6 +16,7 @@ from app.calories import (
     normalize_food,
     parse_chat_message,
     parse_energy,
+    parse_entry_note,
     parse_food_phrase,
     progress_bar,
 )
@@ -1093,3 +1094,137 @@ def test_delete_and_edit_hand_back_the_day_they_touched(db):
 
     assert db.delete_calorie_entry(1, 100, cid)["logged_at"]
     assert db.delete_protein_entry(1, 100, pid)["logged_at"]
+
+
+# ---- parse_entry_note -------------------------------------------------------
+
+@pytest.mark.parametrize("note,expected", [
+    ("Flat White", ("flat white", "Flat White", 1.0, "food")),
+    ("Flat White ×2", ("flat white", "Flat White", 2.0, "food")),
+    ("Flat White ×0.5", ("flat white", "Flat White", 0.5, "food")),
+    # x and * read too, so a hand-typed note isn't a second grammar.
+    ("flat white x1.25", ("flat white", "flat white", 1.25, "food")),
+    ("Breakfast (meal)", ("breakfast", "Breakfast", 1.0, "meal")),
+    ("Big Mac Meal (AI estimate)",
+     ("big mac meal", "Big Mac Meal", 1.0, "ai")),
+    ("Weet-Bix (110 g, label)", ("weet-bix", "Weet-Bix", 1.0, "ai")),
+    # A free-text note from `/calories add ... note:` is still something eaten.
+    ("maccas run", ("maccas run", "maccas run", 1.0, "food")),
+])
+def test_parse_entry_note_reads_back_what_was_logged(note, expected):
+    assert tuple(parse_entry_note(note)) == expected
+
+
+@pytest.mark.parametrize("note", [
+    None, "", "   ",
+    "scaled ×1.1",
+    "110 g of the per-100 g values",
+])
+def test_parse_entry_note_ignores_what_names_no_food(note):
+    """The scaling footnotes are the bot showing its working on a plain
+    ``895kj 110g`` post, not a thing anyone ate. Reading them as food would
+    invent one called "scaled" — and give it 1.1 servings."""
+    assert parse_entry_note(note) is None
+
+
+def test_parse_entry_note_keeps_a_bare_count_whole():
+    """Stripping the count off "×2" would leave nothing to name it by."""
+    assert parse_entry_note("×2").display == "×2"
+
+
+def test_parse_entry_note_only_counts_servings_on_a_plain_food():
+    """Meals are logged whole, and an AI label is model prose where a trailing
+    number is words rather than a quantity."""
+    assert parse_entry_note("Wings x2 (meal)").servings == 1.0
+    assert parse_entry_note("Mac x2 (AI estimate)").servings == 1.0
+
+
+def test_parse_entry_note_folds_casing_and_spacing_into_one_key():
+    """Re-saving a food rewrites its display, so history carries both
+    spellings — they have to land in the same bucket."""
+    assert parse_entry_note("Flat  White").key == parse_entry_note("flat white").key
+
+
+# ---- calorie_note_tally -----------------------------------------------------
+
+def test_calorie_note_tally_groups_by_note_and_keeps_nulls(db):
+    base = datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc)
+    db.calorie_add(1, 100, "alice", 80, note="Coffee", logged_at=base)
+    db.calorie_add(1, 100, "alice", 80, note="Coffee",
+                   logged_at=base + timedelta(hours=1))
+    db.calorie_add(2, 100, "alice", 160, note="Coffee ×2",
+                   logged_at=base + timedelta(hours=2))
+    db.calorie_add(1, 100, "alice", 500, logged_at=base + timedelta(hours=3))
+
+    rows = {r["note"]: r for r in db.calorie_note_tally(100)}
+    # Grouped on the raw note — the serving count is still inside the string.
+    assert rows["Coffee"]["n"] == 2 and rows["Coffee"]["kcal"] == 160
+    assert rows["Coffee ×2"]["n"] == 1
+    # A bare `650kcal` post carries no note; it groups under NULL instead of
+    # disappearing, so a caller can say what it isn't covering.
+    assert rows[None]["n"] == 1 and rows[None]["kcal"] == 500
+    assert rows["Coffee"]["first_at"] < rows["Coffee"]["last_at"]
+
+
+def test_calorie_note_tally_spans_servers_and_honours_the_window(db):
+    """Foods are one global diary, so a coffee logged in another server counts
+    — but only when it falls inside the window asked for."""
+    db.calorie_add(1, 100, "alice", 80, note="Coffee",
+                   logged_at=datetime(2026, 6, 1, 8, tzinfo=timezone.utc))
+    db.calorie_add(2, 100, "alice", 80, note="Coffee",
+                   logged_at=datetime(2026, 6, 1, 9, tzinfo=timezone.utc))
+    db.calorie_add(1, 100, "alice", 80, note="Coffee",
+                   logged_at=datetime(2026, 6, 5, 8, tzinfo=timezone.utc))
+
+    assert db.calorie_note_tally(100)[0]["n"] == 3
+    windowed = db.calorie_note_tally(
+        100, "2026-06-01T00:00:00+00:00", "2026-06-02T00:00:00+00:00",
+    )
+    assert windowed[0]["n"] == 2
+    assert db.calorie_note_tally(999) == []
+
+
+@pytest.mark.parametrize("note", [
+    "trail mix 2", "Twix 2", "bento box 2", "Lox 1.5",
+])
+def test_parse_entry_note_does_not_split_a_word_final_x(note):
+    """Food names ending in x are ordinary, and a bare trailing number is the
+    natural way to hand-type a count. Without a boundary the regex ate the
+    word's last letter, inventing a food called "trail mi" had twice."""
+    label = parse_entry_note(note)
+    assert label.servings == 1.0
+    assert label.key == normalize_food(note)
+
+
+@pytest.mark.parametrize("note,key,servings", [
+    ("Flat White ×2", "flat white", 2.0),
+    ("Weet-Bix ×5", "weet-bix", 5.0),
+    ("coffee x2", "coffee", 2.0),
+    ("Twix x2", "twix", 2.0),
+    ("pho x 2", "pho", 2.0),
+])
+def test_parse_entry_note_still_reads_a_real_separator(note, key, servings):
+    """The boundary must not cost the counts the bot actually writes."""
+    label = parse_entry_note(note)
+    assert (label.key, label.servings) == (key, servings)
+
+
+@pytest.mark.parametrize("note", [
+    "label (110 g, label)",
+    "AI estimate (AI estimate)",
+])
+def test_parse_entry_note_treats_bot_placeholders_as_unnamed(note):
+    """bot.py substitutes these when the model names nothing. Reading them as
+    foods fuses every unnamed packet into one row called "label" that claims
+    to have been eaten N times."""
+    assert parse_entry_note(note) is None
+
+
+@pytest.mark.parametrize("note", [
+    "scaled ×1e-05",
+    "5e-05 g of the per-100 g values",
+])
+def test_parse_entry_note_ignores_scale_notes_in_exponent_form(note):
+    """``f"{factor:g}"`` switches to exponent form below 1e-4, and nothing
+    bounds the factor from below — so this spelling reaches the column."""
+    assert parse_entry_note(note) is None

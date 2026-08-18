@@ -3661,3 +3661,190 @@ def test_feed_source_change_ignores_none(monkeypatch, caplog):
         bot._log_feed_source_change(None)
     assert "DEGRADED" not in caplog.text
     assert "RECOVERED" not in caplog.text
+
+
+# ---- /calories food_tally ----------------------------------------------------
+# The rollup, not the embed: `calorie_entries` has no food id, so every number
+# in the tally comes from parsing notes back into foods.
+
+
+def _tally_user(uid: int, guild: int = 9301):
+    _bot_db.calorie_goal_set(guild, uid, "Tally", 2500)
+    return guild, uid
+
+
+def test_food_tally_counts_servings_not_posts():
+    """"How many coffees" is answered by `2 coffee` counting twice. The number
+    of posts is a different question, kept alongside for when they differ."""
+    import app.bot as bot
+
+    gid, uid = _tally_user(9401)
+    _bot_db.calorie_food_set(gid, uid, "coffee", "Coffee", 80)
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="Coffee")
+    _bot_db.calorie_add(gid, uid, "Tally", 160, note="Coffee ×2")
+    _bot_db.calorie_add(gid, uid, "Tally", 40, note="Coffee ×0.5")
+
+    rows, plain_logs, _plain_kcal = bot._food_tally_rows(gid, uid)
+
+    assert len(rows) == 1
+    assert rows[0].servings == 3.5 and rows[0].logs == 3
+    assert rows[0].kcal == 280
+    assert plain_logs == 0
+
+
+def test_food_tally_reports_bare_amounts_instead_of_dropping_them():
+    """A `650kcal` post names no food. Silently omitting it would make the
+    tally look like the whole diary when it covers a fraction of it."""
+    import app.bot as bot
+
+    gid, uid = _tally_user(9402)
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="Coffee")
+    _bot_db.calorie_add(gid, uid, "Tally", 650)
+    _bot_db.calorie_add(gid, uid, "Tally", 300)
+    # The bot's own scaling footnote isn't food either.
+    _bot_db.calorie_add(gid, uid, "Tally", 400, note="scaled ×1.1")
+
+    rows, plain_logs, plain_kcal = bot._food_tally_rows(gid, uid)
+
+    assert [r.display for r in rows] == ["Coffee"]
+    assert plain_logs == 3 and plain_kcal == 1350
+
+
+def test_food_tally_relabels_history_when_a_food_is_renamed():
+    """Notes freeze the display as it was. Re-saving `coffee` as `Flat White`
+    would otherwise split one habit across two rows."""
+    import app.bot as bot
+
+    gid, uid = _tally_user(9403)
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="coffee")
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="Coffee")
+    _bot_db.calorie_food_set(gid, uid, "coffee", "Flat White", 80)
+
+    rows, _plain_logs, _plain_kcal = bot._food_tally_rows(gid, uid)
+
+    assert len(rows) == 1
+    assert rows[0].display == "Flat White" and rows[0].logs == 2
+
+
+def test_food_tally_marks_meals_and_ai_estimates_apart_from_saved_foods():
+    """A meal's calories are a whole bundle and an AI figure is a guess —
+    both belong in the tally, neither should read as a weighed shortcut."""
+    import app.bot as bot
+
+    gid, uid = _tally_user(9404)
+    _bot_db.calorie_food_set(gid, uid, "coffee", "Coffee", 80)
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="Coffee")
+    _bot_db.calorie_add(gid, uid, "Tally", 520, note="Breakfast (meal)")
+    _bot_db.calorie_add(gid, uid, "Tally", 950, note="Big Mac (AI estimate)")
+
+    kinds = {r.display: r.kind for r in bot._food_tally_rows(gid, uid)[0]}
+
+    assert kinds == {
+        "Coffee": "food", "Breakfast": "meal", "Big Mac": "ai",
+    }
+
+
+def test_food_tally_is_ordered_by_how_much_was_eaten():
+    import app.bot as bot
+
+    gid, uid = _tally_user(9405)
+    _bot_db.calorie_add(gid, uid, "Tally", 80, note="Coffee ×2")
+    for _ in range(4):
+        _bot_db.calorie_add(gid, uid, "Tally", 105, note="Banana")
+
+    rows, _plain_logs, _plain_kcal = bot._food_tally_rows(gid, uid)
+
+    assert [r.display for r in rows] == ["Banana", "Coffee"]
+
+
+async def _run_tally(user, **kwargs):
+    """Invoke /calories food_tally and hand back (embed, plain_message)."""
+    import app.bot as bot
+
+    interaction = AsyncMock()
+    interaction.user = user
+    interaction.guild_id = 9301
+    interaction.extras = {}
+    await bot.calories_food_tally_cmd.callback(interaction, **kwargs)
+    call = interaction.response.send_message.call_args
+    return call.kwargs.get("embed"), (call.args[0] if call.args else None)
+
+
+def _tally_member(uid: int, name: str = "Tally"):
+    return SimpleNamespace(
+        id=uid, display_name=name, global_name=None, name=name,
+        display_avatar=SimpleNamespace(url=None),
+    )
+
+
+def test_food_tally_table_reports_the_rows_it_could_not_show(monkeypatch):
+    """15 of 40 foods rendered with no remainder line reads as the whole list,
+    while the footer counts all 40 — the table would be quietly lying."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_deny_channel_outsider", AsyncMock(return_value=False))
+    gid, uid = _tally_user(9406)
+    for n in range(22):
+        _bot_db.calorie_add(gid, uid, "Tally", 100 + n, note=f"Food{n:02d}")
+
+    embed, _msg = asyncio.run(_run_tally(_tally_member(uid)))
+
+    assert "… 7 more" in embed.description
+    assert "22 foods" in embed.footer.text
+
+
+def test_food_tally_food_name_cannot_break_out_of_the_code_fence(monkeypatch):
+    """A name carrying ``` closes the fence, spilling every row below it into
+    the message as prose. Markdown escaping is the wrong fix inside a fence —
+    only the backtick can do this."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_deny_channel_outsider", AsyncMock(return_value=False))
+    gid, uid = _tally_user(9407)
+    _bot_db.calorie_add(gid, uid, "Tally", 200, note="a```b evil")
+    _bot_db.calorie_add(gid, uid, "Tally", 100, note="Coffee")
+
+    embed, _msg = asyncio.run(_run_tally(_tally_member(uid)))
+
+    # Exactly one opening and one closing fence, and no stray backtick inside.
+    assert embed.description.count("```") == 2
+    assert "`" not in embed.description.split("```")[1]
+
+
+def test_food_tally_answers_the_food_asked_about_when_nothing_matched(monkeypatch):
+    """Asking after one food and being told "you haven't logged anything"
+    doesn't answer the question that was asked."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_deny_channel_outsider", AsyncMock(return_value=False))
+    gid, uid = _tally_user(9408)
+
+    _embed, msg = asyncio.run(
+        _run_tally(_tally_member(uid), food="pizza", days=7)
+    )
+
+    assert "pizza" in msg and "last 7 days" in msg
+
+
+def test_food_tally_miss_names_whose_diary_it_searched(monkeypatch):
+    """"No pizza logged yet" reads as your own diary when you asked about
+    someone else's."""
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_deny_channel_outsider", AsyncMock(return_value=False))
+    gid, uid = _tally_user(9409)
+    _bot_db.calorie_add(gid, uid, "Tally", 100, note="Coffee")
+
+    interaction = AsyncMock()
+    interaction.user = _tally_member(9410, "Viewer")
+    interaction.guild_id = gid
+    interaction.extras = {}
+    asyncio.run(bot.calories_food_tally_cmd.callback(
+        interaction, user=_tally_member(uid, "Dos"), food="pizza",
+    ))
+
+    assert "for Dos" in interaction.response.send_message.call_args.args[0]

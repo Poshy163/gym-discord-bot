@@ -8031,6 +8031,8 @@ def _help_sections() -> dict[str, discord.Embed]:
             "shortcut, then log it by typing `coffee`, `2 coffee` or "
             "`0.5 coffee` in chat\n"
             "`/calories food_list` · `/calories food_remove <name>`\n"
+            "`/calories food_tally [user] [days] [food]` — how many of each "
+            "food you've logged (`×24 Flat White`), most-eaten first\n"
             "`/calories meal_set <name> <foods>` — bundle saved foods "
             "(`breakfast` = `coffee, 2x oats`); log it with one word\n"
             "`/calories meal_list` · `/calories meal_remove <name>`\n"
@@ -22827,6 +22829,272 @@ async def calories_food_remove_cmd(
         "See `/calories food_list`."
     )
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+class _FoodTallyRow(NamedTuple):
+    """One food's line in ``/calories food_tally``."""
+
+    key: str
+    display: str
+    kind: str
+    servings: float
+    logs: int
+    kcal: float
+    first_at: str
+    last_at: str
+
+
+#: How each non-food ``kind`` is flagged in the tally table. Plain ASCII: the
+#: rows live inside a monospace fence, where an emoji is not one cell wide and
+#: would stagger every column to its right (see :func:`ui.rank`).
+_TALLY_MARKS = {"meal": "*", "ai": "~"}
+
+#: Rows shown in the tally table before ui.table reports the remainder.
+_TALLY_MAX_ROWS = 15
+
+
+def _fence_cell(text: str, *, limit: int) -> str:
+    """A table cell for a monospace fence: :func:`_plain_label`, backticks gone.
+
+    Markdown doesn't render inside a fence, so escaping it there would only
+    show the backslashes — which is why this starts from ``_plain_label``. But
+    a ``````` in a food name still *closes* the fence, spilling every
+    row below it into the message as prose. Only the backtick can do that, so
+    only the backtick is replaced.
+    """
+    return _plain_label(text, limit=limit).replace("`", "'")
+
+
+def _food_tally_rows(
+    guild_id: int, user_id: int,
+    start_iso: str | None = None, end_iso: str | None = None,
+) -> tuple[list[_FoodTallyRow], int, float]:
+    """Roll a user's intake notes up into one row per food, most-eaten first.
+
+    Returns ``(rows, plain_logs, plain_kcal)``. The second pair counts the
+    entries whose note names nothing — a bare ``650kcal`` post carries no note
+    at all — and is handed back rather than dropped, so the tally can say what
+    it is *not* covering instead of quietly presenting itself as the whole
+    diary.
+
+    Servings are summed, not entries: "how many coffees" is answered by
+    ``2 coffee`` counting twice, while ``logs`` keeps the number of separate
+    posts for the cases where the two differ. A food's *current* saved name
+    wins over the one frozen into the note, so renaming a food relabels its
+    history instead of splitting it across two rows.
+    """
+    saved = {
+        r["name"]: str(r["display"])
+        for r in db.calorie_food_list(guild_id, user_id)
+    }
+    merged: dict[str, dict] = {}
+    plain_logs = 0
+    plain_kcal = 0.0
+    for row in db.calorie_note_tally(user_id, start_iso, end_iso):
+        label = calories.parse_entry_note(row["note"])
+        logs = int(row["n"] or 0)
+        kcal = float(row["kcal"] or 0.0)
+        if label is None:
+            plain_logs += logs
+            plain_kcal += kcal
+            continue
+        cur = merged.get(label.key)
+        if cur is None:
+            # Rows arrive busiest-first, so the first spelling seen is the one
+            # used most — the best label when the food isn't saved any more.
+            cur = merged[label.key] = {
+                "display": label.display, "kind": label.kind,
+                "servings": 0.0, "logs": 0, "kcal": 0.0,
+                "first_at": row["first_at"], "last_at": row["last_at"],
+            }
+        # Every entry in this group shares one note, so one serving count.
+        cur["servings"] += label.servings * logs
+        cur["logs"] += logs
+        cur["kcal"] += kcal
+        cur["first_at"] = min(cur["first_at"], row["first_at"])
+        cur["last_at"] = max(cur["last_at"], row["last_at"])
+
+    out = [
+        _FoodTallyRow(
+            key=key,
+            display=saved.get(key) or v["display"],
+            # Still a saved food? Then it's a food, whatever suffix the note it
+            # was logged under happened to carry.
+            kind="food" if key in saved else v["kind"],
+            servings=round(v["servings"], 3),
+            logs=v["logs"],
+            kcal=v["kcal"],
+            first_at=v["first_at"],
+            last_at=v["last_at"],
+        )
+        for key, v in merged.items()
+    ]
+    out.sort(key=lambda r: (-r.servings, -r.logs, r.display.lower()))
+    return out, plain_logs, plain_kcal
+
+
+@calories_group.command(
+    name="food_tally",
+    description="How many of each food you've logged.",
+)
+@app_commands.describe(
+    user="The member to look up (defaults to you).",
+    days="Only count the last N days (default: all time).",
+    food="Show just this one food's totals.",
+)
+@app_commands.autocomplete(food=_saved_food_autocomplete)
+async def calories_food_tally_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    days: app_commands.Range[int, 1, 365] | None = None,
+    food: str | None = None,
+) -> None:
+    target_user = user or interaction.user
+    if await _deny_invisible_target(interaction, target_user):
+        return
+    if await _deny_channel_outsider(interaction, target_user):
+        return
+    guild_id = _ctx_guild_id(interaction)
+    if db.calorie_goal_get(guild_id, target_user.id) is None:
+        await interaction.response.send_message(
+            embed=_calories_not_set_embed(
+                None if target_user == interaction.user
+                else target_user.display_name
+            ),
+            ephemeral=True,
+        )
+        return
+
+    start_iso: str | None = None
+    end_iso: str | None = None
+    window = "all time"
+    # The same window said two ways: `window` labels the card, `scope` slots
+    # into a sentence, where "over the all time" is not English.
+    scope = "yet"
+    if days is not None:
+        # Whole local days ending today, matching _week_window — a tally that
+        # started partway through a day would drop this morning's coffee.
+        today = datetime.now(DISPLAY_TZ).date()
+        start_local = datetime.combine(
+            today - timedelta(days=days - 1), dtime.min, tzinfo=DISPLAY_TZ,
+        )
+        end_local = datetime.combine(
+            today + timedelta(days=1), dtime.min, tzinfo=DISPLAY_TZ,
+        )
+        start_iso = start_local.astimezone(timezone.utc).isoformat()
+        end_iso = end_local.astimezone(timezone.utc).isoformat()
+        window = f"last {ui.plural(days, 'day')}"
+        scope = f"in the {window}"
+
+    rows, plain_logs, plain_kcal = _food_tally_rows(
+        guild_id, target_user.id, start_iso, end_iso,
+    )
+    mine = target_user.id == interaction.user.id
+
+    if food:
+        want = calories.normalize_food(food)
+        match = next((r for r in rows if r.key == want), None)
+        if match is None:
+            # Fall back to the same alias / plural resolution the logger used,
+            # so asking for "wings" finds the food saved as "wing".
+            resolved = db.calorie_food_get(guild_id, target_user.id, want)
+            if resolved is not None:
+                match = next(
+                    (r for r in rows if r.key == str(resolved["name"])), None,
+                )
+        if match is None:
+            # Name whose diary was searched: "No pizza logged yet" reads as
+            # your own when you asked about someone else.
+            whose = "" if mine else (
+                f" for {_safe_label(_display_name(target_user), limit=32)}"
+            )
+            await interaction.response.send_message(
+                f"No **{_safe_label(food, limit=40)}** logged{whose} {scope}.",
+                ephemeral=True,
+            )
+            return
+        had = f"**×{calories.format_servings(match.servings)}**"
+        if match.servings != match.logs:
+            had += f" across {ui.plural(match.logs, 'log')}"
+        each = (
+            f" · {calories.format_kcal(match.kcal / match.servings)} each"
+            if match.servings > 0 else ""
+        )
+        embed = ui.card(
+            f"{ui.FOOD} {_plain_label(match.display, limit=64)}",
+            description="\n".join([
+                had,
+                f"{calories.format_kcal(match.kcal)} total{each}",
+                (
+                    f"First {ui.when(match.first_at)} · "
+                    f"last {ui.when(match.last_at)}"
+                ),
+            ]),
+            member=target_user,
+            footer=window,
+        )
+        await interaction.response.send_message(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if not rows:
+        # "Post a food in chat" is advice the reader can't act on for someone
+        # else, so only the owner of the diary gets the how-to.
+        await interaction.response.send_message(
+            embed=ui.empty(
+                f"You haven't logged a named food {scope}" if mine else
+                f"{_plain_label(_display_name(target_user), limit=32)} "
+                f"hasn't logged a named food {scope}",
+                hint=(
+                    "Save a shortcut with `/calories food_set coffee 5`, then "
+                    "type `coffee` in chat — named entries are what a tally "
+                    "can count."
+                    if mine else "Plain amounts carry no food to count."
+                ),
+                cmd="/calories food_list shows your shortcuts" if mine else None,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    lines = [ui.table(
+        [
+            (
+                ui.rank(i, mono=True),
+                _fence_cell(r.display, limit=18) + _TALLY_MARKS.get(r.kind, ""),
+                f"×{calories.format_servings(r.servings)}",
+                calories.format_kcal(r.kcal),
+            )
+            for i, r in enumerate(rows)
+        ],
+        headers=("#", "Food", "Had", "Calories"),
+        align="> >>",
+        max_rows=_TALLY_MAX_ROWS,
+    )]
+    kinds = {r.kind for r in rows[:_TALLY_MAX_ROWS]}
+    legend = [
+        text for kind, text in
+        (("meal", "`*` saved meal"), ("ai", "`~` AI estimate"))
+        if kind in kinds
+    ]
+    if legend:
+        lines.append(ui.subtext(" · ".join(legend)))
+    if plain_logs:
+        lines.append(ui.subtext(
+            f"plus {ui.plural(plain_logs, 'entry', 'entries')} "
+            f"({calories.format_kcal(plain_kcal)}) with no food name to "
+            "count"
+        ))
+    embed = ui.card(
+        f"{ui.FOOD} Food tally",
+        description="\n".join(lines),
+        member=target_user,
+        footer=f"{window} · {ui.plural(len(rows), 'food')}",
+    )
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @calories_group.command(

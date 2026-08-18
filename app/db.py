@@ -6474,6 +6474,41 @@ class Database:
             ).fetchone()
             return float(row["total"] or 0.0), int(row["n"] or 0)
 
+    def calorie_note_tally(
+        self, user_id: int,
+        start_iso: str | None = None, end_iso: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Every distinct ``note`` on the user's intake entries, each with the
+        number of entries carrying it, their total kcal, and the first and last
+        time it was logged. Busiest first. Bounded to [start_iso, end_iso) when
+        both are given, otherwise all time.
+
+        Grouped on the **raw** note because that is all SQL can see: a serving
+        count lives inside the string (``"Flat White ×2"``), so folding
+        those into one food is the caller's job via
+        :func:`app.calories.parse_entry_note`. Entries with no note group under
+        a single ``NULL`` row rather than being dropped — that row is how a
+        caller can say what share of the diary is unlabelled instead of
+        quietly reporting a total that doesn't add up.
+
+        Per-user and global, like every other calorie read: a food logged in
+        any server or DM counts once, so there is no ``guild_id`` to pass.
+        Scans ``idx_calorie_entries_user_global``.
+        """
+        where = "user_id = ?"
+        params: list = [user_id]
+        if start_iso is not None and end_iso is not None:
+            where += " AND logged_at >= ? AND logged_at < ?"
+            params += [start_iso, end_iso]
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT note, COUNT(*) AS n, COALESCE(SUM(kcal), 0) AS kcal, "
+                "MIN(logged_at) AS first_at, MAX(logged_at) AS last_at "
+                f"FROM calorie_entries WHERE {where} "
+                "GROUP BY note ORDER BY n DESC, note",
+                params,
+            ))
+
     # ---- protein (grams) -------------------------------------------------
 
     def _protein_goal_write(

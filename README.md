@@ -242,6 +242,24 @@ Saved foods (personal name → calorie shortcuts):
 - `/calories food_remove <name>` — delete one; the name field autocompletes to
   your saved foods with their calories/protein, so you pick instead of recall.
   Saved meals work the same way in `/calories meal_remove`.
+- `/calories food_tally [user] [days] [food]` — how many of each food you've
+  actually logged, most-eaten first, with what they added up to:
+
+  ```
+    #  Food             Had   Calories
+  ───  ─────────────  ─────  ─────────
+   1.  Flat White     ×15.5  1,240 cal
+   2.  Weet-Bix          ×6  2,200 cal
+   3.  Breakfast*        ×1    520 cal
+  ```
+
+  It counts **servings**, not posts, so `2 coffee` counts twice and
+  `0.5 coffee` counts half. All time by default; `days:` limits it to a window,
+  and `food:` shows one food on its own with when you first and last had it.
+  Saved meals (`*`) and `/estimate` guesses (`~`) are counted too and marked as
+  such. Anything with no food name to count — a plain `650kcal` post, or a
+  photo the AI couldn't name — is reported as a separate tally-line rather than
+  quietly left out or filed under an invented food.
 
 Saved foods are per-user, so your `coffee` and someone else's can be different
 amounts. Chat shortcuts only fire on an exact full-message match of a food
