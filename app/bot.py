@@ -8439,6 +8439,11 @@ def _compute_attendance_streak(row) -> tuple[int, int] | None:
     try:
         client = _client_for_user(row)
         attended = _revo_attended_dates(client, now_local)
+    except revo_client.RevoAccessGuarded:
+        # Expected while streaks.php is access-guarded — not an error worth a
+        # traceback. Caller falls back to the log-based daily streak.
+        LOG.info("Revo attendance streak unavailable (streaks page access-guarded)")
+        return None
     except revo_client.RevoAuthError:
         _drop_cached_client(int(row["user_id"]))
         return None
@@ -12082,6 +12087,23 @@ async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
         )
 
 
+# Shown when a Revo page a command needs is behind the `Invalid Access! B`
+# server-side guard (docs/REVO_PORTAL.md §1.2) — a page-level block Revo applies
+# to streaks.php / raffle.php that we can't work around from a scraper. Kept
+# distinct from auth/network errors so users aren't wrongly told to re-link or
+# "try again in a minute".
+_REVO_STREAKS_GUARDED_MSG = (
+    "🔒 Revo is currently blocking access to its **streaks** page, so weekly "
+    "streaks and the per-day check-in calendar aren't available right now. Your "
+    "ticket balance, attendance feed and live gym counts still work."
+)
+_REVO_RAFFLE_GUARDED_MSG = (
+    "🔒 Revo is currently blocking access to its **raffle** page, so the draw "
+    "countdowns — and whether you're opted in to the monthly draw — can't be "
+    "read right now. Check the Revo rewards page to confirm you're entered."
+)
+
+
 @bot.tree.command(
     name="revo_streak",
     description="Show a Revo Fitness weekly check-in streak (yours, or another member's).",
@@ -12121,6 +12143,8 @@ async def revo_streak_cmd(
         try:
             client = _client_for_user(row)
             return client.get_streak_weeks()
+        except revo_client.RevoAccessGuarded:
+            return "guarded"
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(int(row["user_id"]))
             return f"auth-failed: {exc}"
@@ -12129,6 +12153,9 @@ async def revo_streak_cmd(
             return f"error: {exc}"
 
     result = await bot.loop.run_in_executor(None, _do)
+    if result == "guarded":
+        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        return
     if isinstance(result, str):
         msg = (
             f"Couldn't fetch your streak ({result})."
@@ -12209,21 +12236,27 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    def _fetch_streaks() -> list[tuple[int, int | None]]:
-        """Return list of (user_id, streak_weeks) fetched live."""
+    def _fetch_streaks() -> "tuple[list[tuple[int, int | None]], bool]":
+        """Return (list of (user_id, streak_weeks), any_guarded) fetched live."""
         out: list[tuple[int, int | None]] = []
+        guarded = False
         for row in guild_accounts:
             uid = int(row["user_id"])
             try:
                 client = _client_for_user(row)
                 streak = client.get_streak_weeks()
+            except revo_client.RevoAccessGuarded:
+                # Streaks page is server-side blocked — fall back to the last
+                # value the poller cached, and flag it so we can say so.
+                guarded = True
+                streak = row["last_streak_weeks"]
             except Exception:
                 # Fall back to the cached value stored by the poller.
                 streak = row["last_streak_weeks"]
             out.append((uid, streak))
-        return out
+        return out, guarded
 
-    results = await bot.loop.run_in_executor(None, _fetch_streaks)
+    results, guarded = await bot.loop.run_in_executor(None, _fetch_streaks)
 
     # Sort: highest streak first; None / 0 go to the bottom.
     results.sort(key=lambda t: t[1] if t[1] is not None else -1, reverse=True)
@@ -12239,6 +12272,12 @@ async def revo_streak_compare_cmd(interaction: discord.Interaction) -> None:
         )
         name = _bot_name(uid, f"<@{uid}>")
         lines.append(f"{badge} **{name}** — {streak_txt}")
+
+    if guarded:
+        lines.append(
+            "-# 🔒 Revo is blocking its streaks page right now — values shown are "
+            "the last ones recorded, not live."
+        )
 
     await interaction.followup.send(
         "\n".join(lines),
@@ -12300,6 +12339,8 @@ async def revo_calendar_cmd(
         try:
             client = _client_for_user(row)
             return client.get_streak_calendar(m, y)
+        except revo_client.RevoAccessGuarded:
+            return "guarded"
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(int(row["user_id"]))
             return f"auth-failed: {exc}"
@@ -12308,6 +12349,9 @@ async def revo_calendar_cmd(
             return f"error: {exc}"
 
     result = await bot.loop.run_in_executor(None, _do)
+    if result == "guarded":
+        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        return
     if isinstance(result, str):
         msg = (
             f"Couldn't fetch your calendar ({result})."
@@ -12430,21 +12474,30 @@ async def revo_calendar_compare_cmd(
         )
         return
 
-    def _fetch_all() -> list[tuple[int, "dict[int, bool] | None"]]:
+    def _fetch_all() -> "tuple[list[tuple[int, dict[int, bool] | None]], bool]":
         out: list[tuple[int, "dict[int, bool] | None"]] = []
+        guarded = False
         for row in guild_accounts:
             uid = int(row["user_id"])
             try:
                 client = _client_for_user(row)
                 out.append((uid, client.get_streak_calendar(m, y)))
+            except revo_client.RevoAccessGuarded:
+                guarded = True
+                out.append((uid, None))
             except Exception:
                 LOG.warning(
                     "revo_calendar_compare: fetch failed for user %s", uid, exc_info=True,
                 )
                 out.append((uid, None))
-        return out
+        return out, guarded
 
-    results = await bot.loop.run_in_executor(None, _fetch_all)
+    results, guarded = await bot.loop.run_in_executor(None, _fetch_all)
+    # The guard is page-level (blocks everyone), so if it fired and nothing came
+    # back, say so plainly rather than rendering a wall of "unavailable" rows.
+    if guarded and all(cal is None for _uid, cal in results):
+        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        return
 
     def _count(cal: "dict[int, bool] | None") -> int:
         return sum(1 for v in cal.values() if v) if cal else -1
@@ -12661,13 +12714,20 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     row = db.get_revo_account(interaction.user.id)
     personal = row is not None
 
-    def _do() -> "tuple[int | None, dict[str, int | None], dict[str, str | None]] | str":
+    def _do() -> "tuple[int | None, revo_client.RaffleInfo | None, dict[str, str | None]] | str":
         try:
             if row is not None:
                 client = _client_for_user(row)
             else:
                 client = revo_client.shared_client_from_env()
-            raffle = client.get_raffle()
+            # Best-effort: raffle.php is currently access-guarded, but tickets and
+            # the prize copy live on other pages that still render, so a guarded
+            # raffle must not sink the whole reply.
+            raffle: revo_client.RaffleInfo | None = None
+            try:
+                raffle = client.get_raffle()
+            except revo_client.RevoAccessGuarded:
+                LOG.info("Revo raffle: page access-guarded")
             tickets = None
             try:
                 tickets, _rows = client.get_tickets()
@@ -12708,22 +12768,38 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     lines = ["🎰 **Revo Raffle**"]
     if personal and tickets is not None:
         display = _bot_name(interaction.user.id, interaction.user.display_name)
+        # "in the draw" is a claim about ENTRY, and the only readable source of
+        # opt-in state is the raffle page. When that page is guarded we can't know
+        # whether these tickets are entered at all — an opted-out member would be
+        # told their tickets are in play when they aren't (the exact failure
+        # parse_raffle_optin exists to prevent). Say only what we know: the count.
+        suffix = " in the draw" if raffle is not None else ""
         lines.append(
-            f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''} "
-            "in the draw"
+            f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''}"
+            f"{suffix}"
         )
-    lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
-    if prize.get("monthly"):
-        lines.append(f"-# 🏆 {prize['monthly']}")
-    # Only the caller's own opt state is theirs to be told about, and it's only
-    # meaningful next to their own ticket count.
-    if personal:
-        note = _raffle_optin_note(raffle.opted_in)
-        if note:
-            lines.append(note)
-    lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
-    if prize.get("major"):
-        lines.append(f"-# 🏆 {prize['major']}")
+    if raffle is not None:
+        lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
+        if prize.get("monthly"):
+            lines.append(f"-# 🏆 {prize['monthly']}")
+        # Only the caller's own opt state is theirs to be told about, and it's only
+        # meaningful next to their own ticket count.
+        if personal:
+            note = _raffle_optin_note(raffle.opted_in)
+            if note:
+                lines.append(note)
+        lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
+        if prize.get("major"):
+            lines.append(f"-# 🏆 {prize['major']}")
+    else:
+        # raffle.php is access-guarded: show the prize copy we still have (it
+        # lives on prize-pool.php) and say the countdowns are unavailable rather
+        # than inventing them.
+        if prize.get("monthly"):
+            lines.append(f"-# 🏆 {prize['monthly']}")
+        if prize.get("major"):
+            lines.append(f"-# 🏆 {prize['major']}")
+        lines.append(_REVO_RAFFLE_GUARDED_MSG)
     if not personal:
         lines.append("-# Link your account with `/revo_link` to show *your* ticket count.")
     await interaction.followup.send(
@@ -12777,10 +12853,30 @@ async def revo_summary_cmd(
     def _do() -> "dict[str, object] | str":
         try:
             client = _client_for_user(row)
-            streak = client.get_streak_weeks()
+            # Tickets first: ticket-tally.php still renders, and it's the fetch
+            # that triggers login (so a real auth failure surfaces here, not
+            # swallowed by a per-page guard catch below).
             avail, _rows = client.get_tickets()
-            raffle = client.get_raffle()
-            calendar = client.get_streak_calendar(m, y)
+            # streaks.php (streak + calendar) and raffle.php are currently
+            # access-guarded; each is best-effort so a guard on one doesn't blank
+            # the whole dashboard. Track which so the render can say "restricted".
+            streaks_guarded = False
+            streak = None
+            try:
+                streak = client.get_streak_weeks()
+            except revo_client.RevoAccessGuarded:
+                streaks_guarded = True
+            calendar: dict[int, bool] = {}
+            try:
+                calendar = client.get_streak_calendar(m, y)
+            except revo_client.RevoAccessGuarded:
+                streaks_guarded = True
+            raffle = None
+            raffle_guarded = False
+            try:
+                raffle = client.get_raffle()
+            except revo_client.RevoAccessGuarded:
+                raffle_guarded = True
             prize: dict[str, str | None] = {"monthly": None, "major": None}
             try:
                 prize = client.get_prize_pool()
@@ -12814,8 +12910,10 @@ async def revo_summary_cmd(
                 )
             return {
                 "streak": streak,
+                "streaks_guarded": streaks_guarded,
                 "tickets": avail,
                 "raffle": raffle,
+                "raffle_guarded": raffle_guarded,
                 "calendar": calendar,
                 "prize": prize,
                 "membership": membership,
@@ -12839,33 +12937,44 @@ async def revo_summary_cmd(
         return
 
     streak = result["streak"]
+    streaks_guarded = bool(result.get("streaks_guarded"))
     tickets = result["tickets"]
     raffle = result["raffle"]
+    raffle_guarded = bool(result.get("raffle_guarded"))
     calendar = result["calendar"] or {}
     prize = result.get("prize") or {"monthly": None, "major": None}
     month_checkins = sum(1 for v in calendar.values() if v)
     month_name = today.strftime("%B")
     display = _bot_name(target.id, target.display_name)
 
-    streak_txt = (
-        f"**{streak} week{'s' if streak != 1 else ''}**"
-        if streak is not None
-        else "*unknown*"
-    )
+    # While streaks.php is access-guarded we get no streak and an empty calendar;
+    # showing "0 check-ins" would read as "hasn't trained", which is wrong — say
+    # "restricted" instead of implying a real zero.
+    if streaks_guarded:
+        streak_txt = "restricted 🔒"
+        checkins_txt = "restricted 🔒"
+    else:
+        streak_txt = (
+            f"**{streak} week{'s' if streak != 1 else ''}**"
+            if streak is not None
+            else "*unknown*"
+        )
+        checkins_txt = f"**{month_checkins}**"
     tickets_txt = f"**{tickets}**" if tickets is not None else "*unknown*"
     lines = [
         f"🏋️ **{display}** — Revo summary",
         f"🔥 Weekly streak: {streak_txt}",
-        f"📅 {month_name} check-ins: **{month_checkins}**",
+        f"📅 {month_name} check-ins: {checkins_txt}",
         f"🎟️ Tickets available: {tickets_txt}",
-        _format_draw_countdown(raffle.monthly_draw_days, "Monthly"),
     ]
-    # Raffle opt state is personal, and this reply is public — only ever tell the
-    # member about their OWN, mirroring the _summary_status_line rule below.
-    if target == interaction.user:
-        optin_note = _raffle_optin_note(raffle.opted_in)
-        if optin_note:
-            lines.append(optin_note)
+    if raffle is not None:
+        lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
+        # Raffle opt state is personal, and this reply is public — only ever tell
+        # the member about their OWN, mirroring the _summary_status_line rule below.
+        if target == interaction.user:
+            optin_note = _raffle_optin_note(raffle.opted_in)
+            if optin_note:
+                lines.append(optin_note)
     membership = result.get("membership")
     if membership is not None:
         tier = " · ".join(
@@ -12891,9 +13000,12 @@ async def revo_summary_cmd(
         lines.insert(1, status_line)
     if prize.get("monthly"):
         lines.append(f"-# 🏆 {prize['monthly']}")
-    lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
+    if raffle is not None:
+        lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
     if prize.get("major"):
         lines.append(f"-# 🏆 {prize['major']}")
+    if raffle is None and raffle_guarded:
+        lines.append(_REVO_RAFFLE_GUARDED_MSG)
     await interaction.followup.send(
         "\n".join(lines),
         allowed_mentions=discord.AllowedMentions.none(),
@@ -13515,6 +13627,36 @@ async def nicks_cmd(interaction: discord.Interaction) -> None:
 
 # ---- attendance poller ----------------------------------------------------
 
+# Last attendance source the poller reported ("calendar" / "tickets"), so a
+# switch can be logged once instead of every cycle. The Revo portal degrades
+# SILENTLY — its access guard answers HTTP 200 — so without this, the feed
+# quietly dropping to the coarse ticket fallback (or recovering to real per-day
+# data) leaves no trace at all. That is what made the 2026-08 breakage hard to
+# spot. Process-local and best-effort: a restart just re-logs the current state.
+_revo_feed_source: str | None = None
+
+
+def _log_feed_source_change(source: str | None) -> None:
+    """Log once when the attendance feed changes data source."""
+    global _revo_feed_source
+    if source is None or source == _revo_feed_source:
+        return
+    previous, _revo_feed_source = _revo_feed_source, source
+    if source == "tickets":
+        LOG.warning(
+            "Revo attendance feed DEGRADED (was=%s): the per-day streaks "
+            "calendar is unavailable, falling back to the weekly ticket grant — "
+            "check-ins will be later and less precise. See docs/REVO_PORTAL.md "
+            "3.2.4; run scripts/revo_health.py for the full picture.",
+            previous or "unknown",
+        )
+    elif previous is not None:
+        LOG.info(
+            "Revo attendance feed RECOVERED (was=%s): reading the per-day "
+            "streaks calendar again.", previous,
+        )
+
+
 @tasks.loop(minutes=REVO_POLL_MINUTES)
 async def revo_attendance_poll() -> None:
     """Walk every linked Revo account and announce new check-ins.
@@ -13560,33 +13702,45 @@ async def _poll_one_account(row) -> None:
     if prev_checkin == today_iso:
         return
 
-    def _fetch() -> "tuple[str | None, int | None] | str":
-        """Return (latest_checkin_iso, streak_weeks) or an error string."""
+    def _fetch() -> "tuple[str | None, int | None, str | None, bool] | str":
+        """Return (latest_iso, streak_weeks, source, streak_readable) or an error.
+
+        ``source`` is ``"calendar"`` (the per-day streaks calendar — a real visit
+        day) or ``"tickets"`` (the ticket-tally ``Attendance`` grant, used only
+        while the calendar is access-guarded — a coarse, lagging weekly signal).
+        The announcement below reads ``source`` so it only claims "trained today"
+        when that's actually what the data supports.
+
+        ``streak_readable`` is False when the streaks page couldn't be read at all
+        (guarded or erroring), which is different from a streak that is genuinely
+        unknown — see :class:`revo_client.AttendanceInfo`.
+        """
         try:
             client = _client_for_user(row)
-            cal = client.get_streak_calendar(now_local.month, now_local.year)
-            latest_day = revo_client.latest_attended_day(cal)
-            latest_iso: str | None = (
-                datetime(now_local.year, now_local.month, latest_day).strftime("%Y-%m-%d")
-                if latest_day
-                else None
-            )
+            info = client.get_latest_attendance(now_local.month, now_local.year)
+            latest_iso = info.date
+            streak = info.streak_weeks
+            source = info.source
+            streak_readable = info.streak_readable
             # Near a month boundary the current month may not yet hold the most
-            # recent visit — bridge by also checking the previous month.
-            if latest_iso is None and now_local.day <= 2:
+            # recent visit — bridge via the previous month. Calendar path only:
+            # source is None here iff the calendar rendered but held no visit this
+            # month; a "tickets" source already spans months, so nothing to bridge.
+            if latest_iso is None and source is None and now_local.day <= 2:
                 prev_month = now_local.replace(day=1) - timedelta(days=1)
-                prev_cal = client.get_streak_calendar(prev_month.month, prev_month.year)
-                prev_day = revo_client.latest_attended_day(prev_cal)
-                if prev_day:
-                    latest_iso = datetime(
-                        prev_month.year, prev_month.month, prev_day
-                    ).strftime("%Y-%m-%d")
-            streak = None
-            try:
-                streak = client.get_streak_weeks()
-            except Exception:  # pragma: no cover
-                LOG.warning("Revo streak fetch failed for user %s", user_id, exc_info=True)
-            return latest_iso, streak
+                try:
+                    prev_cal = client.get_streak_calendar(
+                        prev_month.month, prev_month.year,
+                    )
+                    prev_day = revo_client.latest_attended_day(prev_cal)
+                    if prev_day:
+                        latest_iso = datetime(
+                            prev_month.year, prev_month.month, prev_day
+                        ).strftime("%Y-%m-%d")
+                        source = "calendar"
+                except revo_client.RevoAccessGuarded:  # pragma: no cover
+                    pass
+            return latest_iso, streak, source, streak_readable
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(user_id)
             return f"auth-failed: {exc}"
@@ -13597,12 +13751,20 @@ async def _poll_one_account(row) -> None:
     if isinstance(result, str):
         LOG.warning("Revo poll skipped user %s: %s", user_id, result)
         return
-    latest_iso, streak = result
+    latest_iso, streak, source, streak_readable = result
+    _log_feed_source_change(source)
 
     # Advance the cursor to the newest date we know about, then persist first so
     # a notify-failure doesn't replay forever. ISO dates sort lexicographically.
     cursor = max(d for d in (prev_checkin, latest_iso) if d) if (prev_checkin or latest_iso) else None
-    db.update_revo_checkin_state(user_id, cursor, streak)
+    # Persist the live streak whenever the streaks page actually answered — even
+    # if that answer is None (a streak really can lapse, and freezing a stale one
+    # would mis-rank the leaderboard and mislead the AI coach). Only when the page
+    # was UNREADABLE (access-guarded or erroring) do we keep the last known value
+    # rather than nulling it.
+    db.update_revo_checkin_state(
+        user_id, cursor, streak if streak_readable else prev_streak,
+    )
 
     if latest_iso is None:
         return
@@ -13639,9 +13801,9 @@ async def _poll_one_account(row) -> None:
     # wall clock at detection plus how old the visit already was. A few weeks of
     # these lines pins the real cadence (and would catch it changing).
     LOG.info(
-        "Revo check-in detected user=%s visit_date=%s detected_at=%s (%s UTC) "
-        "lag_days=%d",
-        user_id, latest_iso, now_local.strftime("%Y-%m-%d %H:%M %Z"),
+        "Revo check-in detected user=%s visit_date=%s source=%s detected_at=%s "
+        "(%s UTC) lag_days=%d",
+        user_id, latest_iso, source, now_local.strftime("%Y-%m-%d %H:%M %Z"),
         now_local.astimezone(timezone.utc).strftime("%H:%M"),
         (today - checkin_date).days,
     )
@@ -13650,7 +13812,14 @@ async def _poll_one_account(row) -> None:
     # attendance flag that Revo batches into the rewards system, so by the time
     # we see it the session can be many hours old — claiming "just" is usually
     # wrong. "Trained today" is what the data actually supports.
-    if checkin_date == today:
+    if source == "tickets":
+        # Fallback path: the streaks calendar is access-guarded, so this came from
+        # the ticket-tally Attendance grant — a coarse weekly reward dated to
+        # ISSUANCE, not the training day. The grant can land days after the visit
+        # and even in a later week than the session it rewards, so this must not
+        # assert a day *or* a week: "recently" is the true resolution of the signal.
+        text = f"🏋️ <@{user_id}> has been training at Revo recently!{streak_tail} 💪"
+    elif checkin_date == today:
         text = f"🏋️ <@{user_id}> trained at Revo today!{streak_tail}"
     else:
         when = "yesterday" if checkin_date == today - timedelta(days=1) else (
@@ -13669,8 +13838,13 @@ async def _poll_one_account(row) -> None:
 
     # Append a streak leaderboard if there are other linked accounts in the
     # same notify guild (using the cached streak values — no extra HTTP calls).
+    # Gated on the streaks page being READABLE, not on this member having a
+    # streak: while it's access-guarded nobody's cached value is being refreshed,
+    # so a "leaderboard" of frozen numbers would mislead. When the page works,
+    # peers' cached values are current and the board is worth showing even if this
+    # member's own streak came back unknown.
     notify_guild_id = row["notify_guild_id"]
-    if notify_guild_id is not None:
+    if streak_readable and notify_guild_id is not None:
         all_accounts = db.list_revo_accounts()
         peers = [
             (int(r["user_id"]), r["last_streak_weeks"])

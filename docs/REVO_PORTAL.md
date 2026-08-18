@@ -40,6 +40,20 @@ Verified by re-testing every gated route with a confirmed L2 cookie (and various
 
 ### 1.2 The `Invalid Access! B` guard (new 2026-07) — distinct from L2 gating
 
+> ⛔ **Spread (2026-08): the guard now also covers `rewards/streaks.php` and
+> `rewards/raffle.php`.** It began on `club-counter.php` / `massage-chair.php`;
+> as of ~2026-08 both the streaks page (**HTML *and* the `?m=&y=` calendar
+> JSON**) and the raffle page return the same 17-byte `Invalid Access! B`. This
+> is what **broke the attendance tracker** — the poller read the streaks
+> calendar. Re-probed exhaustively (Referer, full Chrome UA, `Sec-Fetch-*`,
+> `X-Requested-With`, `X-Forwarded-For`, param/case/path variants, warm-up GET of
+> the rewards index first, and a fresh re-login): **all return the identical 17
+> bytes**, so it is no more client-settable here than it was for club-counter.
+> **Still working (2026-08):** the rewards landing (`/portal/rewards/`),
+> `ticket-tally.php` and `prize-pool.php`. See §3.2.4 for how the poller fell back
+> to ticket-tally, and `revo_client.is_access_guarded()` / `RevoAccessGuarded`
+> for how the code now distinguishes this from an auth/parse failure.
+
 `club-counter.php` and `massage-chair.php` — the *only* two pages that
 server-rendered dynamic in-club blobs (live occupancy + the access QR) — now
 return **HTTP 200, `Content-Type: text/html`, Content-Length 17, body exactly
@@ -85,10 +99,10 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/` (L2 onl
 | GET | `/portal/api/` | ✅ | Returns literal `:)` — no JSON API mounted here |
 | GET | `/portal/club-counter.php` | ⛔ | **Blocked (2026-07):** returns 200 + 17-byte `Invalid Access! B` (see §1.2). The all-clubs board is gone. Fav-club-only live count survives on the rewards landing (§3.5). |
 | GET | `/portal/rewards/` | ✅ | Rewards landing (ticket count + favourite-club summary) |
-| GET | `/portal/rewards/streaks.php` | ✅ | Current weekly streak + monthly check-in calendar |
-| GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ✅ | **JSON** per-day attendance for any month (see §3.2.1) |
-| GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned |
-| GET | `/portal/rewards/raffle.php` | ✅ | Tickets + countdowns to monthly + major draws |
+| GET | `/portal/rewards/streaks.php` | ⛔ | **Blocked (2026-08):** 200 + 17-byte `Invalid Access! B` (§1.2). Was: current weekly streak + monthly check-in calendar. |
+| GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ⛔ | **Blocked (2026-08):** same guard. Was: **JSON** per-day attendance (§3.2.1). This is the feed the attendance poller lost. |
+| GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned. Now also the **attendance-poll fallback** (§3.2.4). |
+| GET | `/portal/rewards/raffle.php` | ⛔ | **Blocked (2026-08):** 200 + 17-byte `Invalid Access! B` (§1.2). Was: tickets + countdowns to monthly + major draws. |
 | GET | `/portal/rewards/raffle.php?optval=1` | ⚠️ | **State-changing** — a pure **TOGGLE** of monthly raffle opt-in (both buttons send `optval=1`; it is *not* a `0`/`1` setter). JSON `{"Status":"0\|1"}`. **Never call this** — read the opt state from the DOM instead (§3.4). |
 | GET | `/portal/rewards/major-prize-winners.php` | ✅ | Past major-draw dates + winners (initial, surname, postcode). Real draw dates; ⚠️ third-party PII (§3.4). |
 | GET | `/portal/rewards/prize-pool.php` | ✅ | Same counters + current prize copy |
@@ -342,6 +356,83 @@ fence in the wrong place for 25 clubs.
 > than replace it. Note also that *being at the club* is not the same fact as
 > *having checked in* — someone can walk past — so the honest design is to
 > announce on presence and let the calendar confirm the visit later.
+
+#### 3.2.4 Attendance poller fallback after the streaks guard (2026-08)
+
+When the `Invalid Access! B` guard spread to `streaks.php` (§1.2), the attendance
+poller — which read the per-day streaks calendar — went silent: the guarded page
+parses to an empty calendar, so `latest_attended_day` was always `None` and the
+cursor never advanced. No crash, just no announcements.
+
+**Fix:** `RevoClient.get_latest_attendance(month, year)` now prefers the
+calendar and **falls back to the newest `Attendance` grant on `ticket-tally.php`**
+(which still renders) when the calendar raises `RevoAccessGuarded`. It returns an
+`AttendanceInfo(date, source, streak_weeks)` so the poller can word the ping
+honestly:
+
+- `source == "calendar"` — a real per-day visit; announces "trained at Revo
+  today / (day)" with the weekly streak.
+- `source == "tickets"` — the ticket-tally `Attendance` grant, a **coarse,
+  roughly-weekly reward dated to *issuance*** (§3.3), not the training day. The
+  ping says "**has been training at Revo recently**" and omits the streak (the
+  streaks page is guarded too, so there's no reliable number — do **not** try to
+  reconstruct one from the irregular grant cadence).
+  > ⚠️ Not "today", and **not "this week" either**: a grant issued Tue can reward
+  > training from the *previous* week, so a week-level claim is falsifiable in
+  > ordinary use. "Recently" is the true resolution of this signal.
+
+`AttendanceInfo.streak_readable` is the other half of the contract, and it exists
+because "the streak is 0/unknown" and "we couldn't read the streak" must not be
+conflated when the value is **cached**:
+
+- **readable** (the page answered, even with `None`) → write it through. A streak
+  really can lapse, and freezing a stale one mis-ranks the streak leaderboard and
+  feeds the AI-coach payload (`last_streak_weeks`) a number the member no longer
+  has.
+- **unreadable** (guarded *or* a transient 5xx/timeout) → keep the last known
+  value rather than nulling it, and suppress the leaderboard on that ping, since
+  nobody's cached value is being refreshed while the page is down.
+
+The streak is read on **every** poll — including polls where this month holds no
+visit yet — for the same reason: reading it only alongside a check-in would let a
+cached streak freeze for anyone mid-gap and never clear for someone who churned.
+It is also read **defensively**: any failure degrades to "no streak tail", never
+an aborted poll. Letting a transient streaks.php error escape would drop a real
+check-in announcement entirely, which is the worse failure.
+
+Trade-offs to remember before "improving" this: the ticket fallback lags real
+visits by days and collapses several visits in a week into one grant, so it will
+announce at most ~weekly, never per-visit. It is strictly worse than the calendar
+— it's what's left. If Revo ever lifts the guard, `get_latest_attendance`
+transparently goes back to the calendar (calendar-first), no code change needed.
+The cursor (`last_checkin_date`) tolerates the source switch because it only ever
+advances to a lexicographically newer ISO date.
+
+**One more guard consequence worth not re-discovering:** `raffle.php` is the only
+readable source of monthly-draw **opt-in state** (§3.4), so while it is guarded
+`/revo_raffle` must not describe a member's tickets as "**in the draw**" — an
+opted-out member would be told their tickets are in play when they aren't. The
+command drops that phrase (showing only the count) whenever the raffle page
+didn't answer.
+
+#### 3.2.5 Seeing this happen next time
+
+The reason the 2026-08 breakage was invisible is that **this portal fails
+silently**: the guard returns HTTP 200, so every request still "succeeds" and the
+calendar merely parses to empty. Two things now make that observable — worth
+knowing about before spending an afternoon re-deriving it:
+
+- **`scripts/revo_health.py`** — probes every source in one pass and prints
+  whether check-in tracking is healthy / degraded / down. Exit code `0`/`1`/`2`
+  respectively (`3` = couldn't log in), so it also works as a cron canary. This is
+  the fastest way to tell **when Revo lifts a block** and per-day tracking
+  resumes. Backed by `revo_client.probe_sources()` +
+  `attendance_feed_state()`.
+- **The poller logs source changes**, once per change rather than per cycle:
+  `Revo attendance feed DEGRADED …` when it drops to the ticket fallback, and
+  `… RECOVERED …` when the calendar comes back.
+
+Both are read-only and cost one request per source — diagnostics, not polls (§6).
 
 ### 3.3 Tickets / Attendance log — `/portal/rewards/ticket-tally.php`
 

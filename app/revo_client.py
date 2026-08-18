@@ -42,6 +42,16 @@ PRIZE_POOL_PATH = "/portal/rewards/prize-pool.php"
 USER_AGENT = "gym-discord-bot/0.1 (+https://github.com/Poshy163/gym-discord-bot)"
 REQUEST_TIMEOUT = 20
 
+# The portal's server-side access guard: a PHP ``die("Invalid Access! B")``
+# returned with HTTP 200 and a 17-byte body (see docs/REVO_PORTAL.md §1.2). It
+# began (2026-07) on ``club-counter.php`` / ``massage-chair.php``, and as of
+# ~2026-08 it also covers ``streaks.php`` (HTML *and* the ``?m=&y=`` calendar
+# JSON) and ``raffle.php``. It keys on an IP / app-context we cannot set from a
+# scraper — every header / referer / cookie / param variation returns the same
+# 17 bytes — so it cannot be worked around client-side. ``ticket-tally.php``,
+# ``prize-pool.php`` and the rewards landing are (so far) unaffected.
+GUARD_BODY = "Invalid Access! B"
+
 # Live counter is refreshed on the server side fairly slowly; cache for a
 # minute to avoid hammering the portal when several people run /busy in quick
 # succession.
@@ -54,6 +64,22 @@ class RevoUnavailable(RuntimeError):
 
 class RevoAuthError(RuntimeError):
     """Raised when login fails (bad credentials, account locked, etc.)."""
+
+
+class RevoAccessGuarded(RevoUnavailable):
+    """Raised when a page returns the ``Invalid Access! B`` guard (docs §1.2).
+
+    A subclass of :class:`RevoUnavailable` so existing broad ``except`` handlers
+    keep degrading gracefully, but distinct so callers that want to say "Revo has
+    restricted this page" (rather than "no data" or "wrong credentials") can catch
+    it specifically. The guard is *not* client-settable, so retrying with different
+    headers/params is pointless — treat it as "this page is unavailable to us".
+    """
+
+
+def is_access_guarded(body: str | None) -> bool:
+    """True when *body* is exactly the portal's access-guard ``die()`` string."""
+    return bool(body) and body.strip() == GUARD_BODY
 
 
 # Optional deps — only imported lazily so the bot can boot without them.
@@ -415,6 +441,66 @@ def latest_attended_day(calendar: dict[int, bool]) -> Optional[int]:
     return max(days) if days else None
 
 
+def _ddmmyyyy_to_iso(date_str: str) -> Optional[str]:
+    """Convert a portal ``dd/mm/yyyy`` date to ISO ``YYYY-MM-DD`` (None if bad)."""
+    m = re.match(r"\s*(\d{2})/(\d{2})/(\d{4})", date_str or "")
+    if not m:
+        return None
+    day, month, year = m.groups()
+    return f"{year}-{month}-{day}"
+
+
+def latest_attendance_ticket_date(rows: list["TicketRow"]) -> Optional[str]:
+    """Most recent ``Attendance`` grant date from ticket-tally, as ISO YYYY-MM-DD.
+
+    This is the *fallback* attendance signal the poller uses when the per-day
+    streaks calendar is access-guarded (see :data:`GUARD_BODY` and
+    docs/REVO_PORTAL.md §3.3). The ``Attendance`` ticket is a roughly-weekly
+    reward grant dated to *issuance*, so it lags real visits by days and misses
+    most of them — but it is the only attendance signal that still renders once
+    ``streaks.php`` is guarded. Only ``Attendance`` rows count: ``Monthiversary``
+    / ``Welcome`` / ``BONUSDAILY`` are not gym visits.
+
+    ISO strings sort lexicographically, so ``max`` picks the newest grant.
+    """
+    isos: list[str] = []
+    for r in rows:
+        if r.source.lower() != "attendance":
+            continue
+        iso = _ddmmyyyy_to_iso(r.date)
+        if iso is not None:
+            isos.append(iso)
+    return max(isos) if isos else None
+
+
+@dataclass(frozen=True)
+class AttendanceInfo:
+    """Latest attendance the bot could observe, plus where it came from.
+
+    ``source`` is:
+      * ``"calendar"`` — the per-day streaks calendar; ``date`` is a real visit
+        day and ``streak_weeks`` may be populated.
+      * ``"tickets"`` — the ticket-tally ``Attendance`` grant, used only while the
+        calendar is access-guarded; ``date`` is a coarse, lagging *issuance* date
+        (the member trained on or before it, often days earlier) and
+        ``streak_weeks`` is ``None`` (the streak page is guarded too).
+      * ``None`` — nothing found (no visits recorded, or the fallback was empty).
+
+    ``date`` is ISO ``YYYY-MM-DD`` or ``None``.
+
+    ``streak_readable`` says whether the streaks page actually answered. It
+    separates "the streak is genuinely unknown/absent" (``True`` with
+    ``streak_weeks is None``) from "we could not read it at all" (``False`` —
+    access-guarded or a transient error). Callers that *cache* the streak need
+    that distinction: overwriting a good cached value with ``None`` just because
+    the page was unreachable would silently degrade the streak leaderboard.
+    """
+    date: Optional[str]
+    source: Optional[str]
+    streak_weeks: Optional[int]
+    streak_readable: bool = False
+
+
 # Weekly-streak milestones worth celebrating in the attendance feed.
 STREAK_MILESTONES: tuple[int, ...] = (4, 8, 12, 26, 52)
 
@@ -646,7 +732,10 @@ class RevoClient:
         return parse_prize_pool(self._get(PRIZE_POOL_PATH))
 
     def get_streak_weeks(self) -> Optional[int]:
-        return parse_streak_weeks(self._get(STREAKS_PATH))
+        html = self._get(STREAKS_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the streaks page.")
+        return parse_streak_weeks(html)
 
     def get_streak_calendar(self, month: int, year: int) -> dict[int, bool]:
         """Per-day attendance for the given calendar month.
@@ -683,10 +772,68 @@ class RevoClient:
         if r.status_code in (301, 302):
             return {}
         r.raise_for_status()
+        if is_access_guarded(r.text):
+            raise RevoAccessGuarded("Revo has access-guarded the streaks calendar.")
         return parse_streak_calendar(r.text)
 
     def get_tickets(self) -> tuple[Optional[int], list[TicketRow]]:
         return parse_tickets(self._get(TICKETS_PATH))
+
+    def get_latest_attendance(self, month: int, year: int) -> AttendanceInfo:
+        """Most recent attendance date, resilient to the streaks-page guard.
+
+        Prefers the per-day streaks calendar (a real visit day, plus the weekly
+        streak). When ``streaks.php`` is access-guarded (:data:`GUARD_BODY`),
+        falls back to the newest ``Attendance`` grant on ``ticket-tally.php``,
+        which still renders. The returned :class:`AttendanceInfo` carries the
+        ``source`` so the poller can word an announcement honestly — a ticket
+        grant date is coarser and later than the day the member actually trained.
+
+        Only covers *this* month; the poller bridges the previous month near a
+        month boundary for the calendar path (the ticket page already spans
+        months, so the fallback needs no bridging).
+        """
+        try:
+            cal = self.get_streak_calendar(month, year)
+        except RevoAccessGuarded:
+            iso = latest_attendance_ticket_date(self.get_tickets()[1])
+            return AttendanceInfo(
+                date=iso,
+                source="tickets" if iso else None,
+                streak_weeks=None,
+                streak_readable=False,  # streaks page is guarded too
+            )
+
+        # The streak is an optional *tail* on the announcement, never a reason to
+        # lose the attendance itself, so it is read defensively and separately:
+        #   * read it even when this month holds no visit yet — the cached value
+        #     backs the streak leaderboard, and skipping the read here would let
+        #     it freeze at a stale number for anyone between check-ins;
+        #   * swallow ANY failure, not just the access guard. A transient 5xx or
+        #     timeout on streaks.php must not abort the poll and drop a real
+        #     "trained today" announcement (which is what propagating it did).
+        streak: Optional[int] = None
+        streak_readable = False
+        try:
+            streak = self.get_streak_weeks()
+            streak_readable = True
+        except RevoAccessGuarded:  # streaks HTML guarded even when calendar isn't
+            streak = None
+        except Exception:  # pragma: no cover - network
+            LOG.warning("Revo streak fetch failed for %s", self.email, exc_info=True)
+            streak = None
+
+        latest_day = latest_attended_day(cal)
+        if latest_day is None:
+            return AttendanceInfo(
+                date=None, source=None,
+                streak_weeks=streak, streak_readable=streak_readable,
+            )
+        iso = f"{year:04d}-{month:02d}-{latest_day:02d}"
+        return AttendanceInfo(
+            date=iso, source="calendar",
+            streak_weeks=streak, streak_readable=streak_readable,
+        )
 
     def get_raffle(self) -> RaffleInfo:
         """Draw countdowns **and** this member's raffle opt-in state, one fetch.
@@ -694,14 +841,111 @@ class RevoClient:
         Both come off the same page, so they're parsed together rather than making
         the caller GET it twice — and pairing them is what stops a caller from
         announcing a countdown to someone who isn't entered.
+
+        Raises :class:`RevoAccessGuarded` when ``raffle.php`` returns the access
+        guard, so callers can distinguish "Revo blocked this page" from a genuine
+        parse of an empty/opted-out page.
         """
         html = self._get(RAFFLE_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the raffle page.")
         days = parse_raffle(html)
         return RaffleInfo(
             monthly_draw_days=days["monthly_draw_days"],
             major_draw_days=days["major_draw_days"],
             opted_in=parse_raffle_optin(html),
         )
+
+
+# ---------------------------------------------------------------------------
+# Source health probe
+# ---------------------------------------------------------------------------
+
+# Status values for :class:`SourceHealth`.
+HEALTH_OK = "ok"            # page answered with usable data
+HEALTH_EMPTY = "empty"      # page answered, but parsed to nothing (shape drift?)
+HEALTH_GUARDED = "guarded"  # the `Invalid Access! B` server-side block (§1.2)
+HEALTH_ERROR = "error"      # auth/network/HTTP failure
+
+
+@dataclass(frozen=True)
+class SourceHealth:
+    """Whether one Revo page the bot depends on is currently usable."""
+    label: str
+    status: str
+    detail: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == HEALTH_OK
+
+
+def _probe(label: str, fn) -> SourceHealth:
+    """Run one probe, classifying guard / error / empty / ok.
+
+    ``fn`` returns a truthy value when the page yielded usable data. The guard is
+    caught *before* the generic handler because ``RevoAccessGuarded`` subclasses
+    ``RevoUnavailable`` — an operator needs "Revo is blocking this" to read
+    differently from "our credentials/network broke".
+    """
+    try:
+        got = fn()
+    except RevoAccessGuarded:
+        return SourceHealth(label, HEALTH_GUARDED, "blocked by Revo (Invalid Access)")
+    except RevoAuthError as exc:
+        return SourceHealth(label, HEALTH_ERROR, f"auth failed: {exc}")
+    except Exception as exc:  # pragma: no cover - network
+        return SourceHealth(label, HEALTH_ERROR, str(exc)[:120])
+    return SourceHealth(label, HEALTH_OK if got else HEALTH_EMPTY)
+
+
+def probe_sources(client: "RevoClient", month: int, year: int) -> list[SourceHealth]:
+    """Check every portal page the bot reads, newest-breakage-first order.
+
+    Exists because this portal degrades *silently*: the guard returns HTTP 200,
+    so a page can stop working while every request still "succeeds". That is
+    exactly how the attendance tracker went quiet (§3.2.4) — nothing raised, the
+    calendar just parsed to empty. This turns that class of failure into
+    something a human can see in one command instead of a log dig.
+
+    Costs one request per source, so callers should rate-limit it (the portal
+    notes ask for gentle traffic) — it is a diagnostic, not a poll.
+    """
+    return [
+        # The attendance feed's primary source, and the one currently guarded.
+        _probe("Check-in calendar", lambda: client.get_streak_calendar(month, year)),
+        _probe("Weekly streak", lambda: client.get_streak_weeks() is not None),
+        # The fallback that keeps the attendance feed alive while the above is out.
+        _probe("Tickets", lambda: client.get_tickets()[0] is not None),
+        _probe("Raffle", lambda: client.get_raffle()),
+        _probe("Prize pool", lambda: any(client.get_prize_pool().values())),
+        _probe(
+            "Rewards landing",
+            lambda: client.get_rewards_landing().fav_club_id is not None,
+        ),
+    ]
+
+
+def attendance_feed_state(sources: list[SourceHealth]) -> tuple[str, str]:
+    """Summarise what :func:`probe_sources` means for the attendance tracker.
+
+    Returns ``(state, explanation)`` where *state* is ``"ok"`` (per-day calendar
+    working), ``"degraded"`` (calendar out, ticket fallback carrying it) or
+    ``"down"`` (neither source usable).
+    """
+    by_label = {s.label: s for s in sources}
+    calendar = by_label.get("Check-in calendar")
+    tickets = by_label.get("Tickets")
+    if calendar is not None and calendar.ok:
+        return "ok", "Per-day check-ins are being read normally."
+    if tickets is not None and tickets.ok:
+        return (
+            "degraded",
+            "The per-day calendar is unavailable, so check-ins are detected from "
+            "the weekly ticket grant instead — later and less precise, but the "
+            "feed still fires.",
+        )
+    return "down", "No attendance source is readable, so check-ins can't be detected."
 
 
 # ---------------------------------------------------------------------------

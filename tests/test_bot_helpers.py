@@ -3211,8 +3211,24 @@ def _revo_row(**kw):
     return base
 
 
-def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None):
+class _Boom:
+    """Pass as ``streak=`` to make the fake client's streak fetch raise.
+
+    Models a transient streaks.php failure (5xx / timeout) that is NOT the access
+    guard — the streak is only a tail on the announcement, so it must degrade to
+    "no streak", never abort the poll.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+
+def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False):
     """Drive _poll_one_account with the network + DB + Discord stubbed out.
+
+    ``guarded`` simulates the streaks page being access-guarded: the calendar
+    raises ``RevoAccessGuarded`` and the attendance date comes from a ticket-tally
+    ``Attendance`` row (dated to ``latest_iso``) instead — the real fallback path.
 
     Returns (sent_texts, fetch_calls, saved_state).
     """
@@ -3226,8 +3242,14 @@ def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None):
             sent.append(text)
 
     class _Client:
+        # Mirrors RevoClient's shape closely enough for the real
+        # get_latest_attendance() to run against it (it logs self.email).
+        email = "tester@example.test"
+
         def get_streak_calendar(self, m, y):
             fetches.append(("calendar", m, y))
+            if guarded:
+                raise bot.revo_client.RevoAccessGuarded("streaks guarded")
             if latest_iso is None:
                 return {}
             d = datetime.strptime(latest_iso, "%Y-%m-%d")
@@ -3235,7 +3257,26 @@ def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None):
 
         def get_streak_weeks(self):
             fetches.append(("streak",))
+            if guarded:
+                raise bot.revo_client.RevoAccessGuarded("streaks guarded")
+            if isinstance(streak, _Boom):
+                raise streak.exc
             return streak
+
+        def get_tickets(self):
+            # Reached only when the calendar path is guarded — the ticket-tally
+            # Attendance row is the fallback attendance signal.
+            fetches.append(("tickets",))
+            if latest_iso is None:
+                return (None, [])
+            d = datetime.strptime(latest_iso, "%Y-%m-%d")
+            row = bot.revo_client.TicketRow(2, "Attendance", d.strftime("%d/%m/%Y"))
+            return (41, [row])
+
+        def get_latest_attendance(self, m, y):
+            # Exercise the REAL calendar-first fallback logic against this fake's
+            # primitives, rather than reimplementing it in the test.
+            return bot.revo_client.RevoClient.get_latest_attendance(self, m, y)
 
     class _Loop:
         # discord.Client.loop raises before the client connects, so the whole
@@ -3321,6 +3362,84 @@ def test_poll_cursor_never_goes_backwards(monkeypatch):
     row = _revo_row(last_checkin_date="2026-07-28")
     _sent, _f, saved = _run_poll(monkeypatch, row, latest_iso="2026-07-20")
     assert saved == [(42, "2026-07-28", 3)]
+
+
+def test_poll_ticket_fallback_wording_when_streaks_guarded(monkeypatch):
+    """When streaks.php is access-guarded the poller falls back to the
+    ticket-tally Attendance grant — a coarse weekly issuance date, not the
+    training day — so it must NOT claim a specific day, and must not carry a
+    (now-unavailable) streak number."""
+    row = _revo_row(last_checkin_date="2026-07-20", last_streak_weeks=5)
+    sent, fetches, saved = _run_poll(
+        monkeypatch, row, latest_iso="2026-07-31", guarded=True,
+    )
+    assert len(sent) == 1
+    assert "has been training at Revo recently" in sent[0]
+    # The grant date is an issuance date, so no day AND no week may be claimed.
+    assert "today" not in sent[0]
+    assert "yesterday" not in sent[0]
+    assert "this week" not in sent[0]
+    assert "streak" not in sent[0]  # streaks page guarded ⇒ no streak tail
+    assert ("tickets",) in fetches  # it used the ticket fallback
+    # Cursor advanced to the ticket date; last-known streak (5) is preserved,
+    # not nulled, while streaks are guarded.
+    assert saved == [(42, "2026-07-31", 5)]
+
+
+def test_poll_persists_a_lapsed_streak_when_the_page_is_readable(monkeypatch):
+    """A streak that legitimately lapses must be written through, not frozen.
+
+    The 'keep the old value' rule exists only for an UNREADABLE streaks page. If
+    the page answers and says the streak is gone, caching the old number would
+    mis-rank the leaderboard and feed the AI coach a streak the member no longer
+    has."""
+    row = _revo_row(last_checkin_date="2026-07-20", last_streak_weeks=9)
+    _sent, _f, saved = _run_poll(
+        monkeypatch, row, latest_iso="2026-07-31", streak=None,
+    )
+    assert saved == [(42, "2026-07-31", None)]
+
+
+def test_poll_refreshes_streak_even_with_no_checkin_this_month(monkeypatch):
+    """The streak must keep tracking live between check-ins.
+
+    Reading it only when the month already holds a visit would freeze the cached
+    value for anyone mid-gap, which the leaderboard reads."""
+    row = _revo_row(last_checkin_date="2026-06-30", last_streak_weeks=2)
+    _sent, _f, saved = _run_poll(monkeypatch, row, latest_iso=None, streak=6)
+    # No new check-in to announce, but the streak was still refreshed to 6.
+    assert saved == [(42, "2026-06-30", 6)]
+
+
+def test_poll_still_announces_when_the_streak_fetch_errors(monkeypatch):
+    """A transient streaks.php failure must not sink a real check-in ping.
+
+    The streak is only a tail on the message; propagating its error would abort
+    the poll and silently drop the announcement entirely."""
+    import app.bot as bot
+
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=4)
+    sent, _f, saved = _run_poll(
+        monkeypatch, row, latest_iso="2026-07-31",
+        streak=_Boom(RuntimeError("streaks.php 500")),
+    )
+    assert len(sent) == 1
+    assert "trained at Revo today" in sent[0]
+    assert "streak" not in sent[0]  # no tail — we couldn't read it
+    # Unreadable ⇒ keep the last known streak rather than nulling it.
+    assert saved == [(42, "2026-07-31", 4)]
+
+
+def test_poll_ticket_fallback_preserves_last_streak(monkeypatch):
+    """A guarded streak read must not overwrite a previously-cached streak with
+    None (so /revo_streak_compare's cached fallback stays useful)."""
+    row = _revo_row(last_checkin_date=None, last_streak_weeks=7)
+    _sent, _f, saved = _run_poll(
+        monkeypatch, row, latest_iso="2026-07-28", guarded=True,
+    )
+    # First poll after linking is silent, but the baseline still records the
+    # ticket date and keeps the old streak value.
+    assert saved == [(42, "2026-07-28", 7)]
 
 
 def test_club_detail_pin_prefers_the_precise_coordinate():
@@ -3505,3 +3624,40 @@ def test_entry_date_autocomplete_stays_quiet_for_a_delete_you_cant_do(monkeypatc
         user_id=100, equipment="bench press", user=SimpleNamespace(id=999),
     )
     assert asyncio.run(bot._entry_date_autocomplete(interaction, "")) == []
+
+
+def test_feed_source_change_logs_degrade_then_recover(monkeypatch, caplog):
+    """The portal degrades silently (its guard answers HTTP 200), so a switch
+    between the per-day calendar and the coarse ticket fallback must leave a
+    trace — and must log once per change, not once per poll."""
+    import logging
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_revo_feed_source", None)
+    with caplog.at_level(logging.INFO, logger="gymbot"):
+        # First observation establishes the baseline without a recovery claim.
+        bot._log_feed_source_change("calendar")
+        assert "RECOVERED" not in caplog.text
+
+        bot._log_feed_source_change("tickets")
+        assert "DEGRADED" in caplog.text
+
+        # Repeats of the same source stay quiet.
+        before = caplog.text.count("DEGRADED")
+        bot._log_feed_source_change("tickets")
+        assert caplog.text.count("DEGRADED") == before
+
+        bot._log_feed_source_change("calendar")
+        assert "RECOVERED" in caplog.text
+
+
+def test_feed_source_change_ignores_none(monkeypatch, caplog):
+    """A poll that found no attendance at all says nothing about the source."""
+    import logging
+    import app.bot as bot
+
+    monkeypatch.setattr(bot, "_revo_feed_source", "calendar")
+    with caplog.at_level(logging.INFO, logger="gymbot"):
+        bot._log_feed_source_change(None)
+    assert "DEGRADED" not in caplog.text
+    assert "RECOVERED" not in caplog.text
