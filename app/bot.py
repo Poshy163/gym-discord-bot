@@ -22831,19 +22831,6 @@ async def calories_food_remove_cmd(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-class _FoodTallyRow(NamedTuple):
-    """One food's line in ``/calories food_tally``."""
-
-    key: str
-    display: str
-    kind: str
-    servings: float
-    logs: int
-    kcal: float
-    first_at: str
-    last_at: str
-
-
 #: How each non-food ``kind`` is flagged in the tally table. Plain ASCII: the
 #: rows live inside a monospace fence, where an emoji is not one cell wide and
 #: would stagger every column to its right (see :func:`ui.rank`).
@@ -22858,7 +22845,7 @@ def _fence_cell(text: str, *, limit: int) -> str:
 
     Markdown doesn't render inside a fence, so escaping it there would only
     show the backslashes — which is why this starts from ``_plain_label``. But
-    a ``````` in a food name still *closes* the fence, spilling every
+    a triple backtick in a food name still *closes* the fence, spilling every
     row below it into the message as prose. Only the backtick can do that, so
     only the backtick is replaced.
     """
@@ -22868,69 +22855,13 @@ def _fence_cell(text: str, *, limit: int) -> str:
 def _food_tally_rows(
     guild_id: int, user_id: int,
     start_iso: str | None = None, end_iso: str | None = None,
-) -> tuple[list[_FoodTallyRow], int, float]:
-    """Roll a user's intake notes up into one row per food, most-eaten first.
+) -> tuple[list[calories.FoodTally], int, float]:
+    """:func:`app.calories.food_tally` against this process's database.
 
-    Returns ``(rows, plain_logs, plain_kcal)``. The second pair counts the
-    entries whose note names nothing — a bare ``650kcal`` post carries no note
-    at all — and is handed back rather than dropped, so the tally can say what
-    it is *not* covering instead of quietly presenting itself as the whole
-    diary.
-
-    Servings are summed, not entries: "how many coffees" is answered by
-    ``2 coffee`` counting twice, while ``logs`` keeps the number of separate
-    posts for the cases where the two differ. A food's *current* saved name
-    wins over the one frozen into the note, so renaming a food relabels its
-    history instead of splitting it across two rows.
+    The rollup itself lives in :mod:`app.calories` because the dashboard
+    renders the same tally and cannot import this module.
     """
-    saved = {
-        r["name"]: str(r["display"])
-        for r in db.calorie_food_list(guild_id, user_id)
-    }
-    merged: dict[str, dict] = {}
-    plain_logs = 0
-    plain_kcal = 0.0
-    for row in db.calorie_note_tally(user_id, start_iso, end_iso):
-        label = calories.parse_entry_note(row["note"])
-        logs = int(row["n"] or 0)
-        kcal = float(row["kcal"] or 0.0)
-        if label is None:
-            plain_logs += logs
-            plain_kcal += kcal
-            continue
-        cur = merged.get(label.key)
-        if cur is None:
-            # Rows arrive busiest-first, so the first spelling seen is the one
-            # used most — the best label when the food isn't saved any more.
-            cur = merged[label.key] = {
-                "display": label.display, "kind": label.kind,
-                "servings": 0.0, "logs": 0, "kcal": 0.0,
-                "first_at": row["first_at"], "last_at": row["last_at"],
-            }
-        # Every entry in this group shares one note, so one serving count.
-        cur["servings"] += label.servings * logs
-        cur["logs"] += logs
-        cur["kcal"] += kcal
-        cur["first_at"] = min(cur["first_at"], row["first_at"])
-        cur["last_at"] = max(cur["last_at"], row["last_at"])
-
-    out = [
-        _FoodTallyRow(
-            key=key,
-            display=saved.get(key) or v["display"],
-            # Still a saved food? Then it's a food, whatever suffix the note it
-            # was logged under happened to carry.
-            kind="food" if key in saved else v["kind"],
-            servings=round(v["servings"], 3),
-            logs=v["logs"],
-            kcal=v["kcal"],
-            first_at=v["first_at"],
-            last_at=v["last_at"],
-        )
-        for key, v in merged.items()
-    ]
-    out.sort(key=lambda r: (-r.servings, -r.logs, r.display.lower()))
-    return out, plain_logs, plain_kcal
+    return calories.food_tally(db, guild_id, user_id, start_iso, end_iso)
 
 
 @calories_group.command(

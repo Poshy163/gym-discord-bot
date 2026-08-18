@@ -862,6 +862,7 @@ def build_app(
                 _food_dict(r, _alias_map(db, uid))
                 for r in db.calorie_food_list(gid, uid)
             ],
+            "food_tally": _food_tally_dict(db, gid, uid),
             "lift_goals": [
                 {
                     "equipment": r["equipment"],
@@ -2057,6 +2058,36 @@ def _food_dict(r, aliases: dict[str, list[str]] | None = None) -> dict:
     }
 
 
+def _food_tally_dict(db, guild_id: int, user_id: int) -> dict:
+    """Per-food tally for the member page, mirroring ``/calories food_tally``.
+
+    All time, because the panel has no range control — the Discord command is
+    where a window is asked for. ``unnamed`` is the entries whose note names no
+    food (a bare ``650kcal`` post, or a nutrition panel the AI couldn't read);
+    reported so the panel can say what it isn't covering rather than looking
+    like the whole diary.
+    """
+    from . import calories as _cal
+
+    rows, unnamed_logs, unnamed_kcal = _cal.food_tally(db, guild_id, user_id)
+    return {
+        "rows": [
+            {
+                "display": r.display,
+                "kind": r.kind,
+                "servings": r.servings,
+                "logs": r.logs,
+                "kcal": r.kcal,
+                "first_at": r.first_at,
+                "last_at": r.last_at,
+            }
+            for r in rows
+        ],
+        "unnamed_logs": unnamed_logs,
+        "unnamed_kcal": unnamed_kcal,
+    }
+
+
 def _alias_map(db, user_id: int) -> dict[str, list[str]]:
     """``{food name: [alias, ...]}`` for one user, in a single query."""
     out: dict[str, list[str]] = {}
@@ -2817,6 +2848,9 @@ let LIVE=null;
 function clearLive(){if(LIVE){clearInterval(LIVE);LIVE=null;}}
 function setLive(fn){clearLive();LIVE=setInterval(fn,15000);}
 function pct(v,g){return Math.max(0,Math.min(100,g?v/g*100:0));}
+// Serving counts drop a trailing .0 — a food had twice reads "x2", not
+// "x2.0" — but keep real fractions, since half a serving is ordinary.
+function servings(n){return (+n||0).toLocaleString(undefined,{maximumFractionDigits:3});}
 function bar(label,val,goal,unit,warnOver){
   val=val||0;
   if(!goal)return `<div class="pgoal"><div class="pgrow"><span>${label}</span>
@@ -3580,7 +3614,7 @@ async function memberView(uid){
   if(!d)return;
   const m=d.member,o=d.overview||{},L=o.lifts||{},cal=o.calories||{},pro=o.protein||{};
   const n=d.nutrition||{},foods=d.foods||[],goals=d.lift_goals||[],bw=d.bodyweights||[],
-    bodyMetrics=d.body_metrics||[];
+    bodyMetrics=d.body_metrics||[],tally=d.food_tally||{rows:[],unnamed_logs:0,unnamed_kcal:0};
   currentFoods=foods;currentNutrition=n;
   v.innerHTML=`<div class="crumb" onclick="go('members')">← Members</div>
     <div class="hero">${avatar(uid,m.display_name,m.avatar,72)}
@@ -3622,6 +3656,20 @@ async function memberView(uid){
           <button class="btn sm" onclick="foodEditIdx('${uid}',${i})">edit</button>
           <button class="btn sm danger" onclick="foodDeleteIdx('${uid}',${i})">del</button>
           </div></td></tr>`).join("")}</tbody></table>`:'<div class="faint">No saved foods.</div>'}</div>
+      <div class="box"><h3>Food tally</h3>${tally.rows.length?`
+        <table><tbody>${tally.rows.slice(0,15).map((t,i)=>`<tr>
+          <td class="faint" style="width:1%;text-align:right">${i+1}</td>
+          <td><b>${esc(t.display)}</b>${t.kind!=='food'?
+            ` <span class="pill">${t.kind==='meal'?'meal':'AI'}</span>`:''}</td>
+          <td>×${servings(t.servings)}</td>
+          <td>${Math.round(t.kcal).toLocaleString()} kcal</td>
+        </tr>`).join("")}</tbody></table>
+        ${tally.rows.length>15?`<div class="faint" style="margin-top:6px">… ${
+          tally.rows.length-15} more</div>`:''}
+        ${tally.unnamed_logs?`<div class="faint" style="margin-top:6px">plus ${
+          tally.unnamed_logs} ${tally.unnamed_logs===1?'entry':'entries'} (${
+          Math.round(tally.unnamed_kcal).toLocaleString()} kcal) with no food name to count</div>`:''}`
+        :'<div class="faint">Nothing logged with a food name yet.</div>'}</div>
       <div class="box"><h3>Lift goals</h3>${goals.length?goals.map(g=>{
         const p=pct(g.current_best,g.target_kg),done=g.current_best>=g.target_kg;
         return `<div class="pgoal"><div class="pgrow"><span>${esc(g.equipment)}${g.bw?' <span class="faint">(BW+)</span>':''}</span>

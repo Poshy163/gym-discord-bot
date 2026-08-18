@@ -588,7 +588,9 @@ for browsing and editing everything the bot tracks without touching Discord:
 - **Members** — searchable list with avatars; drill into one member for their
   lift/nutrition counters, **today's calories & protein vs goal** (progress
   bars), a **bodyweight trend chart**, **lift goals**, their **saved foods**
-  (add/edit/delete, with protein), roles, linked Strava/Revo, and history.
+  (add/edit/delete, with protein), a **food tally** of what they've actually
+  eaten most (the same rollup `/calories food_tally` shows, all-time), roles,
+  linked Strava/Revo, and history.
   You can **grant or remove roles** on a member (the ✕ on a role chip, or the
   **+ Add role** picker), **remove a timeout** (the Moderation box shows an
   active timeout and a **Remove timeout** button when the bot can act), and

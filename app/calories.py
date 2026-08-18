@@ -1,13 +1,16 @@
 """Calorie/kilojoule parsing and conversion helpers.
 
-Everything here is pure and Discord-free so it can be unit-tested directly.
+Everything here is Discord-free so it can be unit-tested directly. It is all
+pure but for :func:`food_tally`, which is handed a database rather than
+importing one — the bot and the dashboard both need that rollup and neither
+should own it (same arrangement as :mod:`app.dayspans`).
 The bot stores energy internally in **kcal** ("calories" in everyday speech;
 Australian food labels print kJ, hence the converter).
 """
 from __future__ import annotations
 
 import re
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from . import scaling
 
@@ -316,6 +319,91 @@ def parse_entry_note(note: str | None) -> EntryLabel | None:
     if kind == "ai" and key in _AI_PLACEHOLDERS:
         return None
     return EntryLabel(key, text, servings, kind)
+
+
+class FoodTally(NamedTuple):
+    """One food's line in a tally, however it is being rendered."""
+
+    key: str
+    display: str
+    kind: str
+    servings: float
+    logs: int
+    kcal: float
+    first_at: str
+    last_at: str
+
+
+def food_tally(
+    db: Any, guild_id: int, user_id: int,
+    start_iso: str | None = None, end_iso: str | None = None,
+) -> tuple[list[FoodTally], int, float]:
+    """Roll a user's intake notes up into one row per food, most-eaten first.
+
+    Returns ``(rows, unnamed_logs, unnamed_kcal)``. The second pair counts the
+    entries whose note names nothing — a bare ``650kcal`` post carries no note,
+    and an unreadable nutrition panel is logged under a placeholder — and is
+    handed back rather than dropped, so a caller can say what it is *not*
+    covering instead of quietly presenting itself as the whole diary.
+
+    Servings are summed, not entries: "how many coffees" is answered by
+    ``2 coffee`` counting twice, while ``logs`` keeps the number of separate
+    posts for the cases where the two differ. A food's *current* saved name
+    wins over the one frozen into the note, so renaming a food relabels its
+    history instead of splitting it across two rows.
+
+    Takes ``db`` rather than importing one: the bot and the dashboard both
+    need this and neither should own it, matching how :mod:`app.dayspans`
+    hands its helpers a database.
+    """
+    saved = {
+        r["name"]: str(r["display"])
+        for r in db.calorie_food_list(guild_id, user_id)
+    }
+    merged: dict[str, dict] = {}
+    unnamed_logs = 0
+    unnamed_kcal = 0.0
+    for row in db.calorie_note_tally(user_id, start_iso, end_iso):
+        label = parse_entry_note(row["note"])
+        logs = int(row["n"] or 0)
+        kcal = float(row["kcal"] or 0.0)
+        if label is None:
+            unnamed_logs += logs
+            unnamed_kcal += kcal
+            continue
+        cur = merged.get(label.key)
+        if cur is None:
+            # Rows arrive busiest-first, so the first spelling seen is the one
+            # used most — the best label when the food isn't saved any more.
+            cur = merged[label.key] = {
+                "display": label.display, "kind": label.kind,
+                "servings": 0.0, "logs": 0, "kcal": 0.0,
+                "first_at": row["first_at"], "last_at": row["last_at"],
+            }
+        # Every entry in this group shares one note, so one serving count.
+        cur["servings"] += label.servings * logs
+        cur["logs"] += logs
+        cur["kcal"] += kcal
+        cur["first_at"] = min(cur["first_at"], row["first_at"])
+        cur["last_at"] = max(cur["last_at"], row["last_at"])
+
+    out = [
+        FoodTally(
+            key=key,
+            display=saved.get(key) or v["display"],
+            # Still a saved food? Then it's a food, whatever suffix the note it
+            # was logged under happened to carry.
+            kind="food" if key in saved else v["kind"],
+            servings=round(v["servings"], _SERVING_DECIMALS),
+            logs=v["logs"],
+            kcal=v["kcal"],
+            first_at=v["first_at"],
+            last_at=v["last_at"],
+        )
+        for key, v in merged.items()
+    ]
+    out.sort(key=lambda r: (-r.servings, -r.logs, r.display.lower()))
+    return out, unnamed_logs, unnamed_kcal
 
 
 # Meals: a named bundle of saved foods ("breakfast" = coffee + oats + shake)

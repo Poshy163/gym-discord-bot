@@ -1623,3 +1623,45 @@ def test_recent_weigh_ins_render_in_the_viewers_timezone(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+def test_member_payload_carries_the_food_tally(tmp_path):
+    """The dashboard panel and `/calories food_tally` are one rollup, so the
+    member page must fold servings the same way — and must report the entries
+    it cannot name rather than presenting a partial diary as the whole one."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.calorie_goal_set(1, 100, "Josh", 2500)
+        db.calorie_food_set(1, 100, "flat white", "Flat White", 80)
+        for note, kcal in (
+            ("Flat White", 80),
+            ("Flat White ×2", 160),
+            ("Breakfast (meal)", 520),
+            ("label (30 g, label)", 200),   # unreadable panel: names no food
+            (None, 650),                    # a bare `650kcal` post
+        ):
+            db.calorie_add(1, 100, "Josh", kcal, note=note)
+
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get(
+                "/api/member", params={"guild": "1", "user": "100"},
+            )
+            assert r.status == 200
+            tally = (await r.json())["food_tally"]
+            rows = {row["display"]: row for row in tally["rows"]}
+
+            # 1 + 2 servings across 2 posts, not "2 coffees".
+            assert rows["Flat White"]["servings"] == 3
+            assert rows["Flat White"]["logs"] == 2
+            assert rows["Breakfast"]["kind"] == "meal"
+            # The placeholder is not a food; it joins the uncounted pair.
+            assert "label" not in rows
+            assert tally["unnamed_logs"] == 2
+            assert tally["unnamed_kcal"] == 850
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
