@@ -267,6 +267,28 @@ def test_explicit_bodyweight_graph_reuses_the_shared_factory(monkeypatch):
     assert sent["file"].filename == chart.filename
 
 
+def _recent_history(prefix: str, *weights: float) -> list[dict]:
+    """Weight-history entries one day apart, ending yesterday, oldest first.
+
+    Anchored to now rather than to fixed calendar dates, because the import
+    cutoff is ``datetime.now(timezone.utc) - HA_BACKFILL_DAYS`` (app/bot.py).
+    Hardcoded timestamps age out of that window one reading at a time, so a
+    test asserting a fixed import count passes until the calendar walks past
+    its oldest entry and then fails for a reason that has nothing to do with
+    the behaviour under test.
+    """
+    oldest = datetime.now(timezone.utc) - timedelta(days=len(weights))
+    return [
+        {
+            "measurement_id": f"{prefix}-{n}",
+            "timestamp": (oldest + timedelta(days=n)).isoformat(),
+            "weight": weight,
+            "weight_unit": "kg",
+        }
+        for n, weight in enumerate(weights)
+    ]
+
+
 def test_home_assistant_announcement_includes_one_refreshed_graph(monkeypatch):
     person = _user()
     bot_mod.db.ha_link(person.id, GUILD, "chart_user")
@@ -315,15 +337,7 @@ def test_home_assistant_backfill_summary_gets_one_graph(monkeypatch):
         bot_mod, "_ha_alert_channel", AsyncMock(return_value=channel),
     )
     monkeypatch.setattr(bot_mod.bot, "get_guild", lambda _gid: None)
-    entries = [
-        {
-            "measurement_id": f"backfill-{day}",
-            "timestamp": f"2026-08-0{day}T03:00:00+00:00",
-            "weight": weight,
-            "weight_unit": "kg",
-        }
-        for day, weight in ((3, 82.0), (4, 81.5), (5, 81.0))
-    ]
+    entries = _recent_history("backfill", 82.0, 81.5, 81.0)
     states = [{
         "entity_id": "sensor.backfill_user_weight",
         "state": "81.0",
@@ -361,15 +375,7 @@ def test_home_assistant_multi_reading_poll_attaches_graph_only_to_newest(monkeyp
         bot_mod, "_ha_alert_channel", AsyncMock(return_value=channel),
     )
     monkeypatch.setattr(bot_mod.bot, "get_guild", lambda _gid: None)
-    entries = [
-        {
-            "measurement_id": f"routine-{day}",
-            "timestamp": f"2026-08-0{day}T03:00:00+00:00",
-            "weight": weight,
-            "weight_unit": "kg",
-        }
-        for day, weight in ((4, 81.5), (5, 81.0))
-    ]
+    entries = _recent_history("routine", 81.5, 81.0)
     states = [{
         "entity_id": "sensor.multi_user_weight",
         "state": "81.0",
@@ -416,15 +422,7 @@ def test_home_assistant_partial_announcement_batch_still_tracks_undo(monkeypatch
         bot_mod, "_ha_alert_channel", AsyncMock(return_value=channel),
     )
     monkeypatch.setattr(bot_mod.bot, "get_guild", lambda _gid: None)
-    entries = [
-        {
-            "measurement_id": f"partial-{day}",
-            "timestamp": f"2026-08-0{day}T03:00:00+00:00",
-            "weight": weight,
-            "weight_unit": "kg",
-        }
-        for day, weight in ((4, 81.5), (5, 81.0))
-    ]
+    entries = _recent_history("partial", 81.5, 81.0)
     states = [{
         "entity_id": "sensor.partial_user_weight",
         "state": "81.0",
