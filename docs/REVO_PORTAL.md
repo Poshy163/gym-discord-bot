@@ -1066,6 +1066,15 @@ Coverage behind that verdict: all 3 class-running clubs × every 7-day page acro
 the whole bookable horizon, plus 8 spot-check clubs, past/future dates, and the
 SPA's full parameter set — `CalendarData` was `[]` in 100% of 40 calls.
 
+> 🔁 **Re-confirmed 2026-08.** `Clubs/GetAvailableClassesClubs` still returns the
+> same three clubs — **Cranbourne (id 53), Glenelg (26), Pitt St (20)** — and a
+> further 12 `DailyClasses` calls across those clubs and four dates returned
+> `CalendarData: []` every time. Revo still publishes no timetables here. Note the
+> routes themselves are *live and well-formed* (they return a proper
+> `{CalendarData, PagerData}` envelope with working `NextDate`/`PreviousDate`
+> paging) — "not reachable" in this heading means **the data is not published**,
+> not that the endpoint is missing. Don't re-read a `200` here as progress.
+
 Two traps worth recording, both of which make a naive probe *look* successful:
 - `DailyClasses` **silently resets an unparseable or out-of-range `date` to today**
   and returns a normal empty envelope — no `400`, no error. A bogus `clubId`
@@ -1111,8 +1120,15 @@ Recommended order for any future spelunking:
 2. **Fetch every `<Area>/Views/<Name>` template** and grep for `baf:data-source`.
 3. Only then probe, using the §8.1 status taxonomy to tell real routes apart.
 
-Roughly **30 listed templates are still unmined** — one cheap unauthenticated-ish
-GET each, and the single highest-yield thing to do next.
+> ✅ **Mining is COMPLETE as of 2026-08 — this is no longer the next thing to do.**
+> The old "~30 templates still unmined" note is resolved. The extraction that
+> finishes it: the minified form is **`$View("Module.Name","Area/Path/ViewName")`**
+> — the **second** argument is the fetchable path (a regex expecting a numeric
+> first arg finds only ~28 of them and badly under-reports). That yields **169
+> distinct template paths, 162 of which fetch 200**, and grepping their
+> `baf:data-source url="…"` tags gives **48 distinct API routes** — the full
+> member-facing surface. The complete list, with what each returns, is in §12.2.
+> Re-run only if the bundle hash changes; there is nothing left to mine today.
 
 ## 10. Membership status slice — `User.Member.NotificationsData`
 
@@ -1215,8 +1231,49 @@ operator app *is* present but gated — `/MobileApp/`, `/GoFit/`, `/pgapi/` all
 > `Items: []` for a member who doesn't book classes, which is most Revo members —
 > Revo runs classes at only 3 of 79 clubs (§9.2).
 
-See **§14** for the two member reads that *were* confirmed new — neither is a visit
-log, and neither is implemented.
+See **§14** for the member reads that *were* confirmed new — none is a visit
+log, and none is implemented.
+
+### 12.2 Re-confirmed again 2026-08, from a COMPLETE route inventory
+
+Re-run after the `revocentral` guard killed the streaks calendar (§1.2), to ask
+whether PerfectGym could give the attendance feed back. **It cannot**, and this
+pass is stronger than §12.1 because it enumerated the surface instead of guessing
+names:
+
+1. **The tenant feature list is byte-identical to §3.2.2** — same 14 flags
+   (`Login`…`ShowAgreementsOnUserProfile`). Still **no** visits / attendance /
+   activity / check-in feature. Per §3.2.2 this is where such a feature would
+   appear *first*, so it is the decisive check and it costs one request.
+2. **All 48 template-declared routes were probed** (§9.3, list below). None is a
+   visit log.
+3. **Validated controls.** `Profile/Visits/GetVisits`,
+   `Profile/Attendance/GetHistory`, `Profile/Attendance/GetMemberVisits`,
+   `MyCalendar/MyCalendar/GetVisitHistoryXyz` and two nonsense routes all returned
+   the **identical 17,210-byte 404** — so "absent" here is a measured result, not
+   an assumption.
+4. `Profile/Skills/GetMemberActivities` still returns `[]`, and
+   `Profile/Skills/IsCertificateGenerationEnabled` returns **`false`** — the whole
+   Skills module is dark on this tenant, which corroborates the flag list.
+5. `MyCalendar/MyCalendar/GetPastActivities` still returns `Items: []` (bookings,
+   not visits — §12.1's warning stands). `GetTodayTickets`, referenced in the
+   bundles, **404s**.
+
+**The full 48-route inventory**, by what it does for us:
+
+| Result | Routes |
+|---|---|
+| **200 + data** | `Clubs/Clubs/GetMembersInClubs` (occupancy, implemented) · `Profile/Contracts/ContractList?userId` (§14.1) · `Profile/Contracts/ContractDetails?contractId` (**new**, §14.4) · `Profile/Freeze/GetFreezeHistory?contractId` (**new**, §14.5) · `Profile/Profile/GetProfileForEdit?userId` (§14.2) · `Profile/PaymentSettings/GetPaymentSettingsData?userId` (**new**, card/billing — sensitive) · `Profile/Profile/GetUserAgreementsForEdit?userId` · `Profile/ChangePassword/GetModel` · `Culture/Languages` · `PersonalData/GetCountries` · `PersonalData/GetCities?countryId` (**882 KB** — never fetch from a command) · `PersonalData/IsLegalGuardianRequired` · `WebToLeadForm/GetAvailableClubs` · `Shopping/ShoppingCart/GetTotalQuantity` · the four `Get*FamilyMembers*` choosers (self-row only, 451 B each) |
+| **200 but empty** | `Classes/ClassCalendar/DailyClasses` / `WeeklyClasses` / `GetCalendarFilters` (§9.2) · `Profile/Skills/GetMemberActivities` · `MyCalendar/*` · `Contracts/FriendAccess/GetFriendInfo` (0 bytes) |
+| **403 not entitled** | `FacilityBookings/FacilityCalendar/GetClubZoneTypes` · `Groups/GroupsCalendar/*` · `Products/ChooseProducts/*` · `Files/GetFamilyMembersForDocuments` · `Family/Family/GetFriendsAndFamily` |
+| **400 (exists, params unknown)** | `Profile/Skills/GetCategorySummary` (resisted `userId`/`memberId`/`categoryId`/`id`; module is dark anyway) · `WebToLeadForm/GetConfiguration` · `PersonalData/GetCities` bare |
+| **500 provisioned-but-dark** | `Contracts/FriendAccess/SummaryForFriendAccess` |
+| **404 absent** | `Files/CanUserUploadDocuments` — *declared in a template but not routed*, a reminder that a template reference alone doesn't prove a live route |
+
+> **Bottom line: PerfectGym still cannot restore per-day attendance.** The
+> ticket-tally fallback (§3.2.4) remains the only working substitute while
+> `streaks.php` is guarded. Do not spend another pass here unless the feature list
+> in §3.2.2 changes — check that first, it is one request.
 
 ## 13. Profile first name + photo — `/seeprofile` and auto-nicknames
 
@@ -1255,12 +1312,17 @@ fetch fails). The old manual `/set_nick` + `/remove_nick` commands were **retire
 
 ## 14. Confirmed-new member reads — documented, deliberately NOT implemented
 
-Two endpoints returned rich, real, non-duplicated member data. Both were
-reproduced independently against the live backend. **Neither is wired up**, and
-that is a decision rather than an omission: this bot posts into shared Discord
-channels, and both carry data classes nothing in the repo currently handles.
+These endpoints returned rich, real, non-duplicated member data, each reproduced
+independently against the live backend. **None is wired up**, and that is a
+decision rather than an omission: this bot posts into shared Discord channels, and
+they carry data classes — personal financial and contract detail — that nothing in
+the repo currently handles.
 
 They are written up in enough detail to build from directly if wanted.
+
+§14.1–14.3 were confirmed 2026-07; **§14.4–14.5 are new in 2026-08**, found once
+the template mine was completed (§9.3). None of them is a visit log — see §12.2
+for why no such endpoint exists on this backend.
 
 ### 14.1 `GET /Profile/Contracts/ContractList?userId=<own Member.Id>` — the real contract
 
@@ -1328,3 +1390,46 @@ BindedDate, EndDate}]`. `Relation` is `FamilyChild | FriendAccess`. Carries
 `UserNumber` (barcode) and a signed `PhotoUrl` **for other people**, so the same
 rules as §11 apply per row. The test account has no relatives, so only the
 self-row returns — the populated shape is unverified.
+
+### 14.4 `GET /Profile/Contracts/ContractDetails?contractId=<id>` — per-contract detail + action flags (new 2026-08)
+
+The single-contract companion to `ContractList` (§14.1), found by the completed
+template mine. `contractId` comes from `ContractList`; a bare call is `400`.
+
+```json
+{"ContractDetails": {"Id":…, "Name":"Revo Fitness - Level One SA", "AddonsNames":[],
+   "Club":{"Id":25,"Name":"Modbury","Address":…,"Latitude":…,"Longitude":…,"StateId":3},
+   "CommitmentPeriod":"1M", "SignupDate":…, "StartDate":…, "EndDate":null,
+   "CommitmentDate":…, "CurrentFreezeEndDate":null, "NextPaymentDate":…,
+   "Cost":{"Gross":42.0,"Net":38.18,"Tax":3.82}},
+ "CanTerminateContract":…, "CanFreezeContract":…, "CanUpgradeContract":…,
+ "CanWithdrawFromContract":…, "IsEligibleForWithdrawal":…}
+```
+
+What it adds over `ContractList`: the five **`Can…` action flags** (whether this
+member may freeze / upgrade / terminate / withdraw right now) and a fuller `Club`
+block with coordinates. The contract fields themselves duplicate `ContractList`,
+so **if you only need plan + price + `NextPaymentDate`, use `ContractList`** — one
+call covers every contract, where this needs one call per contract.
+
+### 14.5 `GET /Profile/Freeze/GetFreezeHistory?contractId=<id>` — freeze history (new 2026-08)
+
+```json
+{"Freezes": [], "CanAddNew": true, "BlockReasons": []}
+```
+
+`contractId` required (the template declares `params="{contractId: …}"`);
+`userId` does **not** satisfy it. `FreezeContract` *is* an enabled tenant feature
+(§3.2.2), so this is live rather than dark — the array is empty only because the
+research account has never frozen. **The populated shape is therefore unverified**
+— don't assume a field layout for `Freezes[]` without re-checking against a
+frozen contract.
+
+Together with `CurrentFreezeEndDate` (§14.1/§14.4) this is the only *dated
+membership-event* history a member client can read. It is **not** a visit log and
+cannot substitute for one.
+
+> 🔒 Both of the above are **personal financial/contract data** and fall under the
+> same non-negotiable rules as §14.1: own credentials only, `ephemeral=True` on
+> every path, `contractId`/`userId` never user-supplied, and no module-level cache
+> (it is per-member, so a shared cache is a cross-member leak).
