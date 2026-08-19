@@ -22,6 +22,10 @@ venv/
 *.db-wal
 data/
 
+# Production database dumps pulled down for local analysis (/db_dump output).
+# Real member data - never commit these; the folder stays local by design.
+dumps/
+
 # Revo portal research scratch dumps (may contain personal account HTML)
 scripts/_revo_probe_out/
 
@@ -31,4 +35,3 @@ scripts/_revo_probe_out/
 .DS_Store
 Thumbs.db
 
-/database dump
