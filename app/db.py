@@ -695,10 +695,21 @@ CREATE TABLE IF NOT EXISTS hevy_account (
     measurements_synced_at TEXT
 );
 
+-- The shape columns cache what each imported workout *was* — which routine it
+-- ran, when it started, what Hevy last said about it — so a routine-usage view
+-- needs no API calls and no new table. They are metadata on the dedup ledger
+-- rather than a table of their own because they share its lifecycle exactly:
+-- created by the import claim, deleted by unlink. ``updated_at`` is Hevy's own
+-- edit stamp, stored now so an edit-sync can later tell a stale import from a
+-- current one without re-migrating this table.
 CREATE TABLE IF NOT EXISTS hevy_imported (
     user_id     INTEGER NOT NULL,
     workout_id  TEXT    NOT NULL,
     imported_at TEXT    NOT NULL,
+    routine_id  TEXT,
+    title       TEXT,
+    started_at  TEXT,
+    updated_at  TEXT,
     PRIMARY KEY (user_id, workout_id)
 );
 
@@ -1271,6 +1282,22 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE hevy_account ADD COLUMN backfilled_at TEXT"
                 )
+            # Workout shape metadata on the Hevy dedup ledger (routine, title,
+            # start, Hevy's edit stamp). Filled by hevy_record_shape on every
+            # poll — including for already-imported page-1 workouts, which is
+            # what backfills recent history for accounts linked before these
+            # columns existed. Pre-migration rows stay NULL until re-stamped.
+            hevy_imp_cols = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(hevy_imported)"
+                )
+            }
+            for col in ("routine_id", "title", "started_at", "updated_at"):
+                if hevy_imp_cols and col not in hevy_imp_cols:
+                    self._connection.execute(
+                        f"ALTER TABLE hevy_imported ADD COLUMN {col} TEXT"
+                    )
             # Hevy profile name/URL, filled in from /v1/user/info on the next
             # sync. Nullable and additive: an account that never syncs again
             # simply keeps showing the member's Discord name.
@@ -4204,6 +4231,66 @@ class Database:
                 "SELECT 1 FROM hevy_imported WHERE user_id = ? AND workout_id = ?",
                 (user_id, str(workout_id)),
             ).fetchone() is not None
+
+    def hevy_record_shape(
+        self, user_id: int, workout_id: str,
+        routine_id: str | None, title: str | None,
+        started_at: str | None, updated_at: str | None,
+    ) -> None:
+        """Stamp an imported workout's shape onto its dedup-ledger row.
+
+        UPDATE-only, deliberately: a workout id that was never claimed gets
+        nothing, so this can never manufacture a ledger row and break the
+        claim-then-write dedup. Idempotent, so the poll re-stamps the page-1
+        workouts every pass — which is also what backfills accounts that were
+        linked before the shape columns existed, with no one-shot needed.
+
+        Timestamps are stored verbatim (Hevy's own ISO strings) or NULL; they
+        must not be defaulted to "now", which would make every historical
+        workout look like it happened at the last poll."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_imported SET routine_id = ?, title = ?, "
+                "started_at = ?, updated_at = ? "
+                "WHERE user_id = ? AND workout_id = ?",
+                (
+                    routine_id or None, (title or "").strip() or None,
+                    started_at or None, updated_at or None,
+                    user_id, workout_id,
+                ),
+            )
+
+    def hevy_routine_usage(self, user_id: int) -> list[sqlite3.Row]:
+        """Sessions per routine for one member, most-used first.
+
+        One row per distinct ``routine_id`` (NULL = workouts logged outside any
+        routine): session count, first/last start, and the title of the most
+        recent workout in the group — the display fallback when the routine was
+        deleted in Hevy and its id no longer resolves to a name. Only rows with
+        a ``started_at`` count; pre-migration rows have no shape yet and would
+        otherwise surface as a ghost routine with no dates."""
+        with self._conn() as c:
+            return list(c.execute(
+                """
+                SELECT routine_id,
+                       COUNT(*)        AS sessions,
+                       MIN(started_at) AS first_at,
+                       MAX(started_at) AS last_at,
+                       (
+                         SELECT h2.title FROM hevy_imported h2
+                          WHERE h2.user_id = h.user_id
+                            AND COALESCE(h2.routine_id, '') =
+                                COALESCE(h.routine_id, '')
+                            AND h2.started_at IS NOT NULL
+                          ORDER BY h2.started_at DESC LIMIT 1
+                       ) AS last_title
+                  FROM hevy_imported h
+                 WHERE user_id = ? AND started_at IS NOT NULL
+                 GROUP BY routine_id
+                 ORDER BY sessions DESC, last_at DESC
+                """,
+                (user_id,),
+            ))
 
     def hevy_mark_workout(self, user_id: int, workout_id: str) -> bool:
         """Record ``workout_id`` as imported. Returns True if newly recorded

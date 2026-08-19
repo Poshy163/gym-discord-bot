@@ -59,6 +59,12 @@ available; importing works even without a feed channel.
   is stored **encrypted**.
 - `/hevy status` — show whether you're linked, your Hevy profile, when it last
   synced, and whether weigh-ins are being mirrored.
+- `/hevy routines` — sessions per routine with when each was last run, resolved
+  to routine (and folder) names where the poll has them cached, falling back to
+  the most recent workout title for routines since deleted in Hevy. Accrues as
+  workouts sync — each poll stamps the shape (routine, title, start, Hevy's
+  edit timestamp) of the ~10 most recent workouts onto the import ledger, which
+  also backfills accounts linked before the feature existed.
 - `/hevy unlink` — delete your stored key and import history.
 
 Only `/hevy link` replies privately (so the key never appears in a channel); the
@@ -124,6 +130,13 @@ value but says so instead of pretending it applied.
   produces no lifts, and used to vanish silently — imported, but never shown.
   It now gets a feed embed describing what it *did* record: reps, distance and
   time, with the volume line omitted rather than reading "0 kg".
+- **Supersets are marked** with a 🔗 on each exercise that shares its superset
+  with at least one other (Hevy numbers supersets from zero — a lone survivor
+  of a deleted partner is not marked). Stair-machine floors and treadmill steps
+  (Hevy's `custom_metric`, labelled via the exercise template's type) appear on
+  the exercise line; the per-exercise breakdown now also meets Discord's field
+  cap by folding whole trailing lines into "…and N more" instead of slicing
+  mid-line.
 - **What the embed shows:** exercises, sets (working vs warmup), reps, volume,
   duration, per-exercise breakdown and top set, plus — where Hevy has the data —
   a **muscle-group split**, RPE, dropset and to-failure counts, distance/time

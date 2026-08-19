@@ -17000,6 +17000,7 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
         name="Commands",
         value=(
             "`/hevy link` — link your account\n"
+            "`/hevy routines` — which routines you actually run\n"
             "`/hevy recent` — show your most recent workout\n"
             "`/hevy sync` — re-sync your last 50 workouts\n"
             "`/hevy status` — check link + last sync time\n"
@@ -17438,13 +17439,15 @@ def _hevy_distance_str(metres: float | None) -> str | None:
     return f"{metres / 1000:.2f} km".replace(".00 km", " km")
 
 
-def _hevy_exercise_line(ex: dict) -> str:
+def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
     """One breakdown line: name + set count + the best thing it recorded.
 
     Hevy exercises are not all weight×reps — a set can carry distance, a
     duration, or nothing but reps. The line falls back through those in turn so
     a plank or a treadmill row says something useful instead of just its set
-    count, and appends RPE when the member logged one."""
+    count, and appends RPE when the member logged one. ``kind`` is the exercise
+    template's type; it decides whether the custom metric gets a label (floors
+    for stair machines, steps for treadmills) or stays out of the embed."""
     sets = ex.get("sets") or 0
     bits = [f"{sets} set{'s' if sets != 1 else ''}"]
     if ex.get("best_weight_kg"):
@@ -17458,6 +17461,9 @@ def _hevy_exercise_line(ex: dict) -> str:
     held = _hevy_duration_str(ex.get("duration_seconds"))
     if held:
         bits.append(held)
+    metric_label = hevy_client.CUSTOM_METRIC_LABELS.get(kind)
+    if metric_label and ex.get("custom_metric"):
+        bits.append(f"{ex['custom_metric']:g} {metric_label}")
     if ex.get("rpe"):
         bits.append(f"RPE {ex['rpe']:g}")
     return f"**{_safe_label(ex.get('title') or 'Exercise')}** · " + " · ".join(bits)
@@ -17554,18 +17560,29 @@ def _hevy_workout_embed(
             name="Note", value=_safe_label(note)[:1024], inline=False,
         )
 
-    # Per-exercise breakdown, capped so the field stays within Discord's 1024
-    # char limit (and doesn't dominate the feed for a 20-exercise session).
+    # Per-exercise breakdown, budgeted against Discord's 1024-char field cap
+    # by dropping whole trailing lines (folded into the "…and N more" count)
+    # rather than slicing mid-line. Supersetted exercises get a link glyph —
+    # marks are positional, so they are computed over the FULL list and sliced
+    # together with it, never zipped against a truncated one.
     exercises = summary.get("exercises") or []
+    marks = hevy_client.superset_marks(exercises)
     lines: list[str] = []
-    for ex in exercises[:12]:
-        lines.append(_hevy_exercise_line(ex))
-    if len(exercises) > 12:
-        lines.append(f"…and {len(exercises) - 12} more")
-    if lines:
-        embed.add_field(
-            name="Exercises", value="\n".join(lines)[:1024], inline=False,
+    for ex, marked in list(zip(exercises, marks))[:12]:
+        kind = ((templates or {}).get(ex.get("template_id") or "") or {}).get(
+            "type", "",
         )
+        prefix = "🔗 " if marked else ""
+        lines.append(prefix + _hevy_exercise_line(ex, kind))
+    dropped = len(exercises) - len(lines)
+    while lines:
+        more = f"\n…and {dropped} more" if dropped else ""
+        value = "\n".join(lines) + more
+        if len(value) <= 1024:
+            embed.add_field(name="Exercises", value=value, inline=False)
+            break
+        lines.pop()
+        dropped += 1
 
     split = hevy_client.muscle_split(summary, templates or {})
     if len(split) > 1:
@@ -17643,12 +17660,36 @@ def _hevy_import_workout(
     Returns ``{"summary", "lifts", "prs", "when"}`` for a freshly-imported
     workout, or None if it has no id or was already imported. PRs are computed
     against the DB **before** the insert so the comparison excludes this
-    workout's own sets."""
+    workout's own sets.
+
+    The shape stamp runs for already-imported workouts too, on purpose: it is
+    an idempotent UPDATE on the ledger row, so every poll refreshes the ~10
+    page-1 workouts — which is what backfills routine-usage data for accounts
+    linked before the shape columns existed, with no one-shot migration. It
+    also runs *before* the lift insert but can never fail the import: a shape
+    is bookkeeping, lifts are the product."""
     wid = str(workout.get("id") or "")
-    if not wid or db.hevy_workout_imported(user_id, wid):
+    if not wid:
+        return None
+    # Pure and total over junk payloads — safe to compute before the claim.
+    summary = hevy_client.summarize_workout(workout)
+
+    def _stamp() -> None:
+        try:
+            db.hevy_record_shape(
+                user_id, wid,
+                summary.get("routine_id"), summary.get("title"),
+                summary.get("start_time"), summary.get("updated_at"),
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Hevy: failed to stamp shape for %s", wid)
+
+    if db.hevy_workout_imported(user_id, wid):
+        _stamp()  # self-heal / backfill the ledger row's shape
         return None
     if not db.hevy_mark_workout(user_id, wid):
         return None  # raced with another poll
+    _stamp()
     lifts = hevy_client.workout_to_lifts(workout, templates)
     prs = _collapse_prs(_new_prs_for_lifts(guild_id, user_id, lifts)) if lifts else {}
     when = _parse_hevy_time(workout.get("start_time"))
@@ -17661,7 +17702,7 @@ def _hevy_import_workout(
         except Exception:  # pragma: no cover - defensive
             LOG.exception("Hevy: failed to import workout %s", wid)
     return {
-        "summary": hevy_client.summarize_workout(workout),
+        "summary": summary,
         "lifts": lifts, "prs": prs, "when": when,
     }
 
@@ -18076,6 +18117,90 @@ async def hevy_mirror_cmd(
     )
     await interaction.followup.send(
         _hevy_admin_reply(result, applied), ephemeral=True,
+    )
+
+
+@hevy_group.command(
+    name="routines",
+    description="Which Hevy routines someone actually runs, and when they last did.",
+)
+@app_commands.describe(member="Whose routine usage to show. Defaults to you.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_routines_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if not _hevy_enabled():
+        await interaction.response.send_message(
+            "Hevy integration isn't available right now.",
+        )
+        return
+    target = member or interaction.user
+    if await _deny_invisible_target(interaction, target):
+        return
+    row = db.hevy_get(target.id)
+    if row is None:
+        msg = (
+            "You haven't linked Hevy yet — see `/hevy help`."
+            if target.id == interaction.user.id
+            else f"{target.mention} hasn't linked a Hevy account."
+        )
+        await interaction.response.send_message(
+            msg, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    usage = db.hevy_routine_usage(target.id)
+    if not usage:
+        await interaction.response.send_message(
+            f"No routine data recorded for {target.display_name} yet — it "
+            "accrues as workouts sync (about the last 10 are stamped each "
+            "poll).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    # Names come from the poll-warmed per-user cache when it has them; the
+    # stored last-workout title is the fallback for routines deleted in Hevy
+    # (their UUID no longer resolves) and for a cold cache. No API call and no
+    # key decrypt on this path — a leaderboard lookup shouldn't cost either.
+    cached = _HEVY_ROUTINES.get(target.id)
+    names = cached[1] if cached else {}
+    lines: list[str] = []
+    firsts: list[str] = []
+    for r in usage[:10]:
+        rid = r["routine_id"]
+        if rid and rid in names:
+            info = names[rid]
+            label = (
+                f"{info['folder']} / {info['title']}"
+                if info.get("folder") else info["title"]
+            )
+        elif rid:
+            label = r["last_title"] or "Unnamed routine"
+        else:
+            label = "No routine (freestyle)"
+        last = _parse_hevy_time(r["last_at"])
+        when = f" · last <t:{int(last.timestamp())}:R>" if last else ""
+        n_s = int(r["sessions"])
+        lines.append(
+            f"**{_safe_label(label)}** · {n_s} session"
+            f"{'s' if n_s != 1 else ''}{when}"
+        )
+        if r["first_at"]:
+            firsts.append(r["first_at"])
+    embed = discord.Embed(
+        title=f"📋 {_plain_label(_display_name(target))}'s routines",
+        colour=HEVY_COLOUR,
+        description="\n".join(lines)[:4096],
+    )
+    earliest = _parse_hevy_time(min(firsts)) if firsts else None
+    embed.set_footer(text=(
+        "via Hevy · from workouts recorded since "
+        f"{earliest.date().isoformat()}" if earliest else "via Hevy"
+    ))
+    await interaction.response.send_message(
+        embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
 
 

@@ -730,6 +730,7 @@ def summarize_workout(workout: dict) -> dict:
         ex_reps = 0
         ex_distance = 0.0
         ex_seconds = 0
+        ex_custom = 0.0
         ex_rpe: float | None = None
         ex_top: tuple[float, int] | None = None
         for s in ex_sets:
@@ -759,6 +760,9 @@ def summarize_workout(workout: dict) -> dict:
             if seconds > 0:
                 active_seconds += seconds
                 ex_seconds += seconds
+            custom = _as_float(s.get("custom_metric")) or 0.0
+            if custom > 0:
+                ex_custom += custom
             rpe = _as_float(s.get("rpe"))
             if rpe is not None:
                 if best_rpe is None or rpe > best_rpe:
@@ -781,6 +785,12 @@ def summarize_workout(workout: dict) -> dict:
             "rpe": ex_rpe,
             "distance_m": round(ex_distance) if ex_distance else None,
             "duration_seconds": ex_seconds or None,
+            # Raw sum of Hevy's per-set custom metric. What it *means* depends
+            # on the exercise template's type (floors for stair machines, steps
+            # for treadmills), so it is summed here but only labelled by the
+            # renderer, which has the template. Never totalled per workout —
+            # floors + steps is not a number.
+            "custom_metric": ex_custom or None,
             # The real payload uses ``superset_id``; Hevy's own OpenAPI spec
             # says ``supersets_id`` and is wrong (verified live). Read both.
             "superset_id": ex.get("superset_id", ex.get("supersets_id")),
@@ -869,6 +879,35 @@ def muscle_split(summary: dict, templates: dict) -> list[tuple[str, int]]:
         key=lambda pair: (-pair[1], pair[0]),
     )
     return ranked
+
+
+#: Template types whose ``custom_metric`` has a display label. Everything else
+#: keeps the raw number out of the embed rather than showing an unlabelled sum.
+CUSTOM_METRIC_LABELS: dict[str, str] = {
+    "floors_duration": "floors",
+    "steps_duration": "steps",
+}
+
+
+def superset_marks(exercises: list[dict]) -> list[bool]:
+    """Which exercise-summary entries belong to a multi-member superset.
+
+    Positional (``marks[i]`` describes ``exercises[i]``). An exercise is marked
+    only when at least one *other* exercise shares its superset id — a lone
+    survivor of a deleted partner is not a superset. Membership tests use
+    ``is not None`` because Hevy numbers supersets from **0**, and a truthiness
+    check would silently unmark the first superset in every workout.
+    """
+    counts: dict[object, int] = {}
+    for ex in exercises or []:
+        sid = ex.get("superset_id")
+        if sid is not None:
+            counts[sid] = counts.get(sid, 0) + 1
+    return [
+        ex.get("superset_id") is not None
+        and counts.get(ex.get("superset_id"), 0) > 1
+        for ex in exercises or []
+    ]
 
 
 def index_templates(templates: list[dict]) -> dict[str, dict]:

@@ -555,3 +555,99 @@ def test_admin_save_rejects_an_invalid_value(monkeypatch, tmp_path):
     assert result is not None and result.get("ok") is False
     assert bot_mod._hevy_admin_reply(result, "x").startswith("❌")
     database.close()
+
+
+def test_import_stamps_shape_even_for_already_imported_workouts(monkeypatch,
+                                                                tmp_path):
+    """The self-healing backfill: an account linked before the shape columns
+    existed gets its page-1 workouts stamped on the next ordinary poll, because
+    the stamp runs above the dedup early-return."""
+    from app.db import Database
+
+    database = Database(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    database.hevy_link(7, 42, "enc")
+    workout = {
+        "id": "w1", "title": "Arms", "routine_id": "r1",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "updated_at": "2026-08-19T13:40:46.788Z",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 100, "reps": 5}]}],
+    }
+    # Simulate the pre-shape era: claimed, no shape.
+    database.hevy_mark_workout(7, "w1")
+    assert database.hevy_routine_usage(7) == []
+
+    out = bot_mod._hevy_import_workout(7, 42, "poshy", workout)
+    assert out is None                          # dedup still holds — no re-import
+    usage = database.hevy_routine_usage(7)
+    assert [(r["routine_id"], r["sessions"]) for r in usage] == [("r1", 1)]
+    database.close()
+
+
+def test_import_survives_a_failing_shape_stamp(monkeypatch, tmp_path):
+    """The shape is bookkeeping, lifts are the product — a stamp failure must
+    never cost the import."""
+    from app.db import Database
+
+    database = Database(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    database.hevy_link(7, 42, "enc")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("stamp failed")
+
+    monkeypatch.setattr(database, "hevy_record_shape", _boom)
+    workout = {
+        "id": "w1", "title": "Arms",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 100, "reps": 5}]}],
+    }
+    out = bot_mod._hevy_import_workout(7, 42, "poshy", workout)
+    assert out is not None and len(out["lifts"]) == 1
+    database.close()
+
+
+def test_breakdown_budget_never_slices_a_line(monkeypatch):
+    """The 1024-char field cap is met by dropping whole trailing lines into the
+    "…and N more" count, never by cutting a line mid-markdown."""
+    summary = hevy_client.summarize_workout({
+        "title": "Everything day",
+        "exercises": [
+            {"title": f"Extremely Long Exercise Name Variant {i} (Machine)" * 2,
+             "superset_id": i % 3,
+             "sets": [{"weight_kg": 50 + i, "reps": 8, "rpe": 9}]}
+            for i in range(12)
+        ],
+    })
+    embed = bot_mod._hevy_workout_embed("poshy", summary)
+    field = next(f for f in embed.fields if f.name == "Exercises")
+    assert len(field.value) <= 1024
+    lines = field.value.split("\n")
+    # Every line is intact: it either starts with the superset glyph or bold
+    # markdown, and bold never dangles unclosed.
+    for line in lines:
+        assert line.startswith(("🔗 ", "**", "…")), repr(line)
+        assert line.count("**") % 2 == 0, repr(line)
+    assert lines[-1].startswith("…and ")
+
+
+def test_stair_machine_shows_floors_with_its_template(monkeypatch):
+    templates = hevy_client.index_templates([
+        {"id": "TPL-STAIR", "title": "Stair Machine", "type": "floors_duration"},
+    ])
+    summary = hevy_client.summarize_workout({
+        "title": "Cardio",
+        "exercises": [{
+            "title": "Stair Machine", "exercise_template_id": "TPL-STAIR",
+            "sets": [{"duration_seconds": 600, "custom_metric": 42}],
+        }],
+    })
+    embed = bot_mod._hevy_workout_embed("poshy", summary, None, templates)
+    field = next(f for f in embed.fields if f.name == "Exercises")
+    assert "42 floors" in field.value
+    # Without the template the raw number stays out of the embed.
+    embed2 = bot_mod._hevy_workout_embed("poshy", summary)
+    field2 = next(f for f in embed2.fields if f.name == "Exercises")
+    assert "42" not in field2.value

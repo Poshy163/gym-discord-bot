@@ -739,3 +739,81 @@ def test_index_routines_resolves_folder_titles():
         "r1": {"title": "Arms", "folder": "Push Pull"},
         "r2": {"title": "Legs", "folder": None},
     }
+
+
+# ---------------------------------------------------------------------------
+# Workout shape (routine usage) + supersets + custom metrics
+# ---------------------------------------------------------------------------
+
+def test_superset_marks_include_superset_zero():
+    """Hevy numbers supersets from 0 — a truthiness check would silently
+    unmark the first superset in every workout."""
+    exercises = [
+        {"title": "A", "superset_id": 0},
+        {"title": "B", "superset_id": 0},
+        {"title": "C", "superset_id": None},
+        {"title": "D", "superset_id": 1},   # lone survivor of a deleted partner
+    ]
+    assert hevy_client.superset_marks(exercises) == [True, True, False, False]
+    assert hevy_client.superset_marks([]) == []
+
+
+def test_summarize_sums_custom_metric_per_exercise_only():
+    s = hevy_client.summarize_workout({"exercises": [
+        {"title": "Stair Machine", "sets": [
+            {"duration_seconds": 300, "custom_metric": 20},
+            {"duration_seconds": 300, "custom_metric": 15},
+        ]},
+        {"title": "Bench", "sets": [{"weight_kg": 100, "reps": 5}]},
+    ]})
+    assert s["exercises"][0]["custom_metric"] == 35.0
+    assert s["exercises"][1]["custom_metric"] is None   # absent, not 0
+    assert "custom_metric" not in s or not isinstance(s.get("custom_metric"), float)
+
+
+def test_hevy_record_shape_is_update_only(db):
+    """A workout id that was never claimed gets nothing — the shape stamp must
+    never manufacture a ledger row and weaken the claim-then-write dedup."""
+    db.hevy_link(1, 42, "enc")
+    db.hevy_record_shape(1, "ghost", "r1", "T", "2026-08-19T13:16:09+00:00", None)
+    assert db.hevy_workout_imported(1, "ghost") is False
+    assert db.hevy_routine_usage(1) == []
+
+
+def test_hevy_record_shape_stores_null_not_now(db):
+    """A missing started_at must stay NULL — defaulting to "now" would make
+    every historical workout look like it happened at the last poll, and the
+    usage reader would count it."""
+    db.hevy_link(1, 42, "enc")
+    db.hevy_mark_workout(1, "w1")
+    db.hevy_record_shape(1, "w1", "r1", "Arms", None, None)
+    assert db.hevy_routine_usage(1) == []   # no started_at -> not counted
+
+
+def test_hevy_routine_usage_groups_and_falls_back(db):
+    db.hevy_link(1, 42, "enc")
+    for wid, rid, title, at in [
+        ("w1", "r1", "Arms", "2026-08-01T10:00:00+00:00"),
+        ("w2", "r1", "Arms", "2026-08-08T10:00:00+00:00"),
+        ("w3", "r1", "Arms v2", "2026-08-15T10:00:00+00:00"),
+        ("w4", None, "Freestyle", "2026-08-10T10:00:00+00:00"),
+    ]:
+        db.hevy_mark_workout(1, wid)
+        db.hevy_record_shape(1, wid, rid, title, at, None)
+    usage = db.hevy_routine_usage(1)
+    assert [(r["routine_id"], r["sessions"]) for r in usage] == [
+        ("r1", 3), (None, 1),
+    ]
+    top = usage[0]
+    # The freshest title represents the group (deleted-routine fallback).
+    assert top["last_title"] == "Arms v2"
+    assert top["first_at"] == "2026-08-01T10:00:00+00:00"
+    assert top["last_at"] == "2026-08-15T10:00:00+00:00"
+
+
+def test_hevy_unlink_clears_shapes_with_the_ledger(db):
+    db.hevy_link(1, 42, "enc")
+    db.hevy_mark_workout(1, "w1")
+    db.hevy_record_shape(1, "w1", "r1", "Arms", "2026-08-01T10:00:00+00:00", None)
+    db.hevy_unlink(1)
+    assert db.hevy_routine_usage(1) == []
