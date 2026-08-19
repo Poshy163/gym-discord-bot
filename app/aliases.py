@@ -19,6 +19,10 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     ],
     "shoulder press": [
         "shoulder press", "ohp", "overhead press", "military press",
+        # Hevy names the machine variant "Seated Shoulder Press (Machine)";
+        # without this it forks its own equipment and never meets a chat-logged
+        # "ohp" in the same PR or leaderboard.
+        "seated shoulder press", "seated overhead press",
     ],
     "chest press": [
         "chest press", "machine chest press", "plate loaded chest press",
@@ -44,6 +48,10 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "pec dec": [
         "pec dec", "pec fly", "pec deck", "pekdek", "chest fly", "chest flys",
         "chest flies",
+        # Hevy's own name for this machine is "Butterfly (Pec Deck)". The
+        # parenthetical is stripped before the fallback lookup, so the bare
+        # "butterfly" has to resolve too or the lift lands in its own bucket.
+        "butterfly", "butterfly pec deck", "machine fly", "pec deck fly",
     ],
     "solo arm pec dec": ["solo arm pec dec", "single arm pec dec"],
     "chin assist": ["chin assist", "assisted pullups", "assisted pull ups", "assisted pull-ups", "pull ups assisted", "pullups assisted", "pull-ups assisted"],

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any
 
@@ -29,6 +30,16 @@ LOG = logging.getLogger("gym-bot.hevy")
 
 API_BASE = "https://api.hevyapp.com/v1"
 _TIMEOUT = 15
+
+#: Attempts for a 429. Hevy rate-limits per key, and a single sync can burst a
+#: dozen requests — the workout page, the exercise-template catalogue, then the
+#: body-measurement pages, one per ten entries. Without a retry the whole sync is
+#: abandoned on the first refusal and its workouts wait for the next poll.
+_RATE_LIMIT_ATTEMPTS = 4
+
+#: Seconds to wait before retrying a 429 when Hevy sends no ``Retry-After``,
+#: doubling each attempt (2, 4, 8).
+_RATE_LIMIT_BACKOFF = 2.0
 
 
 class HevyError(Exception):
@@ -48,6 +59,14 @@ class HevyNotFound(HevyError):
 
     Distinct from :class:`HevyError` because "no measurement for that date" is a
     normal, expected answer on the write-back path, not a failure."""
+
+
+class HevyRateLimited(HevyError):
+    """Raised on a 429. ``retry_after`` carries Hevy's own hint when it sent one."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class HevyConflict(HevyError):
@@ -129,6 +148,21 @@ def fernet_ready() -> bool:
 # HTTP
 # ---------------------------------------------------------------------------
 
+def _retry_after(resp: Any) -> float | None:
+    """Seconds Hevy asked us to wait, from ``Retry-After``. Pure-ish helper."""
+    raw = ""
+    try:
+        raw = (resp.headers or {}).get("Retry-After", "")
+    except Exception:  # pragma: no cover - exotic response objects
+        return None
+    try:
+        wait = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    # Ignore a nonsensical or punitive value rather than stalling a poll on it.
+    return wait if 0 < wait <= 60 else None
+
+
 def _request(
     api_key: str, method: str, path: str,
     params: dict | None = None, payload: dict | None = None,
@@ -158,6 +192,10 @@ def _request(
         raise HevyError(f"Hevy request failed: {exc}") from exc
     if resp.status_code in (401, 403):
         raise HevyAuthError("Hevy rejected the API key (401/403).")
+    if resp.status_code == 429:
+        raise HevyRateLimited(
+            "Hevy is rate-limiting this API key (429).", _retry_after(resp),
+        )
     if resp.status_code == 404:
         raise HevyNotFound(f"Hevy has no resource at {path}.")
     if resp.status_code == 409:
@@ -172,8 +210,36 @@ def _request(
         raise HevyError("Hevy returned a non-JSON response.") from exc
 
 
+def _request_retrying(
+    api_key: str, method: str, path: str,
+    params: dict | None = None, payload: dict | None = None,
+) -> Any:
+    """:func:`_request`, retrying a 429 with Hevy's own ``Retry-After``.
+
+    Only 429 is retried. A timeout or a 5xx could mean the write landed and the
+    response was lost, and body measurements are not idempotent enough to replay
+    blindly — a rate-limit refusal is the one failure Hevy guarantees did
+    nothing.
+    """
+    delay = _RATE_LIMIT_BACKOFF
+    for attempt in range(_RATE_LIMIT_ATTEMPTS):
+        try:
+            return _request(api_key, method, path, params=params, payload=payload)
+        except HevyRateLimited as exc:
+            if attempt == _RATE_LIMIT_ATTEMPTS - 1:
+                raise
+            wait = exc.retry_after if exc.retry_after is not None else delay
+            LOG.info(
+                "Hevy: rate-limited on %s, retrying in %.1fs (attempt %d/%d)",
+                path, wait, attempt + 1, _RATE_LIMIT_ATTEMPTS,
+            )
+            time.sleep(wait)
+            delay *= 2
+    raise HevyRateLimited("Hevy is rate-limiting this API key (429).")
+
+
 def _get(api_key: str, path: str, params: dict | None = None) -> Any:
-    return _request(api_key, "GET", path, params=params)
+    return _request_retrying(api_key, "GET", path, params=params)
 
 
 def verify_key(api_key: str) -> dict:
@@ -351,7 +417,9 @@ def measurement_weight(measurement: dict) -> float | None:
 
 def create_body_measurement(api_key: str, payload: dict) -> Any:
     """POST a new body measurement. Raises :class:`HevyConflict` if the date is taken."""
-    return _request(api_key, "POST", "/body_measurements", payload=payload)
+    return _request_retrying(
+        api_key, "POST", "/body_measurements", payload=payload,
+    )
 
 
 def update_body_measurement(api_key: str, date: str, payload: dict) -> Any:
@@ -360,7 +428,7 @@ def update_body_measurement(api_key: str, date: str, payload: dict) -> Any:
     Hevy overwrites **every** field on a PUT — anything omitted is set to null —
     so callers must send a complete object. :func:`merge_measurement` builds one.
     """
-    return _request(
+    return _request_retrying(
         api_key, "PUT", f"/body_measurements/{date}", payload=payload,
     )
 

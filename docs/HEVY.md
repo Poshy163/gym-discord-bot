@@ -66,6 +66,16 @@ other Hevy commands reply publicly.
 
 ## Behaviour notes
 
+- **Rate limits are retried, not surrendered to.** Hevy rate-limits per API key
+  and one sync can burst a dozen requests, so a 429 is retried up to four times,
+  honouring Hevy's own `Retry-After` when it sends one and backing off 2/4/8s
+  when it doesn't. Without this the first refusal abandoned the whole sync.
+- **Exercise names follow Hevy's own vocabulary.** Hevy writes machines as
+  `Butterfly (Pec Deck)` and `Seated Shoulder Press (Machine)`; both used to fork
+  their own equipment rather than meeting a chat-logged `pec dec` or `ohp` in the
+  same PR and leaderboard. Assisted variants stay on a bodyweight-assisted key,
+  where the logged kg is read as machine *assistance* (true load = bodyweight −
+  assistance) rather than as load.
 - **No double-logging:** each Hevy workout id is recorded once imported, so
   repeated polls never re-import. Unlinking clears that history.
 - **First sync is quiet:** the poll right after linking imports your recent

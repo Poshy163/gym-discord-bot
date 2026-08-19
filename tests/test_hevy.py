@@ -466,3 +466,90 @@ def test_relink_clears_the_cached_hevy_profile(db):
     assert row["hevy_username"] is None
     assert row["hevy_profile_url"] is None
     assert row["api_key_enc"] == "enc-v2"
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (429) — hit for real while validating against a live account
+# ---------------------------------------------------------------------------
+
+class _RateLimitedThenOk:
+    """429 for the first ``fails`` calls, then a normal response."""
+
+    class RequestException(Exception):
+        pass
+
+    def __init__(self, fails: int, retry_after: str | None = None):
+        self.fails = fails
+        self.retry_after = retry_after
+        self.calls = 0
+
+    def request(self, method, url, headers=None, params=None, json=None, timeout=None):
+        self.calls += 1
+        if self.calls <= self.fails:
+            resp = _FakeResponse(429)
+            resp.headers = (
+                {"Retry-After": self.retry_after} if self.retry_after else {}
+            )
+            return resp
+        ok = _FakeResponse(200, {"workouts": [{"id": "w1"}]})
+        ok.headers = {}
+        return ok
+
+
+def test_rate_limited_request_retries_and_succeeds(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(hevy_client.time, "sleep", sleeps.append)
+    fake = _RateLimitedThenOk(fails=2)
+    monkeypatch.setattr(hevy_client, "requests", fake)
+    assert hevy_client.fetch_workouts("k") == [{"id": "w1"}]
+    assert fake.calls == 3
+    assert sleeps == [2.0, 4.0]  # exponential backoff
+
+
+def test_rate_limit_honours_hevys_own_retry_after(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(hevy_client.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        hevy_client, "requests", _RateLimitedThenOk(fails=1, retry_after="5"),
+    )
+    hevy_client.fetch_workouts("k")
+    assert sleeps == [5.0]
+
+
+def test_rate_limit_ignores_an_absurd_retry_after(monkeypatch):
+    """A punitive or malformed hint must not stall a poll for an hour."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(hevy_client.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        hevy_client, "requests", _RateLimitedThenOk(fails=1, retry_after="3600"),
+    )
+    hevy_client.fetch_workouts("k")
+    assert sleeps == [2.0]  # fell back to the backoff
+
+
+def test_rate_limit_gives_up_and_raises(monkeypatch):
+    monkeypatch.setattr(hevy_client.time, "sleep", lambda _s: None)
+    fake = _RateLimitedThenOk(fails=99)
+    monkeypatch.setattr(hevy_client, "requests", fake)
+    with pytest.raises(hevy_client.HevyRateLimited):
+        hevy_client.fetch_workouts("k")
+    assert fake.calls == hevy_client._RATE_LIMIT_ATTEMPTS
+    # Still a HevyError, so every existing caller's except-branch still catches it.
+    assert issubclass(hevy_client.HevyRateLimited, hevy_client.HevyError)
+
+
+def test_hevy_names_land_on_the_same_equipment_as_chat_logged_ones():
+    """Checked against a real Hevy workout: these three forked their own
+    equipment, so a Hevy "Butterfly (Pec Deck)" and a typed "pec dec" were two
+    different lifts with two different PRs."""
+    from app.aliases import canonicalize
+    assert canonicalize("Butterfly (Pec Deck)") == "pec dec"
+    assert canonicalize("Seated Shoulder Press (Machine)") == "shoulder press"
+    # These already worked — pinned so the new aliases don't disturb them.
+    assert canonicalize("Lat Pulldown (Cable)") == "lat pulldown"
+    assert canonicalize("Preacher Curl (Machine)") == "preacher curl"
+    assert canonicalize("Hammer Curl (Dumbbell)") == "hammer curl"
+    assert canonicalize("Lateral Raise (Machine)") == "lateral raise"
+    # Assisted pull-ups must stay on a bodyweight-assisted equipment key, where
+    # the logged kg is read as machine assistance rather than load.
+    assert canonicalize("Pull Up (Assisted)") in {"pull ups", "chin assist"}
