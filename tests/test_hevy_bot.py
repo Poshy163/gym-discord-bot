@@ -447,3 +447,27 @@ def test_recanon_notice_silent_when_nothing_was_renamed(monkeypatch):
     monkeypatch.setattr(bot_mod.db, "take_hevy_recanon_notice", lambda: {})
     _run(bot_mod._hevy_announce_recanon())
     channel.send.assert_not_awaited()
+
+
+def test_workout_embed_labels_the_routine_when_it_adds_information():
+    summary = hevy_client.summarize_workout({
+        "title": "Wednesday session", "routine_id": "r1",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 100, "reps": 5}]}],
+    })
+    routines = {"r1": {"title": "Arms", "folder": "Push Pull"}}
+    embed = bot_mod._hevy_workout_embed("poshy", summary, None, None, None, routines)
+    assert embed.title == "Wednesday session — Push Pull / Arms"
+
+
+def test_workout_embed_skips_a_redundant_routine_label():
+    """Most members name the workout after the routine — "Arms — from Arms"
+    is noise, so an identical title suppresses the label."""
+    summary = hevy_client.summarize_workout({
+        "title": "Arms", "routine_id": "r1",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 100, "reps": 5}]}],
+    })
+    routines = {"r1": {"title": "Arms", "folder": None}}
+    embed = bot_mod._hevy_workout_embed("poshy", summary, None, None, None, routines)
+    assert embed.title == "Arms"

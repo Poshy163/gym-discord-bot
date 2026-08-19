@@ -2988,13 +2988,22 @@ function bodyMetricCards(metrics){
 // rather than by hand-editing the database.
 function bwList(pts,uid){
   if(!pts||!pts.length)return '';
-  const rows=pts.slice().reverse().slice(0,12);
-  return `<details class="bwlist"><summary class="link">Recent weigh-ins (${pts.length})</summary>
-    <table><tbody>${rows.map(p=>`<tr>
+  // Every loaded weigh-in, newest first, behind a "show all". The old
+  // newest-12 cap made a back-dated row (a Hevy history import, a scale
+  // reading with a wrong date) invisible and therefore undeletable from the
+  // UI — the one place a stray reading is supposed to be removable.
+  const rows=pts.slice().reverse();
+  const render=p=>`<tr>
       <td><b>${Number(p.weight_kg).toFixed(2)}</b> kg</td>
       <td class="muted">${esc(fmtTs(p.at))}</td>
       <td class="right">${p.id?`<a class="link danger" onclick="delBodyweight('${uid}',${p.id},'${Number(p.weight_kg).toFixed(2)}')">delete</a>`:''}</td>
-    </tr>`).join("")}</tbody></table></details>`;
+    </tr>`;
+  const head=rows.slice(0,12).map(render).join("");
+  const rest=rows.slice(12).map(render).join("");
+  const more=rest?`<tr><td colspan="3"><details><summary class="link">…and ${rows.length-12} older</summary>
+      <table><tbody>${rest}</tbody></table></details></td></tr>`:"";
+  return `<details class="bwlist"><summary class="link">Recent weigh-ins (${pts.length})</summary>
+    <table><tbody>${head}${more}</tbody></table></details>`;
 }
 
 async function delBodyweight(uid,id,kg){

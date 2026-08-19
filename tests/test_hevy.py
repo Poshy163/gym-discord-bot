@@ -697,3 +697,45 @@ def test_ordinary_lifts_are_never_marked_bodyweight_relative():
 def test_index_templates_keeps_the_type():
     assert BW_TEMPLATES["TPL-W"]["type"] == "bodyweight_weighted"
     assert BW_TEMPLATES["TPL-A"]["type"] == "bodyweight_assisted"
+
+
+# ---------------------------------------------------------------------------
+# Routines, folders, and live-API quirks (verified against a real account)
+# ---------------------------------------------------------------------------
+
+def test_summarize_reads_the_real_superset_key():
+    """The live payload uses ``superset_id``; Hevy's OpenAPI spec documents
+    ``supersets_id`` and is wrong. Trusting the spec meant the field read None
+    forever."""
+    s = hevy_client.summarize_workout({"exercises": [
+        {"title": "A", "superset_id": 0, "sets": [{"weight_kg": 50, "reps": 5}]},
+        {"title": "B", "supersets_id": 1, "sets": [{"weight_kg": 50, "reps": 5}]},
+    ]})
+    assert s["exercises"][0]["superset_id"] == 0
+    assert s["exercises"][1]["superset_id"] == 1  # spec spelling still accepted
+
+
+def test_fetch_routine_folders_accepts_the_misnamed_key(monkeypatch):
+    """Live quirk: /routine_folders returns its list under "routines"."""
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/routine_folders"): _FakeResponse(200, {
+            "page": 1, "page_count": 1,
+            "routines": [{"id": 42, "title": "Push Pull", "index": 0}],
+        }),
+    }))
+    got = hevy_client.fetch_routine_folders("k")
+    assert got == [{"id": 42, "title": "Push Pull", "index": 0}]
+
+
+def test_index_routines_resolves_folder_titles():
+    routines = [
+        {"id": "r1", "title": "Arms", "folder_id": 42},
+        {"id": "r2", "title": "Legs", "folder_id": None},
+        {"id": "", "title": "ignored"},
+    ]
+    folders = [{"id": 42, "title": "Push Pull"}]
+    got = hevy_client.index_routines(routines, folders)
+    assert got == {
+        "r1": {"title": "Arms", "folder": "Push Pull"},
+        "r2": {"title": "Legs", "folder": None},
+    }

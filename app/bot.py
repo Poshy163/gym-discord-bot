@@ -17314,6 +17314,38 @@ async def _hevy_announce_recanon() -> None:
         LOG.info("Hevy: failed to post the re-canonicalisation notice")
 
 
+#: Per-user cache of routine id -> {"title", "folder"}. Unlike the exercise
+#: templates (a shared, near-static catalogue), routines are personal and
+#: renameable, so the cache is keyed by user and refreshed hourly — a stale
+#: label is only cosmetic, but showing member A's routine name on member B's
+#: workout would be wrong, not stale.
+_HEVY_ROUTINES: dict[int, tuple[datetime, dict[str, dict]]] = {}
+_HEVY_ROUTINE_TTL = timedelta(hours=1)
+
+
+async def _hevy_routines(user_id: int, api_key: str) -> dict[str, dict]:
+    """The member's routine map, refreshed at most hourly. Never raises —
+    a routine label is a garnish, so a failed fetch degrades to no label."""
+    now = datetime.now(timezone.utc)
+    cached = _HEVY_ROUTINES.get(user_id)
+    if cached is not None and now - cached[0] < _HEVY_ROUTINE_TTL:
+        return cached[1]
+
+    def _fetch() -> dict[str, dict]:
+        return hevy_client.index_routines(
+            hevy_client.fetch_routines(api_key),
+            hevy_client.fetch_routine_folders(api_key),
+        )
+
+    try:
+        fetched = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: routine fetch failed for %s: %s", user_id, exc)
+        return cached[1] if cached else {}
+    _HEVY_ROUTINES[user_id] = (now, fetched)
+    return fetched
+
+
 def _hevy_push_enabled() -> bool:
     """True when weigh-ins should be mirrored into linked Hevy accounts."""
     return bool(HEVY_PUSH_BODYWEIGHT) and _hevy_enabled()
@@ -17444,6 +17476,7 @@ def _hevy_workout_embed(
     prs_by_equip: dict[str, tuple[float, float | None]] | None = None,
     templates: dict[str, dict] | None = None,
     profile_url: str | None = None,
+    routines: dict[str, dict] | None = None,
 ) -> discord.Embed:
     """Build the feed embed for a completed Hevy workout — the full stat line,
     a per-exercise breakdown, any new personal bests, and the heaviest set.
@@ -17485,8 +17518,18 @@ def _hevy_workout_embed(
         extras.append(f"RPE up to {summary['best_rpe']:g}")
     if extras:
         desc.append(" · ".join(extras))
+    routine = (routines or {}).get(summary.get("routine_id") or "")
+    title = summary["title"]
+    if routine and routine.get("title") and routine["title"] != title:
+        # Only label when it adds information — most members name the workout
+        # after the routine, and "Arms — from Arms" is noise.
+        folder = routine.get("folder")
+        label = (
+            f"{folder} / {routine['title']}" if folder else routine["title"]
+        )
+        title = f"{title} — {_plain_label(label)}"
     embed = discord.Embed(
-        title=summary["title"], colour=HEVY_COLOUR, description=" · ".join(desc),
+        title=title, colour=HEVY_COLOUR, description=" · ".join(desc),
     )
     embed.set_author(
         name=f"🏋️ {member_name} finished a Hevy workout",
@@ -17730,12 +17773,13 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
             # no lifts. A calisthenics or treadmill session has no weighted set
             # to import, and skipping it made the workout vanish silently — it
             # was marked imported, so nothing would ever post it again.
+            routines = await _hevy_routines(user_id, api_key)
             for r in imported:
                 try:
                     await feed_channel.send(
                         embed=_hevy_workout_embed(
                             username, r["summary"], r["prs"],
-                            templates, profile_url,
+                            templates, profile_url, routines,
                         ),
                     )
                 except discord.HTTPException:  # pragma: no cover - best effort
@@ -17863,8 +17907,15 @@ async def hevy_recent_cmd(
     profile_url = (
         row["hevy_profile_url"] if "hevy_profile_url" in row.keys() else None
     )
+    routines: dict[str, dict] = {}
+    try:
+        routines = await _hevy_routines(
+            target.id, hevy_client.decrypt_key(row["api_key_enc"]),
+        )
+    except hevy_client.HevyError:  # pragma: no cover - unreadable stored key
+        pass
     embed = _hevy_workout_embed(
-        _display_name(target), summary, None, templates, profile_url,
+        _display_name(target), summary, None, templates, profile_url, routines,
     )
     await interaction.followup.send(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),

@@ -337,6 +337,74 @@ def fetch_exercise_templates(api_key: str, limit: int = 500) -> list[dict]:
     return out[:limit]
 
 
+def fetch_routines(api_key: str, limit: int = 100) -> list[dict]:
+    """The account's workout routines (programmes), paged ten at a time."""
+    out: list[dict] = []
+    page = 1
+    while len(out) < limit:
+        data = _get(api_key, "/routines", {"page": page, "pageSize": 10})
+        batch = data.get("routines", []) or [] if isinstance(data, dict) else []
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 10:
+            break  # last page
+        page += 1
+        if page > 20:  # hard safety cap against a bad loop
+            break
+    return out[:limit]
+
+
+def fetch_routine_folders(api_key: str, limit: int = 50) -> list[dict]:
+    """The account's routine folders.
+
+    Live quirk: the endpoint returns its list under the key ``"routines"``, not
+    ``"routine_folders"`` as the OpenAPI spec documents (verified against a real
+    account). Accept both so a future server-side fix doesn't break us."""
+    out: list[dict] = []
+    page = 1
+    while len(out) < limit:
+        data = _get(api_key, "/routine_folders", {"page": page, "pageSize": 10})
+        batch = []
+        if isinstance(data, dict):
+            batch = data.get("routine_folders") or data.get("routines") or []
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 10:
+            break
+        page += 1
+        if page > 10:
+            break
+    return out[:limit]
+
+
+def index_routines(
+    routines: list[dict], folders: list[dict] | None = None,
+) -> dict[str, dict]:
+    """Index routines by id as ``{id: {"title", "folder"}}`` for embed labels.
+
+    ``folder`` is the folder's title or None; a workout embed shows
+    "from **Push Pull / Arms**" when the routine sits in a folder and just the
+    routine title when it doesn't."""
+    folder_titles: dict[object, str] = {}
+    for f in folders or []:
+        fid = f.get("id")
+        title = (f.get("title") or "").strip()
+        if fid is not None and title:
+            folder_titles[fid] = title
+    out: dict[str, dict] = {}
+    for r in routines or []:
+        rid = str(r.get("id") or "")
+        if not rid:
+            continue
+        out[rid] = {
+            "title": (r.get("title") or "").strip(),
+            "folder": folder_titles.get(r.get("folder_id")),
+        }
+    return out
+
+
 def fetch_body_measurement(api_key: str, date: str) -> dict | None:
     """The measurement recorded for ``date`` (YYYY-MM-DD), or None if there is none.
 
@@ -713,7 +781,9 @@ def summarize_workout(workout: dict) -> dict:
             "rpe": ex_rpe,
             "distance_m": round(ex_distance) if ex_distance else None,
             "duration_seconds": ex_seconds or None,
-            "superset_id": ex.get("supersets_id"),
+            # The real payload uses ``superset_id``; Hevy's own OpenAPI spec
+            # says ``supersets_id`` and is wrong (verified live). Read both.
+            "superset_id": ex.get("superset_id", ex.get("supersets_id")),
         })
     start = _iso_dt(workout.get("start_time") or workout.get("created_at"))
     end = _iso_dt(workout.get("end_time"))
