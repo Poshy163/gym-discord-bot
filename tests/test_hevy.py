@@ -1008,3 +1008,39 @@ def test_workout_to_lifts_prefers_the_override():
     # Without the override the alias table decides, as before.
     lift, = hevy_client.workout_to_lifts(workout)
     assert lift.equipment == "pec dec"
+
+
+# ---------------------------------------------------------------------------
+# Shape backfill by id + one-shot claims + the debounce window helper
+# ---------------------------------------------------------------------------
+
+def test_unshaped_workouts_lists_oldest_first_and_skips_gone(db):
+    db.hevy_link(1, 42, "enc")
+    for wid, at in (("w-old", "2026-01-01T00:00:00+00:00"),
+                    ("w-mid", "2026-02-01T00:00:00+00:00"),
+                    ("w-new", "2026-03-01T00:00:00+00:00")):
+        with db._conn() as c:
+            c.execute("INSERT INTO hevy_imported (user_id, workout_id,"
+                      " imported_at) VALUES (1, ?, ?)", (wid, at))
+    assert db.hevy_unshaped_workouts(1, limit=2) == ["w-old", "w-mid"]
+    # Shaped rows drop out; gone rows are never retried.
+    db.hevy_record_shape(1, "w-old", None, "T", "2026-01-01T00:00:00+00:00", None)
+    db.hevy_mark_gone(1, "w-mid")
+    assert db.hevy_unshaped_workouts(1) == ["w-new"]
+
+
+def test_app_meta_claim_is_single_shot(db):
+    assert db.app_meta_claim("release_test") is True
+    assert db.app_meta_claim("release_test") is False
+    assert db.app_meta_claim("another_key") is True
+
+
+def test_bodyweight_within_window(db):
+    from datetime import datetime, timezone, timedelta
+
+    base = datetime(2026, 7, 30, 3, 19, tzinfo=timezone.utc)
+    db.set_bodyweight(42, 1, 106.3, recorded_at=base)
+    assert db.bodyweight_within(1, base + timedelta(minutes=9), 1800) is True
+    assert db.bodyweight_within(1, base - timedelta(minutes=9), 1800) is True
+    assert db.bodyweight_within(1, base + timedelta(minutes=31), 1800) is False
+    assert db.bodyweight_within(2, base, 1800) is False   # other member

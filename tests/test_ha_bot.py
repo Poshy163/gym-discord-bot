@@ -523,7 +523,9 @@ def _sync(uid: int, states: list[dict], monkeypatch, **kwargs):
 
 def test_sync_first_link_imports_history_as_one_summary(monkeypatch):
     uid = _user()
-    entries = [_entry(40, 106.3, "m1"), _entry(20, 106.4, "m2"),
+    # Spaced past the half-hour scale-bounce debounce: this test is about the
+    # backfill announcing as ONE summary, not about same-session readings.
+    entries = [_entry(130, 106.3, "m1"), _entry(70, 106.4, "m2"),
                _entry(5, 106.7, "m3")]
     _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
     result, embeds = _sync(uid, _scale_state(entries, current="106.7"),
@@ -558,10 +560,11 @@ def test_sync_routine_double_weigh_in_posts_one_embed_each(monkeypatch):
     """
     uid = _user()
     _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
-    first = [_entry(60, 106.3, "m1")]
+    first = [_entry(180, 106.3, "m1")]
     _sync(uid, _scale_state(first, current="106.3"), monkeypatch)
 
-    later = first + [_entry(10, 106.5, "m2"), _entry(2, 106.8, "m3")]
+    # Spaced past the debounce window — genuinely separate weigh-ins.
+    later = first + [_entry(90, 106.5, "m2"), _entry(2, 106.8, "m3")]
     result, embeds = _sync(uid, _scale_state(later, current="106.8"),
                            monkeypatch)
     assert result["new"] == 2
@@ -572,6 +575,29 @@ def test_sync_routine_double_weigh_in_posts_one_embed_each(monkeypatch):
     # Each is diffed against the one before it, not against the same old weight.
     assert "0.20 kg" in embeds[0].description
     assert "0.30 kg" in embeds[1].description
+
+
+def test_sync_debounces_a_scale_bounce_session(monkeypatch):
+    """Stepping on the scale three times in twenty minutes is one weigh-in.
+
+    Real data: seven imports in one morning, 03:19-05:29, jittering
+    105.9-106.7 kg — each announced, each re-deriving the protein link, each
+    mirrored to Hevy. The equal-weight replay guard can't catch these because
+    the jitter is exactly what varies; the half-hour window can."""
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "scale_joshua_s")
+    entries = [_entry(29, 106.3, "m1"), _entry(20, 106.7, "m2"),
+               _entry(12, 106.4, "m3")]
+    result, embeds = _sync(uid, _scale_state(entries, current="106.4"),
+                           monkeypatch)
+    # Only the first reading of the session lands; the bounces are suppressed.
+    assert result["new"] == 1
+    assert [r["weight_kg"] for r in _bot_db.bodyweight_history(GUILD, uid)] == [
+        106.3]
+    # ...and stay suppressed on the next poll (their keys were claimed).
+    result2, embeds2 = _sync(uid, _scale_state(entries, current="106.4"),
+                             monkeypatch)
+    assert result2["new"] == 0 and embeds2 == []
 
 
 def test_sync_ignores_entries_older_than_the_backfill_window(monkeypatch):

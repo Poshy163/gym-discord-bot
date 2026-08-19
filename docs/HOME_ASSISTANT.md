@@ -256,6 +256,12 @@ really somebody else standing on the scale, say. Deletions are audited like ever
 other dashboard edit.
 
 ## Behaviour notes
+- **Scale bounce is debounced.** A reading arriving within half an hour of an
+  already-stored weigh-in is the same session — someone stepping back on to
+  double-check — and is suppressed rather than imported (its body-composition
+  numbers still top up the stored weigh-in). Real data showed seven imports in
+  one morning jittering ±0.4 kg, each announced, each re-deriving the protein
+  target, each mirrored to Hevy. The first reading of the session wins.
 - **A sleeping scale is not a weigh-in.** Scales report `unavailable` most of the
   time and `unknown` before their first reading; neither is ever imported.
 - **Units follow the entity.** `unit_of_measurement` is read per sensor on every

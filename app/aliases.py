@@ -37,6 +37,11 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
         "tricep pushdown", "triceps pushdown", "tricep pull", "triceps pull",
         "tricep push down", "tricep extension", "triceps extension",
         "tricep extention", "triceps extention",
+        # Rope vs bar is an attachment on the same cable stack, and this group
+        # already merges the extension family. Hevy logs the rope variant as
+        # "Triceps Rope Pushdown", which forked its own bucket (15 lifts).
+        "triceps rope pushdown", "tricep rope pushdown", "rope pushdown",
+        "rope tricep pushdown", "triceps pulldown", "tricep pulldown",
     ],
     "tricep overhead extension": [
         "tricep overhead extension", "tricep overhead extention",
@@ -77,7 +82,14 @@ _ALIAS_GROUPS: dict[str, list[str]] = {
     "leg curl": ["leg curl", "leg curls", "hamstring curl", "hamstring curls"],
     "hip adduction": ["hip adduction", "hip adductor", "adduction", "adductor"],
     "hip abduction": ["hip abduction", "hip abductor", "abduction", "abductor"],
-    "calf raise": ["calf raise", "calf raises"],
+    "calf raise": [
+        "calf raise", "calf raises",
+        # An unqualified calf raise IS the standing one — the seated machine is
+        # always logged with its qualifier, and stays its own bucket. Merges
+        # the standing calf raise (18) / calf raise (12) / standing calf (3)
+        # three-way split seen in real data.
+        "standing calf raise", "standing calf raises", "standing calf",
+    ],
     "squat": ["squat", "squats", "back squat"],
     "squat rack": ["squat rack", "squat racks", "power rack"],
     "diddy machine": ["diddy machine"],

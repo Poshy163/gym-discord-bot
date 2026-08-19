@@ -21,7 +21,9 @@ def test_unknown_exercise_stored_clean_without_parens():
     # Not in the alias table -> its own machine, but the parenthetical noise is
     # still stripped so it's stored consistently.
     assert canonicalize("Straight Arm Lat Pulldown (Cable)") == "straight arm lat pulldown"
-    assert canonicalize("Standing Calf Raise (Machine)") == "standing calf raise"
+    assert canonicalize("Nordic Hamstring Curl (Machine)") == "nordic hamstring curl"
+    # ...while a formerly-unknown machine that has since been taught stays taught.
+    assert canonicalize("Standing Calf Raise (Machine)") == "calf raise"
     # No parenthetical, no alias -> unchanged clean form.
     assert canonicalize("T Bar Row") == "t bar row"
 

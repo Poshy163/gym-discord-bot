@@ -4206,6 +4206,19 @@ class Database:
             )
             return True
 
+    def app_meta_claim(self, key: str) -> bool:
+        """Atomically claim a one-shot marker. True exactly once per key.
+
+        The INSERT OR IGNORE is the claim: whoever wins posts the one-off
+        (a release note, an announcement); every later caller — including a
+        crash-looping restart — gets False and stays quiet."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)",
+                (key, _normalize_iso(None)),
+            )
+            return (cur.rowcount or 0) > 0
+
     def take_hevy_recanon_notice(self) -> dict[str, int]:
         """Claim the pending equipment-rename summary, if any. Empty when none.
 
@@ -4480,6 +4493,57 @@ class Database:
                     "WHERE overridden = 1",
                 )
             }
+
+    def bodyweight_within(
+        self, user_id: int, when: datetime, window_seconds: int,
+    ) -> bool:
+        """True when a weigh-in exists within ``window_seconds`` of ``when``.
+
+        The smart-scale debounce check: someone stepping on the scale three
+        times in nine minutes is one weigh-in session, not three data points —
+        real data showed seven imports in a morning, each jittering ±0.4 kg.
+        Timestamp-window only, no weight comparison: the jitter is exactly what
+        the existing equal-weight replay guard cannot catch."""
+        low = _normalize_iso(when - timedelta(seconds=window_seconds))
+        high = _normalize_iso(when + timedelta(seconds=window_seconds))
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM bodyweights "
+                "WHERE user_id = ? AND recorded_at BETWEEN ? AND ? LIMIT 1",
+                (user_id, low, high),
+            ).fetchone() is not None
+
+    def hevy_unshaped_workouts(self, user_id: int, limit: int = 5) -> list[str]:
+        """Workout ids imported before shape stamping existed, oldest first.
+
+        Fed to the poll's trickle backfill: a few GET /workouts/{id} calls per
+        pass until every historical import has a shape and /hevy routines sees
+        the member's whole history, not just what the page-1 self-heal reaches.
+        Retracted rows are excluded — Hevy no longer has them to fetch."""
+        with self._conn() as c:
+            return [
+                str(r["workout_id"]) for r in c.execute(
+                    "SELECT workout_id FROM hevy_imported "
+                    "WHERE user_id = ? AND started_at IS NULL "
+                    "  AND retracted_at IS NULL "
+                    "ORDER BY imported_at ASC LIMIT ?",
+                    (user_id, int(limit)),
+                )
+            ]
+
+    def hevy_mark_gone(self, user_id: int, workout_id: str) -> None:
+        """Mark a ledger row whose workout Hevy no longer has (404 on fetch).
+
+        Setting retracted_at is what stops the shape backfill retrying it every
+        poll forever. The lifts stay: a legacy import has no provenance, so
+        nothing could identify its rows anyway — this is bookkeeping, not a
+        retraction."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_imported SET retracted_at = ? "
+                "WHERE user_id = ? AND workout_id = ? AND retracted_at IS NULL",
+                (_normalize_iso(None), user_id, workout_id),
+            )
 
     def hevy_get_import(self, user_id: int, workout_id: str) -> sqlite3.Row | None:
         """The full ledger row for one workout — the events sync's admission

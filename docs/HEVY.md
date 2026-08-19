@@ -59,7 +59,11 @@ available; importing works even without a feed channel.
   is stored **encrypted**.
 - `/hevy status` — show whether you're linked, your Hevy profile, when it last
   synced, and whether weigh-ins are being mirrored.
-- `/hevy routines` — sessions per routine with when each was last run, resolved
+- `/hevy routines` — sessions per routine with when each was last run. History
+  older than the page-1 window trickle-backfills automatically: each poll
+  fetches a few pre-existing workouts by id (five per pass) until every import
+  has its shape, so long-time members' full history appears within hours of
+  deploying, not never, resolved
   to routine (and folder) names where the poll has them cached, falling back to
   the most recent workout title for routines since deleted in Hevy. Accrues as
   workouts sync — each poll stamps the shape (routine, title, start, Hevy's

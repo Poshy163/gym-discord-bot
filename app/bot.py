@@ -3261,6 +3261,7 @@ async def on_ready() -> None:
                 "workout feed."
             )
         await _hevy_announce_recanon()
+        await _announce_release_notes()
 
     if _ha_enabled() and not ha_poll.is_running():
         ha_poll.start()
@@ -5145,6 +5146,15 @@ async def on_message(message: discord.Message) -> None:
                     reply = "\n".join(lines)
                 if backdate_note:
                     reply = reply + backdate_note
+                # A third of stored lifts carry no rep count (347 of 1053 on
+                # real data), which starves the 1RM estimates. One gentle line,
+                # only when the whole message went in rep-less, and never on a
+                # PR post — that moment belongs to the celebration.
+                if not prs and all(l.reps is None for l in lifts):
+                    reply += (
+                        "\n-# Tip: add reps — `bench 100kg x5` — and "
+                        "estimated-1RM charts get much sharper."
+                    )
                 if prs:
                     pr_lines = ["", "🎉 **New PR!**"]
                     for lift, prev in prs:
@@ -17301,6 +17311,59 @@ async def _hevy_reconcile_locked(
     return result
 
 
+#: One app_meta key per release note. Bump the key when there is a new note to
+#: post; an unchanged key means the note (or silence) already happened.
+_RELEASE_NOTE_KEY = "release_note_2026_08_20"
+
+
+async def _announce_release_notes() -> None:
+    """Post a short what's-new to the feed channel, once per release key.
+
+    Claimed through app_meta before anything is sent, so a crash loop or a
+    double on_ready can never post it twice. Dropped (with the claim kept)
+    when no feed channel is configured — a stale announcement surfacing the
+    day a channel is finally set would be worse than silence."""
+    try:
+        if not db.app_meta_claim(_RELEASE_NOTE_KEY):
+            return
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Could not claim the release note marker")
+        return
+    channel = (
+        bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
+    )
+    if channel is None:
+        LOG.info("Release note %s dropped — no feed channel", _RELEASE_NOTE_KEY)
+        return
+    embed = discord.Embed(
+        title="📣 Bot update — the Hevy integration grew up",
+        colour=HEVY_COLOUR,
+        description=(
+            "**TL;DR**\n"
+            "• **Edits & deletions in Hevy now sync back** — fix a typo in "
+            "the app and the bot's lifts follow, with a correction posted if "
+            "a PR moves.\n"
+            "• Commands moved: `/hevy_link` → **`/hevy link`** (same for "
+            "status/sync/recent/help). New: **`/hevy routines`** — which "
+            "programmes you actually run.\n"
+            "• **Weigh-ins mirror to Hevy** body measurements both ways, "
+            "once per account, history included.\n"
+            "• Feed embeds got richer: muscle split, supersets 🔗, RPE, "
+            "cardio distance/time — and calisthenics workouts post now too.\n"
+            "• Smart-scale bounce is debounced (no more seven weigh-ins "
+            "before breakfast).\n"
+            "• Admins: `/hevy feed` · `/hevy interval` · `/hevy mirror`, and "
+            "a dashboard **machine map** for where Hevy exercises get filed."
+        ),
+    )
+    embed.set_footer(text="Full details: docs/HEVY.md")
+    try:
+        await channel.send(embed=embed)
+        LOG.info("Release note %s posted", _RELEASE_NOTE_KEY)
+    except discord.HTTPException:  # pragma: no cover - best effort
+        LOG.info("Release note %s failed to send", _RELEASE_NOTE_KEY)
+
+
 async def _hevy_announce_recanon() -> None:
     """Post the one-off "these lifts were renamed" notice, once.
 
@@ -17935,6 +17998,56 @@ async def _hevy_apply_event(
     )
 
 
+#: Historical workouts fetched per account per poll to fill in their shape
+#: (routine, title, start). Small on purpose: at 5/poll a 200-workout history
+#: completes in ~10 hours of ordinary polling without ever bursting the API.
+_HEVY_SHAPE_BACKFILL_PER_POLL = 5
+
+
+async def _hevy_backfill_shapes(account_row, api_key: str) -> int:
+    """Trickle-fill shapes for workouts imported before shape stamping existed.
+
+    The page-1 self-heal only reaches a member's ten most recent workouts;
+    everything older sat with a NULL shape, leaving /hevy routines blind to
+    most of a long-time member's history (36 of 47 imports, on real data).
+    Every missing workout's id is in the ledger and GET /workouts/{id} can
+    fetch it — a few per poll until none remain. A 404 marks the row gone so
+    it is never fetched again; any other failure just waits for the next poll.
+    Returns the number of shapes filled."""
+    user_id = int(account_row["user_id"])
+    try:
+        pending = db.hevy_unshaped_workouts(
+            user_id, limit=_HEVY_SHAPE_BACKFILL_PER_POLL,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: could not list unshaped workouts for %s", user_id)
+        return 0
+    filled = 0
+    for wid in pending:
+        def _fetch(wid: str = wid) -> dict | None:
+            return hevy_client.fetch_workout(api_key, wid)
+
+        try:
+            workout = await bot.loop.run_in_executor(None, _fetch)
+        except hevy_client.HevyAuthError:
+            return filled
+        except hevy_client.HevyError as exc:
+            LOG.info("Hevy: shape backfill fetch failed for %s: %s", user_id, exc)
+            return filled  # transient — retry next poll
+        if workout is None:
+            db.hevy_mark_gone(user_id, wid)  # deleted in Hevy: stop asking
+            continue
+        summary = hevy_client.summarize_workout(workout)
+        db.hevy_record_shape(
+            user_id, wid, summary.get("routine_id"), summary.get("title"),
+            summary.get("start_time"), summary.get("updated_at"),
+        )
+        filled += 1
+    if filled:
+        LOG.info("Hevy: backfilled %d workout shape(s) for %s", filled, user_id)
+    return filled
+
+
 async def _hevy_drain_events(
     account_row, api_key: str, templates: dict[str, dict], username: str,
     sync_started: datetime,
@@ -18162,6 +18275,13 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
                 await feed_channel.send(embed=notice)
             except discord.HTTPException:  # pragma: no cover - best effort
                 LOG.info("Hevy: failed to post a correction for %s", user_id)
+
+    # Trickle-fill shapes for pre-stamping imports (a few GETs per poll until
+    # every historical workout has one and /hevy routines sees full history).
+    try:
+        await _hevy_backfill_shapes(row, api_key)
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: shape backfill failed for %s", user_id)
 
     # One-time bodyweight merge with Hevy's body measurements. Gated on its own
     # marker rather than on `backfill`, so accounts linked before this existed
@@ -18674,6 +18794,14 @@ async def _ha_send_announcement(
         return await channel.send(**kwargs)
 
 
+#: Readings this close (either side) to an already-stored weigh-in are the
+#: same session's scale bounce, not new data. Real data: seven imports in one
+#: morning, 03:19-05:29, jittering 105.9-106.7 kg — each announced, each
+#: re-deriving the protein link, each pushed to Hevy. The equal-weight replay
+#: guard can't catch these because the jitter is precisely what varies.
+_HA_DEBOUNCE_SECONDS = 30 * 60
+
+
 def _ha_valid_weight(weight_kg: float) -> bool:
     """Reject a weight before it reaches the database.
 
@@ -18763,6 +18891,20 @@ def _ha_import_reading(
             "Home Assistant: %s kg for user %s is a restored state, not a new "
             "weigh-in", weight_kg, user_id,
         )
+        return None
+    if db.bodyweight_within(user_id, measured_at, _HA_DEBOUNCE_SECONDS):
+        # Same weigh-in session: someone stepping on the scale again within
+        # half an hour is re-measuring, not re-weighing. Claim the key so this
+        # bounce is never re-evaluated, still top up any body composition it
+        # carried (idempotent), and log nothing to the member.
+        if db.ha_mark_reading(user_id, key):
+            LOG.debug(
+                "Home Assistant: %s kg for user %s debounced — a weigh-in "
+                "exists within %d min", weight_kg, user_id,
+                _HA_DEBOUNCE_SECONDS // 60,
+            )
+        if metrics:
+            _ha_store_metrics(user_id, guild_id, metrics, measured_at)
         return None
     if not db.ha_mark_reading(user_id, key):
         return None  # raced with another sync attempt

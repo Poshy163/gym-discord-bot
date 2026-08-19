@@ -914,3 +914,85 @@ def test_drain_is_gated_by_the_config_switch(events_env, monkeypatch):
     ))
     assert out == {"replaced": 0, "retracted": 0, "notices": []}
     assert env.row()["events_since"] is None   # not even seeded
+
+
+# ---------------------------------------------------------------------------
+# Shape backfill loop + the one-shot release note
+# ---------------------------------------------------------------------------
+
+def test_shape_backfill_fetches_and_stamps(events_env, monkeypatch):
+    """36 of 47 imports had no shape on real data — /hevy routines was blind to
+    them. The trickle backfill fetches each by id and stamps it; a 404 (deleted
+    in Hevy) is marked gone so it is never fetched again."""
+    env = events_env
+    with env.db._conn() as c:
+        for wid in ("old-1", "old-2", "old-gone"):
+            c.execute("INSERT INTO hevy_imported (user_id, workout_id,"
+                      " imported_at) VALUES (7, ?, '2026-01-01T00:00:00+00:00')",
+                      (wid,))
+
+    payloads = {
+        "old-1": {"id": "old-1", "title": "Push", "routine_id": "r1",
+                  "start_time": "2026-01-01T10:00:00+00:00", "exercises": []},
+        "old-2": {"id": "old-2", "title": "Pull", "routine_id": "r1",
+                  "start_time": "2026-01-03T10:00:00+00:00", "exercises": []},
+        "old-gone": None,   # 404 — deleted in Hevy
+    }
+    fetched: list[str] = []
+
+    def _fetch(api_key, wid):
+        fetched.append(wid)
+        return payloads[wid]
+
+    monkeypatch.setattr(hevy_client, "fetch_workout", _fetch)
+    filled = _run(bot_mod._hevy_backfill_shapes(env.row(), "key"))
+
+    assert filled == 2 and sorted(fetched) == ["old-1", "old-2", "old-gone"]
+    usage = env.db.hevy_routine_usage(7)
+    assert [(r["routine_id"], r["sessions"]) for r in usage] == [("r1", 2)]
+    # Nothing left to do — and the gone one is never asked for again.
+    fetched.clear()
+    assert _run(bot_mod._hevy_backfill_shapes(env.row(), "key")) == 0
+    assert fetched == []
+
+
+def test_shape_backfill_stops_on_transient_failure(events_env, monkeypatch):
+    env = events_env
+    with env.db._conn() as c:
+        c.execute("INSERT INTO hevy_imported (user_id, workout_id, imported_at)"
+                  " VALUES (7, 'old-1', '2026-01-01T00:00:00+00:00')")
+
+    def _boom(*_a, **_k):
+        raise hevy_client.HevyError("timeout")
+
+    monkeypatch.setattr(hevy_client, "fetch_workout", _boom)
+    assert _run(bot_mod._hevy_backfill_shapes(env.row(), "key")) == 0
+    # Still pending: the next poll retries rather than losing it.
+    assert env.db.hevy_unshaped_workouts(7) == ["old-1"]
+
+
+def test_release_note_posts_exactly_once(events_env, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    env = events_env
+    sent: list = []
+    channel = SimpleNamespace(send=AsyncMock(side_effect=lambda **kw: sent.append(kw)))
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", 999, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "get_channel", lambda cid: channel)
+
+    _run(bot_mod._announce_release_notes())
+    _run(bot_mod._announce_release_notes())   # crash-loop / double on_ready
+
+    assert len(sent) == 1
+    embed = sent[0]["embed"]
+    assert "TL;DR" in (embed.description or "")
+    assert len(embed.description) <= 4096
+
+
+def test_release_note_is_dropped_without_a_channel(events_env, monkeypatch):
+    """The claim is kept even when there is nowhere to post: a stale release
+    note surfacing the day a feed channel is finally set is worse than none."""
+    env = events_env
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", None, raising=False)
+    _run(bot_mod._announce_release_notes())
+    assert env.db.app_meta_claim(bot_mod._RELEASE_NOTE_KEY) is False
