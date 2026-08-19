@@ -148,5 +148,14 @@ an account is linked merges them, in both directions at once:
 - **Bounded to the most recent 200 entries per side.** Hevy pages body
   measurements ten at a time, so an unbounded merge on a years-old daily-weigh-in
   account would be hundreds of round trips on first contact.
+- **Nothing older than 180 days is imported.** A lone year-old entry lands in a
+  stretch the bot has no other data for, where the trend line either side of it
+  is pure interpolation across the gap — it drags the chart's window back months
+  and skews the headline trend for the sake of one point. Pushing *out* to Hevy
+  is not age-limited; filling Hevy's own history costs nothing.
+- **The merge is claimed before it runs**, so the poll firing on startup while
+  somebody runs `/hevy_sync` cannot both walk the same history. A day is also
+  re-checked immediately before it is written, because `bodyweights` has no
+  unique constraint and would happily accept a second identical row.
 - If Hevy is unreachable the marker is left unset, so the merge is retried next
   poll rather than being silently skipped forever.

@@ -305,3 +305,87 @@ def test_reconcile_is_skipped_when_the_push_setting_is_off(reconcile_env,
         "pushed": 0, "imported": 0,
     }
     assert env.row()["measurements_synced_at"] is None
+
+
+def test_reconcile_refuses_to_import_ancient_history(reconcile_env, monkeypatch):
+    """The bug that put a lone 2025 weigh-in on a 2026 chart: a year-old Hevy
+    entry lands in a stretch with no other data, where the trend either side of
+    it is pure interpolation across the gap."""
+    env = reconcile_env
+    env.db.set_bodyweight(42, 7, 103.9,
+                          recorded_at=datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc))
+    env.set_remote([
+        {"date": "2025-11-06", "weight_kg": 103.0},   # far outside the horizon
+        {"date": "2026-08-18", "weight_kg": 104.0},   # recent — still imported
+    ])
+
+    out = _run(bot_mod._hevy_reconcile_measurements(env.row()))
+
+    assert out["imported"] == 1
+    days = [r["recorded_at"][:10]
+            for r in env.db.bodyweight_history(42, 7, limit=50)]
+    assert "2025-11-06" not in days
+    assert "2026-08-18" in days
+    # Pushing outward is deliberately not age-limited — filling Hevy's own
+    # history costs the member nothing.
+    assert [day for day, _ in env.pushed] == ["2026-08-19"]
+
+
+def test_reconcile_cannot_double_import_a_day_with_a_stale_view(reconcile_env,
+                                                                 monkeypatch):
+    """The production symptom: two identical 103.0 kg rows at the same instant.
+
+    The "days Hevy has that the bot doesn't" set is computed once, before the
+    import loop starts writing, and bodyweights has no unique constraint to
+    reject a repeat. This pins the guard by making that view permanently stale --
+    whatever made it stale in production -- and asserting the day still lands
+    exactly once.
+    """
+    env = reconcile_env
+    monkeypatch.setattr(env.db, "bodyweight_history", lambda *a, **k: [])
+    env.set_remote([{"date": "2026-08-18", "weight_kg": 103.0}])
+
+    first = _run(bot_mod._hevy_reconcile_measurements(env.row(), force=True))
+    second = _run(bot_mod._hevy_reconcile_measurements(env.row(), force=True))
+
+    assert first["imported"] == 1
+    assert second["imported"] == 0
+    monkeypatch.undo()
+    history = env.db.bodyweight_history(42, 7, limit=50)
+    assert len(history) == 1, f"double import: {[dict(r) for r in history]}"
+
+
+def test_reconcile_claim_blocks_a_concurrent_run(reconcile_env):
+    """A second run holding the same stale account row must not start. The claim
+    is an atomic UPDATE ... WHERE measurements_synced_at IS NULL, so only the
+    writer that actually matched a NULL row proceeds."""
+    env = reconcile_env
+    stale = env.row()
+    assert stale["measurements_synced_at"] is None
+    assert env.db.hevy_claim_measurement_sync(7) is True
+    # The loser still believes it has work to do, and must bail anyway.
+    assert env.db.hevy_claim_measurement_sync(7) is False
+    assert _run(bot_mod._hevy_reconcile_measurements(stale)) == {
+        "pushed": 0, "imported": 0,
+    }
+    # Releasing hands the retry back.
+    env.db.hevy_release_measurement_sync(7)
+    assert env.row()["measurements_synced_at"] is None
+
+
+def test_reconcile_hands_the_claim_back_when_hevy_fails(reconcile_env,
+                                                         monkeypatch):
+    """Claiming before the work must not cost the retry: a transient outage has
+    to leave the marker NULL, or the one chance to merge is burned."""
+    env = reconcile_env
+
+    def _boom(*_a, **_k):
+        raise hevy_client.HevyError("timeout")
+
+    monkeypatch.setattr(hevy_client, "fetch_body_measurements", _boom)
+    _run(bot_mod._hevy_reconcile_measurements(env.row()))
+    assert env.row()["measurements_synced_at"] is None
+
+    # ...and the retry then works.
+    env.set_remote([{"date": "2026-08-18", "weight_kg": 104.0}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1

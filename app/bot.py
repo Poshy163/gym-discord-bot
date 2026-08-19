@@ -17053,6 +17053,18 @@ async def _hevy_templates(api_key: str) -> dict[str, dict]:
 #: time they are polled. Recent history is the part anyone looks at.
 _HEVY_RECONCILE_LIMIT = 200
 
+#: How far back the reconcile will import a Hevy measurement. Beyond this a
+#: lone old entry lands in a stretch the bot has no other data for, where it
+#: contributes nothing but drags the chart's window back months and skews the
+#: headline trend across a gap that is pure interpolation. Pushing *out* to Hevy
+#: is not limited this way -- filling Hevy's history costs the member nothing.
+_HEVY_RECONCILE_MAX_AGE_DAYS = 180
+
+#: Accounts with a reconcile in flight in this process. The DB claim below is
+#: the real guard, but a forced /hevy_sync deliberately bypasses that claim, and
+#: two forced runs at once would still race.
+_HEVY_RECONCILE_INFLIGHT: set[int] = set()
+
 
 def _hevy_local_day(when: datetime) -> str:
     """The ``YYYY-MM-DD`` Hevy should file a moment under (local, not UTC)."""
@@ -17102,16 +17114,36 @@ async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
     guild_id = int(row["guild_id"])
     if not _hevy_push_enabled():
         return result
-    synced = (
-        row["measurements_synced_at"]
-        if "measurements_synced_at" in row.keys() else None
-    )
-    if synced is not None and not force:
+    if user_id in _HEVY_RECONCILE_INFLIGHT:
         return result
+    # Claim before doing any work. The reconcile writes through set_bodyweight,
+    # which appends with no unique constraint, so a concurrent second run would
+    # import the same day twice and nothing downstream would notice.
+    if force:
+        synced = (
+            row["measurements_synced_at"]
+            if "measurements_synced_at" in row.keys() else None
+        )
+        if synced is None and not db.hevy_claim_measurement_sync(user_id):
+            return result  # another run got there first
+    elif not db.hevy_claim_measurement_sync(user_id):
+        return result  # already done, or claimed by a concurrent run
 
+    _HEVY_RECONCILE_INFLIGHT.add(user_id)
+    try:
+        return await _hevy_reconcile_locked(row, user_id, guild_id, result)
+    finally:
+        _HEVY_RECONCILE_INFLIGHT.discard(user_id)
+
+
+async def _hevy_reconcile_locked(
+    row, user_id: int, guild_id: int, result: dict,
+) -> dict:
+    """The reconcile body, with the claim already held. See the caller."""
     try:
         api_key = hevy_client.decrypt_key(row["api_key_enc"])
     except hevy_client.HevyError:
+        db.hevy_release_measurement_sync(user_id)
         return result
 
     def _fetch() -> list[dict]:
@@ -17123,10 +17155,12 @@ async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
         remote = await bot.loop.run_in_executor(None, _fetch)
     except hevy_client.HevyAuthError:
         LOG.warning("Hevy: key rejected during the measurement reconcile for %s", user_id)
+        db.hevy_release_measurement_sync(user_id)
         return result
     except hevy_client.HevyError as exc:
         LOG.info("Hevy: measurement reconcile fetch failed for %s: %s", user_id, exc)
-        return result  # leave the marker NULL so the next poll retries
+        db.hevy_release_measurement_sync(user_id)  # so the next poll retries
+        return result
 
     remote_by_day: dict[str, dict] = {}
     for entry in remote:
@@ -17166,13 +17200,30 @@ async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
         result["pushed"] += 1
 
     # --- Hevy → bot: days the bot has never heard of -----------------------
+    floor = (
+        datetime.now(timezone.utc) - timedelta(days=_HEVY_RECONCILE_MAX_AGE_DAYS)
+    ).astimezone(DISPLAY_TZ).date().isoformat()
     for day in sorted(set(remote_by_day) - set(local_by_day)):
+        if day < floor:
+            # Older than the bot's own horizon. Importing it would plant a lone
+            # point in a stretch with no other data, where the trend line either
+            # side of it is pure interpolation across the gap.
+            LOG.debug(
+                "Hevy: skipping %s for %s — older than the import horizon",
+                day, user_id,
+            )
+            continue
         entry = remote_by_day[day]
         weight = hevy_client.measurement_weight(entry)
         if weight is None or not _ha_valid_weight(weight):
             continue  # a circumference-only entry describes no weigh-in
         when = _hevy_day_start(day)
         if when is None:
+            continue
+        if db.bodyweight_exists_at(user_id, when):
+            # Checked here rather than trusting the day-set computed further up:
+            # that view was read before this loop began writing, and nothing in
+            # bodyweights would reject a second identical row.
             continue
         try:
             db.set_bodyweight(guild_id, user_id, weight, recorded_at=when)
@@ -17191,7 +17242,7 @@ async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
                 LOG.exception("Hevy: failed to store imported metrics for %s", user_id)
         result["imported"] += 1
 
-    db.hevy_mark_measurements_synced(user_id)
+    db.hevy_mark_measurements_synced(user_id)  # refresh the timestamp
     if result["pushed"] or result["imported"]:
         LOG.info(
             "Hevy: bodyweight reconcile for %s — %d pushed, %d imported",

@@ -4059,6 +4059,54 @@ class Database:
             )
             return True
 
+    def bodyweight_exists_at(self, user_id: int, recorded_at: datetime) -> bool:
+        """True if this user already has a weigh-in at exactly this instant.
+
+        The last line of defence for the Hevy measurement import, which
+        materialises a date-only entry at a fixed local midday: two runs that
+        both decided to import the same day would otherwise both append, because
+        ``bodyweights`` has no unique constraint and ``set_bodyweight`` never
+        checks. Cheap, and it does not care *how* the duplicate decision arose."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM bodyweights "
+                "WHERE user_id = ? AND recorded_at = ? LIMIT 1",
+                (user_id, _normalize_iso(recorded_at)),
+            ).fetchone() is not None
+
+    def hevy_claim_measurement_sync(
+        self, user_id: int, at: datetime | None = None,
+    ) -> bool:
+        """Atomically claim the one-time bodyweight reconcile. True if won.
+
+        Claim-before-work, like :meth:`hevy_mark_workout`, because the reconcile
+        writes through ``set_bodyweight`` — which appends with no unique
+        constraint, so nothing downstream can catch a double import. Two
+        overlapping runs (the poll firing on startup while somebody runs
+        ``/hevy_sync``) both used to read a NULL marker, both walk the same
+        history and both import it, leaving two identical weigh-ins at the same
+        timestamp. Only the writer whose UPDATE actually matched a NULL row may
+        proceed; the loser returns immediately.
+
+        The caller must :meth:`hevy_release_measurement_sync` if it then fails,
+        or a transient outage burns the one chance to merge."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE hevy_account SET measurements_synced_at = ? "
+                "WHERE user_id = ? AND measurements_synced_at IS NULL",
+                (_normalize_iso(at), user_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def hevy_release_measurement_sync(self, user_id: int) -> None:
+        """Hand a claimed reconcile back, so the next poll retries it."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET measurements_synced_at = NULL "
+                "WHERE user_id = ?",
+                (user_id,),
+            )
+
     def hevy_mark_measurements_synced(
         self, user_id: int, at: datetime | None = None,
     ) -> None:
