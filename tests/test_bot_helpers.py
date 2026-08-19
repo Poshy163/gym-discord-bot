@@ -1731,6 +1731,25 @@ def test_apple_health_commands_are_grouped_below_discord_global_limit():
     assert len(bot.bot.tree.get_commands()) <= 100
 
 
+def test_hevy_commands_are_grouped_below_discord_global_limit():
+    """The six hevy_* roots became one /hevy group (freeing five slots at the
+    100-root cap), plus the admin subcommands that write settings from Discord."""
+    import app.bot as bot
+
+    group = bot.bot.tree.get_command("hevy")
+    assert group is not None
+    names = {command.name for command in group.commands}
+    assert {
+        "link", "unlink", "status", "sync", "help", "recent",
+        "feed", "interval", "mirror",
+    } <= names
+    # The old roots are gone, not duplicated.
+    for stale in ("hevy_link", "hevy_unlink", "hevy_status",
+                  "hevy_sync", "hevy_help", "hevy_recent"):
+        assert bot.bot.tree.get_command(stale) is None
+    assert len(bot.bot.tree.get_commands()) <= 100
+
+
 def test_no_dangling_set_remove_nick_strings_in_bot_source():
     """No user-facing (or any) '/set_nick' / '/remove_nick' string survives in the
     bot module — help text, command descriptions, and comments all cleaned up."""

@@ -1028,6 +1028,9 @@ _CONTEXT_FREE: frozenset[str] = frozenset({
     "ping", "help", "version", "server",
     "revo_link", "revo_unlink", "help_revo_link",
     "strava_link", "strava_unlink",
+    # Subcommands resolve by qualified_name, which is space-separated. These
+    # write global settings and read no guild data.
+    "hevy feed", "hevy interval", "hevy mirror",
 })
 
 
@@ -8149,12 +8152,12 @@ def _help_sections() -> dict[str, discord.Embed]:
         section(
             "Hevy", "📱 Hevy",
             (
-                "`/hevy_help` — how it works + how to link\n"
-                "`/hevy_link` — link Hevy (workouts import as lifts + post to the feed)\n"
-                "`/hevy_recent` — show the most recent workout\n"
-                "`/hevy_sync` — re-sync your last 50 workouts\n"
-                "`/hevy_status` — check if you're linked\n"
-                "`/hevy_unlink` — remove your stored API key"
+                "`/hevy help` — how it works + how to link\n"
+                "`/hevy link` — link Hevy (workouts import as lifts + post to the feed)\n"
+                "`/hevy recent` — show the most recent workout\n"
+                "`/hevy sync` — re-sync your last 50 workouts\n"
+                "`/hevy status` — check if you're linked\n"
+                "`/hevy unlink` — remove your stored API key"
             ),
         )
         sections["Hevy"].colour = ui.HEVY
@@ -16738,8 +16741,17 @@ async def apple_health_help_cmd(interaction: discord.Interaction) -> None:
 # Hevy slash commands + poll loop
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(
-    name="hevy_link",
+# One /hevy group rather than six hevy_* roots: the command tree sits at
+# Discord's 100-root cap (tests/test_bot_helpers.py asserts it), so grouping
+# frees five slots and makes room for subcommands. Mirrors cardio_group.
+hevy_group = app_commands.Group(
+    name="hevy",
+    description="Hevy workout imports, bodyweight sync, and admin settings.",
+)
+
+
+@hevy_group.command(
+    name="link",
     description="Link your Hevy account so your workouts import as lifts + post to the feed.",
 )
 @app_commands.describe(
@@ -16800,13 +16812,13 @@ async def hevy_link_cmd(
     await interaction.followup.send(
         f"✅ Hevy linked ({result.get('count', 0)} workouts found). Your key is "
         f"stored **encrypted**.{feed}\nWorkouts sync about every "
-        f"{HEVY_POLL_MINUTES} min. Unlink any time with `/hevy_unlink`.",
+        f"{HEVY_POLL_MINUTES} min. Unlink any time with `/hevy unlink`.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(
-    name="hevy_unlink",
+@hevy_group.command(
+    name="unlink",
     description="Unlink your Hevy account and delete your stored API key.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16819,8 +16831,8 @@ async def hevy_unlink_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="hevy_status",
+@hevy_group.command(
+    name="status",
     description="Show whether your Hevy account is linked.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16829,7 +16841,7 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
     row = db.hevy_get(interaction.user.id)
     if row is None:
         await interaction.response.send_message(
-            "No Hevy account linked. Use `/hevy_link` to connect one.",
+            "No Hevy account linked. Use `/hevy link` to connect one.",
         )
         return
     feed = (
@@ -16858,8 +16870,8 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="hevy_sync",
+@hevy_group.command(
+    name="sync",
     description="Re-sync your last 50 Hevy workouts (imports any the bot missed).",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16873,14 +16885,14 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
     row = db.hevy_get(interaction.user.id)
     if row is None:
         await interaction.response.send_message(
-            "You haven't linked Hevy yet — see `/hevy_help`.",
+            "You haven't linked Hevy yet — see `/hevy help`.",
         )
         return
     await interaction.response.defer(thinking=True)
     result = await _hevy_sync_account(row, force_backfill=True)
     if result.get("error") == "auth":
         await interaction.followup.send(
-            "❌ Hevy rejected your API key — re-link with `/hevy_link`.",
+            "❌ Hevy rejected your API key — re-link with `/hevy link`.",
         )
         return
     if result.get("error"):
@@ -16914,8 +16926,8 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="hevy_help",
+@hevy_group.command(
+    name="help",
     description="How the Hevy integration works and how to link your account.",
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -16944,7 +16956,7 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="2 · Link it",
         value=(
-            "Run `/hevy_link api_key:<your key>` — do this in a **DM** with me to "
+            "Run `/hevy link api_key:<your key>` — do this in a **DM** with me to "
             "keep the key private. It's stored **encrypted**; the plaintext is "
             "never saved or shown back."
         ),
@@ -16987,12 +16999,13 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Commands",
         value=(
-            "`/hevy_link` — link your account\n"
-            "`/hevy_recent` — show your most recent workout\n"
-            "`/hevy_sync` — re-sync your last 50 workouts\n"
-            "`/hevy_status` — check link + last sync time\n"
-            "`/hevy_unlink` — remove your key and stop syncing\n"
-            "`/hevy_help` — this message"
+            "`/hevy link` — link your account\n"
+            "`/hevy recent` — show your most recent workout\n"
+            "`/hevy sync` — re-sync your last 50 workouts\n"
+            "`/hevy status` — check link + last sync time\n"
+            "`/hevy unlink` — remove your key and stop syncing\n"
+            "`/hevy help` — this message\n"
+            "Admins: `/hevy feed` · `/hevy interval` · `/hevy mirror`"
         ),
         inline=False,
     )
@@ -17062,7 +17075,7 @@ _HEVY_RECONCILE_LIMIT = 200
 _HEVY_RECONCILE_MAX_AGE_DAYS = 180
 
 #: Accounts with a reconcile in flight in this process. The DB claim below is
-#: the real guard, but a forced /hevy_sync deliberately bypasses that claim, and
+#: the real guard, but a forced /hevy sync deliberately bypasses that claim, and
 #: two forced runs at once would still race.
 _HEVY_RECONCILE_INFLIGHT: set[int] = set()
 
@@ -17831,8 +17844,8 @@ async def _hevy_poll_before() -> None:  # pragma: no cover - discord runtime
     await bot.wait_until_ready()
 
 
-@bot.tree.command(
-    name="hevy_recent",
+@hevy_group.command(
+    name="recent",
     description="Show the most recent Hevy workout (yours, or another member's).",
 )
 @app_commands.describe(member="Whose latest workout to show. Defaults to you.")
@@ -17853,7 +17866,7 @@ async def hevy_recent_cmd(
     row = db.hevy_get(target.id)
     if row is None:
         msg = (
-            "You haven't linked Hevy yet — see `/hevy_help`."
+            "You haven't linked Hevy yet — see `/hevy help`."
             if target.id == interaction.user.id
             else f"{target.mention} hasn't linked a Hevy account."
         )
@@ -17878,7 +17891,7 @@ async def hevy_recent_cmd(
     if isinstance(result, str):
         if result == "auth":
             msg = (
-                "❌ Hevy rejected your API key — re-link with `/hevy_link`."
+                "❌ Hevy rejected your API key — re-link with `/hevy link`."
                 if target.id == interaction.user.id
                 else f"{target.display_name}'s Hevy key was rejected (they may "
                 "need to re-link)."
@@ -17920,6 +17933,153 @@ async def hevy_recent_cmd(
     await interaction.followup.send(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+# --- /hevy admin subcommands ------------------------------------------------
+# These write real settings through the same validated path the dashboard uses
+# (SettingsService -> app_settings + history + config_rev), then rebind the
+# worker's own globals so the change applies without a restart. The dashboard's
+# "pending restart" staging lives in the supervisor process and has no reverse
+# RPC channel, but none of these three keys needs it: the feed channel and the
+# mirror flag are read at call time, and the poll interval is fixed up with
+# change_interval() exactly as _rpc_reload_config already does for Revo.
+
+def _hevy_settings_service():
+    """A worker-side SettingsService. Constructed per call — it is stateless
+    over (db, box), and callers are rare interactive commands."""
+    from . import settings_service as settings_service_mod
+    return settings_service_mod.SettingsService(db, _box)
+
+
+async def _hevy_admin_save(
+    interaction: discord.Interaction, key: str, value: str | None,
+) -> dict | None:
+    """Gate, defer, write, rebind. Returns the SettingsService result, or None
+    when the caller already got a refusal.
+
+    Deferred *before* the write: SettingsService.set takes a BEGIN IMMEDIATE
+    transaction and a full config reload, which can blow Discord's 3-second
+    acknowledgement deadline on a busy database. The write itself runs in an
+    executor for the same reason.
+    """
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=ui.denied("Admins only — this changes bot-wide settings."),
+            ephemeral=True,
+        )
+        return None
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    def _write() -> dict:
+        return _hevy_settings_service().set(
+            key, value, actor=f"discord:{interaction.user.id}",
+        )
+
+    result = await bot.loop.run_in_executor(None, _write)
+    if result.get("ok"):
+        # Apply in-process. This is what _rpc_reload_config does when the
+        # dashboard saves a hot key; these keys are worker-read so the worker
+        # can rebind them for itself.
+        _bind_config(config_mod.load(db, decrypt=_box.decryptor()))
+    return result
+
+
+def _hevy_admin_reply(result: dict, applied: str) -> str:
+    if not result.get("ok"):
+        return f"❌ {result.get('error') or 'Could not save that.'}"
+    if result.get("effective") is False:
+        pinner = result.get("pinned_by") or "the environment"
+        return (
+            f"⚠️ Saved, but **not applied**: `{pinner}` pins this key, so the "
+            "container env value wins until the pin is removed."
+        )
+    return f"✅ {applied}"
+
+
+@hevy_group.command(
+    name="feed",
+    description="(Admin) Set or clear the channel Hevy workout embeds post to.",
+)
+@app_commands.describe(
+    channel="Channel for the workout feed. Leave unset to clear it.",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_feed_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    result = await _hevy_admin_save(
+        interaction, "HEVY_FEED_CHANNEL_ID",
+        str(channel.id) if channel else "",
+    )
+    if result is None:
+        return
+    applied = (
+        f"Hevy feed now posts to {channel.mention}." if channel
+        else "Hevy feed channel cleared — workouts still import as lifts."
+    )
+    await interaction.followup.send(
+        _hevy_admin_reply(result, applied), ephemeral=True,
+    )
+
+
+@hevy_group.command(
+    name="interval",
+    description="(Admin) Set how often the bot checks Hevy for new workouts.",
+)
+@app_commands.describe(minutes="Minutes between polls (1–1440).")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_interval_cmd(
+    interaction: discord.Interaction,
+    minutes: app_commands.Range[int, 1, 1440],
+) -> None:
+    result = await _hevy_admin_save(
+        interaction, "HEVY_POLL_MINUTES", str(minutes),
+    )
+    if result is None:
+        return
+    # Rebinding the global is not enough: @tasks.loop captured the interval at
+    # import, so reschedule the live loop — same fix _rpc_reload_config applies
+    # to the Revo poll.
+    if result.get("ok") and result.get("effective") is not False:
+        try:
+            if hevy_poll.is_running() and hevy_poll.minutes != HEVY_POLL_MINUTES:
+                hevy_poll.change_interval(minutes=HEVY_POLL_MINUTES)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to apply the new Hevy poll interval")
+    await interaction.followup.send(
+        _hevy_admin_reply(result, f"Hevy now polls every {minutes} min."),
+        ephemeral=True,
+    )
+
+
+@hevy_group.command(
+    name="mirror",
+    description="(Admin) Turn the weigh-in mirror to Hevy body measurements on or off.",
+)
+@app_commands.describe(enabled="Mirror new weigh-ins into linked Hevy accounts?")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_mirror_cmd(
+    interaction: discord.Interaction, enabled: bool,
+) -> None:
+    result = await _hevy_admin_save(
+        interaction, "HEVY_PUSH_BODYWEIGHT", "1" if enabled else "0",
+    )
+    if result is None:
+        return
+    applied = (
+        "Weigh-ins are mirrored to linked Hevy accounts again." if enabled
+        else "Weigh-in mirroring to Hevy is off."
+    )
+    await interaction.followup.send(
+        _hevy_admin_reply(result, applied), ephemeral=True,
+    )
+
+
+bot.tree.add_command(hevy_group)
 
 
 # ---------------------------------------------------------------------------

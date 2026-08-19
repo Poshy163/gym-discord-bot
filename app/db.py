@@ -4150,7 +4150,7 @@ class Database:
         writes through ``set_bodyweight`` — which appends with no unique
         constraint, so nothing downstream can catch a double import. Two
         overlapping runs (the poll firing on startup while somebody runs
-        ``/hevy_sync``) both used to read a NULL marker, both walk the same
+        ``/hevy sync``) both used to read a NULL marker, both walk the same
         history and both import it, leaving two identical weigh-ins at the same
         timestamp. Only the writer whose UPDATE actually matched a NULL row may
         proceed; the loser returns immediately.

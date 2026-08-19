@@ -471,3 +471,87 @@ def test_workout_embed_skips_a_redundant_routine_label():
     routines = {"r1": {"title": "Arms", "folder": None}}
     embed = bot_mod._hevy_workout_embed("poshy", summary, None, None, None, routines)
     assert embed.title == "Arms"
+
+
+# ---------------------------------------------------------------------------
+# /hevy admin subcommands — settings written through the dashboard's own path
+# ---------------------------------------------------------------------------
+
+def test_admin_save_writes_through_settings_service(monkeypatch, tmp_path):
+    """The command must produce a real, validated, history-tracked settings
+    write — the same row the dashboard would create — then rebind in-process."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.db import Database
+    from app import secretbox
+
+    database = Database(tmp_path / "gym.sqlite3")
+    box = secretbox.SecretBox.open_at(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    monkeypatch.setattr(bot_mod, "_box", box)
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", {42}, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop(), raising=False)
+    rebinds: list[bool] = []
+    monkeypatch.setattr(bot_mod, "_bind_config", lambda cfg: rebinds.append(True))
+
+    interaction = MagicMock()
+    interaction.user.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+
+    result = asyncio.run(bot_mod._hevy_admin_save(
+        interaction, "HEVY_POLL_MINUTES", "30",
+    ))
+
+    assert result is not None and result["ok"] is True
+    interaction.response.defer.assert_awaited()  # 3s deadline: defer first
+    assert rebinds, "the worker must rebind its own config after a write"
+    # The write is real and validated, not an in-memory flag.
+    from app import config as config_mod
+    assert config_mod.load(database)["HEVY_POLL_MINUTES"] == 30
+    row = database._connection.execute(
+        "SELECT value FROM app_settings WHERE key = 'HEVY_POLL_MINUTES'"
+    ).fetchone()
+    assert row["value"] == "30"
+    database.close()
+
+
+def test_admin_save_refuses_non_admins(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", {42}, raising=False)
+    interaction = MagicMock()
+    interaction.user.id = 7   # not an admin
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+
+    out = asyncio.run(bot_mod._hevy_admin_save(
+        interaction, "HEVY_POLL_MINUTES", "5",
+    ))
+    assert out is None
+    interaction.response.send_message.assert_awaited()   # the refusal
+    interaction.response.defer.assert_not_awaited()      # never got that far
+
+
+def test_admin_save_rejects_an_invalid_value(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+    from app.db import Database
+    from app import secretbox
+
+    database = Database(tmp_path / "gym.sqlite3")
+    box = secretbox.SecretBox.open_at(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    monkeypatch.setattr(bot_mod, "_box", box)
+    monkeypatch.setattr(bot_mod, "ADMIN_USER_IDS", {42}, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop(), raising=False)
+    monkeypatch.setattr(bot_mod, "_bind_config", lambda cfg: None)
+
+    interaction = MagicMock()
+    interaction.user.id = 42
+    interaction.response.defer = AsyncMock()
+
+    result = asyncio.run(bot_mod._hevy_admin_save(
+        interaction, "HEVY_POLL_MINUTES", "not-a-number",
+    ))
+    assert result is not None and result.get("ok") is False
+    assert bot_mod._hevy_admin_reply(result, "x").startswith("❌")
+    database.close()

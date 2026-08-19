@@ -54,15 +54,26 @@ available; importing works even without a feed channel.
 
 ## Member usage
 
-- `/hevy_link api_key:<key>` — paste the key from Hevy → Settings → API. Best run
+- `/hevy link api_key:<key>` — paste the key from Hevy → Settings → API. Best run
   in a **DM** so the key stays private; the reply is always ephemeral and the key
   is stored **encrypted**.
-- `/hevy_status` — show whether you're linked, your Hevy profile, when it last
+- `/hevy status` — show whether you're linked, your Hevy profile, when it last
   synced, and whether weigh-ins are being mirrored.
-- `/hevy_unlink` — delete your stored key and import history.
+- `/hevy unlink` — delete your stored key and import history.
 
-Only `/hevy_link` replies privately (so the key never appears in a channel); the
+Only `/hevy link` replies privately (so the key never appears in a channel); the
 other Hevy commands reply publicly.
+
+Admins can also configure the integration from Discord — each writes the real
+setting through the same validated path as the dashboard, records history, and
+applies immediately (no restart):
+
+- `/hevy feed [channel]` — set or clear the workout feed channel.
+- `/hevy interval minutes:` — the poll cadence (the running loop is rescheduled).
+- `/hevy mirror enabled:` — the weigh-in mirror on or off.
+
+If a key is pinned by a container environment variable the command saves the
+value but says so instead of pretending it applied.
 
 ## Behaviour notes
 
@@ -168,7 +179,7 @@ an account is linked merges them, in both directions at once:
   poll and is caught up on its next pass. Nobody has to re-link.
 - **A day both sides already have is never touched.** That is what stops the
   reconcile echoing — re-importing a weight the bot pushed moments earlier — and
-  what makes re-running it (`/hevy_sync`) a no-op: anything imported the first
+  what makes re-running it (`/hevy sync`) a no-op: anything imported the first
   time is now one of the bot's own days. There is no ledger table; the two
   histories *are* the ledger.
 - **Imported days land at local midday**, matching how the bot materialises any
@@ -186,7 +197,7 @@ an account is linked merges them, in both directions at once:
   and skews the headline trend for the sake of one point. Pushing *out* to Hevy
   is not age-limited; filling Hevy's own history costs nothing.
 - **The merge is claimed before it runs**, so the poll firing on startup while
-  somebody runs `/hevy_sync` cannot both walk the same history. A day is also
+  somebody runs `/hevy sync` cannot both walk the same history. A day is also
   re-checked immediately before it is written, because `bodyweights` has no
   unique constraint and would happily accept a second identical row.
 - If Hevy is unreachable the marker is left unset, so the merge is retried next
