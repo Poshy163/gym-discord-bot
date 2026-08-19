@@ -1345,6 +1345,47 @@ class Database:
                     "INSERT OR REPLACE INTO app_meta (key, value) "
                     "VALUES ('hevy_equip_recanon_v1', 'done')"
                 )
+            # One-time, again: the alias table learned Hevy's own machine names
+            # ("Butterfly (Pec Deck)" -> pec dec, "Seated Shoulder Press
+            # (Machine)" -> shoulder press), and imports made before that landed
+            # in their own equipment bucket with their own PRs. Re-derive from
+            # the Hevy title kept in ``raw`` so that history merges with the
+            # matching machine.
+            #
+            # Every future change to _ALIAS_GROUPS that affects a Hevy title
+            # needs its own _vN key: Hevy workout ids are recorded as imported
+            # for good, so nothing will ever re-read the workout and fix it.
+            #
+            # The rename summary is left in app_meta for the bot process to
+            # announce once. The migration runs in the supervisor, which has no
+            # Discord connection, so it cannot post the notice itself.
+            if self._connection.execute(
+                "SELECT 1 FROM app_meta WHERE key = 'hevy_equip_recanon_v2'"
+            ).fetchone() is None:
+                from .aliases import canonicalize as _canon
+                renames: dict[str, int] = {}
+                for r in self._connection.execute(
+                    "SELECT id, raw, equipment FROM lifts WHERE raw LIKE 'hevy:%'"
+                ).fetchall():
+                    eq = _canon(r["raw"][5:])
+                    if not eq or eq == r["equipment"]:
+                        continue
+                    key = f"{r['equipment']}→{eq}"
+                    renames[key] = renames.get(key, 0) + 1
+                    self._connection.execute(
+                        "UPDATE lifts SET equipment = ? WHERE id = ?",
+                        (eq, r["id"]),
+                    )
+                if renames:
+                    self._connection.execute(
+                        "INSERT OR REPLACE INTO app_meta (key, value) "
+                        "VALUES ('hevy_recanon_v2_announce', ?)",
+                        (json.dumps(renames, sort_keys=True),),
+                    )
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO app_meta (key, value) "
+                    "VALUES ('hevy_equip_recanon_v2', 'done')"
+                )
             self._consolidate_global_goals()
             # Must follow consolidation: it guarantees one legacy row per user,
             # so the backfill has an unambiguous target to copy.
@@ -4058,6 +4099,32 @@ class Database:
                 (name, url, user_id),
             )
             return True
+
+    def take_hevy_recanon_notice(self) -> dict[str, int]:
+        """Claim the pending equipment-rename summary, if any. Empty when none.
+
+        Read-and-clear in one transaction so a restart loop cannot announce the
+        same rename twice. The summary is written by the ``_migrate`` pass in the
+        supervisor process, which has no Discord connection of its own; the bot
+        picks it up on the next ``on_ready``.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM app_meta WHERE key = 'hevy_recanon_v2_announce'"
+            ).fetchone()
+            if row is None:
+                return {}
+            c.execute(
+                "DELETE FROM app_meta WHERE key = 'hevy_recanon_v2_announce'"
+            )
+        try:
+            parsed = json.loads(row["value"] or "{}")
+        except (TypeError, ValueError):  # pragma: no cover - corrupted value
+            return {}
+        return {
+            str(k): int(v) for k, v in parsed.items()
+            if isinstance(v, (int, float))
+        }
 
     def bodyweight_exists_at(self, user_id: int, recorded_at: datetime) -> bool:
         """True if this user already has a weigh-in at exactly this instant.

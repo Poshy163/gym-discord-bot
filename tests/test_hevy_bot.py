@@ -389,3 +389,61 @@ def test_reconcile_hands_the_claim_back_when_hevy_fails(reconcile_env,
     # ...and the retry then works.
     env.set_remote([{"date": "2026-08-18", "weight_kg": 104.0}])
     assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The one-off "these lifts were re-filed" chat notice
+# ---------------------------------------------------------------------------
+
+def test_recanon_notice_is_posted_once_to_the_feed(monkeypatch):
+    """A rename merges two histories into one PR and one leaderboard line, so a
+    member's best can move without them lifting anything. That gets said out
+    loud rather than appearing as an unexplained change."""
+    from unittest.mock import AsyncMock
+
+    sent: list = []
+    channel = SimpleNamespace(send=AsyncMock(side_effect=lambda **kw: sent.append(kw)))
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", 999, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "get_channel", lambda cid: channel)
+
+    notices = [{"butterfly\u2192pec dec": 16,
+                "seated shoulder press\u2192shoulder press": 2}]
+    monkeypatch.setattr(
+        bot_mod.db, "take_hevy_recanon_notice",
+        lambda: notices.pop() if notices else {},
+    )
+
+    _run(bot_mod._hevy_announce_recanon())
+    assert len(sent) == 1
+    embed = sent[0]["embed"]
+    assert "18" in (embed.description or "")          # 16 + 2 lifts
+    body = embed.fields[0].value
+    assert "**butterfly** → **pec dec** (16 lifts)" in body
+    assert "**seated shoulder press** → **shoulder press** (2 lifts)" in body
+    # Biggest rename first.
+    assert body.index("butterfly") < body.index("seated shoulder")
+
+    # Claimed read-and-clear, so a restart loop cannot repeat it.
+    _run(bot_mod._hevy_announce_recanon())
+    assert len(sent) == 1
+
+
+def test_recanon_notice_is_dropped_when_no_feed_channel(monkeypatch):
+    """Holding it forever would mean announcing a months-old rename the day a
+    feed channel is finally configured."""
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", None, raising=False)
+    monkeypatch.setattr(
+        bot_mod.db, "take_hevy_recanon_notice", lambda: {"a\u2192b": 1},
+    )
+    _run(bot_mod._hevy_announce_recanon())  # must not raise
+
+
+def test_recanon_notice_silent_when_nothing_was_renamed(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    channel = SimpleNamespace(send=AsyncMock())
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", 999, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "get_channel", lambda cid: channel)
+    monkeypatch.setattr(bot_mod.db, "take_hevy_recanon_notice", lambda: {})
+    _run(bot_mod._hevy_announce_recanon())
+    channel.send.assert_not_awaited()

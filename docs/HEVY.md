@@ -76,6 +76,17 @@ other Hevy commands reply publicly.
   same PR and leaderboard. Assisted variants stay on a bodyweight-assisted key,
   where the logged kg is read as machine *assistance* (true load = bodyweight −
   assistance) rather than as load.
+- **Renames are applied retroactively, once, and announced.** A Hevy workout id
+  is recorded as imported for good, so nothing will ever re-read it — an alias
+  fix would otherwise only help future workouts and leave the existing ones in
+  the wrong bucket. A one-shot migration (`hevy_equip_recanon_v2`, gated on
+  `app_meta` like its v1 predecessor) re-derives equipment from the Hevy title
+  kept in each lift's `raw`, and leaves a summary the bot posts to the feed on
+  its next start. It says so out loud because a rename merges two histories:
+  somebody's PR can move without them having lifted anything.
+
+  **Any future alias change affecting a Hevy title needs its own `_vN` key** —
+  there is no other route back to those rows.
 - **No double-logging:** each Hevy workout id is recorded once imported, so
   repeated polls never re-import. Unlinking clears that history.
 - **First sync is quiet:** the poll right after linking imports your recent

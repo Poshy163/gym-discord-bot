@@ -3255,6 +3255,7 @@ async def on_ready() -> None:
                 "lifts but won't be posted to any channel. Set it to enable the "
                 "workout feed."
             )
+        await _hevy_announce_recanon()
 
     if _ha_enabled() and not ha_poll.is_running():
         ha_poll.start()
@@ -17249,6 +17250,68 @@ async def _hevy_reconcile_locked(
             user_id, result["pushed"], result["imported"],
         )
     return result
+
+
+async def _hevy_announce_recanon() -> None:
+    """Post the one-off "these lifts were renamed" notice, once.
+
+    A rename is not cosmetic: merging ``butterfly`` into ``pec dec`` means the
+    two histories share a PR and a leaderboard line from now on, so somebody's
+    best may visibly move without them having lifted anything. That deserves
+    saying out loud rather than appearing as an unexplained change.
+
+    The summary is claimed read-and-clear, so a crash loop cannot repeat it. If
+    no feed channel is configured the notice is logged and dropped — holding it
+    forever would mean announcing a months-old rename the day one is finally
+    set.
+    """
+    try:
+        renames = db.take_hevy_recanon_notice()
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: could not read the re-canonicalisation notice")
+        return
+    if not renames:
+        return
+    total = sum(renames.values())
+    LOG.info("Hevy: announcing %d renamed lift(s)", total)
+    channel = (
+        bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
+    )
+    if channel is None:
+        LOG.info("Hevy: no feed channel — rename notice dropped: %s", renames)
+        return
+    lines = [
+        f"**{_safe_label(old)}** → **{_safe_label(new)}** "
+        f"({count} lift{'s' if count != 1 else ''})"
+        for old, new, count in sorted(
+            (
+                (pair.split("→")[0], pair.split("→")[-1], count)
+                for pair, count in renames.items()
+            ),
+            key=lambda row: (-row[2], row[0]),
+        )
+    ]
+    embed = discord.Embed(
+        title="🔁 Hevy exercises re-filed",
+        colour=HEVY_COLOUR,
+        description=(
+            f"I taught the bot Hevy's own machine names, and re-filed "
+            f"**{total}** already-imported lift"
+            f"{'s' if total != 1 else ''} to match.\n\n"
+            "These were landing in their own bucket, so they never met the "
+            "same lift logged by hand — separate PRs, separate leaderboard "
+            "lines. They share one history now, which means a personal best "
+            "may have moved without anybody lifting anything."
+        ),
+    )
+    embed.add_field(
+        name="Re-filed", value="\n".join(lines)[:1024], inline=False,
+    )
+    embed.set_footer(text="via Hevy · one-off correction")
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:  # pragma: no cover - best effort
+        LOG.info("Hevy: failed to post the re-canonicalisation notice")
 
 
 def _hevy_push_enabled() -> bool:

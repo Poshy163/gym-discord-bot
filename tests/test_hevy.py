@@ -553,3 +553,88 @@ def test_hevy_names_land_on_the_same_equipment_as_chat_logged_ones():
     # Assisted pull-ups must stay on a bodyweight-assisted equipment key, where
     # the logged kg is read as machine assistance rather than load.
     assert canonicalize("Pull Up (Assisted)") in {"pull ups", "chin assist"}
+
+
+# ---------------------------------------------------------------------------
+# One-off re-canonicalisation of already-imported Hevy lifts
+# ---------------------------------------------------------------------------
+
+def _seed_legacy_hevy_lift(path, equipment: str, raw_title: str) -> None:
+    """Write a lift as an older build would have stored it, then clear the
+    migration marker so the next open re-runs the one-shot."""
+    import sqlite3 as _sq
+    c = _sq.connect(path)
+    c.execute(
+        "INSERT INTO lifts (guild_id, user_id, username, equipment, weight_kg,"
+        " reps, raw, logged_at) VALUES (1, 7, 'poshy', ?, 100, 6, ?, ?)",
+        (equipment, f"hevy:{raw_title}", "2026-08-19T13:16:09+00:00"),
+    )
+    # Only the v2 marker: v1 does the same re-derivation and in any real
+    # database ran long ago, so clearing it too would let v1 silently do
+    # v2's work and the test would prove nothing.
+    c.execute("DELETE FROM app_meta WHERE key = 'hevy_equip_recanon_v2'")
+    c.commit()
+    c.close()
+
+
+def test_recanon_v2_refiles_hevy_machine_names(tmp_path):
+    """The lifts were already imported and their workout id is recorded for
+    good, so nothing will ever re-read them — the migration is the only way
+    their equipment can be corrected."""
+    path = tmp_path / "gym.sqlite3"
+    Database(path).close()
+    _seed_legacy_hevy_lift(path, "butterfly", "Butterfly (Pec Deck)")
+    _seed_legacy_hevy_lift(path, "seated shoulder press",
+                           "Seated Shoulder Press (Machine)")
+    _seed_legacy_hevy_lift(path, "lat pulldown", "Lat Pulldown (Cable)")
+
+    db2 = Database(path)
+    try:
+        rows = {
+            r["raw"]: r["equipment"]
+            for r in db2._connection.execute(
+                "SELECT raw, equipment FROM lifts WHERE raw LIKE 'hevy:%'")
+        }
+        assert rows["hevy:Butterfly (Pec Deck)"] == "pec dec"
+        assert rows["hevy:Seated Shoulder Press (Machine)"] == "shoulder press"
+        # Untouched: it was already correct, so it must not appear in the notice.
+        assert rows["hevy:Lat Pulldown (Cable)"] == "lat pulldown"
+
+        notice = db2.take_hevy_recanon_notice()
+        assert notice == {
+            "butterfly\u2192pec dec": 1,
+            "seated shoulder press\u2192shoulder press": 1,
+        }
+        # Read-and-clear: a restart loop must not announce the same rename twice.
+        assert db2.take_hevy_recanon_notice() == {}
+    finally:
+        db2.close()
+
+
+def test_recanon_v2_is_silent_when_nothing_changes(tmp_path):
+    path = tmp_path / "gym.sqlite3"
+    Database(path).close()
+    _seed_legacy_hevy_lift(path, "lat pulldown", "Lat Pulldown (Cable)")
+    db2 = Database(path)
+    try:
+        assert db2.take_hevy_recanon_notice() == {}
+    finally:
+        db2.close()
+
+
+def test_recanon_v2_runs_only_once(tmp_path):
+    path = tmp_path / "gym.sqlite3"
+    Database(path).close()
+    _seed_legacy_hevy_lift(path, "butterfly", "Butterfly (Pec Deck)")
+    Database(path).close()          # migration runs, notice written
+    db3 = Database(path)             # reopening must not re-run it
+    try:
+        assert db3.take_hevy_recanon_notice() == {
+            "butterfly\u2192pec dec": 1,
+        }
+        db3.close()
+        db4 = Database(path)
+        assert db4.take_hevy_recanon_notice() == {}
+        db4.close()
+    finally:
+        pass
