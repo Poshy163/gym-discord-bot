@@ -31,7 +31,13 @@ CREATE TABLE IF NOT EXISTS lifts (
     channel_id    INTEGER,
     logged_at     TEXT    NOT NULL,
     raw           TEXT,
-    reps          INTEGER
+    reps          INTEGER,
+    -- Which Hevy workout produced this row, or NULL for every chat-logged
+    -- lift. The workout id cannot live in ``raw``: both hevy_equip_recanon
+    -- one-shots parse raw[5:] as the exercise title and future _vN passes are
+    -- committed to the same format. This column is what lets an edit or
+    -- deletion in Hevy find exactly the rows it produced.
+    hevy_workout_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_lifts_user_equip
@@ -692,7 +698,12 @@ CREATE TABLE IF NOT EXISTS hevy_account (
     last_synced_at        TEXT,
     linked_at             TEXT    NOT NULL,
     backfilled_at         TEXT,
-    measurements_synced_at TEXT
+    measurements_synced_at TEXT,
+    -- Events cursor (canonical _normalize_iso spelling, always). NULL means
+    -- "never drained": the first drain seeds it to now and makes ZERO Hevy
+    -- requests — every pre-existing import has lifts_linked NULL and would be
+    -- refused anyway, so reading years of edit history buys nothing.
+    events_since          TEXT
 );
 
 -- The shape columns cache what each imported workout *was* — which routine it
@@ -710,6 +721,17 @@ CREATE TABLE IF NOT EXISTS hevy_imported (
     title       TEXT,
     started_at  TEXT,
     updated_at  TEXT,
+    -- ``lifts_linked``: how many lift rows this import wrote with provenance.
+    -- NULL means "imported before provenance existed — its rows cannot be
+    -- identified", and the events sync refuses to touch such a workout: a
+    -- replace would delete 0 rows and insert N, silently doubling the lifts.
+    -- 0 is legitimate (a cardio session imports no weighted set).
+    -- ``retracted_at``: set when Hevy reported the workout deleted. The row is
+    -- kept, not deleted — a deleted ledger row would look never-imported and
+    -- the next page-1 poll would re-import the workout if Hevy still listed it,
+    -- and a replayed "deleted" event must be a no-op.
+    lifts_linked INTEGER,
+    retracted_at TEXT,
     PRIMARY KEY (user_id, workout_id)
 );
 
@@ -1298,6 +1320,34 @@ class Database:
                     self._connection.execute(
                         f"ALTER TABLE hevy_imported ADD COLUMN {col} TEXT"
                     )
+            # Events-sync bookkeeping. lifts_linked stays NULL for every
+            # pre-existing import on purpose — see the SCHEMA comment.
+            if hevy_imp_cols and "lifts_linked" not in hevy_imp_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_imported ADD COLUMN lifts_linked INTEGER"
+                )
+            if hevy_imp_cols and "retracted_at" not in hevy_imp_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_imported ADD COLUMN retracted_at TEXT"
+                )
+            # Lift provenance for the events sync. The index lives HERE, not in
+            # SCHEMA: executescript runs before this ALTER on an upgrade, so a
+            # SCHEMA index would reference a column that doesn't exist yet —
+            # the idx_calorie_entries_dedupe rule. Partial because almost every
+            # lift is chat-logged and would pay for an index it can't use.
+            lift_cols = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(lifts)")
+            }
+            if lift_cols and "hevy_workout_id" not in lift_cols:
+                self._connection.execute(
+                    "ALTER TABLE lifts ADD COLUMN hevy_workout_id TEXT"
+                )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifts_hevy_workout "
+                "ON lifts (user_id, hevy_workout_id) "
+                "WHERE hevy_workout_id IS NOT NULL"
+            )
             # Hevy profile name/URL, filled in from /v1/user/info on the next
             # sync. Nullable and additive: an account that never syncs again
             # simply keeps showing the member's Discord name.
@@ -1312,6 +1362,10 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE hevy_account "
                     "ADD COLUMN measurements_synced_at TEXT"
+                )
+            if hevy_cols and "events_since" not in hevy_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_account ADD COLUMN events_since TEXT"
                 )
             msg_cols = {
                 row["name"]
@@ -1380,8 +1434,9 @@ class Database:
             # matching machine.
             #
             # Every future change to _ALIAS_GROUPS that affects a Hevy title
-            # needs its own _vN key: Hevy workout ids are recorded as imported
-            # for good, so nothing will ever re-read the workout and fix it.
+            # needs its own _vN key. The events sync re-reads a workout only
+            # when Hevy reports it edited; everything else is never re-read,
+            # so a mapper change still cannot reach already-imported rows.
             #
             # The rename summary is left in app_meta for the bot process to
             # announce once. The migration runs in the supervisor, which has no
@@ -1686,9 +1741,14 @@ class Database:
         logged_at: datetime | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        hevy_workout_id: str | None = None,
     ) -> int:
         """Insert lifts. Returns the number of rows actually inserted
         (duplicates from the same message are ignored).
+
+        ``hevy_workout_id`` stamps provenance on Hevy-imported rows so an edit
+        or deletion in Hevy can later find exactly the rows it produced; NULL
+        for every chat-logged lift.
 
         The whole batch runs inside a single transaction (see ``_conn``),
         so a mid-batch failure won't leave half the lifts persisted.
@@ -1711,15 +1771,15 @@ class Database:
                         INSERT INTO lifts
                         (guild_id, user_id, username, equipment, weight_kg,
                          bodyweight_add, message_id, channel_id, logged_at,
-                         raw, reps)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         raw, reps, hevy_workout_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             guild_id, user_id, username,
                             lift.equipment, lift.weight_kg,
                             1 if lift.bodyweight_add else 0,
                             message_id, channel_id, ts, lift.raw,
-                            getattr(lift, "reps", None),
+                            getattr(lift, "reps", None), hevy_workout_id,
                         ),
                     )
                     inserted += 1
@@ -4291,6 +4351,192 @@ class Database:
                 """,
                 (user_id,),
             ))
+
+    def hevy_get_import(self, user_id: int, workout_id: str) -> sqlite3.Row | None:
+        """The full ledger row for one workout — the events sync's admission
+        check reads this once instead of the boolean :meth:`hevy_workout_imported`."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM hevy_imported "
+                "WHERE user_id = ? AND workout_id = ?",
+                (user_id, workout_id),
+            ).fetchone()
+
+    def hevy_record_import(
+        self, user_id: int, workout_id: str, lifts_linked: int,
+    ) -> None:
+        """Record how many provenance-linked lift rows an import wrote.
+
+        Separate from :meth:`hevy_mark_workout` — the claim must stay a bare
+        claim-before-work INSERT, and this count only exists after the write."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_imported SET lifts_linked = ? "
+                "WHERE user_id = ? AND workout_id = ?",
+                (int(lifts_linked), user_id, workout_id),
+            )
+
+    def hevy_set_events_since(self, user_id: int, at: datetime) -> None:
+        """Advance the events cursor, never backwards.
+
+        The guard parses both sides rather than comparing SQL strings: Hevy
+        stamps events like ``...:00.500Z`` while :func:`_normalize_iso` writes
+        ``+00:00``, and lexicographically ``.`` sorts below ``Z`` — a string
+        compare would silently reject a strictly later fractional-second event
+        and stall the cursor. Everything stored here is canonical, but the
+        guard must not depend on that staying true."""
+        new_ts = _normalize_iso(at)
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT events_since FROM hevy_account WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return
+            current = (
+                _parse_iso(row["events_since"]) if row["events_since"] else None
+            )
+            proposed = _parse_iso(new_ts)
+            if proposed is None:
+                return
+            if current is not None and proposed <= current:
+                return
+            c.execute(
+                "UPDATE hevy_account SET events_since = ? WHERE user_id = ?",
+                (new_ts, user_id),
+            )
+
+    def hevy_lift_provenance(
+        self, user_id: int, workout_id: str,
+    ) -> tuple[int | None, set[str], int]:
+        """(guild_id, equipments, row_count) for a workout's linked lifts.
+
+        guild_id comes from the rows themselves, not from hevy_account: a
+        re-link rewrites the account's guild, and replacing an old workout's
+        lifts under the *current* guild would silently move them to another
+        server. None when the workout has no linked rows."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT guild_id, equipment FROM lifts "
+                "WHERE user_id = ? AND hevy_workout_id = ?",
+                (user_id, workout_id),
+            ).fetchall()
+        if not rows:
+            return None, set(), 0
+        return (
+            int(rows[0]["guild_id"]),
+            {str(r["equipment"]) for r in rows},
+            len(rows),
+        )
+
+    def hevy_replace_lifts(
+        self, user_id: int, workout_id: str, guild_id: int, username: str,
+        lifts: list, logged_at: datetime | None,
+        hevy_updated_at: str | None,
+    ) -> tuple[int, int]:
+        """Swap a workout's lifts for a fresh payload, in ONE transaction.
+
+        Returns ``(deleted, inserted)``. Single-transaction is mandatory, not
+        tidy: split in two, a crash between them leaves the member's lifts
+        deleted and never re-added. The INSERT is inlined rather than calling
+        :meth:`add_lifts` because ``_conn()`` issues BEGIN IMMEDIATE and cannot
+        nest — the same duplication ``add_lifts_returning_ids`` carries."""
+        ts = _normalize_iso(logged_at)
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM lifts WHERE user_id = ? AND hevy_workout_id = ?",
+                (user_id, workout_id),
+            )
+            deleted = cur.rowcount or 0
+            inserted = 0
+            for lift in lifts:
+                c.execute(
+                    """
+                    INSERT INTO lifts
+                    (guild_id, user_id, username, equipment, weight_kg,
+                     bodyweight_add, message_id, channel_id, logged_at,
+                     raw, reps, hevy_workout_id)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id, user_id, username,
+                        lift.equipment, lift.weight_kg,
+                        1 if lift.bodyweight_add else 0,
+                        ts, lift.raw, getattr(lift, "reps", None), workout_id,
+                    ),
+                )
+                inserted += 1
+            c.execute(
+                "UPDATE hevy_imported SET lifts_linked = ?, updated_at = ? "
+                "WHERE user_id = ? AND workout_id = ?",
+                (inserted, hevy_updated_at, user_id, workout_id),
+            )
+            self._audit_data(
+                c, guild_id, "hevy_edit_sync", subject_id=user_id,
+                actor_id=user_id, actor_name=username,
+                detail=(
+                    f"workout {workout_id}: {deleted} lift(s) replaced by "
+                    f"{inserted} after a Hevy edit"
+                ),
+            )
+        return deleted, inserted
+
+    def hevy_retract_workout(
+        self, user_id: int, workout_id: str, at: datetime | None = None,
+    ) -> tuple[int, set[str], int | None]:
+        """Delete a workout's linked lifts after Hevy reported it deleted.
+
+        One transaction; idempotent — a replayed event finds no rows and the
+        already-set retracted_at, and changes nothing. Returns
+        ``(deleted_count, equipments_touched, guild_id_or_None)``."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT guild_id, equipment FROM lifts "
+                "WHERE user_id = ? AND hevy_workout_id = ?",
+                (user_id, workout_id),
+            ).fetchall()
+            guild_id = int(rows[0]["guild_id"]) if rows else None
+            equipments = {str(r["equipment"]) for r in rows}
+            c.execute(
+                "DELETE FROM lifts WHERE user_id = ? AND hevy_workout_id = ?",
+                (user_id, workout_id),
+            )
+            c.execute(
+                "UPDATE hevy_imported SET retracted_at = ?, lifts_linked = 0 "
+                "WHERE user_id = ? AND workout_id = ?",
+                (_normalize_iso(at), user_id, workout_id),
+            )
+            if rows:
+                self._audit_data(
+                    c, guild_id or 0, "hevy_delete_sync", subject_id=user_id,
+                    actor_id=user_id, actor_name=None,
+                    detail=(
+                        f"workout {workout_id}: {len(rows)} lift(s) removed "
+                        "after a Hevy deletion"
+                    ),
+                )
+        return len(rows), equipments, guild_id
+
+    def bests_for_equipment(
+        self, user_id: int, equipments: "Iterable[str]",
+    ) -> dict[str, float]:
+        """{equipment: all-time best} for a set of equipments, one query.
+
+        Same semantics as :meth:`previous_best` — per-user, cross-guild,
+        all-time — so the before/after snapshots that word a correction notice
+        cannot disagree with what the PR surfaces show."""
+        equips = [str(e) for e in equipments if e]
+        if not equips:
+            return {}
+        placeholders = ",".join("?" * len(equips))
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT equipment, MAX(weight_kg) AS best FROM lifts "
+                f"WHERE user_id = ? AND equipment IN ({placeholders}) "
+                f"GROUP BY equipment",
+                (user_id, *equips),
+            ).fetchall()
+        return {str(r["equipment"]): float(r["best"]) for r in rows}
 
     def hevy_mark_workout(self, user_id: int, workout_id: str) -> bool:
         """Record ``workout_id`` as imported. Returns True if newly recorded

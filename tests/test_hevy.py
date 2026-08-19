@@ -817,3 +817,127 @@ def test_hevy_unlink_clears_shapes_with_the_ledger(db):
     db.hevy_record_shape(1, "w1", "r1", "Arms", "2026-08-01T10:00:00+00:00", None)
     db.hevy_unlink(1)
     assert db.hevy_routine_usage(1) == []
+
+
+# ---------------------------------------------------------------------------
+# Events sync: client pagers, parsers, and the DB replace/retract primitives
+# ---------------------------------------------------------------------------
+
+def test_parse_workout_event_normalises_both_kinds():
+    up = hevy_client.parse_workout_event({
+        "type": "updated",
+        "workout": {"id": "w1", "title": "Arms",
+                    "updated_at": "2026-08-19T13:40:46.788Z"},
+    })
+    assert up == {"kind": "updated", "workout_id": "w1",
+                  "workout": {"id": "w1", "title": "Arms",
+                              "updated_at": "2026-08-19T13:40:46.788Z"},
+                  "at": "2026-08-19T13:40:46.788Z"}
+    de = hevy_client.parse_workout_event({
+        "type": "deleted", "id": "w2", "deleted_at": "2026-08-19T14:00:00Z",
+    })
+    assert de == {"kind": "deleted", "workout_id": "w2", "workout": None,
+                  "at": "2026-08-19T14:00:00Z"}
+    assert hevy_client.parse_workout_event({"type": "updated"}) is None
+    assert hevy_client.parse_workout_event({"type": "exploded"}) is None
+    assert hevy_client.parse_workout_event("junk") is None
+
+
+def test_walk_workout_events_reports_the_cap(monkeypatch):
+    """capped=True is the signal the cursor must NOT advance: events come
+    newest-first, so the unread remainder is older than everything read."""
+    pages = {
+        1: {"page_count": 3, "events": [{"type": "deleted", "id": "e1"}] * 10},
+        2: {"page_count": 3, "events": [{"type": "deleted", "id": "e2"}] * 10},
+        3: {"page_count": 3, "events": [{"type": "deleted", "id": "e3"}] * 4},
+    }
+    monkeypatch.setattr(
+        hevy_client, "fetch_workout_events",
+        lambda api_key, since, page=1, page_size=10: pages.get(page, {}),
+    )
+    events, capped = hevy_client.walk_workout_events("k", "s", max_pages=2)
+    assert len(events) == 20 and capped is True
+    events, capped = hevy_client.walk_workout_events("k", "s", max_pages=5)
+    assert len(events) == 24 and capped is False
+
+
+def test_fetch_workout_unwraps_and_maps_404(monkeypatch):
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/workouts/w1"): _FakeResponse(200, {"workout": {"id": "w1"}}),
+        ("GET", "/workouts/w2"): _FakeResponse(200, {"id": "w2"}),
+        ("GET", "/workouts/gone"): _FakeResponse(404),
+    }))
+    assert hevy_client.fetch_workout("k", "w1") == {"id": "w1"}
+    assert hevy_client.fetch_workout("k", "w2") == {"id": "w2"}
+    assert hevy_client.fetch_workout("k", "gone") is None
+
+
+def _seed_import(db, wid, lifts_weights, *, guild=42, user=1):
+    """Claim a workout and give it provenance-linked lifts."""
+    db.hevy_mark_workout(user, wid)
+    lifts = [Lift(equipment="bench press", weight_kg=w, reps=5,
+                  raw=f"hevy:Bench", confident=True, structured=True)
+             for w in lifts_weights]
+    n = db.add_lifts(guild_id=guild, user_id=user, username="u",
+                     lifts=lifts, hevy_workout_id=wid)
+    db.hevy_record_import(user, wid, n)
+    return n
+
+
+def test_hevy_retract_workout_removes_exactly_its_rows(db):
+    db.hevy_link(1, 42, "enc")
+    _seed_import(db, "w1", [100.0, 105.0])
+    _seed_import(db, "w2", [90.0])
+    # A chat-logged lift with no provenance must survive any retraction.
+    db.add_lifts(guild_id=42, user_id=1, username="u",
+                 lifts=[Lift(equipment="bench press", weight_kg=80.0,
+                             raw="bench 80", confident=True, structured=True)])
+
+    deleted, equips, guild = db.hevy_retract_workout(1, "w1")
+    assert deleted == 2 and equips == {"bench press"} and guild == 42
+    assert db.bests_for_equipment(1, ["bench press"]) == {"bench press": 90.0}
+    # Idempotent: a replayed event is a no-op.
+    assert db.hevy_retract_workout(1, "w1") == (0, set(), None)
+    # The ledger row survives, marked — so the page-1 poll cannot re-import.
+    row = db.hevy_get_import(1, "w1")
+    assert row["retracted_at"] is not None and row["lifts_linked"] == 0
+
+
+def test_hevy_replace_lifts_swaps_in_one_transaction(db):
+    db.hevy_link(1, 42, "enc")
+    _seed_import(db, "w1", [100.0])
+    new_lifts = [Lift(equipment="bench press", weight_kg=140.0, reps=5,
+                      raw="hevy:Bench", confident=True, structured=True)]
+    deleted, inserted = db.hevy_replace_lifts(
+        1, "w1", 42, "u", new_lifts, None, hevy_updated_at="stamp-2",
+    )
+    assert (deleted, inserted) == (1, 1)
+    assert db.bests_for_equipment(1, ["bench press"]) == {"bench press": 140.0}
+    row = db.hevy_get_import(1, "w1")
+    assert row["lifts_linked"] == 1 and row["updated_at"] == "stamp-2"
+
+
+def test_events_cursor_is_monotonic_across_spellings(db):
+    """Hevy stamps fractional seconds with a Z suffix while the store writes
+    +00:00 — a string compare would let '...00.500Z' lose to '...00Z' and stall
+    the cursor. The guard parses."""
+    from datetime import datetime, timezone
+
+    db.hevy_link(1, 42, "enc")
+    t1 = datetime(2026, 8, 19, 13, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 8, 19, 13, 0, 0, 500000, tzinfo=timezone.utc)
+    db.hevy_set_events_since(1, t1)
+    first = db.hevy_get(1)["events_since"]
+    db.hevy_set_events_since(1, t2)          # half a second later: advances
+    assert db.hevy_get(1)["events_since"] != first
+    db.hevy_set_events_since(1, t1)          # earlier: refused
+    assert db.hevy_get(1)["events_since"] != first
+
+
+def test_lift_provenance_reads_guild_from_the_rows(db):
+    """A re-link rewrites hevy_account.guild_id; the rows must keep their own."""
+    db.hevy_link(1, 42, "enc")
+    _seed_import(db, "w1", [100.0], guild=42)
+    db.hevy_link(1, 99, "enc-2")     # member re-links from another server
+    guild, equips, count = db.hevy_lift_provenance(1, "w1")
+    assert guild == 42 and count == 1

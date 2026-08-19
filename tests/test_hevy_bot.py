@@ -651,3 +651,266 @@ def test_stair_machine_shows_floors_with_its_template(monkeypatch):
     embed2 = bot_mod._hevy_workout_embed("poshy", summary)
     field2 = next(f for f in embed2.fields if f.name == "Exercises")
     assert "42" not in field2.value
+
+
+# ---------------------------------------------------------------------------
+# Events sync: cursor policy, admission rules, correction notices
+# ---------------------------------------------------------------------------
+
+def _dt(*args):
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+def test_cursor_stays_put_on_a_capped_read():
+    """Events are newest-first: a capped read holds the NEWEST 50, so any
+    advance would jump the cursor clean over the unread older remainder."""
+    out = bot_mod._hevy_events_next_cursor(
+        _dt(2026, 8, 1), [_dt(2026, 8, 19)], capped=True,
+        request_start=_dt(2026, 8, 20),
+    )
+    assert out is None
+
+
+def test_cursor_advances_to_hevys_own_clock():
+    out = bot_mod._hevy_events_next_cursor(
+        _dt(2026, 8, 1), [_dt(2026, 8, 3), _dt(2026, 8, 5)], capped=False,
+        request_start=_dt(2026, 8, 20),
+    )
+    assert out == _dt(2026, 8, 5)
+
+
+def test_cursor_quiet_poll_advances_with_a_margin():
+    out = bot_mod._hevy_events_next_cursor(
+        _dt(2026, 8, 1), [], capped=False, request_start=_dt(2026, 8, 20, 12, 0),
+    )
+    assert out == _dt(2026, 8, 20, 11, 58)
+
+
+def test_cursor_never_goes_backwards():
+    out = bot_mod._hevy_events_next_cursor(
+        _dt(2026, 8, 20), [_dt(2026, 8, 19)], capped=False,
+        request_start=_dt(2026, 8, 20, 0, 1),
+    )
+    assert out is None
+
+
+def test_best_change_lines_are_symmetric():
+    lines = bot_mod._hevy_best_change_lines(
+        {"bench press": 100.0, "squat": 180.0, "curl": 30.0},
+        {"bench press": 140.0, "squat": 170.0, "curl": 30.0},
+    )
+    assert any("140" in l and "100" in l for l in lines)   # raised
+    assert any("170" in l and "180" in l for l in lines)   # lowered
+    assert not any("curl" in l for l in lines)              # unchanged: silent
+    assert bot_mod._hevy_best_change_lines({}, {}) == []
+
+
+@pytest.fixture()
+def events_env(monkeypatch, tmp_path):
+    from app.db import Database
+
+    database = Database(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    monkeypatch.setattr(bot_mod, "HEVY_EDIT_SYNC", True, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop(), raising=False)
+    database.hevy_link(7, 42, "enc")
+
+    def _seed(wid, weights, stamp="stamp-1"):
+        from app.parser import Lift
+        database.hevy_mark_workout(7, wid)
+        lifts = [Lift(equipment="bench press", weight_kg=w, reps=5,
+                      raw="hevy:Bench", confident=True, structured=True)
+                 for w in weights]
+        n = database.add_lifts(guild_id=42, user_id=7, username="u",
+                               lifts=lifts, hevy_workout_id=wid)
+        database.hevy_record_import(7, wid, n)
+        database.hevy_record_shape(7, wid, None, "Arms",
+                                   "2026-08-19T13:16:09+00:00", stamp)
+        return n
+
+    return SimpleNamespace(db=database, seed=_seed,
+                           row=lambda: database.hevy_get(7))
+
+
+def test_apply_deleted_event_retracts_and_reports(events_env):
+    env = events_env
+    env.seed("w1", [100.0, 120.0])
+    outcome, notice = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "deleted", "workout_id": "w1", "workout": None,
+                    "at": "2026-08-19T14:00:00Z"},
+        {}, "poshy",
+    ))
+    assert outcome == "retracted"
+    assert notice is not None
+    assert "withdrawn" in (notice.fields[0].value if notice.fields else
+                           notice.description)
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {}
+
+
+def test_apply_updated_event_replaces_and_reports_the_moved_best(events_env):
+    env = events_env
+    env.seed("w1", [100.0])
+    workout = {
+        "id": "w1", "title": "Arms",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "updated_at": "stamp-2",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 140, "reps": 5}]}],
+    }
+    outcome, notice = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "updated", "workout_id": "w1",
+                    "workout": workout, "at": "stamp-2"},
+        {}, "poshy",
+    ))
+    assert outcome == "replaced"
+    assert notice is not None and "140" in notice.fields[0].value
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {
+        "bench press": 140.0,
+    }
+
+
+def test_apply_updated_event_short_circuits_on_the_same_stamp(events_env):
+    env = events_env
+    env.seed("w1", [100.0], stamp="stamp-1")
+    workout = {"id": "w1", "updated_at": "stamp-1", "exercises": []}
+    outcome, notice = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "updated", "workout_id": "w1",
+                    "workout": workout, "at": "stamp-1"},
+        {}, "poshy",
+    ))
+    assert outcome == "unchanged" and notice is None
+    # Nothing was deleted by the no-op.
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {
+        "bench press": 100.0,
+    }
+
+
+def test_apply_event_refuses_legacy_imports(events_env):
+    """A pre-provenance import has NULL lifts_linked: replacing it would delete
+    0 rows and insert N, silently doubling the member's lifts."""
+    env = events_env
+    env.db.hevy_mark_workout(7, "old")     # claimed, but never linked
+    workout = {"id": "old", "updated_at": "s",
+               "exercises": [{"title": "Bench Press (Barbell)",
+                              "sets": [{"weight_kg": 100, "reps": 5}]}]}
+    outcome, notice = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "updated", "workout_id": "old",
+                    "workout": workout, "at": "s"},
+        {}, "poshy",
+    ))
+    assert outcome == "skipped-legacy" and notice is None
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {}
+
+
+def test_apply_event_never_creates(events_env):
+    """Events act only on workouts already in the ledger — an edit to an
+    ancient workout the backfill never reached must not import lifts."""
+    env = events_env
+    workout = {"id": "never-seen", "updated_at": "s",
+               "exercises": [{"title": "Bench Press (Barbell)",
+                              "sets": [{"weight_kg": 100, "reps": 5}]}]}
+    outcome, _ = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "updated", "workout_id": "never-seen",
+                    "workout": workout, "at": "s"},
+        {}, "poshy",
+    ))
+    assert outcome == "skipped-unknown"
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {}
+
+
+def test_apply_event_refuses_on_provenance_drift(events_env):
+    """An admin purge deleted some of this workout's rows on purpose; a replace
+    would resurrect them, so the edit is refused."""
+    env = events_env
+    env.seed("w1", [100.0, 120.0])
+    with env.db._conn() as c:
+        c.execute("DELETE FROM lifts WHERE user_id = 7 AND weight_kg = 120.0")
+    workout = {"id": "w1", "updated_at": "stamp-9",
+               "exercises": [{"title": "Bench Press (Barbell)",
+                              "sets": [{"weight_kg": 140, "reps": 5}]}]}
+    outcome, _ = _run(bot_mod._hevy_apply_event(
+        env.row(), {"kind": "updated", "workout_id": "w1",
+                    "workout": workout, "at": "stamp-9"},
+        {}, "poshy",
+    ))
+    assert outcome == "skipped-drift"
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {
+        "bench press": 100.0,
+    }
+
+
+def test_drain_seeds_the_cursor_with_zero_requests(events_env, monkeypatch):
+    env = events_env
+
+    def _boom(*_a, **_k):
+        raise AssertionError("the seeding drain must not call Hevy")
+
+    monkeypatch.setattr(hevy_client, "walk_workout_events", _boom)
+    out = _run(bot_mod._hevy_drain_events(
+        env.row(), "key", {}, "poshy",
+        datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+    ))
+    assert out == {"replaced": 0, "retracted": 0, "notices": []}
+    assert env.row()["events_since"] is not None
+
+
+def test_drain_applies_oldest_first_and_advances_the_cursor(events_env,
+                                                            monkeypatch):
+    env = events_env
+    env.seed("w1", [100.0])
+    env.db.hevy_set_events_since(
+        7, datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc),
+    )
+    events = [   # newest-first, as the API delivers them
+        {"type": "deleted", "id": "w1", "deleted_at": "2026-08-19T15:00:00Z"},
+        {"type": "updated", "workout": {
+            "id": "w1", "title": "Arms", "updated_at": "2026-08-19T14:00:00Z",
+            "start_time": "2026-08-19T13:16:09+00:00",
+            "exercises": [{"title": "Bench Press (Barbell)",
+                           "sets": [{"weight_kg": 140, "reps": 5}]}],
+        }},
+    ]
+    monkeypatch.setattr(
+        hevy_client, "walk_workout_events",
+        lambda api_key, since, max_pages=5: (list(events), False),
+    )
+    out = _run(bot_mod._hevy_drain_events(
+        env.row(), "key", {}, "poshy",
+        datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+    ))
+    # Edit applied first (oldest), then the deletion — the end state is gone.
+    assert out["replaced"] == 1 and out["retracted"] == 1
+    assert env.db.bests_for_equipment(7, ["bench press"]) == {}
+    # Cursor advanced to Hevy's newest event time, not the bot clock.
+    assert env.row()["events_since"].startswith("2026-08-19T15:00:00")
+
+
+def test_drain_leaves_the_cursor_on_a_capped_read(events_env, monkeypatch):
+    env = events_env
+    env.db.hevy_set_events_since(
+        7, datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc),
+    )
+    before = env.row()["events_since"]
+    monkeypatch.setattr(
+        hevy_client, "walk_workout_events",
+        lambda api_key, since, max_pages=5: (
+            [{"type": "deleted", "id": "nope",
+              "deleted_at": "2026-08-19T15:00:00Z"}], True,
+        ),
+    )
+    _run(bot_mod._hevy_drain_events(
+        env.row(), "key", {}, "poshy",
+        datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+    ))
+    assert env.row()["events_since"] == before
+
+
+def test_drain_is_gated_by_the_config_switch(events_env, monkeypatch):
+    env = events_env
+    monkeypatch.setattr(bot_mod, "HEVY_EDIT_SYNC", False, raising=False)
+    out = _run(bot_mod._hevy_drain_events(
+        env.row(), "key", {}, "poshy",
+        datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+    ))
+    assert out == {"replaced": 0, "retracted": 0, "notices": []}
+    assert env.row()["events_since"] is None   # not even seeded

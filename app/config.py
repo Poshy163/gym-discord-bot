@@ -460,6 +460,12 @@ _SETTINGS: tuple[Setting, ...] = (
        restart_note="Setting this for the first time needs a restart."),
     _S("HEVY_POLL_MINUTES", "int", "15", "hevy", _floor_int(1),
        apply="worker", min=1, max=1440, label="Poll interval (minutes)"),
+    _S("HEVY_EDIT_SYNC", "bool", "1", "hevy", _bool,
+       apply="worker", label="Sync edits and deletions",
+       help="When a member edits or deletes a workout in the Hevy app, apply "
+            "the change to their imported lifts here too, and post a short "
+            "correction to the feed when a personal best moves because of it. "
+            "Only reaches workouts imported after this feature landed."),
     _S("HEVY_PUSH_BODYWEIGHT", "bool", "1", "hevy", _bool,
        apply="worker", label="Mirror weigh-ins to Hevy",
        help="When a member logs a bodyweight -- by hand or from a linked "

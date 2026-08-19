@@ -144,6 +144,41 @@ value but says so instead of pretending it applied.
 - Workouts are filed under the **server you linked from** (or your `/server`
   default when linking via DM).
 
+## Edits and deletions sync back
+
+Fixing a mistyped weight in the Hevy app used to leave the wrong lift here
+forever, and deleting a workout left its lifts — and any PR they set — behind.
+The poll now also drains `GET /workouts/events`:
+
+- **An edit replaces the workout's lifts** — delete-and-reinsert in one
+  transaction, keyed on the `hevy_workout_id` provenance every new import
+  stamps on its rows. An unchanged `updated_at` short-circuits to a no-op.
+- **A deletion withdraws them**, idempotently; the import ledger row is kept
+  and marked so the next poll cannot re-import the workout.
+- **When a personal best moves because of it, the feed gets one plain
+  correction** ("bench press best is now 140kg (was 100kg)") — deliberately
+  unstyled so it never reads as a second PR announcement. Silent when nothing
+  moved: a title edit is not news. PRs, leaderboards and goals need no other
+  repair because they are all computed live from the lifts table.
+- **Only workouts imported after this feature landed are reachable.** Older
+  imports have no provenance (nothing recorded which rows they produced), so
+  events touching them are refused rather than guessed at — a replace against
+  unidentifiable rows would silently double the member's lifts. For the same
+  reason the events cursor seeds to "now" on its first run, reading zero
+  history.
+- The cursor advances on **Hevy's own event clock**, never the bot's, stays put
+  when a burst of events overflows the per-poll page cap (events arrive
+  newest-first, so advancing would skip the older remainder forever), and stays
+  put on any error so the next poll retries.
+- An edit applied while some of the workout's rows were deliberately deleted
+  here (an admin purge, an undo) is **refused**, not merged — re-inserting the
+  full payload would resurrect what the admin removed.
+- Off switch: **Sync edits and deletions** in the dashboard, or
+  `HEVY_EDIT_SYNC=0`.
+- One honest caveat: retracting lifts can split a training streak that relied
+  on the deleted day, with no notice — streaks are computed live from lift
+  dates, same as PRs.
+
 ## Weigh-ins are mirrored into Hevy
 
 Hevy's API also stores **body measurements**, so the bot writes to it as well as

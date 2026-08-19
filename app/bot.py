@@ -277,6 +277,7 @@ def _bind_config(cfg: config_mod.Config) -> None:
     g["HEVY_FEED_CHANNEL_ID"] = cfg["HEVY_FEED_CHANNEL_ID"]
     g["HEVY_POLL_MINUTES"] = cfg["HEVY_POLL_MINUTES"]
     g["HEVY_PUSH_BODYWEIGHT"] = cfg["HEVY_PUSH_BODYWEIGHT"]
+    g["HEVY_EDIT_SYNC"] = cfg["HEVY_EDIT_SYNC"]
 
     # -- Home Assistant ---------------------------------------------------
     # No URL or token here: each member's own credential lives encrypted in
@@ -16908,7 +16909,13 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
                       f"{'s' if result['weigh_ins_pushed'] != 1 else ''} sent to Hevy")
     if result.get("weigh_ins_imported"):
         scales.append(f"{result['weigh_ins_imported']} imported from Hevy")
-    weigh = f"\n⚖️ Bodyweight: {', '.join(scales)}." if scales else ""
+    if result.get("edited"):
+        scales.append(f"{result['edited']} edit"
+                      f"{'s' if result['edited'] != 1 else ''} applied")
+    if result.get("retracted"):
+        scales.append(f"{result['retracted']} deletion"
+                      f"{'s' if result['retracted'] != 1 else ''} applied")
+    weigh = f"\n🔁 Also: {', '.join(scales)}." if scales else ""
     if result["new"] == 0:
         await interaction.followup.send(
             f"✅ Already up to date — no new workouts to import.{weigh}",
@@ -17693,18 +17700,281 @@ def _hevy_import_workout(
     lifts = hevy_client.workout_to_lifts(workout, templates)
     prs = _collapse_prs(_new_prs_for_lifts(guild_id, user_id, lifts)) if lifts else {}
     when = _parse_hevy_time(workout.get("start_time"))
+    linked = 0
     if lifts:
         try:
-            db.add_lifts(
+            linked = db.add_lifts(
                 guild_id=guild_id, user_id=user_id, username=username,
-                lifts=lifts, logged_at=when,
+                lifts=lifts, logged_at=when, hevy_workout_id=wid,
             )
         except Exception:  # pragma: no cover - defensive
             LOG.exception("Hevy: failed to import workout %s", wid)
+    try:
+        # 0 is a real value (a cardio session imports no weighted set) and is
+        # what admits the workout to the events sync; NULL marks the legacy
+        # imports whose rows can never be identified.
+        db.hevy_record_import(user_id, wid, linked)
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: failed to record link count for %s", wid)
     return {
         "summary": summary,
         "lifts": lifts, "prs": prs, "when": when,
     }
+
+
+#: Pages of /workouts/events read per account per poll. Events are ordered
+#: newest-to-oldest, so a capped read holds the newest and the remainder is
+#: older — the cursor must then stay put (see _hevy_events_next_cursor).
+_HEVY_EVENTS_MAX_PAGES = 5
+
+
+def _hevy_events_next_cursor(
+    since: datetime, event_times: list[datetime], capped: bool,
+    request_start: datetime,
+) -> datetime | None:
+    """The whole cursor policy, pure and testable. Returns the new cursor, or
+    None to leave it untouched.
+
+    * capped: **stay put.** The unread remainder is OLDER than everything just
+      read (newest-first ordering), so any advance would skip it forever.
+      Replaying the read events next poll is free — retraction is idempotent
+      and an unchanged ``updated_at`` short-circuits a replace.
+    * events processed: Hevy's own newest event time — the only clock immune to
+      skew between this host and Hevy's.
+    * nothing at all: the request start minus a two-minute margin, so an event
+      stamped during the request cannot fall between two cursors.
+
+    All comparisons are on datetimes, never strings: Hevy stamps fractional
+    seconds with a ``Z`` suffix and the store writes ``+00:00``, which do not
+    sort together lexicographically.
+    """
+    if capped:
+        return None
+    if event_times:
+        newest = max(event_times)
+        return newest if newest > since else None
+    fallback = request_start - timedelta(seconds=120)
+    return fallback if fallback > since else None
+
+
+def _hevy_best_change_lines(
+    before: dict[str, float], after: dict[str, float],
+) -> list[str]:
+    """Diff two all-time-best snapshots into correction lines. PURE.
+
+    Symmetric on purpose: an edit that fixes a mistyped 100 to 140 raises the
+    best and deserves the same single line as a deletion that lowers it.
+    Empty when nothing moved — the signal to post no notice at all."""
+    lines: list[str] = []
+    for equip in sorted(set(before) | set(after)):
+        was = before.get(equip)
+        now = after.get(equip)
+        if was is not None and now is None:
+            lines.append(
+                f"**{_safe_label(equip)}** best withdrawn (was {was:g}kg — "
+                "no other lift recorded)"
+            )
+        elif was is None and now is not None:
+            lines.append(f"**{_safe_label(equip)}** best is now **{now:g}kg**")
+        elif was is not None and now is not None and abs(was - now) >= 0.005:
+            lines.append(
+                f"**{_safe_label(equip)}** best is now **{now:g}kg** "
+                f"(was {was:g}kg)"
+            )
+    return lines
+
+
+def _hevy_change_embed(
+    member_name: str, title: str, kind: str,
+    deleted: int, inserted: int, change_lines: list[str],
+) -> discord.Embed:
+    """The single correction notice for a Hevy edit or deletion.
+
+    Deliberately plain — no trophy styling even when a best goes up — so it
+    reads as a correction, never as a second PR announcement."""
+    if kind == "deleted":
+        what = (
+            f"deleted **{_safe_label(title)}** in Hevy — its {deleted} lift"
+            f"{'s' if deleted != 1 else ''} have been withdrawn here too"
+        )
+    else:
+        what = (
+            f"edited **{_safe_label(title)}** in Hevy — {deleted} lift"
+            f"{'s' if deleted != 1 else ''} replaced by {inserted}"
+        )
+    embed = discord.Embed(
+        title="✏️ Hevy correction",
+        colour=HEVY_COLOUR,
+        description=f"{_plain_label(member_name)} {what}.",
+    )
+    if change_lines:
+        embed.add_field(
+            name="Personal bests affected",
+            value="\n".join(change_lines)[:1024], inline=False,
+        )
+    embed.set_footer(text="via Hevy · synced from an edit in the app")
+    return embed
+
+
+async def _hevy_apply_event(
+    account_row, event: dict, templates: dict[str, dict], username: str,
+) -> tuple[str, discord.Embed | None]:
+    """Apply one normalised event. Returns (outcome, notice_embed_or_None).
+
+    Admission, in order: the ledger row must exist (events NEVER create — an
+    edit to an ancient workout the backfill never reached must not import
+    lifts and post an embed), it must not already be retracted, and for an
+    update its rows must be identifiable (``lifts_linked`` NOT NULL — legacy
+    imports are refused rather than silently doubled)."""
+    user_id = int(account_row["user_id"])
+    wid = event["workout_id"]
+    ledger = db.hevy_get_import(user_id, wid)
+    if ledger is None:
+        return "skipped-unknown", None
+    if ledger["retracted_at"] is not None:
+        return "unchanged", None
+    title = (
+        (ledger["title"] if "title" in ledger.keys() else None)
+        or "a workout"
+    )
+
+    if event["kind"] == "deleted":
+        before_equips = db.hevy_lift_provenance(user_id, wid)[1]
+        before = db.bests_for_equipment(user_id, before_equips)
+        deleted, equips, _guild = db.hevy_retract_workout(
+            user_id, wid, at=datetime.now(timezone.utc),
+        )
+        if not deleted:
+            return "unchanged", None
+        after = db.bests_for_equipment(user_id, equips)
+        lines = _hevy_best_change_lines(before, after)
+        return "retracted", _hevy_change_embed(
+            username, title, "deleted", deleted, 0, lines,
+        )
+
+    # kind == "updated"
+    linked = ledger["lifts_linked"] if "lifts_linked" in ledger.keys() else None
+    if linked is None:
+        return "skipped-legacy", None
+    workout = event["workout"] or {}
+    stored_stamp = ledger["updated_at"] if "updated_at" in ledger.keys() else None
+    new_stamp = workout.get("updated_at") or event.get("at")
+    if stored_stamp and new_stamp and stored_stamp == new_stamp:
+        return "unchanged", None
+
+    prov_guild, old_equips, actual_rows = db.hevy_lift_provenance(user_id, wid)
+    if actual_rows != int(linked):
+        # Somebody deliberately deleted some of these rows here (an admin
+        # purge, an undo). Re-inserting the full payload would resurrect what
+        # they removed, so refuse and leave the drift for a human.
+        LOG.warning(
+            "Hevy: workout %s for %s has %d linked lifts but the ledger says "
+            "%d — skipping the edit to avoid resurrecting deleted rows",
+            wid, user_id, actual_rows, linked,
+        )
+        return "skipped-drift", None
+    guild_id = prov_guild if prov_guild is not None else int(account_row["guild_id"])
+
+    summary = hevy_client.summarize_workout(workout)
+    lifts = hevy_client.workout_to_lifts(workout, templates)
+    when = _parse_hevy_time(workout.get("start_time"))
+    new_equips = {lift.equipment for lift in lifts}
+    before = db.bests_for_equipment(user_id, old_equips | new_equips)
+    deleted, inserted = db.hevy_replace_lifts(
+        user_id, wid, guild_id, username, lifts, when,
+        hevy_updated_at=new_stamp,
+    )
+    try:
+        db.hevy_record_shape(
+            user_id, wid, summary.get("routine_id"), summary.get("title"),
+            summary.get("start_time"), new_stamp,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: failed to re-stamp shape for %s", wid)
+    after = db.bests_for_equipment(user_id, old_equips | new_equips)
+    lines = _hevy_best_change_lines(before, after)
+    if not lines and deleted == inserted:
+        # A title/notes edit, or set tweaks that moved no best: the data is
+        # refreshed, but a notice would be noise.
+        return "replaced", None
+    return "replaced", _hevy_change_embed(
+        username, summary.get("title") or title, "edited",
+        deleted, inserted, lines,
+    )
+
+
+async def _hevy_drain_events(
+    account_row, api_key: str, templates: dict[str, dict], username: str,
+    sync_started: datetime,
+) -> dict:
+    """Apply Hevy-side edits and deletions since the cursor. Returns counts.
+
+    A NULL cursor seeds to ``sync_started`` with ZERO Hevy requests: every
+    pre-existing import has ``lifts_linked`` NULL and would be refused anyway,
+    so reading years of edit history is hundreds of pages for no effect. The
+    cursor advances only after every read event has been applied — a mid-drain
+    failure leaves it untouched and the next poll retries.
+    """
+    result = {"replaced": 0, "retracted": 0, "notices": []}
+    if not HEVY_EDIT_SYNC:
+        return result
+    user_id = int(account_row["user_id"])
+    since_raw = (
+        account_row["events_since"]
+        if "events_since" in account_row.keys() else None
+    )
+    since = _parse_hevy_time(since_raw) if since_raw else None
+    if since is None:
+        db.hevy_set_events_since(user_id, sync_started)
+        return result
+
+    since_param = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _fetch() -> tuple[list[dict], bool]:
+        return hevy_client.walk_workout_events(
+            api_key, since_param, max_pages=_HEVY_EVENTS_MAX_PAGES,
+        )
+
+    try:
+        raw_events, capped = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyAuthError:
+        return result
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: events fetch failed for %s: %s", user_id, exc)
+        return result  # cursor untouched — the next poll retries
+
+    events = [
+        e for e in (hevy_client.parse_workout_event(ev) for ev in raw_events)
+        if e is not None
+    ]
+    times: list[datetime] = []
+    # Newest-first from the API; apply oldest-first so an edit-then-delete of
+    # the same workout lands in the order the member performed it.
+    for event in reversed(events):
+        at = _parse_hevy_time(event.get("at"))
+        try:
+            outcome, notice = await _hevy_apply_event(
+                account_row, event, templates, username,
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception(
+                "Hevy: failed to apply a %s event for %s",
+                event.get("kind"), user_id,
+            )
+            continue
+        if at is not None:
+            times.append(at)
+        if outcome == "replaced":
+            result["replaced"] += 1
+        elif outcome == "retracted":
+            result["retracted"] += 1
+        if notice is not None:
+            result["notices"].append(notice)
+
+    new_cursor = _hevy_events_next_cursor(since, times, capped, sync_started)
+    if new_cursor is not None:
+        db.hevy_set_events_since(user_id, new_cursor)
+    return result
 
 
 async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
@@ -17719,6 +17989,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
     result = {
         "new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False,
         "weigh_ins_pushed": 0, "weigh_ins_imported": 0,
+        "edited": 0, "retracted": 0,
     }
     user_id = int(row["user_id"])
     guild_id = int(row["guild_id"])
@@ -17728,6 +17999,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
         LOG.warning("Hevy: unreadable API key for user %s — skipping", user_id)
         return result
 
+    sync_started = datetime.now(timezone.utc)
     first_sync = row["last_synced_at"] is None
     # Accounts linked before the 50-workout backfill existed have a NULL
     # backfilled_at — catch them up automatically on their next poll.
@@ -17790,7 +18062,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
     # Fetched before the import loop, not just before the feed post: the
     # template's `type` decides whether a bodyweight lift's kg is assistance or
     # added load, and that has to be right at the moment the Lift is written.
-    templates = await _hevy_templates(api_key) if workouts else {}
+    templates = await _hevy_templates(api_key)
 
     imported: list[dict] = []
     for workout in reversed(workouts):
@@ -17838,6 +18110,26 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
                     )
                 except discord.HTTPException:  # pragma: no cover - best effort
                     LOG.info("Hevy: failed to post feed embed for %s", user_id)
+
+    # Apply Hevy-side edits and deletions since the cursor. AFTER the import
+    # loop, so a brand-new workout (which also arrives as an "updated" event
+    # with updated_at == created_at) is already in the ledger and short-circuits
+    # to "unchanged" instead of being skipped as unknown.
+    try:
+        drained = await _hevy_drain_events(
+            row, api_key, templates, username, sync_started,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: events drain failed for %s", user_id)
+        drained = {"replaced": 0, "retracted": 0, "notices": []}
+    result["edited"] = drained["replaced"]
+    result["retracted"] = drained["retracted"]
+    if feed_channel is not None:
+        for notice in drained["notices"]:
+            try:
+                await feed_channel.send(embed=notice)
+            except discord.HTTPException:  # pragma: no cover - best effort
+                LOG.info("Hevy: failed to post a correction for %s", user_id)
 
     # One-time bodyweight merge with Hevy's body measurements. Gated on its own
     # marker rather than on `backfill`, so accounts linked before this existed

@@ -337,6 +337,94 @@ def fetch_exercise_templates(api_key: str, limit: int = 500) -> list[dict]:
     return out[:limit]
 
 
+def fetch_workout(api_key: str, workout_id: str) -> dict | None:
+    """One workout's full detail, or None if Hevy no longer has it.
+
+    None-for-404 like :func:`fetch_body_measurement`: on the events path a 404
+    means the workout was deleted between the event and this fetch, which the
+    caller treats as a retraction rather than an error."""
+    try:
+        data = _get(api_key, f"/workouts/{workout_id}")
+    except HevyNotFound:
+        return None
+    if isinstance(data, dict):
+        inner = data.get("workout")
+        if isinstance(inner, dict):
+            return inner  # tolerate an envelope, like /user/info's "data"
+        return data
+    return None
+
+
+def fetch_workout_events(
+    api_key: str, since: str, page: int = 1, page_size: int = 10,
+) -> dict:
+    """One page of GET /workouts/events. Newest-first, per the API docs."""
+    data = _get(
+        api_key, "/workouts/events",
+        {"page": page, "pageSize": page_size, "since": since},
+    )
+    return data if isinstance(data, dict) else {}
+
+
+def walk_workout_events(
+    api_key: str, since: str, max_pages: int = 5,
+) -> tuple[list[dict], bool]:
+    """Up to ``max_pages`` of events since ``since``. Returns ``(events, capped)``.
+
+    ``capped`` True means there was more than we read. Hevy orders events
+    newest-to-oldest (the endpoint documents this), so a capped read holds the
+    NEWEST events and the unread remainder is OLDER — the caller must therefore
+    NOT advance its cursor past ``since`` on a capped read, or the unread events
+    are skipped forever. Replaying them next poll is free: retraction is
+    idempotent and an unchanged ``updated_at`` short-circuits a replace.
+    """
+    out: list[dict] = []
+    page = 1
+    while page <= max_pages:
+        data = fetch_workout_events(api_key, since, page=page)
+        batch = data.get("events") or []
+        if not batch:
+            return out, False
+        out.extend(batch)
+        page_count = data.get("page_count")
+        if isinstance(page_count, int) and page >= page_count:
+            return out, False
+        page += 1
+    return out, True
+
+
+def parse_workout_event(event: dict) -> dict | None:
+    """Normalise one event envelope. PURE — the guesswork is unit-testable.
+
+    Returns ``{"kind", "workout_id", "workout", "at"}`` or None for a malformed
+    event. Tolerant about spellings on purpose: this API names the same field
+    ``superset_id`` in payloads and ``supersets_id`` in its spec, so the event
+    envelope gets no benefit of the doubt."""
+    if not isinstance(event, dict):
+        return None
+    kind = str(event.get("type") or "").strip().lower()
+    if kind == "updated":
+        workout = event.get("workout")
+        if not isinstance(workout, dict):
+            return None
+        wid = str(workout.get("id") or "")
+        if not wid:
+            return None
+        return {
+            "kind": "updated", "workout_id": wid, "workout": workout,
+            "at": workout.get("updated_at") or None,
+        }
+    if kind == "deleted":
+        wid = str(event.get("id") or event.get("workout_id") or "")
+        if not wid:
+            return None
+        return {
+            "kind": "deleted", "workout_id": wid, "workout": None,
+            "at": event.get("deleted_at") or None,
+        }
+    return None
+
+
 def fetch_routines(api_key: str, limit: int = 100) -> list[dict]:
     """The account's workout routines (programmes), paged ten at a time."""
     out: list[dict] = []
