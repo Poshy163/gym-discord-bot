@@ -20,6 +20,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import tempfile
@@ -7402,26 +7403,44 @@ async def db_dump_cmd(interaction: discord.Interaction) -> None:
             src.close()
 
         size_bytes = tmp_path.stat().st_size
-        # Discord's per-attachment limit for non-Nitro bots is 25 MiB.
-        if size_bytes > 24 * 1024 * 1024:
+        # Gzip the snapshot: SQLite files compress ~4-5x, and Discord's real
+        # per-attachment cap for a bot is 10 MiB — the old 24 MiB guard let a
+        # 9 MB database through to a 413 from Discord. Compression happens in
+        # an executor; a multi-MB gzip on the event loop stalls every command.
+        gz_path = tmp_path.with_suffix(".sqlite3.gz")
+
+        def _compress() -> int:
+            import gzip
+            with open(tmp_path, "rb") as src_f, gzip.open(
+                gz_path, "wb", compresslevel=6,
+            ) as dst_f:
+                shutil.copyfileobj(src_f, dst_f)
+            return gz_path.stat().st_size
+
+        gz_bytes = await bot.loop.run_in_executor(None, _compress)
+        if gz_bytes > int(9.5 * 1024 * 1024):
             await interaction.followup.send(
-                f"DB snapshot is {size_bytes/1024/1024:.1f} MiB — too "
-                "large to attach. Pull it directly from the host volume.",
+                f"DB snapshot is {size_bytes/1024/1024:.1f} MiB "
+                f"({gz_bytes/1024/1024:.1f} MiB gzipped) — over Discord's "
+                "10 MiB attachment cap even compressed. Pull it from the "
+                "host volume, or use the dashboard's backup folder.",
                 ephemeral=True,
             )
             return
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        filename = f"gym-{stamp}.sqlite3"
+        filename = f"gym-{stamp}.sqlite3.gz"
         try:
             user = interaction.user
             dm = await user.create_dm()
             await dm.send(
                 content=(
                     f"Snapshot of `{db_path.name}` "
-                    f"({size_bytes/1024:.1f} KiB) taken at {stamp}."
+                    f"({size_bytes/1024/1024:.1f} MiB, "
+                    f"{gz_bytes/1024/1024:.2f} MiB gzipped) taken at {stamp}. "
+                    "Decompress with `gunzip` (or 7-Zip on Windows)."
                 ),
-                file=discord.File(str(tmp_path), filename=filename),
+                file=discord.File(str(gz_path), filename=filename),
             )
             await interaction.followup.send(
                 f"Sent {filename} to your DMs.", ephemeral=True
@@ -7433,10 +7452,11 @@ async def db_dump_cmd(interaction: discord.Interaction) -> None:
                 ephemeral=True,
             )
     finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+        for leftover in (tmp_path, tmp_path.with_suffix(".sqlite3.gz")):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
 
 @bot.tree.command(
@@ -17066,6 +17086,14 @@ async def _hevy_templates(api_key: str) -> dict[str, dict]:
     if fetched:
         _HEVY_TEMPLATES = fetched
         _HEVY_TEMPLATES_AT = now
+        try:
+            # Keep the dashboard's machine map in step with the catalogue —
+            # same data, zero extra API calls. Operator overrides survive.
+            db.hevy_equipment_map_refresh(
+                {"id": tid, **info} for tid, info in fetched.items()
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Hevy: failed to refresh the equipment map")
     return _HEVY_TEMPLATES
 
 
@@ -17697,7 +17725,9 @@ def _hevy_import_workout(
     if not db.hevy_mark_workout(user_id, wid):
         return None  # raced with another poll
     _stamp()
-    lifts = hevy_client.workout_to_lifts(workout, templates)
+    lifts = hevy_client.workout_to_lifts(
+        workout, templates, db.hevy_equipment_overrides(),
+    )
     prs = _collapse_prs(_new_prs_for_lifts(guild_id, user_id, lifts)) if lifts else {}
     when = _parse_hevy_time(workout.get("start_time"))
     linked = 0
@@ -17876,7 +17906,9 @@ async def _hevy_apply_event(
     guild_id = prov_guild if prov_guild is not None else int(account_row["guild_id"])
 
     summary = hevy_client.summarize_workout(workout)
-    lifts = hevy_client.workout_to_lifts(workout, templates)
+    lifts = hevy_client.workout_to_lifts(
+        workout, templates, db.hevy_equipment_overrides(),
+    )
     when = _parse_hevy_time(workout.get("start_time"))
     new_equips = {lift.equipment for lift in lifts}
     before = db.bests_for_equipment(user_id, old_equips | new_equips)

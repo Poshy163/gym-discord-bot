@@ -144,6 +144,23 @@ value but says so instead of pretending it applied.
 - Workouts are filed under the **server you linked from** (or your `/server`
   default when linking via DM).
 
+## The machine map (dashboard)
+
+The dashboard's **Hevy** tab lists every exercise in Hevy's catalogue (~450,
+fetched with the daily template refresh — no extra API calls) and shows where
+each one's lifts get filed. Roughly 90 land on the alias table's known machines
+out of the box; the rest keep a cleaned-up version of their Hevy title, which is
+consistent but not merged with anything.
+
+Edit the "files under" cell to change it — the value is itself run through the
+alias table, so typing `ohp` lands on `shoulder press` rather than forking a
+new bucket. Saving **pins** the row (the refresh will never revert it); saving
+it empty hands it back to automatic resolution. Mappings are keyed on Hevy's
+stable template id, so they survive the exercise being renamed in Hevy, and
+they apply to imports from now on — including edits replayed by the events
+sync. Already-imported lifts are deliberately left alone; re-filing history is
+a one-shot-migration decision, not a dashboard side effect.
+
 ## Edits and deletions sync back
 
 Fixing a mistyped weight in the Hevy app used to leave the wrong lift here

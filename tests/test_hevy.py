@@ -941,3 +941,70 @@ def test_lift_provenance_reads_guild_from_the_rows(db):
     db.hevy_link(1, 99, "enc-2")     # member re-links from another server
     guild, equips, count = db.hevy_lift_provenance(1, "w1")
     assert guild == 42 and count == 1
+
+
+# ---------------------------------------------------------------------------
+# Hevy machine map (dashboard-editable template -> equipment routing)
+# ---------------------------------------------------------------------------
+
+_CATALOGUE = [
+    {"id": "T-BENCH", "title": "Bench Press (Barbell)",
+     "primary_muscle_group": "chest", "is_custom": False},
+    {"id": "T-BFLY", "title": "Butterfly (Pec Deck)",
+     "primary_muscle_group": "chest", "is_custom": False},
+    {"id": "T-CUSTOM", "title": "Josh's Weird Machine",
+     "primary_muscle_group": "other", "is_custom": True},
+]
+
+
+def test_equipment_map_refresh_seeds_and_is_idempotent(db):
+    assert db.hevy_equipment_map_refresh(_CATALOGUE) == 3
+    rows = {r["template_id"]: r for r in db.hevy_equipment_map_all()}
+    assert rows["T-BENCH"]["equipment"] == "bench press"
+    assert rows["T-BFLY"]["equipment"] == "pec dec"
+    assert rows["T-CUSTOM"]["is_custom"] == 1
+    # Unchanged catalogue -> zero writes.
+    assert db.hevy_equipment_map_refresh(_CATALOGUE) == 0
+
+
+def test_equipment_map_override_survives_a_refresh(db):
+    """The whole reason ``overridden`` exists: the daily catalogue refresh must
+    never revert an operator's dashboard decision."""
+    db.hevy_equipment_map_refresh(_CATALOGUE)
+    assert db.hevy_equipment_map_set("T-BFLY", "chest press", "op") == "chest press"
+    db.hevy_equipment_map_refresh(_CATALOGUE)
+    row = {r["template_id"]: r for r in db.hevy_equipment_map_all()}["T-BFLY"]
+    assert row["equipment"] == "chest press" and row["overridden"] == 1
+    # Clearing hands it back to the automatic resolution and unpins.
+    assert db.hevy_equipment_map_set("T-BFLY", None, "op") == "pec dec"
+    row = {r["template_id"]: r for r in db.hevy_equipment_map_all()}["T-BFLY"]
+    assert row["overridden"] == 0
+    assert db.hevy_equipment_map_set("nope", "x", "op") is None
+
+
+def test_equipment_map_override_is_canonicalised_itself(db):
+    """An operator typing an alias ("ohp") must land on the canonical name, or
+    the map would fork the very buckets it exists to merge."""
+    db.hevy_equipment_map_refresh(_CATALOGUE)
+    assert db.hevy_equipment_map_set("T-BENCH", "OHP", "op") == "shoulder press"
+
+
+def test_equipment_overrides_feed_the_importer(db):
+    db.hevy_equipment_map_refresh(_CATALOGUE)
+    assert db.hevy_equipment_overrides() == {}
+    db.hevy_equipment_map_set("T-BFLY", "chest press", "op")
+    assert db.hevy_equipment_overrides() == {"T-BFLY": "chest press"}
+
+
+def test_workout_to_lifts_prefers_the_override():
+    workout = {"exercises": [{
+        "title": "Butterfly (Pec Deck)", "exercise_template_id": "T-BFLY",
+        "sets": [{"weight_kg": 100, "reps": 6}],
+    }]}
+    lift, = hevy_client.workout_to_lifts(
+        workout, None, {"T-BFLY": "chest press"},
+    )
+    assert lift.equipment == "chest press"
+    # Without the override the alias table decides, as before.
+    lift, = hevy_client.workout_to_lifts(workout)
+    assert lift.equipment == "pec dec"

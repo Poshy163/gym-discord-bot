@@ -1665,3 +1665,62 @@ def test_member_payload_carries_the_food_tally(tmp_path):
             await client.close()
             db.close()
     _run(go())
+
+
+def test_hevy_equipment_map_routes(tmp_path):
+    """GET lists the map; POST pins an override, empty resets, unknown 404s."""
+    async def scenario():
+        db = Database(tmp_path / "gym.sqlite3")
+        db.hevy_equipment_map_refresh([
+            {"id": "T-BFLY", "title": "Butterfly (Pec Deck)",
+             "primary_muscle_group": "chest", "is_custom": False},
+        ])
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            r = await client.get("/api/hevy/equipment")
+            assert r.status == 200
+            rows = (await r.json())["rows"]
+            assert rows[0]["hevy_title"] == "Butterfly (Pec Deck)"
+            assert rows[0]["equipment"] == "pec dec"
+            assert rows[0]["overridden"] is False
+
+            r = await client.post("/api/hevy/equipment/set", json={
+                "template_id": "T-BFLY", "equipment": "chest press",
+            })
+            assert r.status == 200
+            assert (await r.json())["equipment"] == "chest press"
+            assert db.hevy_equipment_overrides() == {"T-BFLY": "chest press"}
+
+            # Empty resets to automatic.
+            r = await client.post("/api/hevy/equipment/set", json={
+                "template_id": "T-BFLY", "equipment": "",
+            })
+            assert (await r.json())["equipment"] == "pec dec"
+            assert db.hevy_equipment_overrides() == {}
+
+            r = await client.post("/api/hevy/equipment/set", json={
+                "template_id": "nope", "equipment": "x",
+            })
+            assert r.status == 404
+        finally:
+            await client.close()
+            db.close()
+
+    _run(scenario())
+
+
+def test_hevy_equipment_map_requires_auth(tmp_path):
+    async def scenario():
+        db = Database(tmp_path / "gym.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            r = await client.get("/api/hevy/equipment")
+            assert r.status in (302, 401, 403)
+        finally:
+            await client.close()
+            db.close()
+
+    _run(scenario())

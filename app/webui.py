@@ -130,6 +130,7 @@ DASHBOARD_TABS: tuple[tuple[str, str], ...] = (
     ("leaderboard", "🏆"),
     ("audit", "📜"),
     ("lifts", "🏋️"),
+    ("hevy", "🔗"),
     ("calories", "🔥"),
     ("protein", "🥩"),
     ("settings", "⚙️"),
@@ -996,6 +997,46 @@ def build_app(
         _require(request)
         gid = _guild_id(request)
         return web.json_response({"equipment": db.known_equipment(gid)})
+
+    async def api_hevy_equipment(request: web.Request) -> web.Response:
+        """The Hevy machine map for the dashboard editor.
+
+        Global rather than guild-scoped: the catalogue is shared across every
+        linked account and the equipment vocabulary is server-wide. Populated
+        by the poll's daily template fetch, so a fresh install shows an empty
+        list until the first linked account syncs."""
+        _require(request)
+        return web.json_response({"rows": [
+            {
+                "template_id": r["template_id"],
+                "hevy_title": r["hevy_title"],
+                "equipment": r["equipment"],
+                "muscle_group": r["muscle_group"],
+                "is_custom": bool(r["is_custom"]),
+                "overridden": bool(r["overridden"]),
+            }
+            for r in db.hevy_equipment_map_all()
+        ]})
+
+    async def api_hevy_equipment_set(request: web.Request) -> web.Response:
+        """Override (or reset) where one Hevy exercise's lifts are filed.
+
+        Affects imports from now on — including edits replayed by the events
+        sync — and deliberately does not re-file lifts already imported; that
+        is a one-shot-migration decision, not a dashboard side effect."""
+        _require(request)
+        try:
+            body = await request.json()
+            template_id = str(body["template_id"]).strip()
+        except Exception:
+            raise web.HTTPBadRequest(text="template_id required")
+        equipment = str(body.get("equipment") or "").strip()
+        value = db.hevy_equipment_map_set(
+            template_id, equipment or None, _actor(request),
+        )
+        if value is None:
+            raise web.HTTPNotFound(text="unknown template id")
+        return web.json_response({"ok": True, "equipment": value})
 
     async def api_leaderboard(request: web.Request) -> web.Response:
         _require(request)
@@ -1962,6 +2003,8 @@ def build_app(
         web.get("/api/protein", api_protein),
         web.get("/api/foods", api_foods),
         web.get("/api/equipment", api_equipment),
+        web.get("/api/hevy/equipment", api_hevy_equipment),
+        web.post("/api/hevy/equipment/set", api_hevy_equipment_set),
         web.get("/api/leaderboard", api_leaderboard),
         web.get("/api/activity", api_activity),
         web.get("/api/activity/log", api_activity_log),
@@ -3251,6 +3294,7 @@ async function render(){
     else if(tab==="roles")await renderRoles(v);
     else if(tab==="leaderboard")await renderLeaderboard(v);
     else if(tab==="audit")await renderAudit(v);
+    else if(tab==="hevy")await renderHevy(v);
     else if(["lifts","calories","protein"].includes(tab))await renderData(v,tab);
   }catch(e){v.innerHTML=errorState(e);}
   finally{v.removeAttribute("aria-busy");}
@@ -4007,6 +4051,64 @@ function setWinDays(d){WIN_DAYS=d;render();}
 function daySeg(){return `<span class="dayseg">`+
   [7,30].map(d=>`<button class="${WIN_DAYS===d?'on':''}" onclick="setWinDays(${d})">${d}d</button>`).join("")+
   `</span>`;}
+
+/* ---- hevy machine map --------------------------------------------------- */
+// One row per Hevy exercise template: where its lifts get filed. The
+// "equipment" cell is editable; saving pins the mapping so the daily catalogue
+// refresh can never revert it, and clearing the cell hands it back to the
+// automatic alias resolution. Only reaches imports from now on — re-filing
+// history is a migration decision, not a dashboard side effect.
+let HEVY_MAP_ROWS=[];
+async function renderHevy(v){
+  const d=await get("/api/hevy/equipment");
+  HEVY_MAP_ROWS=d.rows||[];
+  if(!HEVY_MAP_ROWS.length){
+    v.innerHTML='<div class="state-card"><h2>No Hevy catalogue yet</h2>'+
+      '<p>The machine map fills in when the first linked Hevy account syncs '+
+      '(the poll fetches the exercise catalogue about once a day).</p></div>';
+    return;
+  }
+  v.innerHTML=`<div class="box"><h3 style="display:flex;justify-content:space-between;align-items:center">
+      <span>Hevy machine map <span class="muted">(${HEVY_MAP_ROWS.length} exercises)</span></span>
+      <input id="hevyFilter" placeholder="filter…" style="max-width:220px"
+        oninput="hevyMapDraw()"></h3>
+    <p class="muted">Where each Hevy exercise's lifts are filed. Edit a cell and
+      save to pin it (the automatic refresh will never change a pinned row);
+      save an empty cell to hand it back to the alias table. Changes apply to
+      imports from now on.</p>
+    <div id="hevyMapTable"></div></div>`;
+  hevyMapDraw();
+}
+function hevyMapDraw(){
+  const holder=document.getElementById("hevyMapTable");if(!holder)return;
+  const q=(document.getElementById("hevyFilter")?.value||"").trim().toLowerCase();
+  const rows=HEVY_MAP_ROWS.filter(r=>!q
+    ||r.hevy_title.toLowerCase().includes(q)
+    ||r.equipment.toLowerCase().includes(q)
+    ||(r.muscle_group||"").toLowerCase().includes(q));
+  const shown=rows.slice(0,200);
+  holder.innerHTML=`<table><thead><tr><th>Hevy exercise</th><th>Muscle</th>
+      <th>Files under</th><th></th></tr></thead><tbody>
+    ${shown.map(r=>`<tr>
+      <td><b>${esc(r.hevy_title)}</b>${r.is_custom?' <span class="pill">custom</span>':''}</td>
+      <td class="muted">${esc(r.muscle_group||"")}</td>
+      <td><input value="${esc(r.equipment)}" id="hevyEq-${esc(r.template_id)}"
+        style="min-width:180px">${r.overridden?' <span class="pill">pinned</span>':''}</td>
+      <td class="right"><button class="btn sm"
+        onclick="hevyMapSave('${esc(r.template_id)}')">Save</button></td>
+    </tr>`).join("")}
+  </tbody></table>
+  ${rows.length>shown.length?`<p class="muted">…and ${rows.length-shown.length} more — narrow the filter.</p>`:""}`;
+}
+async function hevyMapSave(tid){
+  const input=document.getElementById("hevyEq-"+tid);if(!input)return;
+  const r=await post("/api/hevy/equipment/set",{template_id:tid,equipment:input.value});
+  if(r&&r.ok){
+    const row=HEVY_MAP_ROWS.find(x=>x.template_id===tid);
+    if(row){row.equipment=r.equipment;row.overridden=!!input.value.trim();}
+    toast(`Filed under “${r.equipment}”`);hevyMapDraw();
+  }else{toast("Could not save that","error");}
+}
 
 async function renderActivity(v){
   const d=await api(`/api/activity?guild=${guild}&days=${WIN_DAYS}`);if(!d)return;

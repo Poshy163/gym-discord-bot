@@ -730,7 +730,10 @@ BODYWEIGHT_ADDED_TYPES = frozenset({"bodyweight_weighted"})
 BODYWEIGHT_ASSISTED_TYPES = frozenset({"bodyweight_assisted"})
 
 
-def workout_to_lifts(workout: dict, templates: dict | None = None) -> list[Lift]:
+def workout_to_lifts(
+    workout: dict, templates: dict | None = None,
+    equipment_overrides: dict[str, str] | None = None,
+) -> list[Lift]:
     """Map a Hevy workout's exercises/sets to canonical :class:`Lift` rows.
 
     One ``Lift`` per *weighted* working set (positive ``weight_kg``); sets with
@@ -749,16 +752,20 @@ def workout_to_lifts(workout: dict, templates: dict | None = None) -> list[Lift]
     the template's ``type``, so consult it and set ``bodyweight_add``
     accordingly. With no template the old reading stands: assistance is the far
     commoner logging style and is what the equipment name already implies.
+
+    ``equipment_overrides`` maps a template id straight to an equipment name —
+    the operator's dashboard decisions. Keyed on the template id rather than
+    the title so the mapping survives Hevy renaming the exercise, and consulted
+    before :func:`canonicalize` so an override always wins.
     """
     out: list[Lift] = []
     for ex in workout.get("exercises") or []:
         title = (ex.get("title") or "").strip()
         if not title:
             continue
-        equipment = canonicalize(title)
-        template = (templates or {}).get(
-            str(ex.get("exercise_template_id") or ""),
-        )
+        tid = str(ex.get("exercise_template_id") or "")
+        equipment = (equipment_overrides or {}).get(tid) or canonicalize(title)
+        template = (templates or {}).get(tid)
         kind = (
             str(template.get("type") or "").strip().lower()
             if isinstance(template, dict) else ""

@@ -735,6 +735,25 @@ CREATE TABLE IF NOT EXISTS hevy_imported (
     PRIMARY KEY (user_id, workout_id)
 );
 
+-- Hevy's exercise catalogue mapped onto the bot's equipment vocabulary. One
+-- row per exercise template, global — the catalogue is shared across accounts
+-- and custom templates carry their own unique ids. ``equipment`` starts as
+-- canonicalize(title) and is what the importer files lifts under; an operator
+-- can override it from the dashboard, and ``overridden`` is what stops the
+-- next catalogue refresh from silently reverting their decision. Deliberately
+-- separate from custom_aliases: that table is guild-scoped chat vocabulary,
+-- this one is keyed by Hevy's stable template id and survives any rename of
+-- the exercise's title.
+CREATE TABLE IF NOT EXISTS hevy_equipment_map (
+    template_id  TEXT PRIMARY KEY,
+    hevy_title   TEXT NOT NULL,
+    equipment    TEXT NOT NULL,
+    muscle_group TEXT,
+    is_custom    INTEGER NOT NULL DEFAULT 0,
+    overridden   INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL
+);
+
 -- Each member's own Home Assistant, set up with /setup_ha. The long-lived access
 -- token is stored Fernet-encrypted in ``token_enc`` — plaintext is never
 -- persisted, matching the Hevy/Strava/Revo convention.
@@ -4351,6 +4370,116 @@ class Database:
                 """,
                 (user_id,),
             ))
+
+    def hevy_equipment_map_refresh(self, templates: "Iterable[dict]") -> int:
+        """Sync the map with a freshly-fetched template catalogue.
+
+        New templates are inserted with ``equipment = canonicalize(title)``.
+        Existing rows get their title/muscle refreshed, and their equipment
+        re-derived **only when not overridden** — an operator's dashboard
+        decision must survive every refresh, while alias-table improvements
+        still propagate to the rows nobody touched. Returns rows written."""
+        from .aliases import canonicalize as _canon
+        now = _normalize_iso(None)
+        written = 0
+        with self._conn() as c:
+            for t in templates or []:
+                tid = str(t.get("id") or "")
+                title = str(t.get("title") or "").strip()
+                if not tid or not title:
+                    continue
+                muscle = str(t.get("primary_muscle_group") or "").strip() or None
+                custom = 1 if t.get("is_custom") else 0
+                derived = _canon(title)
+                row = c.execute(
+                    "SELECT hevy_title, equipment, muscle_group, overridden "
+                    "FROM hevy_equipment_map WHERE template_id = ?",
+                    (tid,),
+                ).fetchone()
+                if row is None:
+                    c.execute(
+                        "INSERT INTO hevy_equipment_map (template_id, "
+                        "hevy_title, equipment, muscle_group, is_custom, "
+                        "overridden, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                        (tid, title, derived, muscle, custom, now),
+                    )
+                    written += 1
+                    continue
+                new_equipment = (
+                    row["equipment"] if row["overridden"] else derived
+                )
+                if (row["hevy_title"], row["equipment"], row["muscle_group"]) \
+                        != (title, new_equipment, muscle):
+                    c.execute(
+                        "UPDATE hevy_equipment_map SET hevy_title = ?, "
+                        "equipment = ?, muscle_group = ?, is_custom = ?, "
+                        "updated_at = ? WHERE template_id = ?",
+                        (title, new_equipment, muscle, custom, now, tid),
+                    )
+                    written += 1
+        return written
+
+    def hevy_equipment_map_all(self) -> list[sqlite3.Row]:
+        """Every mapped template, for the dashboard editor. Title order."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT template_id, hevy_title, equipment, muscle_group, "
+                "is_custom, overridden, updated_at FROM hevy_equipment_map "
+                "ORDER BY hevy_title COLLATE NOCASE",
+            ))
+
+    def hevy_equipment_map_set(
+        self, template_id: str, equipment: str | None, actor: str,
+    ) -> str | None:
+        """Override (or reset) one template's equipment from the dashboard.
+
+        A non-empty ``equipment`` pins the mapping (``overridden = 1``); empty
+        or None resets it to canonicalize(title) and unpins, so the next
+        refresh manages it again. Returns the equipment now in force, or None
+        when the template id is unknown."""
+        from .aliases import canonicalize as _canon
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT hevy_title FROM hevy_equipment_map "
+                "WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            cleaned = (equipment or "").strip().lower()
+            if cleaned:
+                value, overridden = _canon(cleaned), 1
+            else:
+                value, overridden = _canon(row["hevy_title"]), 0
+            c.execute(
+                "UPDATE hevy_equipment_map SET equipment = ?, overridden = ?, "
+                "updated_at = ? WHERE template_id = ?",
+                (value, overridden, _normalize_iso(None), template_id),
+            )
+            self._audit(
+                c, 0, "data", "hevy_equipment_map",
+                actor_name=actor,
+                detail=(
+                    f"{row['hevy_title']} -> {value}"
+                    + ("" if overridden else " (reset to automatic)")
+                ),
+            )
+            return value
+
+    def hevy_equipment_overrides(self) -> dict[str, str]:
+        """{template_id: equipment} for the importer — overridden rows only.
+
+        Only overrides, on purpose: the automatic rows would resolve to the
+        same value canonicalize gives anyway, and keeping the dict small keeps
+        the per-import lookups cheap."""
+        with self._conn() as c:
+            return {
+                str(r["template_id"]): str(r["equipment"])
+                for r in c.execute(
+                    "SELECT template_id, equipment FROM hevy_equipment_map "
+                    "WHERE overridden = 1",
+                )
+            }
 
     def hevy_get_import(self, user_id: int, workout_id: str) -> sqlite3.Row | None:
         """The full ledger row for one workout — the events sync's admission
