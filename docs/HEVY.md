@@ -53,6 +53,9 @@ available; importing works even without a feed channel.
 - `/hevy_status` — show whether you're linked and when it last synced.
 - `/hevy_unlink` — delete your stored key and import history.
 
+Only `/hevy_link` replies privately (so the key never appears in a channel); the
+other Hevy commands reply publicly.
+
 ## Behaviour notes
 
 - **No double-logging:** each Hevy workout id is recorded once imported, so

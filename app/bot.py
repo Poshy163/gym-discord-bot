@@ -16808,7 +16808,6 @@ async def hevy_unlink_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         "🗑️ Hevy unlinked — your encrypted API key was removed."
         if removed else "You don't have a linked Hevy account.",
-        ephemeral=True,
     )
 
 
@@ -16823,7 +16822,6 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
     if row is None:
         await interaction.response.send_message(
             "No Hevy account linked. Use `/hevy_link` to connect one.",
-            ephemeral=True,
         )
         return
     feed = (
@@ -16833,7 +16831,7 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
     )
     last = row["last_synced_at"] or "not yet"
     await interaction.response.send_message(
-        f"✅ Hevy linked. Last sync: {last}.{feed}", ephemeral=True,
+        f"✅ Hevy linked. Last sync: {last}.{feed}",
     )
 
 
@@ -16846,31 +16844,30 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
 async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
     if not _hevy_enabled():
         await interaction.response.send_message(
-            "Hevy integration isn't available right now.", ephemeral=True,
+            "Hevy integration isn't available right now.",
         )
         return
     row = db.hevy_get(interaction.user.id)
     if row is None:
         await interaction.response.send_message(
-            "You haven't linked Hevy yet — see `/hevy_help`.", ephemeral=True,
+            "You haven't linked Hevy yet — see `/hevy_help`.",
         )
         return
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     result = await _hevy_sync_account(row, force_backfill=True)
     if result.get("error") == "auth":
         await interaction.followup.send(
             "❌ Hevy rejected your API key — re-link with `/hevy_link`.",
-            ephemeral=True,
         )
         return
     if result.get("error"):
         await interaction.followup.send(
-            "Couldn't reach Hevy just now — try again shortly.", ephemeral=True,
+            "Couldn't reach Hevy just now — try again shortly.",
         )
         return
     if result["new"] == 0:
         await interaction.followup.send(
-            "✅ Already up to date — no new workouts to import.", ephemeral=True,
+            "✅ Already up to date — no new workouts to import.",
         )
         return
     feed = (
@@ -16882,7 +16879,6 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
         f"✅ Imported **{result['new']}** workout"
         f"{'s' if result['new'] != 1 else ''} — {result['lifts']} lifts, "
         f"{result['volume_kg']:,} kg volume{prs}.{feed}",
-        ephemeral=True,
     )
 
 
@@ -16964,7 +16960,7 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
             inline=False,
         )
     embed.set_footer(text="Hevy Pro required · your key is encrypted at rest")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 
 def _hevy_duration_str(seconds: int | None) -> str | None:
@@ -17276,7 +17272,7 @@ async def hevy_recent_cmd(
 ) -> None:
     if not _hevy_enabled():
         await interaction.response.send_message(
-            "Hevy integration isn't available right now.", ephemeral=True,
+            "Hevy integration isn't available right now.",
         )
         return
     target = member or interaction.user
@@ -17290,7 +17286,7 @@ async def hevy_recent_cmd(
             else f"{target.mention} hasn't linked a Hevy account."
         )
         await interaction.response.send_message(
-            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            msg, allowed_mentions=discord.AllowedMentions.none(),
         )
         return
 
@@ -17319,13 +17315,13 @@ async def hevy_recent_cmd(
             LOG.info("Hevy recent fetch failed for %s: %s", target.id, result)
             msg = "Couldn't reach Hevy just now — try again shortly."
         await interaction.followup.send(
-            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            msg, allowed_mentions=discord.AllowedMentions.none(),
         )
         return
     if result is None:
         await interaction.followup.send(
             f"No Hevy workouts found for {target.display_name}.",
-            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
         return
     summary = hevy_client.summarize_workout(result)
