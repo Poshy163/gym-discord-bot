@@ -638,3 +638,62 @@ def test_recanon_v2_runs_only_once(tmp_path):
         db4.close()
     finally:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Weighted vs assisted bodyweight lifts (resolved by the template's `type`)
+# ---------------------------------------------------------------------------
+
+BW_WORKOUT = {
+    "id": "bw-1", "title": "Calisthenics",
+    "start_time": "2026-08-19T08:00:00Z",
+    "exercises": [
+        {"title": "Pull Up (Weighted)", "exercise_template_id": "TPL-W",
+         "sets": [{"weight_kg": 20, "reps": 5}]},
+        {"title": "Pull Up (Assisted)", "exercise_template_id": "TPL-A",
+         "sets": [{"weight_kg": 36, "reps": 6}]},
+    ],
+}
+
+BW_TEMPLATES = hevy_client.index_templates([
+    # Hevy's real values, confirmed against the live /exercise_templates feed.
+    {"id": "TPL-W", "title": "Pull Up (Weighted)", "type": "bodyweight_weighted",
+     "primary_muscle_group": "lats"},
+    {"id": "TPL-A", "title": "Pull Up (Assisted)", "type": "bodyweight_assisted",
+     "primary_muscle_group": "lats"},
+])
+
+
+def test_weighted_bodyweight_lift_is_added_not_subtracted():
+    """Both titles canonicalize to `pull ups`, which the bot reads as an
+    assistance-logged lift. Without the template a +20kg weighted pull-up became
+    20kg of *assistance* — bodyweight minus 20 instead of plus, a ~40kg error
+    that makes adding weight look like a regression."""
+    weighted, assisted = hevy_client.workout_to_lifts(BW_WORKOUT, BW_TEMPLATES)
+    assert weighted.weight_kg == 20.0 and weighted.bodyweight_add is True
+    assert assisted.weight_kg == 36.0 and assisted.bodyweight_add is False
+
+
+def test_bodyweight_lift_without_a_template_keeps_the_old_reading():
+    """Assistance is the commoner logging style and what the equipment name
+    already implies, so an unresolved template must not flip the meaning."""
+    for lift in hevy_client.workout_to_lifts(BW_WORKOUT):
+        assert lift.bodyweight_add is False
+    for lift in hevy_client.workout_to_lifts(BW_WORKOUT, {}):
+        assert lift.bodyweight_add is False
+
+
+def test_ordinary_lifts_are_never_marked_bodyweight_relative():
+    templates = hevy_client.index_templates([
+        {"id": "TPL-B", "title": "Bench Press (Barbell)", "type": "weight_reps"},
+    ])
+    w = {"exercises": [{"title": "Bench Press (Barbell)",
+                        "exercise_template_id": "TPL-B",
+                        "sets": [{"weight_kg": 100, "reps": 5}]}]}
+    lift, = hevy_client.workout_to_lifts(w, templates)
+    assert lift.bodyweight_add is False and lift.equipment == "bench press"
+
+
+def test_index_templates_keeps_the_type():
+    assert BW_TEMPLATES["TPL-W"]["type"] == "bodyweight_weighted"
+    assert BW_TEMPLATES["TPL-A"]["type"] == "bodyweight_assisted"

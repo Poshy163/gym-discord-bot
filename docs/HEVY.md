@@ -87,6 +87,17 @@ other Hevy commands reply publicly.
 
   **Any future alias change affecting a Hevy title needs its own `_vN` key** —
   there is no other route back to those rows.
+- **Weighted and assisted bodyweight lifts are told apart.** "Pull Up
+  (Weighted)" and "Pull Up (Assisted)" both canonicalise to `pull ups`, which
+  the bot reads as an assistance-logged lift — so a +20kg weighted pull-up used
+  to be recorded as 20kg of *assistance*, giving a true load of bodyweight minus
+  20 instead of plus. At 104kg bodyweight that is 83.9kg instead of 123.9kg: a
+  40kg error in the wrong direction that makes adding weight look like a
+  regression. Hevy states which it is in the exercise template's `type`
+  (`bodyweight_weighted` vs `bodyweight_assisted`), so the importer consults the
+  template catalogue it already fetches. With no template available the
+  assistance reading stands, since that is the commoner logging style and what
+  the equipment name implies.
 - **No double-logging:** each Hevy workout id is recorded once imported, so
   repeated polls never re-import. Unlinking clears that history.
 - **First sync is quiet:** the poll right after linking imports your recent

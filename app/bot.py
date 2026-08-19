@@ -17580,6 +17580,7 @@ def _hevy_backfill_embed(member_name: str, stats: dict) -> discord.Embed:
 
 def _hevy_import_workout(
     user_id: int, guild_id: int, username: str, workout: dict,
+    templates: dict[str, dict] | None = None,
 ) -> dict | None:
     """Import one Hevy workout's lifts (deduped), detecting any new PRs first.
 
@@ -17592,7 +17593,7 @@ def _hevy_import_workout(
         return None
     if not db.hevy_mark_workout(user_id, wid):
         return None  # raced with another poll
-    lifts = hevy_client.workout_to_lifts(workout)
+    lifts = hevy_client.workout_to_lifts(workout, templates)
     prs = _collapse_prs(_new_prs_for_lifts(guild_id, user_id, lifts)) if lifts else {}
     when = _parse_hevy_time(workout.get("start_time"))
     if lifts:
@@ -17689,9 +17690,16 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
 
     # Hevy returns newest-first; import oldest-first so logs read chronologically
     # and PRs accrue in the right order.
+    # Fetched before the import loop, not just before the feed post: the
+    # template's `type` decides whether a bodyweight lift's kg is assistance or
+    # added load, and that has to be right at the moment the Lift is written.
+    templates = await _hevy_templates(api_key) if workouts else {}
+
     imported: list[dict] = []
     for workout in reversed(workouts):
-        r = _hevy_import_workout(user_id, guild_id, username, workout)
+        r = _hevy_import_workout(
+            user_id, guild_id, username, workout, templates,
+        )
         if r is not None:
             imported.append(r)
 
@@ -17722,7 +17730,6 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
             # no lifts. A calisthenics or treadmill session has no weighted set
             # to import, and skipping it made the workout vanish silently — it
             # was marked imported, so nothing would ever post it again.
-            templates = await _hevy_templates(api_key)
             for r in imported:
                 try:
                     await feed_channel.send(

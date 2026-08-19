@@ -564,7 +564,17 @@ def merge_measurement(existing: dict, fields: dict) -> dict | None:
     return merged if changed else None
 
 
-def workout_to_lifts(workout: dict) -> list[Lift]:
+#: Hevy exercise-template ``type`` values where ``weight_kg`` is **added to**
+#: bodyweight rather than being the whole load: "Pull Up (Weighted)", "Chest Dip
+#: (Weighted)", "Push Up (Weighted)", "Negative Pull Up", ...
+BODYWEIGHT_ADDED_TYPES = frozenset({"bodyweight_weighted"})
+
+#: ...and where it is the machine/band **assistance** taken off them: "Pull Up
+#: (Assisted)", "Pull Up (Band)", "Chin Up (Assisted)", "Chest Dip (Assisted)".
+BODYWEIGHT_ASSISTED_TYPES = frozenset({"bodyweight_assisted"})
+
+
+def workout_to_lifts(workout: dict, templates: dict | None = None) -> list[Lift]:
     """Map a Hevy workout's exercises/sets to canonical :class:`Lift` rows.
 
     One ``Lift`` per *weighted* working set (positive ``weight_kg``); sets with
@@ -572,6 +582,17 @@ def workout_to_lifts(workout: dict) -> list[Lift]:
     lift log. Exercise titles are run through :func:`aliases.canonicalize` so a
     Hevy "Bench Press (Barbell)" lands on the same equipment as a chat-logged
     "bench".
+
+    ``templates`` (from :func:`index_templates`) resolves the one case the title
+    alone cannot. "Pull Up (Assisted)" and "Pull Up (Weighted)" both canonicalize
+    to ``pull ups``, which the bot treats as an assistance-logged lift — so
+    without the template a *weighted* pull-up at +20kg is read as 20kg of
+    assistance and its true load comes out as bodyweight **minus** 20 instead of
+    plus. That is a ~40kg error at a 100kg bodyweight, in the wrong direction,
+    and it makes adding weight look like a regression. Hevy states which it is in
+    the template's ``type``, so consult it and set ``bodyweight_add``
+    accordingly. With no template the old reading stands: assistance is the far
+    commoner logging style and is what the equipment name already implies.
     """
     out: list[Lift] = []
     for ex in workout.get("exercises") or []:
@@ -579,6 +600,14 @@ def workout_to_lifts(workout: dict) -> list[Lift]:
         if not title:
             continue
         equipment = canonicalize(title)
+        template = (templates or {}).get(
+            str(ex.get("exercise_template_id") or ""),
+        )
+        kind = (
+            str(template.get("type") or "").strip().lower()
+            if isinstance(template, dict) else ""
+        )
+        bodyweight_add = kind in BODYWEIGHT_ADDED_TYPES
         for s in ex.get("sets") or []:
             weight = _as_float(s.get("weight_kg"))
             if weight is None or weight <= 0:
@@ -587,6 +616,7 @@ def workout_to_lifts(workout: dict) -> list[Lift]:
             out.append(Lift(
                 equipment=equipment,
                 weight_kg=weight,
+                bodyweight_add=bodyweight_add,
                 reps=reps,
                 raw=f"hevy:{title}",
                 confident=True,
@@ -780,6 +810,7 @@ def index_templates(templates: list[dict]) -> dict[str, dict]:
             continue
         out[tid] = {
             "title": (template.get("title") or "").strip(),
+            "type": (template.get("type") or "").strip().lower(),
             "primary_muscle_group": (
                 template.get("primary_muscle_group") or ""
             ).strip().lower(),
