@@ -112,10 +112,41 @@ written to that member's Hevy body measurements for the day.
   6553.5 kg is never mirrored (it would be far harder to retract from Hevy than
   from the bot).
 - **Linking a scale doesn't backfill Hevy.** The first import after linking Home
-  Assistant pushes only its newest reading; replaying months of history would be
-  one write per day into an account the member didn't ask you to fill.
+  Assistant pushes only its newest reading — the *reconcile* below is what fills
+  in history, once, deliberately.
 - **Hevy failures never fail a weigh-in.** The push happens *after* the weigh-in
   is safely in the bot's database, and any error is logged and swallowed — the
   bot's log is the source of truth and Hevy is the copy.
 - Turn it off with **Mirror weigh-ins to Hevy** in the dashboard, or
   `HEVY_PUSH_BODYWEIGHT=0`.
+
+### The one-time reconcile
+
+Mirroring only covers weigh-ins from the moment it is switched on, which would
+leave every existing member with two half-histories. So the **first** poll after
+an account is linked merges them, in both directions at once:
+
+| | Bot has the day | Bot doesn't |
+| --- | --- | --- |
+| **Hevy has the day** | left alone | imported as a weigh-in |
+| **Hevy doesn't** | pushed to Hevy | — |
+
+- **Already-linked members get this too.** The marker starts NULL, so an account
+  linked long before the feature existed looks exactly like a fresh one to the
+  poll and is caught up on its next pass. Nobody has to re-link.
+- **A day both sides already have is never touched.** That is what stops the
+  reconcile echoing — re-importing a weight the bot pushed moments earlier — and
+  what makes re-running it (`/hevy_sync`) a no-op: anything imported the first
+  time is now one of the bot's own days. There is no ledger table; the two
+  histories *are* the ledger.
+- **Imported days land at local midday**, matching how the bot materialises any
+  other date without a time — midnight would sort before every same-day scale
+  reading and could collide exactly with one.
+- Body fat and lean mass come across with the weight. Entries in Hevy that record
+  only circumferences describe no weigh-in and are skipped, as are implausible
+  weights.
+- **Bounded to the most recent 200 entries per side.** Hevy pages body
+  measurements ten at a time, so an unbounded merge on a years-old daily-weigh-in
+  account would be hundreds of round trips on first contact.
+- If Hevy is unreachable the marker is left unset, so the merge is retried next
+  poll rather than being silently skipped forever.

@@ -283,6 +283,72 @@ def fetch_body_measurement(api_key: str, date: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def fetch_body_measurements(api_key: str, limit: int = 200) -> list[dict]:
+    """The account's recent body measurements, newest-first.
+
+    Pages at Hevy's documented maximum of 10 per request. ``limit`` exists
+    because a member who has weighed in daily for years would otherwise cost
+    hundreds of round trips on a one-time reconcile; capping it means an old
+    account merges its recent history rather than all of it.
+    """
+    page_size = 10
+    out: list[dict] = []
+    page = 1
+    while len(out) < limit:
+        data = _get(
+            api_key, "/body_measurements", {"page": page, "pageSize": page_size},
+        )
+        batch = (
+            data.get("body_measurements", []) or []
+            if isinstance(data, dict) else []
+        )
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < page_size:
+            break  # last page
+        page += 1
+        if page > 40:  # hard safety cap (400 entries) against a bad loop
+            break
+    return out[:limit]
+
+
+def metrics_from_measurement(measurement: dict) -> dict:
+    """Inverse of :func:`measurement_fields` — Hevy's fields as bot metrics.
+
+    Returns the ``{metric_key: (value, unit)}`` shape ``db.add_body_metrics``
+    expects, excluding weight (which is a weigh-in, not a composition metric,
+    and goes through ``set_bodyweight``). Values outside
+    :data:`_MEASUREMENT_BOUNDS` are dropped, so a bad entry in Hevy cannot ride
+    back into the bot's own history.
+    """
+    units = {"fat_percent": "%", "lean_mass_kg": "kg"}
+    out: dict[str, tuple[float, str]] = {}
+    for metric_key, field in MEASUREMENT_FIELDS.items():
+        if metric_key == "weight":
+            continue
+        value = _as_float((measurement or {}).get(field))
+        if value is None:
+            continue
+        low, high = _MEASUREMENT_BOUNDS[field]
+        if not (low <= value <= high):
+            continue
+        out[metric_key] = (value, units.get(field, ""))
+    return out
+
+
+def measurement_weight(measurement: dict) -> float | None:
+    """The weigh-in in a Hevy measurement, or None if it has none or it's daft.
+
+    Hevy lets an entry record only circumferences, so ``weight_kg`` is genuinely
+    optional — such an entry describes no weigh-in and must not become one."""
+    value = _as_float((measurement or {}).get("weight_kg"))
+    if value is None:
+        return None
+    low, high = _MEASUREMENT_BOUNDS["weight_kg"]
+    return value if low <= value <= high else None
+
+
 def create_body_measurement(api_key: str, payload: dict) -> Any:
     """POST a new body measurement. Raises :class:`HevyConflict` if the date is taken."""
     return _request(api_key, "POST", "/body_measurements", payload=payload)

@@ -679,15 +679,20 @@ CREATE INDEX IF NOT EXISTS idx_apple_health_workout_user_started
 -- first sync after linking: the workout payload never names its owner, so
 -- without them the feed can only ever show the member's Discord name and cannot
 -- link their public Hevy profile.
+-- ``measurements_synced_at`` marks the one-time bodyweight reconcile between the
+-- bot and Hevy's body measurements. NULL means "not done yet", which is what
+-- lets accounts linked before the reconcile existed pick it up on their next
+-- poll rather than only ever benefiting new links.
 CREATE TABLE IF NOT EXISTS hevy_account (
-    user_id          INTEGER PRIMARY KEY,
-    guild_id         INTEGER NOT NULL,
-    api_key_enc      TEXT    NOT NULL,
-    hevy_username    TEXT,
-    hevy_profile_url TEXT,
-    last_synced_at   TEXT,
-    linked_at        TEXT    NOT NULL,
-    backfilled_at    TEXT
+    user_id               INTEGER PRIMARY KEY,
+    guild_id              INTEGER NOT NULL,
+    api_key_enc           TEXT    NOT NULL,
+    hevy_username         TEXT,
+    hevy_profile_url      TEXT,
+    last_synced_at        TEXT,
+    linked_at             TEXT    NOT NULL,
+    backfilled_at         TEXT,
+    measurements_synced_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hevy_imported (
@@ -1272,6 +1277,14 @@ class Database:
             if hevy_cols and "hevy_profile_url" not in hevy_cols:
                 self._connection.execute(
                     "ALTER TABLE hevy_account ADD COLUMN hevy_profile_url TEXT"
+                )
+            # One-time bodyweight reconcile marker. Left NULL by this migration
+            # on purpose: every already-linked account then looks exactly like a
+            # fresh one to the poll and gets its history merged on the next pass.
+            if hevy_cols and "measurements_synced_at" not in hevy_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_account "
+                    "ADD COLUMN measurements_synced_at TEXT"
                 )
             msg_cols = {
                 row["name"]
@@ -4045,6 +4058,18 @@ class Database:
                 (name, url, user_id),
             )
             return True
+
+    def hevy_mark_measurements_synced(
+        self, user_id: int, at: datetime | None = None,
+    ) -> None:
+        """Record that this account has had its one-time bodyweight reconcile,
+        so routine polls stop re-walking both histories."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET measurements_synced_at = ? "
+                "WHERE user_id = ?",
+                (_normalize_iso(at), user_id),
+            )
 
     def hevy_mark_backfilled(
         self, user_id: int, at: datetime | None = None,

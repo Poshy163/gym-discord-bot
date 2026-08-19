@@ -13,6 +13,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 import asyncio  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -162,3 +163,145 @@ def test_two_weigh_ins_on_one_local_day_share_a_hevy_entry(push_env, monkeypatch
     _run(bot_mod._hevy_push_bodyweight(7, 80.0, morning))
     _run(bot_mod._hevy_push_bodyweight(7, 80.5, evening))
     assert [call[1] for call in push_env] == ["2026-08-17", "2026-08-17"]
+
+
+# ---------------------------------------------------------------------------
+# One-time two-way bodyweight reconcile
+# ---------------------------------------------------------------------------
+
+class _Row(dict):
+    """Stands in for a sqlite3.Row (which supports both [] and .keys())."""
+
+
+@pytest.fixture()
+def reconcile_env(monkeypatch, tmp_path):
+    from zoneinfo import ZoneInfo
+    from app.db import Database
+
+    monkeypatch.setattr(bot_mod, "HEVY_PUSH_BODYWEIGHT", True, raising=False)
+    monkeypatch.setattr(bot_mod, "_hevy_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "DISPLAY_TZ", ZoneInfo("UTC"))
+    monkeypatch.setattr(bot_mod, "MAX_WEIGHT_KG", 500, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "loop", _SyncLoop(), raising=False)
+    monkeypatch.setattr(hevy_client, "decrypt_key", lambda token: "plain-key")
+
+    database = Database(tmp_path / "gym.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+
+    pushed: list[tuple] = []
+    monkeypatch.setattr(
+        hevy_client, "push_body_measurement",
+        lambda api_key, day, fields: pushed.append((day, fields)) or "created",
+    )
+
+    def _remote(entries):
+        monkeypatch.setattr(
+            hevy_client, "fetch_body_measurements",
+            lambda api_key, limit=200: list(entries),
+        )
+
+    database.hevy_link(7, 42, "enc")
+    return SimpleNamespace(
+        db=database, pushed=pushed, set_remote=_remote,
+        row=lambda: database.hevy_get(7),
+    )
+
+
+
+def test_reconcile_fills_each_side_with_what_the_other_is_missing(reconcile_env):
+    """The headline behaviour: an existing member's history merges both ways on
+    the first poll after linking — nothing is duplicated, nothing is lost."""
+    env = reconcile_env
+    # The bot knows about two days Hevy has never seen.
+    env.db.set_bodyweight(42, 7, 82.4,
+                          recorded_at=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc))
+    env.db.set_bodyweight(42, 7, 81.9,
+                          recorded_at=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc))
+    # Hevy knows about one day the bot has never seen, plus one they share.
+    env.set_remote([
+        {"date": "2026-08-05", "weight_kg": 81.9},
+        {"date": "2026-07-20", "weight_kg": 83.2, "fat_percent": 19.0,
+         "lean_mass_kg": 64.0},
+    ])
+
+    out = _run(bot_mod._hevy_reconcile_measurements(env.row()))
+
+    assert out == {"pushed": 1, "imported": 1}
+    # Only the day Hevy lacked was pushed; the shared day was left alone.
+    assert [day for day, _ in env.pushed] == ["2026-08-01"]
+    # The day only Hevy had is now a real weigh-in, at local midday.
+    history = env.db.bodyweight_history(42, 7, limit=50)
+    assert [round(r["weight_kg"], 1) for r in history] == [83.2, 82.4, 81.9]
+    assert history[0]["recorded_at"].startswith("2026-07-20T12:00")
+    # ...with its body composition alongside it.
+    fat = env.db.body_metric_history(7, "body_fat_pct", limit=10)
+    assert [round(p["value"], 1) for p in fat] == [19.0]
+
+
+def test_reconcile_runs_once_and_is_a_noop_when_forced_again(reconcile_env):
+    """Re-running must not double-log: everything imported the first time is now
+    one of the bot's own days, so the second pass sees both sides agreeing."""
+    env = reconcile_env
+    env.set_remote([{"date": "2026-07-20", "weight_kg": 83.2}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1
+    # Marked done, so an ordinary poll skips it entirely.
+    assert env.row()["measurements_synced_at"] is not None
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
+        "pushed": 0, "imported": 0,
+    }
+    # Even forced, it finds nothing new — no duplicate weigh-in.
+    out = _run(bot_mod._hevy_reconcile_measurements(env.row(), force=True))
+    assert out == {"pushed": 0, "imported": 0}
+    assert len(env.db.bodyweight_history(42, 7, limit=50)) == 1
+
+
+def test_reconcile_catches_up_an_already_linked_account(reconcile_env):
+    """The marker is NULL for every account linked before this existed, which is
+    what makes them pick the merge up on their next ordinary poll."""
+    env = reconcile_env
+    assert env.row()["measurements_synced_at"] is None
+    env.set_remote([{"date": "2026-07-20", "weight_kg": 83.2}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1
+
+
+def test_reconcile_ignores_a_circumference_only_entry(reconcile_env):
+    """Hevy lets an entry record only tape measurements. That describes no
+    weigh-in and must not become one."""
+    env = reconcile_env
+    env.set_remote([{"date": "2026-07-20", "waist": 80.0, "chest_cm": 95.0}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 0
+    assert env.db.bodyweight_history(42, 7, limit=50) == []
+
+
+def test_reconcile_rejects_an_implausible_remote_weight(reconcile_env):
+    env = reconcile_env
+    env.set_remote([{"date": "2026-07-20", "weight_kg": 6553.5}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 0
+    assert env.db.bodyweight_history(42, 7, limit=50) == []
+
+
+def test_reconcile_leaves_the_marker_unset_when_hevy_is_unreachable(reconcile_env,
+                                                                    monkeypatch):
+    """A failed fetch must not count as "reconciled", or the one chance to merge
+    is burned by a transient outage."""
+    env = reconcile_env
+
+    def _boom(*_a, **_k):
+        raise hevy_client.HevyError("timeout")
+
+    monkeypatch.setattr(hevy_client, "fetch_body_measurements", _boom)
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
+        "pushed": 0, "imported": 0,
+    }
+    assert env.row()["measurements_synced_at"] is None
+
+
+def test_reconcile_is_skipped_when_the_push_setting_is_off(reconcile_env,
+                                                           monkeypatch):
+    env = reconcile_env
+    monkeypatch.setattr(bot_mod, "HEVY_PUSH_BODYWEIGHT", False, raising=False)
+    env.set_remote([{"date": "2026-07-20", "weight_kg": 83.2}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
+        "pushed": 0, "imported": 0,
+    }
+    assert env.row()["measurements_synced_at"] is None

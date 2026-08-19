@@ -16887,9 +16887,18 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
             "Couldn't reach Hevy just now — try again shortly.",
         )
         return
+    # The bodyweight reconcile runs even when there are no new workouts, so it
+    # has to be reported on both paths.
+    scales = []
+    if result.get("weigh_ins_pushed"):
+        scales.append(f"{result['weigh_ins_pushed']} weigh-in"
+                      f"{'s' if result['weigh_ins_pushed'] != 1 else ''} sent to Hevy")
+    if result.get("weigh_ins_imported"):
+        scales.append(f"{result['weigh_ins_imported']} imported from Hevy")
+    weigh = f"\n⚖️ Bodyweight: {', '.join(scales)}." if scales else ""
     if result["new"] == 0:
         await interaction.followup.send(
-            "✅ Already up to date — no new workouts to import.",
+            f"✅ Already up to date — no new workouts to import.{weigh}",
         )
         return
     feed = (
@@ -16900,7 +16909,7 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
     await interaction.followup.send(
         f"✅ Imported **{result['new']}** workout"
         f"{'s' if result['new'] != 1 else ''} — {result['lifts']} lifts, "
-        f"{result['volume_kg']:,} kg volume{prs}.{feed}",
+        f"{result['volume_kg']:,} kg volume{prs}.{feed}{weigh}",
     )
 
 
@@ -17038,6 +17047,159 @@ async def _hevy_templates(api_key: str) -> dict[str, dict]:
     return _HEVY_TEMPLATES
 
 
+#: How much history the one-time bodyweight reconcile walks, per side. Bounded
+#: because Hevy pages body measurements ten at a time: a member who has weighed
+#: in daily for years would otherwise cost hundreds of round trips the first
+#: time they are polled. Recent history is the part anyone looks at.
+_HEVY_RECONCILE_LIMIT = 200
+
+
+def _hevy_local_day(when: datetime) -> str:
+    """The ``YYYY-MM-DD`` Hevy should file a moment under (local, not UTC)."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(DISPLAY_TZ).date().isoformat()
+
+
+def _hevy_day_start(date_str: str) -> datetime | None:
+    """A date-only Hevy entry as a local **midday** timestamp.
+
+    Midday, matching how the rest of the bot materialises a date with no time
+    (see ``_backdate_label``): midnight would sort before every same-day scale
+    reading and can collide exactly with one, and it is the value most likely to
+    flip across a timezone boundary.
+    """
+    try:
+        day = date.fromisoformat(date_str)
+    except (TypeError, ValueError):
+        return None
+    return datetime.combine(day, dtime(12, 0), DISPLAY_TZ)
+
+
+async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
+    """Merge the bot's bodyweight history with Hevy's, once per account.
+
+    Runs when ``measurements_synced_at`` is NULL — which every account already
+    linked before this existed is, so they are caught up on their next poll
+    rather than the feature only ever reaching new links.
+
+    Both directions, each filling only what the other is missing:
+
+    * days the bot has a weigh-in for and Hevy does not are **pushed**;
+    * days Hevy has a measurement for and the bot does not are **imported** as
+      weigh-ins (with body fat / lean mass alongside, when Hevy has them).
+
+    A day present on both sides is left alone entirely — that is what stops the
+    reconcile from echoing (re-importing a weight this bot pushed a moment ago)
+    and what makes a forced re-run a no-op: anything imported the first time is
+    now one of the bot's own days. There is deliberately no ledger table; the
+    two histories *are* the ledger.
+
+    Returns ``{"pushed": int, "imported": int}``.
+    """
+    result = {"pushed": 0, "imported": 0}
+    user_id = int(row["user_id"])
+    guild_id = int(row["guild_id"])
+    if not _hevy_push_enabled():
+        return result
+    synced = (
+        row["measurements_synced_at"]
+        if "measurements_synced_at" in row.keys() else None
+    )
+    if synced is not None and not force:
+        return result
+
+    try:
+        api_key = hevy_client.decrypt_key(row["api_key_enc"])
+    except hevy_client.HevyError:
+        return result
+
+    def _fetch() -> list[dict]:
+        return hevy_client.fetch_body_measurements(
+            api_key, limit=_HEVY_RECONCILE_LIMIT,
+        )
+
+    try:
+        remote = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyAuthError:
+        LOG.warning("Hevy: key rejected during the measurement reconcile for %s", user_id)
+        return result
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: measurement reconcile fetch failed for %s: %s", user_id, exc)
+        return result  # leave the marker NULL so the next poll retries
+
+    remote_by_day: dict[str, dict] = {}
+    for entry in remote:
+        day = str((entry or {}).get("date") or "").strip()
+        if day:
+            remote_by_day.setdefault(day, entry)  # newest-first: first wins
+
+    local_rows = db.bodyweight_history(
+        guild_id, user_id, limit=_HEVY_RECONCILE_LIMIT,
+    )
+    local_by_day: dict[str, float] = {}
+    for bw_row in local_rows:
+        when = _parse_hevy_time(bw_row["recorded_at"])
+        if when is None:
+            continue
+        # Oldest-first, so the last write per day wins — the same "later one
+        # wins" rule a same-day re-push follows.
+        local_by_day[_hevy_local_day(when)] = float(bw_row["weight_kg"])
+
+    # --- bot → Hevy: days Hevy has never heard of --------------------------
+    for day in sorted(set(local_by_day) - set(remote_by_day)):
+        fields = hevy_client.measurement_fields(local_by_day[day])
+        if not fields:
+            continue
+
+        def _push(day: str = day, fields: dict = fields) -> str:
+            return hevy_client.push_body_measurement(api_key, day, fields)
+
+        try:
+            await bot.loop.run_in_executor(None, _push)
+        except hevy_client.HevyAuthError:
+            LOG.warning("Hevy: key rejected mid-reconcile for %s", user_id)
+            return result
+        except hevy_client.HevyError as exc:
+            LOG.info("Hevy: reconcile push failed for %s on %s: %s", user_id, day, exc)
+            continue
+        result["pushed"] += 1
+
+    # --- Hevy → bot: days the bot has never heard of -----------------------
+    for day in sorted(set(remote_by_day) - set(local_by_day)):
+        entry = remote_by_day[day]
+        weight = hevy_client.measurement_weight(entry)
+        if weight is None or not _ha_valid_weight(weight):
+            continue  # a circumference-only entry describes no weigh-in
+        when = _hevy_day_start(day)
+        if when is None:
+            continue
+        try:
+            db.set_bodyweight(guild_id, user_id, weight, recorded_at=when)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Hevy: failed to import a measurement for %s", user_id)
+            continue
+        metrics = hevy_client.metrics_from_measurement(entry)
+        if metrics:
+            try:
+                # Same datetime object as the weigh-in: add_body_metrics only
+                # writes alongside a bodyweights row at the identical timestamp.
+                db.add_body_metrics(
+                    guild_id, user_id, metrics, recorded_at=when, source="hevy",
+                )
+            except Exception:  # pragma: no cover - defensive
+                LOG.exception("Hevy: failed to store imported metrics for %s", user_id)
+        result["imported"] += 1
+
+    db.hevy_mark_measurements_synced(user_id)
+    if result["pushed"] or result["imported"]:
+        LOG.info(
+            "Hevy: bodyweight reconcile for %s — %d pushed, %d imported",
+            user_id, result["pushed"], result["imported"],
+        )
+    return result
+
+
 def _hevy_push_enabled() -> bool:
     """True when weigh-ins should be mirrored into linked Hevy accounts."""
     return bool(HEVY_PUSH_BODYWEIGHT) and _hevy_enabled()
@@ -17073,10 +17235,7 @@ async def _hevy_push_bodyweight(
     fields = hevy_client.measurement_fields(weight_kg, metrics)
     if not fields:
         return None
-    when = measured_at or datetime.now(timezone.utc)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    date_str = when.astimezone(DISPLAY_TZ).date().isoformat()
+    date_str = _hevy_local_day(measured_at or datetime.now(timezone.utc))
 
     def _push() -> str:
         api_key = hevy_client.decrypt_key(row["api_key_enc"])
@@ -17345,7 +17504,10 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
     just the new workouts and posts a full-stats embed (with PR callouts) for
     each. Returns a small stats dict for callers that want to report the result
     (e.g. the manual ``/hevy sync`` command)."""
-    result = {"new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False}
+    result = {
+        "new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False,
+        "weigh_ins_pushed": 0, "weigh_ins_imported": 0,
+    }
     user_id = int(row["user_id"])
     guild_id = int(row["guild_id"])
     try:
@@ -17457,6 +17619,17 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
                     )
                 except discord.HTTPException:  # pragma: no cover - best effort
                     LOG.info("Hevy: failed to post feed embed for %s", user_id)
+
+    # One-time bodyweight merge with Hevy's body measurements. Gated on its own
+    # marker rather than on `backfill`, so accounts linked before this existed
+    # get it on their next ordinary poll instead of never.
+    try:
+        merged = await _hevy_reconcile_measurements(row, force=force_backfill)
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: bodyweight reconcile failed for %s", user_id)
+        merged = {"pushed": 0, "imported": 0}
+    result["weigh_ins_pushed"] = merged["pushed"]
+    result["weigh_ins_imported"] = merged["imported"]
 
     db.hevy_mark_synced(user_id)
     if backfill:
