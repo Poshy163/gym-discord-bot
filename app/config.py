@@ -460,6 +460,13 @@ _SETTINGS: tuple[Setting, ...] = (
        restart_note="Setting this for the first time needs a restart."),
     _S("HEVY_POLL_MINUTES", "int", "15", "hevy", _floor_int(1),
        apply="worker", min=1, max=1440, label="Poll interval (minutes)"),
+    _S("HEVY_PUSH_BODYWEIGHT", "bool", "1", "hevy", _bool,
+       apply="worker", label="Mirror weigh-ins to Hevy",
+       help="When a member logs a bodyweight -- by hand or from a linked "
+            "smart scale -- write it to their Hevy body measurements too, "
+            "along with body fat and lean mass when the scale reports them. "
+            "Only affects members who linked Hevy. Existing hand-entered "
+            "measurements (waist, chest, ...) are never overwritten."),
     _S("HEVY_FERNET_KEY", "secret", "", "hevy", _strip,
        apply="worker", secret=True, sibling_env=True,
        label="Hevy encryption key",

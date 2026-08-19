@@ -276,6 +276,7 @@ def _bind_config(cfg: config_mod.Config) -> None:
     g["HEVY_DISABLED"] = cfg["HEVY_DISABLED"]
     g["HEVY_FEED_CHANNEL_ID"] = cfg["HEVY_FEED_CHANNEL_ID"]
     g["HEVY_POLL_MINUTES"] = cfg["HEVY_POLL_MINUTES"]
+    g["HEVY_PUSH_BODYWEIGHT"] = cfg["HEVY_PUSH_BODYWEIGHT"]
 
     # -- Home Assistant ---------------------------------------------------
     # No URL or token here: each member's own credential lives encrypted in
@@ -1502,6 +1503,11 @@ async def _handle_bodyweight_message(
     except Exception:
         LOG.exception("Failed to store bodyweight for user %s", target_id)
         return
+
+    # Mirror it into Hevy (no-op unless the member linked an account and the
+    # setting is on). After the write and the acknowledgement, never before —
+    # the log is the source of truth and Hevy is the copy.
+    await _hevy_push_bodyweight(target_id, weight_kg)
 
     try:
         await message.add_reaction("✅")
@@ -6451,6 +6457,7 @@ async def bodyweight_cmd(
         actor_id=interaction.user.id,
         actor_name=_display_name(interaction.user),
     )
+    await _hevy_push_bodyweight(target.id, weight_kg)
     suffix = _target_suffix(interaction.user, target)
     protein_line = (
         f"\n🥩 Protein max updated to {protein_grams} g (tied to bodyweight)."
@@ -16829,9 +16836,24 @@ async def hevy_status_cmd(interaction: discord.Interaction) -> None:
         if HEVY_FEED_CHANNEL_ID else
         "\nWorkouts import as lifts (no feed channel configured)."
     )
+    who = ((row["hevy_username"] or "").strip()
+           if "hevy_username" in row.keys() else "")
+    url = ((row["hevy_profile_url"] or "").strip()
+           if "hevy_profile_url" in row.keys() else "")
+    if who:
+        feed = (
+            f"\nHevy account: **{_safe_label(who)}**"
+            + (f" — [profile](<{url}>)" if url else "")
+        ) + feed
+    if _hevy_push_enabled():
+        feed += (
+            "\nNew weigh-ins are mirrored to your Hevy body measurements "
+            "(weight, plus body fat and lean mass when your scale reports them)."
+        )
     last = row["last_synced_at"] or "not yet"
     await interaction.response.send_message(
         f"✅ Hevy linked. Last sync: {last}.{feed}",
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -16934,10 +16956,24 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
             "• Every weighted working set becomes a **lift** (feeds PRs, "
             "leaderboards and your stats)\n"
             "• A per-workout summary: exercises, sets, reps, volume, duration, "
-            "a per-exercise breakdown and your top set"
+            "a per-exercise breakdown and your top set\n"
+            "• Muscle-group split, RPE, dropsets and sets to failure, plus "
+            "distance and time for cardio and calisthenics sessions"
         ),
         inline=False,
     )
+    if _hevy_push_enabled():
+        embed.add_field(
+            name="Bodyweight sync",
+            value=(
+                "Weigh-ins travel **to** Hevy as well: log one here (or let a "
+                "linked smart scale do it) and I write it to your Hevy body "
+                "measurements — weight, plus body fat and lean mass when your "
+                "scale reports them. Measurements you typed into Hevy yourself "
+                "(waist, chest, arms, ...) are never overwritten."
+            ),
+            inline=False,
+        )
     embed.add_field(
         name="Commands",
         value=(
@@ -16963,6 +16999,107 @@ async def hevy_help_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed)
 
 
+#: In-process cache of Hevy's exercise-template catalogue, keyed by template id.
+#: Templates carry the muscle group a workout payload omits, and the catalogue is
+#: ~400 near-static rows shared by every member (custom templates get their own
+#: unique ids, so one map cannot mix two members up). Cached for a day because a
+#: miss only costs a muscle-group breakdown, never an import.
+_HEVY_TEMPLATES: dict[str, dict] = {}
+_HEVY_TEMPLATES_AT: datetime | None = None
+_HEVY_TEMPLATE_TTL = timedelta(days=1)
+
+
+async def _hevy_templates(api_key: str) -> dict[str, dict]:
+    """The exercise-template map, refreshed at most once a day.
+
+    Never raises: the muscle-group breakdown is a garnish on the feed embed, so
+    a failed or rate-limited catalogue fetch degrades to "no breakdown" rather
+    than failing the import that carries it.
+    """
+    global _HEVY_TEMPLATES, _HEVY_TEMPLATES_AT
+    now = datetime.now(timezone.utc)
+    if _HEVY_TEMPLATES and _HEVY_TEMPLATES_AT is not None:
+        if now - _HEVY_TEMPLATES_AT < _HEVY_TEMPLATE_TTL:
+            return _HEVY_TEMPLATES
+
+    def _fetch() -> dict[str, dict]:
+        return hevy_client.index_templates(
+            hevy_client.fetch_exercise_templates(api_key),
+        )
+
+    try:
+        fetched = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: exercise-template fetch failed: %s", exc)
+        return _HEVY_TEMPLATES
+    if fetched:
+        _HEVY_TEMPLATES = fetched
+        _HEVY_TEMPLATES_AT = now
+    return _HEVY_TEMPLATES
+
+
+def _hevy_push_enabled() -> bool:
+    """True when weigh-ins should be mirrored into linked Hevy accounts."""
+    return bool(HEVY_PUSH_BODYWEIGHT) and _hevy_enabled()
+
+
+async def _hevy_push_bodyweight(
+    user_id: int, weight_kg: float, measured_at: datetime | None = None,
+    metrics: dict | None = None,
+) -> str | None:
+    """Mirror one weigh-in into the member's Hevy body measurements.
+
+    Returns ``"created"``/``"updated"``/``"unchanged"``, or None when nothing was
+    attempted (feature off, member not linked, nothing worth sending).
+
+    Called after the weigh-in is already in the database, never before: Hevy is a
+    mirror of the bot's record, so a Hevy outage must not be able to lose a
+    weigh-in. Every failure is logged and swallowed for the same reason — the
+    member's ``bw 82`` has already succeeded by the time this runs, and telling
+    them it failed would be describing the mirror, not the log.
+
+    Hevy keys body measurements by **calendar date**, so two weigh-ins on the
+    same day collapse into one entry: the later one wins, which matches what a
+    scale-owner sees in the Hevy app anyway. That date is taken in
+    ``DISPLAY_TZ``, not UTC — every other calendar day in this bot is local, and
+    a UTC date would file an ordinary Adelaide morning weigh-in under the
+    previous day and let two different local days collide on one Hevy entry.
+    """
+    if not _hevy_push_enabled():
+        return None
+    row = db.hevy_get(user_id)
+    if row is None:
+        return None
+    fields = hevy_client.measurement_fields(weight_kg, metrics)
+    if not fields:
+        return None
+    when = measured_at or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    date_str = when.astimezone(DISPLAY_TZ).date().isoformat()
+
+    def _push() -> str:
+        api_key = hevy_client.decrypt_key(row["api_key_enc"])
+        return hevy_client.push_body_measurement(api_key, date_str, fields)
+
+    try:
+        outcome = await bot.loop.run_in_executor(None, _push)
+    except hevy_client.HevyAuthError:
+        LOG.warning(
+            "Hevy: key rejected while mirroring a weigh-in for %s (revoked?)",
+            user_id,
+        )
+        return None
+    except hevy_client.HevyError as exc:
+        LOG.info("Hevy: could not mirror weigh-in for %s: %s", user_id, exc)
+        return None
+    LOG.info(
+        "Hevy: %s body measurement for %s on %s (%s)",
+        outcome, user_id, date_str, ", ".join(sorted(fields)),
+    )
+    return outcome
+
+
 def _hevy_duration_str(seconds: int | None) -> str | None:
     """Render a workout's elapsed time as ``1h 23m`` / ``45m`` / ``30s``."""
     if not seconds or seconds <= 0:
@@ -16974,8 +17111,22 @@ def _hevy_duration_str(seconds: int | None) -> str | None:
     return f"{m}m" if m else f"{s}s"
 
 
+def _hevy_distance_str(metres: float | None) -> str | None:
+    """Human distance: metres below 1 km, otherwise kilometres."""
+    if not metres:
+        return None
+    if metres < 1000:
+        return f"{metres:g} m"
+    return f"{metres / 1000:.2f} km".replace(".00 km", " km")
+
+
 def _hevy_exercise_line(ex: dict) -> str:
-    """One breakdown line: name + set count + top set (or reps for bodyweight)."""
+    """One breakdown line: name + set count + the best thing it recorded.
+
+    Hevy exercises are not all weight×reps — a set can carry distance, a
+    duration, or nothing but reps. The line falls back through those in turn so
+    a plank or a treadmill row says something useful instead of just its set
+    count, and appends RPE when the member logged one."""
     sets = ex.get("sets") or 0
     bits = [f"{sets} set{'s' if sets != 1 else ''}"]
     if ex.get("best_weight_kg"):
@@ -16983,6 +17134,14 @@ def _hevy_exercise_line(ex: dict) -> str:
         bits.append(f"top {ex['best_weight_kg']:g}kg{reps}")
     elif ex.get("reps"):
         bits.append(f"{ex['reps']} reps")
+    distance = _hevy_distance_str(ex.get("distance_m"))
+    if distance:
+        bits.append(distance)
+    held = _hevy_duration_str(ex.get("duration_seconds"))
+    if held:
+        bits.append(held)
+    if ex.get("rpe"):
+        bits.append(f"RPE {ex['rpe']:g}")
     return f"**{_safe_label(ex.get('title') or 'Exercise')}** · " + " · ".join(bits)
 
 
@@ -17010,9 +17169,16 @@ def _hevy_pr_lines(prs_by_equip: dict[str, tuple[float, float | None]]) -> list[
 def _hevy_workout_embed(
     member_name: str, summary: dict,
     prs_by_equip: dict[str, tuple[float, float | None]] | None = None,
+    templates: dict[str, dict] | None = None,
+    profile_url: str | None = None,
 ) -> discord.Embed:
     """Build the feed embed for a completed Hevy workout — the full stat line,
-    a per-exercise breakdown, any new personal bests, and the heaviest set."""
+    a per-exercise breakdown, any new personal bests, and the heaviest set.
+
+    The stat line adapts to what was actually logged: volume is dropped for a
+    session that lifted nothing (it would read "0 kg") in favour of the reps,
+    distance and time that session *did* record, so a calisthenics or treadmill
+    workout describes itself properly instead of looking like an empty one."""
     warm = summary.get("warmup_set_count") or 0
     sets_str = f"**{summary.get('working_set_count', summary['set_count'])}** sets"
     if warm:
@@ -17021,15 +17187,43 @@ def _hevy_workout_embed(
         f"**{summary['exercise_count']}** exercises",
         sets_str,
         f"**{summary.get('total_reps', 0):,}** reps",
-        f"**{summary['volume_kg']:,} kg** volume",
     ]
+    if summary.get("has_lifts", True):
+        desc.append(f"**{summary['volume_kg']:,} kg** volume")
+    distance = _hevy_distance_str(summary.get("distance_m"))
+    if distance:
+        desc.append(f"📍 **{distance}**")
     dur = _hevy_duration_str(summary.get("duration_seconds"))
     if dur:
         desc.append(f"⏱️ **{dur}**")
+    elif summary.get("active_seconds"):
+        # No start/end window (a workout logged after the fact), but the sets
+        # themselves were timed — that total is the honest stand-in.
+        active = _hevy_duration_str(summary["active_seconds"])
+        if active:
+            desc.append(f"⏱️ **{active}** active")
+    extras = []
+    if summary.get("dropset_count"):
+        extras.append(f"{summary['dropset_count']} dropset"
+                      f"{'s' if summary['dropset_count'] != 1 else ''}")
+    if summary.get("failure_set_count"):
+        extras.append(f"{summary['failure_set_count']} to failure")
+    if summary.get("best_rpe"):
+        extras.append(f"RPE up to {summary['best_rpe']:g}")
+    if extras:
+        desc.append(" · ".join(extras))
     embed = discord.Embed(
         title=summary["title"], colour=HEVY_COLOUR, description=" · ".join(desc),
     )
-    embed.set_author(name=f"🏋️ {member_name} finished a Hevy workout")
+    embed.set_author(
+        name=f"🏋️ {member_name} finished a Hevy workout",
+        url=profile_url or None,
+    )
+    note = summary.get("description")
+    if note:
+        embed.add_field(
+            name="Note", value=_safe_label(note)[:1024], inline=False,
+        )
 
     # Per-exercise breakdown, capped so the field stays within Discord's 1024
     # char limit (and doesn't dominate the feed for a 20-exercise session).
@@ -17042,6 +17236,19 @@ def _hevy_workout_embed(
     if lines:
         embed.add_field(
             name="Exercises", value="\n".join(lines)[:1024], inline=False,
+        )
+
+    split = hevy_client.muscle_split(summary, templates or {})
+    if len(split) > 1:
+        total = sum(kg for _, kg in split) or 1
+        embed.add_field(
+            name="Muscle split",
+            value="\n".join(
+                f"**{_safe_label(hevy_client.muscle_label(group))}** "
+                f"{kg:,} kg ({kg * 100 // total:.0f}%)"
+                for group, kg in split[:6]
+            )[:1024],
+            inline=False,
         )
 
     if prs_by_equip:
@@ -17181,6 +17388,29 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
         bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
     )
 
+    # The workout payload never says whose it is, so the profile comes from a
+    # separate endpoint. Only worth a call when there is something to post.
+    profile_url = (
+        row["hevy_profile_url"]
+        if "hevy_profile_url" in row.keys() else None
+    )
+    profile_name = (
+        row["hevy_username"] if "hevy_username" in row.keys() else None
+    )
+    # Refetch when *either* half is missing, not just the URL: a re-link clears
+    # both, and keying on one alone would leave the other permanently blank.
+    if workouts and not (profile_url and profile_name):
+        def _profile() -> dict:
+            return hevy_client.fetch_user_info(api_key)
+
+        try:
+            info = await bot.loop.run_in_executor(None, _profile)
+        except hevy_client.HevyError as exc:
+            LOG.info("Hevy: profile fetch failed for %s: %s", user_id, exc)
+        else:
+            db.hevy_set_profile(user_id, info.get("name"), info.get("url"))
+            profile_url = info.get("url") or None
+
     # Hevy returns newest-first; import oldest-first so logs read chronologically
     # and PRs accrue in the right order.
     imported: list[dict] = []
@@ -17212,13 +17442,17 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
             except discord.HTTPException:  # pragma: no cover - best effort
                 LOG.info("Hevy: failed to post backfill summary for %s", user_id)
         else:
+            # Every imported workout gets an embed, including ones that produced
+            # no lifts. A calisthenics or treadmill session has no weighted set
+            # to import, and skipping it made the workout vanish silently — it
+            # was marked imported, so nothing would ever post it again.
+            templates = await _hevy_templates(api_key)
             for r in imported:
-                if not r["lifts"]:
-                    continue
                 try:
                     await feed_channel.send(
                         embed=_hevy_workout_embed(
                             username, r["summary"], r["prs"],
+                            templates, profile_url,
                         ),
                     )
                 except discord.HTTPException:  # pragma: no cover - best effort
@@ -17325,7 +17559,19 @@ async def hevy_recent_cmd(
         )
         return
     summary = hevy_client.summarize_workout(result)
-    embed = _hevy_workout_embed(_display_name(target), summary)
+    templates: dict[str, dict] = {}
+    try:
+        templates = await _hevy_templates(
+            hevy_client.decrypt_key(row["api_key_enc"]),
+        )
+    except hevy_client.HevyError:  # pragma: no cover - unreadable stored key
+        pass
+    profile_url = (
+        row["hevy_profile_url"] if "hevy_profile_url" in row.keys() else None
+    )
+    embed = _hevy_workout_embed(
+        _display_name(target), summary, None, templates, profile_url,
+    )
     await interaction.followup.send(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -17829,6 +18075,18 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
     result["metrics"] = sum(r["metrics_written"] for r in imported)
     result["latest_kg"] = newest["weight_kg"]
     result["protein_grams"] = newest["protein_grams"]
+
+    # Mirror the scale's numbers into Hevy, body composition included — the
+    # richest weigh-in the bot ever sees, so it is the one most worth having in
+    # both apps. A first-time history import pushes only its newest reading:
+    # Hevy keys measurements by date, so replaying months of history would be one
+    # write per day and would fill a member's Hevy account the moment they link
+    # a scale. That mirrors the "first sync is quiet" rule the feed already uses.
+    for entry in ([newest] if is_first_import else imported):
+        await _hevy_push_bodyweight(
+            user_id, entry["weight_kg"], entry["measured_at"],
+            (entry.get("reading") or {}).get("metrics"),
+        )
 
     channel = await _ha_alert_channel()
     if channel is None:

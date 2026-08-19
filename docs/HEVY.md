@@ -13,7 +13,13 @@ member finishes a Hevy workout
         │
         ├─▶ import exercises/sets as lifts  (dedup on Hevy workout id)
         └─▶ post embed to HEVY_FEED_CHANNEL_ID
+
+member logs a bodyweight (chat, /bodyweight, or a linked smart scale)
+        │
+        └─▶ POST/PUT api.hevyapp.com/v1/body_measurements
 ```
+
+Data flows **both ways**: workouts come in, weigh-ins go out.
 
 Unlike Strava, Hevy uses a **per-user API key** (no OAuth) and the bot only makes
 **outbound** calls — there's **no public web server to expose**.
@@ -36,6 +42,7 @@ Dashboard → **Settings → Hevy**:
 | Disable Hevy entirely | off | Turns the integration off. |
 | Feed channel | — | Channel for workout embeds. Blank → lifts still import, no feed post. |
 | Poll interval (minutes) | `15` | How often to check Hevy for new workouts (minimum 1). |
+| Mirror weigh-ins to Hevy | on | Write each new bodyweight to the member's Hevy body measurements. |
 
 Changing any of these stages a bot restart; press **Apply & restart bot**.
 
@@ -50,7 +57,8 @@ available; importing works even without a feed channel.
 - `/hevy_link api_key:<key>` — paste the key from Hevy → Settings → API. Best run
   in a **DM** so the key stays private; the reply is always ephemeral and the key
   is stored **encrypted**.
-- `/hevy_status` — show whether you're linked and when it last synced.
+- `/hevy_status` — show whether you're linked, your Hevy profile, when it last
+  synced, and whether weigh-ins are being mirrored.
 - `/hevy_unlink` — delete your stored key and import history.
 
 Only `/hevy_link` replies privately (so the key never appears in a channel); the
@@ -61,11 +69,53 @@ other Hevy commands reply publicly.
 - **No double-logging:** each Hevy workout id is recorded once imported, so
   repeated polls never re-import. Unlinking clears that history.
 - **First sync is quiet:** the poll right after linking imports your recent
-  workouts as lifts but does **not** post feed embeds (so linking doesn't spam
-  the channel with backfill). New workouts after that post normally.
-- **What imports:** one lift per *weighted working set* (positive `weight_kg`);
-  bodyweight-only/cardio sets are skipped. Exercise names are canonicalised, so a
-  Hevy "Bench Press (Barbell)" lands on the same equipment as a chat-logged
-  "bench".
+  workouts as lifts and posts a **single** summary embed for the whole backfill,
+  rather than one embed per historical workout. New workouts after that each
+  post their own.
+- **What imports:** one lift per set with a positive `weight_kg` — including
+  warmup sets, which are counted separately in the embed but still logged.
+  Sets with no weight (bodyweight-only, cardio) become no lift. Exercise names
+  are canonicalised, so a Hevy "Bench Press (Barbell)" lands on the same
+  equipment as a chat-logged "bench".
+- **Lift-free workouts still post.** A pure calisthenics or treadmill session
+  produces no lifts, and used to vanish silently — imported, but never shown.
+  It now gets a feed embed describing what it *did* record: reps, distance and
+  time, with the volume line omitted rather than reading "0 kg".
+- **What the embed shows:** exercises, sets (working vs warmup), reps, volume,
+  duration, per-exercise breakdown and top set, plus — where Hevy has the data —
+  a **muscle-group split**, RPE, dropset and to-failure counts, distance/time
+  per exercise, the workout description and your Hevy profile link.
 - Workouts are filed under the **server you linked from** (or your `/server`
   default when linking via DM).
+
+## Weigh-ins are mirrored into Hevy
+
+Hevy's API also stores **body measurements**, so the bot writes to it as well as
+reading from it. Whenever a bodyweight is recorded — typed in chat, logged with
+`/bodyweight`, or imported from a member's Home Assistant smart scale — it is
+written to that member's Hevy body measurements for the day.
+
+- **What is sent:** `weight_kg` always; `fat_percent` and `lean_mass_kg` too when
+  the reading came from a scale that reports body fat / lean mass. The bot has no
+  source for Hevy's tape-measure fields (waist, chest, arms, ...) and never
+  invents one.
+- **Your hand-entered measurements are safe.** Hevy's update endpoint overwrites
+  *every* field it is sent and nulls the ones it isn't, so a naive write would
+  wipe the circumferences you typed into the Hevy app. The bot creates the day's
+  entry if it is free, and otherwise re-reads it and merges its three values over
+  the top, leaving everything else untouched. If Hevy already holds the same
+  numbers, nothing is written at all.
+- **One entry per day.** Hevy keys measurements by calendar date, so two weigh-ins
+  on the same day collapse into one — the later wins, which is what the Hevy app
+  shows anyway.
+- **Implausible readings are dropped, not clamped.** A smart scale glitching to
+  6553.5 kg is never mirrored (it would be far harder to retract from Hevy than
+  from the bot).
+- **Linking a scale doesn't backfill Hevy.** The first import after linking Home
+  Assistant pushes only its newest reading; replaying months of history would be
+  one write per day into an account the member didn't ask you to fill.
+- **Hevy failures never fail a weigh-in.** The push happens *after* the weigh-in
+  is safely in the bot's database, and any error is logged and swallowed — the
+  bot's log is the source of truth and Hevy is the copy.
+- Turn it off with **Mirror weigh-ins to Hevy** in the dashboard, or
+  `HEVY_PUSH_BODYWEIGHT=0`.

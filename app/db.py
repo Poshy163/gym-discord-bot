@@ -675,14 +675,19 @@ CREATE INDEX IF NOT EXISTS idx_apple_health_workout_user_started
 -- ``guild_id`` is where polled workouts are imported as lifts and where the feed
 -- embed is posted. ``hevy_imported`` records which Hevy workout ids have already
 -- been imported so repeated polls never double-log.
+-- ``hevy_username``/``hevy_profile_url`` come from GET /v1/user/info on the
+-- first sync after linking: the workout payload never names its owner, so
+-- without them the feed can only ever show the member's Discord name and cannot
+-- link their public Hevy profile.
 CREATE TABLE IF NOT EXISTS hevy_account (
-    user_id        INTEGER PRIMARY KEY,
-    guild_id       INTEGER NOT NULL,
-    api_key_enc    TEXT    NOT NULL,
-    hevy_username  TEXT,
-    last_synced_at TEXT,
-    linked_at      TEXT    NOT NULL,
-    backfilled_at  TEXT
+    user_id          INTEGER PRIMARY KEY,
+    guild_id         INTEGER NOT NULL,
+    api_key_enc      TEXT    NOT NULL,
+    hevy_username    TEXT,
+    hevy_profile_url TEXT,
+    last_synced_at   TEXT,
+    linked_at        TEXT    NOT NULL,
+    backfilled_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hevy_imported (
@@ -1260,6 +1265,13 @@ class Database:
             if hevy_cols and "backfilled_at" not in hevy_cols:
                 self._connection.execute(
                     "ALTER TABLE hevy_account ADD COLUMN backfilled_at TEXT"
+                )
+            # Hevy profile name/URL, filled in from /v1/user/info on the next
+            # sync. Nullable and additive: an account that never syncs again
+            # simply keeps showing the member's Discord name.
+            if hevy_cols and "hevy_profile_url" not in hevy_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_account ADD COLUMN hevy_profile_url TEXT"
                 )
             msg_cols = {
                 row["name"]
@@ -3952,19 +3964,25 @@ class Database:
         hevy_username: str | None = None,
     ) -> None:
         """Link (or re-link) a Hevy account. ``api_key_enc`` must already be a
-        Fernet token — this layer never sees the plaintext key."""
+        Fernet token — this layer never sees the plaintext key.
+
+        A re-link clears the cached profile. The key may now belong to a
+        *different* Hevy account, and keeping the old name and profile URL would
+        caption the member's feed embeds with someone else's identity; the next
+        sync re-reads /user/info and fills it back in."""
         with self._conn() as c:
             c.execute(
                 """
                 INSERT INTO hevy_account
                     (user_id, guild_id, api_key_enc, hevy_username,
-                     last_synced_at, linked_at)
-                VALUES (?, ?, ?, ?, NULL, ?)
+                     hevy_profile_url, last_synced_at, linked_at)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    guild_id      = excluded.guild_id,
-                    api_key_enc   = excluded.api_key_enc,
-                    hevy_username = excluded.hevy_username,
-                    linked_at     = excluded.linked_at
+                    guild_id         = excluded.guild_id,
+                    api_key_enc      = excluded.api_key_enc,
+                    hevy_username    = excluded.hevy_username,
+                    hevy_profile_url = excluded.hevy_profile_url,
+                    linked_at        = excluded.linked_at
                 """,
                 (user_id, guild_id, api_key_enc, hevy_username,
                  _normalize_iso(None)),
@@ -3998,6 +4016,35 @@ class Database:
                 "UPDATE hevy_account SET last_synced_at = ? WHERE user_id = ?",
                 (_normalize_iso(at), user_id),
             )
+
+    def hevy_set_profile(
+        self, user_id: int, username: str | None, profile_url: str | None,
+    ) -> bool:
+        """Cache the Hevy display name / public profile URL. Returns True if changed.
+
+        Separate from :meth:`hevy_link` because the profile is learned on the
+        first *sync*, not at link time — linking only proves the key works, and
+        re-running the upsert would need the encrypted key just to store a name.
+        Only writes when something actually differs so a poll every few minutes
+        isn't a write every few minutes."""
+        name = (username or "").strip() or None
+        url = (profile_url or "").strip() or None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT hevy_username, hevy_profile_url FROM hevy_account "
+                "WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["hevy_username"] == name and row["hevy_profile_url"] == url:
+                return False
+            c.execute(
+                "UPDATE hevy_account SET hevy_username = ?, "
+                "hevy_profile_url = ? WHERE user_id = ?",
+                (name, url, user_id),
+            )
+            return True
 
     def hevy_mark_backfilled(
         self, user_id: int, at: datetime | None = None,

@@ -123,6 +123,7 @@ PRE_REFACTOR_DEFAULTS = {
     "HEVY_DISABLED": False,
     "HEVY_FEED_CHANNEL_ID": None,
     "HEVY_POLL_MINUTES": 15,
+    "HEVY_PUSH_BODYWEIGHT": True,
     # home assistant — no pre-refactor equivalent (the integration was added
     # after settings moved into the database), so these assert the shipped
     # defaults rather than a historical os.getenv call. An unconfigured
