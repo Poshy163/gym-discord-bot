@@ -17345,7 +17345,8 @@ async def _announce_release_notes() -> None:
             "a PR moves.\n"
             "• Commands moved: `/hevy_link` → **`/hevy link`** (same for "
             "status/sync/recent/help). New: **`/hevy routines`** — which "
-            "programmes you actually run.\n"
+            "programmes you actually run, and **`/hevy routine <name>`** "
+            "to see one in full.\n"
             "• **Weigh-ins mirror to Hevy** body measurements both ways, "
             "once per account, history included.\n"
             "• Feed embeds got richer: muscle split, supersets 🔗, RPE, "
@@ -17547,8 +17548,20 @@ def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
     template's type; it decides whether the custom metric gets a label (floors
     for stair machines, steps for treadmills) or stays out of the embed."""
     sets = ex.get("sets") or 0
-    bits = [f"{sets} set{'s' if sets != 1 else ''}"]
-    if ex.get("best_weight_kg"):
+    # Real working sets, spelled out. "top 100kg×6" hid that the second set was
+    # 93kg — a reader couldn't tell a planned drop from a typo. Uniform sets
+    # collapse ("2×30kg×6"), differing ones are listed in order. The "N sets"
+    # prefix only survives when the detail doesn't already cover every set
+    # (warmups, or weightless sets alongside weighted ones).
+    detail = hevy_client.format_set_summary(ex.get("set_details"))
+    covered = len(ex.get("set_details") or [])
+    bits = (
+        [] if detail and covered == sets
+        else [f"{sets} set{'s' if sets != 1 else ''}"]
+    )
+    if detail:
+        bits.append(detail)
+    elif ex.get("best_weight_kg"):
         reps = f"×{ex['best_reps']}" if ex.get("best_reps") else ""
         bits.append(f"top {ex['best_weight_kg']:g}kg{reps}")
     elif ex.get("reps"):
@@ -18646,6 +18659,157 @@ async def hevy_routines_cmd(
     await interaction.response.send_message(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+async def _hevy_routine_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Routine-name choices from the caller's cached routine map.
+
+    Served from the hourly per-user cache so a keystroke never costs an API
+    call; the first invocation on a cold cache does one fetch (the same one the
+    feed labels use) and every later keystroke rides it. The choice *value* is
+    the routine id, so renaming a routine between autocomplete and submit still
+    resolves the right one."""
+    row = db.hevy_get(interaction.user.id)
+    if row is None or not _hevy_enabled():
+        return []
+    try:
+        routines = await _hevy_routines(
+            interaction.user.id, hevy_client.decrypt_key(row["api_key_enc"]),
+        )
+    except hevy_client.HevyError:
+        return []
+    needle = (current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    for rid, info in routines.items():
+        label = (
+            f"{info['folder']} / {info['title']}"
+            if info.get("folder") else info["title"]
+        )
+        if needle and needle not in label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=rid[:100]))
+        if len(choices) == 25:  # Discord's autocomplete cap
+            break
+    return choices
+
+
+@hevy_group.command(
+    name="routine",
+    description="Show one Hevy routine in full — every exercise and its target sets.",
+)
+@app_commands.describe(name="The routine to show (pick from the list, or type part of its name).")
+@app_commands.autocomplete(name=_hevy_routine_autocomplete)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def hevy_routine_cmd(
+    interaction: discord.Interaction, name: str,
+) -> None:
+    if not _hevy_enabled():
+        await interaction.response.send_message(
+            "Hevy integration isn't available right now.",
+        )
+        return
+    row = db.hevy_get(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You haven't linked Hevy yet — see `/hevy help`.",
+        )
+        return
+    await interaction.response.defer(thinking=True)
+    api_key = hevy_client.decrypt_key(row["api_key_enc"])
+
+    # The autocomplete submits a routine id; free-typed text matches on title.
+    routines = await _hevy_routines(interaction.user.id, api_key)
+    wanted = (name or "").strip()
+    routine_id = wanted if wanted in routines else None
+    if routine_id is None:
+        needle = wanted.lower()
+        matches = [
+            rid for rid, info in routines.items()
+            if needle and needle in (info["title"] or "").lower()
+        ]
+        if len(matches) == 1:
+            routine_id = matches[0]
+        elif len(matches) > 1:
+            titles = ", ".join(
+                f"**{_safe_label(routines[m]['title'])}**" for m in matches[:5]
+            )
+            await interaction.followup.send(
+                f"That matches more than one routine — {titles}. "
+                "Pick one from the autocomplete list.",
+            )
+            return
+    if routine_id is None:
+        await interaction.followup.send(
+            f"No routine matching “{_safe_label(wanted, limit=40)}” — "
+            "start typing and pick from the list.",
+        )
+        return
+
+    def _fetch() -> dict | None:
+        return hevy_client.fetch_routine(api_key, routine_id)
+
+    try:
+        routine = await bot.loop.run_in_executor(None, _fetch)
+    except hevy_client.HevyAuthError:
+        await interaction.followup.send(
+            "❌ Hevy rejected your API key — re-link with `/hevy link`.",
+        )
+        return
+    except hevy_client.HevyError:
+        await interaction.followup.send(
+            "Couldn't reach Hevy just now — try again shortly.",
+        )
+        return
+    if routine is None:
+        await interaction.followup.send(
+            "Hevy no longer has that routine (deleted?).",
+        )
+        return
+    detail = hevy_client.summarize_routine(routine)
+    info = routines.get(routine_id) or {}
+    embed = _hevy_routine_embed(detail, info.get("folder"))
+    await interaction.followup.send(embed=embed)
+
+
+def _hevy_routine_embed(detail: dict, folder: str | None) -> discord.Embed:
+    """The /hevy routine detail card: one line per exercise, sets spelled out.
+
+    Same set formatting as the workout feed (uniform sets collapse, differing
+    ones are listed) so a routine and the workout it produced read alike.
+    Superset partners share a 🔗 marker, matching the feed embed."""
+    lines: list[str] = []
+    for ex in detail.get("exercises") or []:
+        marker = "🔗 " if ex.get("superset_id") is not None else ""
+        sets = hevy_client.format_set_summary(ex.get("set_details"))
+        if not sets and ex.get("rep_only"):
+            reps = ex["rep_only"]
+            sets = (
+                f"{len(reps)}×{reps[0]} reps"
+                if len(set(reps)) == 1 and len(reps) > 1
+                else ", ".join(f"{r} reps" for r in reps[:6])
+            )
+        if not sets:
+            count = ex.get("set_count") or 0
+            sets = f"{count} set{'s' if count != 1 else ''}"
+        lines.append(f"{marker}**{_safe_label(ex['title'])}** · {sets}")
+        if ex.get("notes"):
+            lines.append(f"-# {_safe_label(ex['notes'], limit=100)}")
+    title = detail.get("title") or "Routine"
+    embed = discord.Embed(
+        title=f"📋 {_plain_label(title)}",
+        colour=HEVY_COLOUR,
+        description="\n".join(lines)[:4096] or "This routine has no exercises.",
+    )
+    count = detail.get("exercise_count") or 0
+    embed.set_author(name=(
+        f"{folder} · {count} exercise{'s' if count != 1 else ''}"
+        if folder else f"{count} exercise{'s' if count != 1 else ''}"
+    ))
+    embed.set_footer(text="via Hevy · target sets, not a logged workout")
+    return embed
 
 
 bot.tree.add_command(hevy_group)

@@ -615,10 +615,13 @@ def test_breakdown_budget_never_slices_a_line(monkeypatch):
     summary = hevy_client.summarize_workout({
         "title": "Everything day",
         "exercises": [
+            # Bulky on purpose: the field must overflow 1024 chars so the
+            # budget path (whole-line drop + "…and N more" tail) engages.
             {"title": f"Extremely Long Exercise Name Variant {i} (Machine)" * 2,
              "superset_id": i % 3,
-             "sets": [{"weight_kg": 50 + i, "reps": 8, "rpe": 9}]}
-            for i in range(12)
+             "sets": [{"weight_kg": 50 + i + j, "reps": 8, "rpe": 9}
+                      for j in range(3)]}
+            for i in range(16)
         ],
     })
     embed = bot_mod._hevy_workout_embed("poshy", summary)
@@ -996,3 +999,49 @@ def test_release_note_is_dropped_without_a_channel(events_env, monkeypatch):
     monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", None, raising=False)
     _run(bot_mod._announce_release_notes())
     assert env.db.app_meta_claim(bot_mod._RELEASE_NOTE_KEY) is False
+
+
+# ---------------------------------------------------------------------------
+# /hevy routine detail embed + the clearer exercise lines
+# ---------------------------------------------------------------------------
+
+def test_exercise_line_spells_out_differing_sets():
+    """The user's real workout: Butterfly logged 100kg then 93kg, and the line
+    said only "top 100kg×6" — a reader couldn't tell a planned drop from a
+    typo. Now both sets show; uniform ones still collapse."""
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Arms", "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [
+            {"title": "Butterfly (Pec Deck)",
+             "sets": [{"weight_kg": 100, "reps": 6}, {"weight_kg": 93, "reps": 6}]},
+            {"title": "Chest Supported T Bar Row",
+             "sets": [{"weight_kg": 30, "reps": 6}, {"weight_kg": 30, "reps": 6}]},
+        ],
+    })
+    embed = bot_mod._hevy_workout_embed("Poshy", summary)
+    body = embed.fields[0].value
+    assert "100kg×6, 93kg×6" in body
+    assert "2×30kg×6" in body
+    assert "top " not in body
+
+
+def test_routine_embed_renders_targets_and_supersets():
+    detail = hevy_client.summarize_routine({
+        "id": "r-1", "title": "Arms",
+        "exercises": [
+            {"title": "Butterfly (Pec Deck)", "notes": "slow negatives",
+             "sets": [{"weight_kg": 100, "reps": 6}, {"weight_kg": 93, "reps": 6}]},
+            {"title": "Plank", "superset_id": 0, "sets": [{"duration_seconds": 60}]},
+            {"title": "Push Up", "superset_id": 0,
+             "sets": [{"reps": 15}, {"reps": 12}]},
+        ],
+    })
+    embed = bot_mod._hevy_routine_embed(detail, "Push Pull")
+    assert embed.title == "📋 Arms"
+    assert "Push Pull" in embed.author.name and "3 exercises" in embed.author.name
+    body = embed.description
+    assert "**Butterfly (Pec Deck)** · 100kg×6, 93kg×6" in body
+    assert "slow negatives" in body
+    assert body.count("🔗") == 2            # both superset partners marked
+    assert "15 reps, 12 reps" in body       # rep-only targets still shown
+    assert "target sets" in embed.footer.text

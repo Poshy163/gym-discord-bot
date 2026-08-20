@@ -59,6 +59,11 @@ available; importing works even without a feed channel.
   is stored **encrypted**.
 - `/hevy status` — show whether you're linked, your Hevy profile, when it last
   synced, and whether weigh-ins are being mirrored.
+- `/hevy routine <name>` — one routine in full: every exercise with its target
+  sets spelled out (uniform sets collapse to `2×30kg×6`, differing ones list in
+  order), superset partners marked 🔗, exercise notes in small print. The name
+  autocompletes from your own routines; picking from the list survives renames
+  because the submitted value is the routine's id.
 - `/hevy routines` — sessions per routine with when each was last run. History
   older than the page-1 window trickle-backfills automatically: each poll
   fetches a few pre-existing workouts by id (five per pass) until every import
@@ -141,6 +146,12 @@ value but says so instead of pretending it applied.
   the exercise line; the per-exercise breakdown now also meets Discord's field
   cap by folding whole trailing lines into "…and N more" instead of slicing
   mid-line.
+- **Working sets are spelled out.** The per-exercise line used to say
+  `top 100kg×6`, which hid that the second set was 93kg — a reader couldn't
+  tell a planned drop from a typo. Uniform sets collapse (`2×30kg×6`);
+  differing ones are listed in order (`100kg×6, 93kg×6`), capped at six with an
+  ellipsis. Warmups stay out of the line (they have their own count in the
+  header).
 - **What the embed shows:** exercises, sets (working vs warmup), reps, volume,
   duration, per-exercise breakdown and top set, plus — where Hevy has the data —
   a **muscle-group split**, RPE, dropset and to-failure counts, distance/time

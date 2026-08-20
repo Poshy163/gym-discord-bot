@@ -1044,3 +1044,76 @@ def test_bodyweight_within_window(db):
     assert db.bodyweight_within(1, base - timedelta(minutes=9), 1800) is True
     assert db.bodyweight_within(1, base + timedelta(minutes=31), 1800) is False
     assert db.bodyweight_within(2, base, 1800) is False   # other member
+
+
+# ---------------------------------------------------------------------------
+# Set-detail formatting + routine detail (the /hevy routine view)
+# ---------------------------------------------------------------------------
+
+def test_format_set_summary_collapses_uniform_and_lists_mixed():
+    f = hevy_client.format_set_summary
+    assert f([[30, 6], [30, 6]]) == "2×30kg×6"
+    # A drop set must be visible, not hidden behind "top 100kg".
+    assert f([[100, 6], [93, 6]]) == "100kg×6, 93kg×6"
+    # Assisted pull-ups where MORE assistance came out on set two.
+    assert f([[36, 6], [41, 6]]) == "36kg×6, 41kg×6"
+    assert f([[100, 5]]) == "100kg×5"
+    assert f([[60, 0]]) == "60kg"          # weight logged, reps not
+    assert f([]) is None and f(None) is None
+    # Long pyramids cut with an ellipsis rather than being summarised away.
+    out = f([[100 - i, 5] for i in range(8)])
+    assert out.endswith(", …") and out.count(",") == 6
+
+
+def test_summarize_workout_carries_working_set_details():
+    s = hevy_client.summarize_workout(RICH_WORKOUT)
+    squat = s["exercises"][0]
+    # The warmup-free working sets, in logged order.
+    assert squat["set_details"] == [[100.0, 5], [100.0, 5], [80.0, 8]]
+    bench = s["exercises"][1]
+    assert bench["set_details"] == [[60.0, 10]]
+
+
+def test_summarize_workout_excludes_warmups_from_set_details():
+    s = hevy_client.summarize_workout(WORKOUT)
+    bench = s["exercises"][0]
+    # WORKOUT's bench: 60kg warmup + two 100x5 working sets.
+    assert bench["set_details"] == [[100.0, 5], [100.0, 5]]
+
+
+ROUTINE = {
+    "id": "r-1", "title": "Arms",
+    "folder_id": 42,
+    "exercises": [
+        {"title": "Chest Supported T Bar Row",
+         "sets": [{"weight_kg": 30, "reps": 6}, {"weight_kg": 30, "reps": 6}]},
+        {"title": "Butterfly (Pec Deck)", "notes": "slow negatives",
+         "sets": [{"weight_kg": 100, "reps": 6}, {"weight_kg": 93, "reps": 6}]},
+        {"title": "Plank", "superset_id": 0,
+         "sets": [{"duration_seconds": 60}]},
+        {"title": "Push Up", "superset_id": 0,
+         "sets": [{"reps": 15}, {"reps": 12}]},
+    ],
+}
+
+
+def test_summarize_routine_maps_targets():
+    d = hevy_client.summarize_routine(ROUTINE)
+    assert d["title"] == "Arms" and d["exercise_count"] == 4
+    row, bfly, plank, push = d["exercises"]
+    assert row["set_details"] == [[30.0, 6], [30.0, 6]]
+    assert bfly["set_details"] == [[100.0, 6], [93.0, 6]]
+    assert bfly["notes"] == "slow negatives"
+    assert plank["set_details"] == [] and plank["set_count"] == 1
+    assert push["rep_only"] == [15, 12]
+    assert push["superset_id"] == 0 and row["superset_id"] is None
+
+
+def test_fetch_routine_unwraps_envelope_and_none_on_404(monkeypatch):
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/routines/r-1"): _FakeResponse(200, {"routine": {"id": "r-1",
+                                                                  "title": "Arms"}}),
+        ("GET", "/routines/r-gone"): _FakeResponse(404),
+    }))
+    assert hevy_client.fetch_routine("k", "r-1")["title"] == "Arms"
+    assert hevy_client.fetch_routine("k", "r-gone") is None

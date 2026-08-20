@@ -467,6 +467,91 @@ def fetch_routine_folders(api_key: str, limit: int = 50) -> list[dict]:
     return out[:limit]
 
 
+def format_set_summary(details: list, max_sets: int = 6) -> str | None:
+    """Human summary of an exercise's weighted sets.
+
+    Uniform sets collapse ("2×30kg×6"); differing ones are listed in order
+    ("100kg×6, 93kg×6") because a bare "top 100kg" hides that the second set
+    dropped — the reader can't tell a pyramid from a typo. Long pyramids are
+    cut at ``max_sets`` with an ellipsis rather than summarised away.
+    """
+    pairs = [
+        (float(d[0]), int(d[1]) if d[1] is not None else 0)
+        for d in details or [] if d and float(d[0]) > 0
+    ]
+    if not pairs:
+        return None
+
+    def one(weight: float, reps: int) -> str:
+        return f"{weight:g}kg×{reps}" if reps else f"{weight:g}kg"
+
+    if len(set(pairs)) == 1 and len(pairs) > 1:
+        weight, reps = pairs[0]
+        return f"{len(pairs)}×{one(weight, reps)}"
+    shown = ", ".join(one(w, r) for w, r in pairs[:max_sets])
+    if len(pairs) > max_sets:
+        shown += ", …"
+    return shown
+
+
+def fetch_routine(api_key: str, routine_id: str) -> dict | None:
+    """One routine's full detail (exercises + target sets), or None on 404.
+
+    The list endpoint carries the same payload, but pages ten at a time — a
+    member with thirty routines would cost three calls to show one. The
+    response wraps the routine in a ``{"routine": ...}`` envelope."""
+    try:
+        data = _get(api_key, f"/routines/{routine_id}")
+    except HevyNotFound:
+        return None
+    if isinstance(data, dict):
+        inner = data.get("routine")
+        if isinstance(inner, dict):
+            return inner
+        if data.get("id"):
+            return data
+    return None
+
+
+def summarize_routine(routine: dict) -> dict:
+    """A routine's planned exercises and target sets, for the detail embed.
+
+    Same shape philosophy as :func:`summarize_workout`: pure, no network, one
+    dict the renderer can walk. Rest-timer and template plumbing are dropped —
+    the embed answers "what am I lifting", not "how is it configured".
+    """
+    exercises: list[dict] = []
+    for ex in routine.get("exercises") or []:
+        title = (ex.get("title") or "").strip()
+        if not title:
+            continue
+        details: list[list[float | int]] = []
+        rep_only: list[int] = []
+        for s in ex.get("sets") or []:
+            weight = _as_float(s.get("weight_kg")) or 0.0
+            reps = _as_int(s.get("reps")) or 0
+            if weight > 0:
+                details.append([weight, reps])
+            elif reps > 0:
+                rep_only.append(reps)
+        exercises.append({
+            "title": title,
+            "set_count": len(ex.get("sets") or []),
+            "set_details": details,
+            "rep_only": rep_only,
+            "notes": (ex.get("notes") or "").strip() or None,
+            "superset_id": ex.get("superset_id", ex.get("supersets_id")),
+        })
+    return {
+        "id": str(routine.get("id") or ""),
+        "title": (routine.get("title") or "Routine").strip() or "Routine",
+        "folder_id": routine.get("folder_id"),
+        "exercise_count": len(exercises),
+        "exercises": exercises,
+        "updated_at": routine.get("updated_at"),
+    }
+
+
 def index_routines(
     routines: list[dict], folders: list[dict] | None = None,
 ) -> dict[str, dict]:
@@ -828,10 +913,16 @@ def summarize_workout(workout: dict) -> dict:
         ex_custom = 0.0
         ex_rpe: float | None = None
         ex_top: tuple[float, int] | None = None
+        ex_set_details: list[list[float | int]] = []
         for s in ex_sets:
             weight = _as_float(s.get("weight_kg")) or 0.0
             reps = _as_int(s.get("reps")) or 0
             set_type = (s.get("type") or "normal").strip().lower()
+            if weight > 0 and set_type != "warmup":
+                # Working sets only: the breakdown line answers "what did the
+                # working weight look like", and warmups already have their own
+                # count in the header.
+                ex_set_details.append([weight, reps])
             set_count += 1
             if set_type == "warmup":
                 warmup_sets += 1
@@ -874,6 +965,7 @@ def summarize_workout(workout: dict) -> dict:
             "reps": ex_reps,
             "best_weight_kg": ex_top[0] if ex_top else None,
             "best_reps": ex_top[1] if ex_top else None,
+            "set_details": ex_set_details,
             "volume_kg": round(ex_volume),
             "template_id": str(ex.get("exercise_template_id") or "") or None,
             "notes": (ex.get("notes") or "").strip() or None,
