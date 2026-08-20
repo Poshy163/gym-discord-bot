@@ -1110,8 +1110,13 @@ def index_templates(templates: list[dict]) -> dict[str, dict]:
             "primary_muscle_group": (
                 template.get("primary_muscle_group") or ""
             ).strip().lower(),
+            # Hevy's OpenAPI spec names this field ``equipment_category``;
+            # the live API actually sends ``equipment`` (verified against a
+            # real account, like the supersets_id/superset_id mismatch). Read
+            # both so a spec-compliant future response keeps working.
             "equipment_category": (
-                template.get("equipment_category") or ""
+                template.get("equipment") or template.get("equipment_category")
+                or ""
             ).strip().lower(),
             "is_custom": bool(template.get("is_custom")),
         }
