@@ -1052,17 +1052,17 @@ def test_bodyweight_within_window(db):
 
 def test_format_set_summary_collapses_uniform_and_lists_mixed():
     f = hevy_client.format_set_summary
-    assert f([[30, 6], [30, 6]]) == "2×30kg×6"
+    assert f([[30, 6], [30, 6]]) == "2 sets of 30kg × 6"
     # A drop set must be visible, not hidden behind "top 100kg".
-    assert f([[100, 6], [93, 6]]) == "100kg×6, 93kg×6"
+    assert f([[100, 6], [93, 6]]) == "100kg × 6 → 93kg × 6"
     # Assisted pull-ups where MORE assistance came out on set two.
-    assert f([[36, 6], [41, 6]]) == "36kg×6, 41kg×6"
-    assert f([[100, 5]]) == "100kg×5"
+    assert f([[36, 6], [41, 6]]) == "36kg × 6 → 41kg × 6"
+    assert f([[100, 5]]) == "100kg × 5"
     assert f([[60, 0]]) == "60kg"          # weight logged, reps not
     assert f([]) is None and f(None) is None
     # Long pyramids cut with an ellipsis rather than being summarised away.
     out = f([[100 - i, 5] for i in range(8)])
-    assert out.endswith(", …") and out.count(",") == 6
+    assert out.endswith(" → …") and out.count("→") == 6
 
 
 def test_summarize_workout_carries_working_set_details():

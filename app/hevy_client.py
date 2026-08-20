@@ -470,10 +470,12 @@ def fetch_routine_folders(api_key: str, limit: int = 50) -> list[dict]:
 def format_set_summary(details: list, max_sets: int = 6) -> str | None:
     """Human summary of an exercise's weighted sets.
 
-    Uniform sets collapse ("2×30kg×6"); differing ones are listed in order
-    ("100kg×6, 93kg×6") because a bare "top 100kg" hides that the second set
-    dropped — the reader can't tell a pyramid from a typo. Long pyramids are
-    cut at ``max_sets`` with an ellipsis rather than summarised away.
+    Uniform sets collapse ("2 sets of 30kg × 6"); differing ones read as the
+    sequence they were done in ("100kg × 6 → 93kg × 6") because a bare
+    "top 100kg" hides that the second set dropped — the reader can't tell a
+    pyramid from a typo. Words over glyph-soup ("2×30kg×6" made members squint)
+    but the arrow keeps a six-set pyramid on one line. Long pyramids are cut at
+    ``max_sets`` with an ellipsis rather than summarised away.
     """
     pairs = [
         (float(d[0]), int(d[1]) if d[1] is not None else 0)
@@ -483,14 +485,14 @@ def format_set_summary(details: list, max_sets: int = 6) -> str | None:
         return None
 
     def one(weight: float, reps: int) -> str:
-        return f"{weight:g}kg×{reps}" if reps else f"{weight:g}kg"
+        return f"{weight:g}kg × {reps}" if reps else f"{weight:g}kg"
 
     if len(set(pairs)) == 1 and len(pairs) > 1:
         weight, reps = pairs[0]
-        return f"{len(pairs)}×{one(weight, reps)}"
-    shown = ", ".join(one(w, r) for w, r in pairs[:max_sets])
+        return f"{len(pairs)} sets of {one(weight, reps)}"
+    shown = " → ".join(one(w, r) for w, r in pairs[:max_sets])
     if len(pairs) > max_sets:
-        shown += ", …"
+        shown += " → …"
     return shown
 
 

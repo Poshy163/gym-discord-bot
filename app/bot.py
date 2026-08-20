@@ -17550,7 +17550,7 @@ def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
     sets = ex.get("sets") or 0
     # Real working sets, spelled out. "top 100kg×6" hid that the second set was
     # 93kg — a reader couldn't tell a planned drop from a typo. Uniform sets
-    # collapse ("2×30kg×6"), differing ones are listed in order. The "N sets"
+    # collapse ("2 sets of 30kg × 6"), differing ones read in order. The "N sets"
     # prefix only survives when the detail doesn't already cover every set
     # (warmups, or weightless sets alongside weighted ones).
     detail = hevy_client.format_set_summary(ex.get("set_details"))
@@ -18770,16 +18770,32 @@ async def hevy_routine_cmd(
         return
     detail = hevy_client.summarize_routine(routine)
     info = routines.get(routine_id) or {}
-    embed = _hevy_routine_embed(detail, info.get("folder"))
+    usage = next(
+        (
+            r for r in db.hevy_routine_usage(interaction.user.id)
+            if r["routine_id"] == routine_id
+        ),
+        None,
+    )
+    embed = _hevy_routine_embed(detail, info.get("folder"), usage)
     await interaction.followup.send(embed=embed)
 
 
-def _hevy_routine_embed(detail: dict, folder: str | None) -> discord.Embed:
+def _hevy_routine_embed(
+    detail: dict, folder: str | None, usage=None,
+) -> discord.Embed:
     """The /hevy routine detail card: one line per exercise, sets spelled out.
 
     Same set formatting as the workout feed (uniform sets collapse, differing
     ones are listed) so a routine and the workout it produced read alike.
-    Superset partners share a 🔗 marker, matching the feed embed."""
+    Superset partners share a 🔗 marker, matching the feed embed.
+
+    ``usage`` is the caller's hevy_routine_usage row for this routine, when
+    they have one. The footer once said "target sets, not a logged workout",
+    which a member read as *you have not logged a workout* — the opposite of
+    the truth. Now the card says what the numbers are ("planned targets") and
+    proves the log exists by dating the last run via ``embed.timestamp``
+    (footers never render Discord timestamps, so the date rides there)."""
     lines: list[str] = []
     for ex in detail.get("exercises") or []:
         marker = "🔗 " if ex.get("superset_id") is not None else ""
@@ -18787,9 +18803,9 @@ def _hevy_routine_embed(detail: dict, folder: str | None) -> discord.Embed:
         if not sets and ex.get("rep_only"):
             reps = ex["rep_only"]
             sets = (
-                f"{len(reps)}×{reps[0]} reps"
+                f"{len(reps)} sets of {reps[0]} reps"
                 if len(set(reps)) == 1 and len(reps) > 1
-                else ", ".join(f"{r} reps" for r in reps[:6])
+                else " → ".join(f"{r} reps" for r in reps[:6])
             )
         if not sets:
             count = ex.get("set_count") or 0
@@ -18808,7 +18824,19 @@ def _hevy_routine_embed(detail: dict, folder: str | None) -> discord.Embed:
         f"{folder} · {count} exercise{'s' if count != 1 else ''}"
         if folder else f"{count} exercise{'s' if count != 1 else ''}"
     ))
-    embed.set_footer(text="via Hevy · target sets, not a logged workout")
+    if usage is not None and usage["sessions"]:
+        n_s = int(usage["sessions"])
+        embed.set_footer(
+            text=(
+                f"via Hevy · planned targets · you've run this "
+                f"{n_s} time{'s' if n_s != 1 else ''} — last"
+            ),
+        )
+        last = _parse_hevy_time(usage["last_at"])
+        if last is not None:
+            embed.timestamp = last
+    else:
+        embed.set_footer(text="via Hevy · planned targets · not run yet")
     return embed
 
 

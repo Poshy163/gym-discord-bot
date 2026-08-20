@@ -1020,8 +1020,8 @@ def test_exercise_line_spells_out_differing_sets():
     })
     embed = bot_mod._hevy_workout_embed("Poshy", summary)
     body = embed.fields[0].value
-    assert "100kg×6, 93kg×6" in body
-    assert "2×30kg×6" in body
+    assert "100kg × 6 → 93kg × 6" in body
+    assert "2 sets of 30kg × 6" in body
     assert "top " not in body
 
 
@@ -1040,8 +1040,8 @@ def test_routine_embed_renders_targets_and_supersets():
     assert embed.title == "📋 Arms"
     assert "Push Pull" in embed.author.name and "3 exercises" in embed.author.name
     body = embed.description
-    assert "**Butterfly (Pec Deck)** · 100kg×6, 93kg×6" in body
+    assert "**Butterfly (Pec Deck)** · 100kg × 6 → 93kg × 6" in body
     assert "slow negatives" in body
     assert body.count("🔗") == 2            # both superset partners marked
-    assert "15 reps, 12 reps" in body       # rep-only targets still shown
-    assert "target sets" in embed.footer.text
+    assert "15 reps → 12 reps" in body      # rep-only targets still shown
+    assert "planned targets" in embed.footer.text
