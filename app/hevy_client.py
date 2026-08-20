@@ -269,6 +269,25 @@ def fetch_workouts(api_key: str, page: int = 1, page_size: int = 10) -> list[dic
     return []
 
 
+def fetch_workouts_page(
+    api_key: str, page: int, page_size: int = 10,
+) -> tuple[list[dict], int]:
+    """One /workouts page **with** the total page count.
+
+    :func:`fetch_workouts` throws page_count away, which is fine for the poll
+    (it only ever wants the newest page) but the deep-history walk needs to
+    know when to stop."""
+    data = _get(api_key, "/workouts", {"page": page, "pageSize": page_size})
+    if not isinstance(data, dict):
+        return ([], 0)
+    workouts = data.get("workouts", []) or []
+    try:
+        page_count = int(data.get("page_count") or 0)
+    except (TypeError, ValueError):
+        page_count = 0
+    return (workouts, page_count)
+
+
 def fetch_recent_workouts(api_key: str, limit: int = 50) -> list[dict]:
     """Most recent up to ``limit`` workouts, paging the API (newest-first).
 

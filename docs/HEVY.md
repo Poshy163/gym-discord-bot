@@ -127,6 +127,21 @@ value but says so instead of pretending it applied.
   the equipment name implies.
 - **No double-logging:** each Hevy workout id is recorded once imported, so
   repeated polls never re-import. Unlinking clears that history.
+- **The whole account comes in, not just the last 50.** The link-time backfill
+  stops at 50 workouts for the instant summary; a background walk then pages
+  through the member's **entire** Hevy history (three pages of ten per poll,
+  resumable across restarts) and imports every workout as lifts through the
+  same dedup the poll uses. Graphs, PRs and leaderboards see all of it — one
+  summary posts when the walk finishes, warning that an all-time best may have
+  moved. Accounts linked before this existed are picked up automatically. The
+  walk ends with a count check against `/workouts/count` and re-walks once if
+  pagination shifted under it; a count still short after that (a workout the
+  ledger remembers but Hevy deleted) is accepted rather than walked forever.
+- **Hevy's exercise names autofill everywhere.** `/graph`, `/history`,
+  `/leaderboard` and friends suggest Hevy titles alongside the bot's own names
+  — typing "butterfly" offers `Butterfly (Pec Deck)  →  pec dec`, with your own
+  Hevy exercises first. The submitted value is the canonical equipment, so
+  nothing downstream changes.
 - **First sync is quiet:** the poll right after linking imports your recent
   workouts as lifts and posts a **single** summary embed for the whole backfill,
   rather than one embed per historical workout. New workouts after that each

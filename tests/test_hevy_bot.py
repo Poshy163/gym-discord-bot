@@ -1045,3 +1045,127 @@ def test_routine_embed_renders_targets_and_supersets():
     assert body.count("🔗") == 2            # both superset partners marked
     assert "15 reps → 12 reps" in body      # rep-only targets still shown
     assert "planned targets" in embed.footer.text
+
+
+# ---------------------------------------------------------------------------
+# Deep-history walk (everything beyond the 50-workout link backfill)
+# ---------------------------------------------------------------------------
+
+def _mk_workout(i: int) -> dict:
+    return {
+        "id": f"deep-{i}", "title": f"Session {i}",
+        "start_time": f"2025-{(i % 12) + 1:02d}-10T10:00:00+00:00",
+        "exercises": [{"title": "Bench Press (Barbell)",
+                       "sets": [{"weight_kg": 60 + i, "reps": 5}]}],
+    }
+
+
+def _paged(workouts: list[dict], page_size: int = 10):
+    """A fetch_workouts_page stand-in over a fixed newest-first list."""
+    import math
+    pages = math.ceil(len(workouts) / page_size) or 1
+
+    def fetch(api_key, page, size=page_size):
+        lo = (page - 1) * page_size
+        return (workouts[lo:lo + page_size], pages)
+
+    return fetch
+
+
+def test_deep_walk_imports_everything_across_polls(events_env, monkeypatch):
+    """A 47-workout account: three pages per poll, resumable cursor, one
+    completion announcement, PRs never celebrated for history."""
+    from unittest.mock import AsyncMock
+
+    env = events_env
+    history = [_mk_workout(i) for i in range(47)]
+    monkeypatch.setattr(hevy_client, "fetch_workouts_page", _paged(history))
+    monkeypatch.setattr(hevy_client, "verify_key",
+                        lambda k: {"ok": True, "count": 47})
+    sent: list = []
+    channel = SimpleNamespace(send=AsyncMock(side_effect=lambda **kw: sent.append(kw)))
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", 999, raising=False)
+    monkeypatch.setattr(bot_mod.bot, "get_channel", lambda cid: channel)
+
+    total = 0
+    passes = 0
+    while env.row()["deep_backfilled_at"] is None and passes < 10:
+        total += _run(bot_mod._hevy_deep_backfill(
+            env.row(), "key", {}, "poshy", 42,
+        ))
+        passes += 1
+
+    assert total == 47
+    assert env.db.hevy_imported_count(7) == 47
+    assert passes == 2  # 3 pages (30) + 2 pages (17) -> done on pass two
+    # One summary, not 47 embeds — and it says PRs may have moved.
+    assert len(sent) == 1
+    assert "47" in sent[0]["embed"].description
+    # Done means done: the next poll costs zero requests.
+    calls = []
+    monkeypatch.setattr(hevy_client, "fetch_workouts_page",
+                        lambda *a, **k: calls.append(1) or ([], 1))
+    assert _run(bot_mod._hevy_deep_backfill(env.row(), "key", {}, "p", 42)) == 0
+    assert calls == []
+
+
+def test_deep_walk_is_idempotent_over_already_imported_pages(events_env,
+                                                             monkeypatch):
+    """Page 1 is always already imported (the poll got there first) — the walk
+    must skip it without double-logging a single lift."""
+    env = events_env
+    history = [_mk_workout(i) for i in range(12)]
+    # The poll already imported the newest two.
+    for w in history[:2]:
+        env.db.hevy_mark_workout(7, w["id"])
+    monkeypatch.setattr(hevy_client, "fetch_workouts_page", _paged(history))
+    monkeypatch.setattr(hevy_client, "verify_key",
+                        lambda k: {"ok": True, "count": 12})
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", None, raising=False)
+
+    got = _run(bot_mod._hevy_deep_backfill(env.row(), "key", {}, "p", 42))
+    assert got == 10                      # 12 minus the 2 the poll owned
+    assert env.db.hevy_imported_count(7) == 12
+
+
+def test_deep_walk_rewalks_once_when_the_count_says_short(events_env,
+                                                          monkeypatch):
+    """Pagination shifts under new workouts, so the end of the last page is
+    not proof of coverage — the count check catches a slipped workout."""
+    env = events_env
+    history = [_mk_workout(i) for i in range(14)]
+    shown = history[:13]                 # one workout hidden first time round
+    state = {"walks": 0}
+
+    def fetch(api_key, page, size=10):
+        lo = (page - 1) * 10
+        src = shown if state["walks"] == 0 else history
+        import math
+        return (src[lo:lo + 10], math.ceil(len(src) / 10))
+
+    monkeypatch.setattr(hevy_client, "fetch_workouts_page", fetch)
+    monkeypatch.setattr(hevy_client, "verify_key",
+                        lambda k: {"ok": True, "count": 14})
+    monkeypatch.setattr(bot_mod, "HEVY_FEED_CHANNEL_ID", None, raising=False)
+
+    for _ in range(6):
+        if env.row()["deep_backfilled_at"] is not None:
+            break
+        _run(bot_mod._hevy_deep_backfill(env.row(), "key", {}, "p", 42))
+        if env.row()["deep_page"] < 0:    # the one re-walk was triggered
+            state["walks"] = 1
+
+    assert env.db.hevy_imported_count(7) == 14
+    assert env.row()["deep_backfilled_at"] is not None
+
+
+def test_deep_walk_transient_failure_keeps_the_cursor(events_env, monkeypatch):
+    env = events_env
+
+    def _boom(*_a, **_k):
+        raise hevy_client.HevyError("timeout")
+
+    monkeypatch.setattr(hevy_client, "fetch_workouts_page", _boom)
+    assert _run(bot_mod._hevy_deep_backfill(env.row(), "key", {}, "p", 42)) == 0
+    assert env.row()["deep_backfilled_at"] is None
+    assert env.row()["deep_page"] == 1    # unmoved — next poll retries

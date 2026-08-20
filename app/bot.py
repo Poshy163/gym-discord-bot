@@ -10555,7 +10555,39 @@ async def _equipment_autocomplete(
         if cur:
             ordered = [n for n in ordered if cur in n.lower()]
 
-    return [app_commands.Choice(name=n, value=n) for n in ordered[:25]]
+    choices = [app_commands.Choice(name=n, value=n) for n in ordered[:25]]
+
+    # Hevy's own exercise names autofill too — someone who trains in Hevy
+    # types "butterfly", not "pec dec". The label shows both halves and the
+    # VALUE is the canonical equipment, so everything downstream (graphs,
+    # leaderboards, history) resolves without knowing Hevy exists. The
+    # member's own exercises come first (that ordering is baked into the db
+    # helper), and titles identical to their canonical name are skipped —
+    # they'd duplicate a suggestion already on the list.
+    if len(choices) < 25:
+        try:
+            pairs = db.hevy_titles_for_autocomplete(
+                interaction.user.id, guild_id,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pairs = []
+        shown = {c.value for c in choices}
+        for title, equipment in pairs:
+            if len(choices) >= 25:
+                break
+            if title.lower() == equipment.lower():
+                continue
+            if cur and cur not in title.lower():
+                continue
+            if not cur and equipment in shown:
+                continue  # untyped: don't shadow the canonical list
+            label = f"{title}  →  {equipment}"
+            choices.append(
+                app_commands.Choice(name=label[:100], value=equipment[:100]),
+            )
+            shown.add(equipment)
+
+    return choices[:25]
 
 
 progress_cmd.autocomplete("equipment")(_equipment_autocomplete)
@@ -18061,6 +18093,118 @@ async def _hevy_backfill_shapes(account_row, api_key: str) -> int:
     return filled
 
 
+#: Pages of /workouts the deep-history walk fetches per account per poll.
+#: Three pages = 30 workouts a pass; a 300-workout account finishes inside a
+#: normal evening of polling without ever bursting the API.
+_HEVY_DEEP_PAGES_PER_POLL = 3
+
+
+async def _hevy_deep_backfill(
+    row, api_key: str, templates: dict[str, dict], username: str,
+    guild_id: int,
+) -> int:
+    """Walk the member's ENTIRE Hevy history into the lift log, a few pages
+    per poll.
+
+    The link-time backfill stops at 50 workouts, so a long-time Hevy user's
+    older history — and the PRs buried in it — never reached the bot. This
+    walks every page of /workouts (newest-first, resumable via a stored page
+    cursor) and imports through the same idempotent claim-then-write the poll
+    uses, so re-seeing a workout is a no-op and interruption costs nothing.
+
+    Import order doesn't matter for correctness: PRs and leaderboards are
+    MAX-over-history at read time, so the final state is identical whichever
+    page lands first. Nothing is announced per workout — a member's 2024
+    training must not spam the feed — and PR celebration is deliberately
+    skipped for history: "new PR" means something happened *today*.
+
+    Pagination shifts while the walk runs (a new workout on page 1 pushes
+    everything down one), so finishing the last page isn't proof of coverage.
+    The walk ends with a count check against /workouts/count and restarts once
+    from page 1 if short — idempotent skips make the re-walk one cheap request
+    per ten workouts. Returns how many workouts this pass imported.
+    """
+    if row["deep_backfilled_at"] is not None:
+        return 0
+    user_id = int(row["user_id"])
+    cursor = int(row["deep_page"] or 1)
+    # A negative cursor means this IS the one permitted re-walk (see
+    # hevy_reset_deep_walk) — a still-short count after it gets accepted, not
+    # walked again forever.
+    rewalking = cursor < 0
+    page = max(1, abs(cursor))
+    imported_this_pass = 0
+    page_count = None
+    for _ in range(_HEVY_DEEP_PAGES_PER_POLL):
+        def _fetch(page: int = page) -> tuple[list[dict], int]:
+            return hevy_client.fetch_workouts_page(api_key, page)
+
+        try:
+            workouts, page_count = await bot.loop.run_in_executor(None, _fetch)
+        except hevy_client.HevyAuthError:
+            return imported_this_pass
+        except hevy_client.HevyError as exc:
+            LOG.info("Hevy: deep walk fetch failed for %s: %s", user_id, exc)
+            return imported_this_pass  # cursor unmoved — retry next poll
+        fresh = 0
+        for workout in workouts:
+            r = _hevy_import_workout(
+                user_id, guild_id, username, workout, templates,
+            )
+            if r is not None:
+                fresh += 1
+        imported_this_pass += fresh
+        page += 1
+        db.hevy_deep_progress(user_id, -page if rewalking else page, fresh)
+        if not workouts or (page_count and page > page_count):
+            break
+
+    if page_count is not None and (not workouts or page > page_count):
+        # Reached the end. Pagination may have shifted mid-walk, so trust the
+        # count, not the page number: one re-walk from page 1 if short.
+        try:
+            expected = int(hevy_client.verify_key(api_key).get("count", 0))
+        except hevy_client.HevyError:
+            expected = 0
+        have = db.hevy_imported_count(user_id)
+        if expected and have < expected and not rewalking:
+            LOG.info(
+                "Hevy: deep walk for %s has %d of %d — re-walking once",
+                user_id, have, expected,
+            )
+            db.hevy_reset_deep_walk(user_id)
+            return imported_this_pass
+        total = db.hevy_mark_deep_done(user_id)
+        LOG.info(
+            "Hevy: deep history walk complete for %s — %d workout(s) imported",
+            user_id, total,
+        )
+        if total:
+            feed_channel = (
+                bot.get_channel(HEVY_FEED_CHANNEL_ID)
+                if HEVY_FEED_CHANNEL_ID else None
+            )
+            if feed_channel is not None:
+                embed = discord.Embed(
+                    title="📚 Full Hevy history imported",
+                    colour=HEVY_COLOUR,
+                    description=(
+                        f"**{username}**'s complete Hevy history is in — "
+                        f"**{total}** older workout"
+                        f"{'s' if total != 1 else ''} beyond the original "
+                        "backfill. Graphs, PRs and leaderboards now see all "
+                        "of it, so an all-time best may have moved without "
+                        "anyone lifting anything today."
+                    ),
+                )
+                embed.set_footer(text="via Hevy · one-time history import")
+                try:
+                    await feed_channel.send(embed=embed)
+                except discord.HTTPException:  # pragma: no cover
+                    LOG.info("Hevy: deep-walk summary failed to post")
+    return imported_this_pass
+
+
 async def _hevy_drain_events(
     account_row, api_key: str, templates: dict[str, dict], username: str,
     sync_started: datetime,
@@ -18147,7 +18291,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
     result = {
         "new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False,
         "weigh_ins_pushed": 0, "weigh_ins_imported": 0,
-        "edited": 0, "retracted": 0,
+        "edited": 0, "retracted": 0, "deep_imported": 0,
     }
     user_id = int(row["user_id"])
     guild_id = int(row["guild_id"])
@@ -18295,6 +18439,16 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
         await _hevy_backfill_shapes(row, api_key)
     except Exception:  # pragma: no cover - defensive
         LOG.exception("Hevy: shape backfill failed for %s", user_id)
+
+    # Walk the rest of their Hevy history into the lift log, a few pages per
+    # poll, until the whole account is in. Trickled for the same reason as the
+    # shapes; announced once at the end, never per workout.
+    try:
+        result["deep_imported"] = await _hevy_deep_backfill(
+            row, api_key, templates, username, guild_id,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOG.exception("Hevy: deep backfill failed for %s", user_id)
 
     # One-time bodyweight merge with Hevy's body measurements. Gated on its own
     # marker rather than on `backfill`, so accounts linked before this existed

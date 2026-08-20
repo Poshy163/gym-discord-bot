@@ -1117,3 +1117,26 @@ def test_fetch_routine_unwraps_envelope_and_none_on_404(monkeypatch):
     }))
     assert hevy_client.fetch_routine("k", "r-1")["title"] == "Arms"
     assert hevy_client.fetch_routine("k", "r-gone") is None
+
+
+def test_hevy_titles_for_autocomplete_puts_own_exercises_first(db):
+    from app.parser import Lift
+
+    db.hevy_equipment_map_refresh([
+        {"id": "T1", "title": "Butterfly (Pec Deck)",
+         "primary_muscle_group": "chest", "is_custom": False},
+        {"id": "T2", "title": "Leg Press (Machine)",
+         "primary_muscle_group": "quadriceps", "is_custom": False},
+        {"id": "T3", "title": "Chin Up (Weighted)",
+         "primary_muscle_group": "lats", "is_custom": False},
+    ])
+    # Member 1 has done the pec deck via Hevy; nothing else.
+    db.add_lifts(guild_id=42, user_id=1, username="u", lifts=[
+        Lift(equipment="pec dec", weight_kg=100, reps=6,
+             raw="hevy:Butterfly (Pec Deck)", confident=True, structured=True),
+    ])
+    pairs = db.hevy_titles_for_autocomplete(1, 42)
+    assert pairs[0] == ("Butterfly (Pec Deck)", "pec dec")
+    assert ("Leg Press (Machine)", "leg press") in pairs[1:]
+    # A member with no Hevy lifts still gets the catalogue, unordered by self.
+    assert len(db.hevy_titles_for_autocomplete(2, 42)) == 3

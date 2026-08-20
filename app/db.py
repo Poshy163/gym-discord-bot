@@ -703,7 +703,14 @@ CREATE TABLE IF NOT EXISTS hevy_account (
     -- "never drained": the first drain seeds it to now and makes ZERO Hevy
     -- requests — every pre-existing import has lifts_linked NULL and would be
     -- refused anyway, so reading years of edit history buys nothing.
-    events_since          TEXT
+    events_since          TEXT,
+    -- Deep-history walk state. NULL deep_backfilled_at = "not done", which is
+    -- what pulls accounts linked before the walk existed into it; deep_page is
+    -- the resume cursor so the walk survives restarts; deep_imported
+    -- accumulates the count for the single completion announcement.
+    deep_backfilled_at    TEXT,
+    deep_page             INTEGER NOT NULL DEFAULT 1,
+    deep_imported         INTEGER NOT NULL DEFAULT 0
 );
 
 -- The shape columns cache what each imported workout *was* — which routine it
@@ -1381,6 +1388,20 @@ class Database:
                 self._connection.execute(
                     "ALTER TABLE hevy_account "
                     "ADD COLUMN measurements_synced_at TEXT"
+                )
+            # Deep-history walk state (see the schema comment). NULL marker on
+            # purpose so existing accounts pick the walk up automatically.
+            if hevy_cols and "deep_backfilled_at" not in hevy_cols:
+                self._connection.execute(
+                    "ALTER TABLE hevy_account ADD COLUMN deep_backfilled_at TEXT"
+                )
+                self._connection.execute(
+                    "ALTER TABLE hevy_account "
+                    "ADD COLUMN deep_page INTEGER NOT NULL DEFAULT 1"
+                )
+                self._connection.execute(
+                    "ALTER TABLE hevy_account "
+                    "ADD COLUMN deep_imported INTEGER NOT NULL DEFAULT 0"
                 )
             if hevy_cols and "events_since" not in hevy_cols:
                 self._connection.execute(
@@ -4512,6 +4533,90 @@ class Database:
                 "WHERE user_id = ? AND recorded_at BETWEEN ? AND ? LIMIT 1",
                 (user_id, low, high),
             ).fetchone() is not None
+
+    def hevy_deep_progress(
+        self, user_id: int, page: int, imported: int,
+    ) -> None:
+        """Advance the deep-history walk's resume cursor."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET deep_page = ?, "
+                "deep_imported = deep_imported + ? WHERE user_id = ?",
+                (int(page), int(imported), user_id),
+            )
+
+    def hevy_mark_deep_done(self, user_id: int) -> int:
+        """Finish the deep walk; returns the total it imported (for the
+        one completion announcement)."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET deep_backfilled_at = ? "
+                "WHERE user_id = ?",
+                (_normalize_iso(None), user_id),
+            )
+            row = c.execute(
+                "SELECT deep_imported FROM hevy_account WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return int(row["deep_imported"]) if row else 0
+
+    def hevy_reset_deep_walk(self, user_id: int) -> None:
+        """Restart the walk from page 1, marked as the one-and-only re-walk.
+
+        Used by the post-walk count check: pagination shifts under new
+        workouts, so a workout can slip across a page boundary mid-walk. The
+        cursor's **sign** carries "this is the re-walk" (-1 = re-walk, page 1),
+        which is what stops a persistently-short count — a deleted workout the
+        ledger still remembers — from re-walking forever. One extra column for
+        one bit felt worse than a signed cursor."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE hevy_account SET deep_page = -1 WHERE user_id = ?",
+                (user_id,),
+            )
+
+    def hevy_imported_count(self, user_id: int) -> int:
+        with self._conn() as c:
+            return int(c.execute(
+                "SELECT COUNT(*) FROM hevy_imported WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0])
+
+    def hevy_titles_for_autocomplete(
+        self, user_id: int, guild_id: int,
+    ) -> list[tuple[str, str]]:
+        """(hevy_title, equipment) pairs for the equipment autocomplete.
+
+        The member's own Hevy exercises first (newest lift first), then the
+        rest of the machine map, so "Butterfly (Pec Deck)" autofills for
+        someone who has actually done it before it appears for everyone else.
+        Titles come from the map rather than from lifts' raw strings so the
+        pair always reflects the *current* routing, overrides included."""
+        with self._conn() as c:
+            own_raw = [
+                str(r["raw"])[5:] for r in c.execute(
+                    "SELECT DISTINCT raw FROM lifts "
+                    "WHERE user_id = ? AND raw LIKE 'hevy:%' "
+                    "ORDER BY id DESC LIMIT 100",
+                    (user_id,),
+                )
+            ]
+            mapped = {
+                str(r["hevy_title"]): str(r["equipment"])
+                for r in c.execute(
+                    "SELECT hevy_title, equipment FROM hevy_equipment_map",
+                )
+            }
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for title in own_raw:
+            if title in mapped and title not in seen:
+                seen.add(title)
+                out.append((title, mapped[title]))
+        for title, equipment in mapped.items():
+            if title not in seen:
+                out.append((title, equipment))
+        return out
 
     def hevy_unshaped_workouts(self, user_id: int, limit: int = 5) -> list[str]:
         """Workout ids imported before shape stamping existed, oldest first.
