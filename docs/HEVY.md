@@ -61,8 +61,9 @@ available; importing works even without a feed channel.
   synced, and whether weigh-ins are being mirrored.
 - `/hevy routine <name>` — one routine in full: every exercise with its target
   sets spelled out (uniform sets collapse to `2 sets of 30kg × 6`, differing
-  ones read in order: `100kg × 6 → 93kg × 6`), superset partners marked 🔗,
-  exercise notes in small print. The footer dates your last run of it. The name
+  ones read in order: `100kg × 6 → 93kg × 6`), the rest timer as `⏳ 1m 30s`,
+  superset partners marked 🔗, and each exercise's notes in small print — in
+  full, never clipped. The footer dates your last run of it. The name
   autocompletes from your own routines; picking from the list survives renames
   because the submitted value is the routine's id.
 - `/hevy routines` — sessions per routine with when each was last run. History
@@ -168,10 +169,19 @@ value but says so instead of pretending it applied.
   (`2 sets of 30kg × 6`); differing ones read in the order they were done
   (`100kg × 6 → 93kg × 6`), capped at six with an ellipsis. Warmups stay out of
   the line (they have their own count in the header).
+- **Rest timers come from the routine.** Hevy's workout payload has no rest
+  field at all — only routines carry `rest_seconds`, per exercise. So the feed
+  embed reads the plan off the routine the session was run from (matched by
+  exercise template id, or by title for a custom exercise), shows it as
+  `⏳ 1m 30s` on the line, and captions the field so nobody mistakes it for time
+  the member actually rested. A freestyle workout shows none. The routine list
+  is already fetched for the "from **Push Pull / Arms**" label, so this costs no
+  extra API call.
 - **What the embed shows:** exercises, sets (working vs warmup), reps, volume,
   duration, per-exercise breakdown and top set, plus — where Hevy has the data —
   a **muscle-group split**, RPE, dropset and to-failure counts, distance/time
-  per exercise, the workout description and your Hevy profile link.
+  per exercise, the workout description (in full, up to Discord's own field cap)
+  and your Hevy profile link.
 - Workouts are filed under the **server you linked from** (or your `/server`
   default when linking via DM).
 

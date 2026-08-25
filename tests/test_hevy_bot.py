@@ -1047,6 +1047,111 @@ def test_routine_embed_renders_targets_and_supersets():
     assert "planned targets" in embed.footer.text
 
 
+def test_rest_str_keeps_the_seconds():
+    """90s is the commonest rest setting there is, and _hevy_duration_str
+    renders it "1m" — hence a separate formatter."""
+    assert bot_mod._hevy_rest_str(90) == "1m 30s"
+    assert bot_mod._hevy_rest_str(120) == "2m"
+    assert bot_mod._hevy_rest_str(45) == "45s"
+    assert bot_mod._hevy_rest_str(0) is None
+    assert bot_mod._hevy_rest_str(None) is None
+
+
+def test_routine_embed_shows_rest_and_the_whole_note():
+    """The user's real card: "Plank · 3 sets" with a cue cut at 100 chars, and
+    no sign anywhere of the 1m rest the routine actually plans."""
+    detail = hevy_client.summarize_routine({
+        "id": "r-1", "title": "Calisthenics",
+        "exercises": [
+            {"title": "Pull Up (Assisted)", "rest_seconds": 120,
+             "sets": [{"weight_kg": 36, "reps": 6}] * 3},
+            {"title": "Plank", "rest_seconds": 60,
+             "notes": ("Elbows under shoulders, squeeze glutes, ribs down - do "
+                       "not let the hips sag. 40s per set. Add 10s each week."),
+             "sets": [{"duration_seconds": 40}] * 3},
+        ],
+    })
+    body = bot_mod._hevy_routine_embed(detail, None).description
+    assert "**Pull Up (Assisted)** · 3 sets of 36kg × 6 · ⏳ 2m" in body
+    assert "**Plank** · 3 sets · ⏳ 1m" in body
+    assert "40s per set. Add 10s each week." in body   # the tail survives
+    assert "…" not in body
+
+
+def test_routine_embed_drops_whole_exercises_rather_than_slicing():
+    """Long notes can outgrow Discord's 4096-char description. What's left has
+    to be whole sentences plus an honest count, not a body cut mid-cue."""
+    detail = hevy_client.summarize_routine({
+        "id": "r-1", "title": "Wordy",
+        "exercises": [
+            {"title": f"Exercise {i}", "notes": "cue. " * 160,
+             "sets": [{"weight_kg": 20, "reps": 5}]}
+            for i in range(8)
+        ],
+    })
+    body = bot_mod._hevy_routine_embed(detail, None).description
+    assert len(body) <= 4096
+    assert body.rstrip().endswith("open the routine in Hevy")
+    assert "more exercise" in body
+    # Every exercise that survived kept its full note.
+    assert body.count(("cue. " * 160).strip()) == body.count("**Exercise ")
+
+
+def test_workout_embed_borrows_the_routines_rest_plan():
+    """A logged workout carries no rest at all (verified live), so the feed
+    embed reads it off the routine the session was run from — and says so, so
+    nobody reads the hourglass as time the member actually rested."""
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Legs", "routine_id": "r-9",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [
+            {"title": "Leg Extension (Machine)",
+             "exercise_template_id": "T1",
+             "sets": [{"weight_kg": 77, "reps": 6}] * 2},
+            {"title": "Sled Push",           # custom: matched by title
+             "sets": [{"weight_kg": 40, "reps": 10}]},
+        ],
+    })
+    routines = {"r-9": {
+        "title": "Legs", "folder": None,
+        "rest": {"T1": 60, "sled push": 150},
+    }}
+    body = bot_mod._hevy_workout_embed(
+        "poshy", summary, None, None, None, routines,
+    ).fields[0].value
+    assert "**Leg Extension (Machine)** · 2 sets of 77kg × 6 · ⏳ 1m" in body
+    assert "**Sled Push** · 40kg × 10 · ⏳ 2m 30s" in body
+    assert "as the routine plans it" in body
+
+
+def test_workout_embed_stays_quiet_about_rest_when_there_is_no_routine():
+    """A freestyle session has no plan to quote — no hourglass, no legend."""
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Freestyle",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [{"title": "Curl", "sets": [{"weight_kg": 20, "reps": 10}]}],
+    })
+    body = bot_mod._hevy_workout_embed("poshy", summary).fields[0].value
+    assert "⏳" not in body
+
+
+def test_workout_embed_keeps_the_whole_description():
+    """The session write-up was being cut to _safe_label's 60-char default —
+    one clause in, on a note the member typed themselves."""
+    note = (
+        "Felt strong today. Shoulder twinged on the third set of presses, so I "
+        "dropped the weight and finished with strict form instead of grinding."
+    )
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Push", "description": note,
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [{"title": "Curl", "sets": [{"weight_kg": 20, "reps": 10}]}],
+    })
+    field = bot_mod._hevy_workout_embed("poshy", summary).fields[0]
+    assert field.name == "Note"
+    assert field.value == note
+
+
 # ---------------------------------------------------------------------------
 # Deep-history walk (everything beyond the 50-workout link backfill)
 # ---------------------------------------------------------------------------

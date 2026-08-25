@@ -534,12 +534,56 @@ def fetch_routine(api_key: str, routine_id: str) -> dict | None:
     return None
 
 
+def _rest_seconds(exercise: dict) -> int | None:
+    """One exercise's configured rest timer in seconds, or None when unset.
+
+    Hevy hangs ``rest_seconds`` off the *exercise* in a routine payload. Logged
+    workouts normally omit it (the app records target rest, not how long the
+    member actually stood around), so set-level values are read as a fallback
+    and the largest wins — that way a payload that moves the field onto the sets
+    still yields a timer, and a lone zeroed warmup row can't mask a real one.
+    """
+    rest = _as_int(exercise.get("rest_seconds"))
+    if rest is None:
+        per_set = [
+            _as_int(s.get("rest_seconds")) or 0
+            for s in exercise.get("sets") or []
+        ]
+        rest = max(per_set) if per_set else None
+    return rest if rest and rest > 0 else None
+
+
+def routine_rest_index(routine: dict) -> dict[str, int]:
+    """``{exercise key: rest seconds}`` for one raw routine payload.
+
+    Keyed by exercise template id *and* by lower-cased title, because a workout
+    summary is matched back against this by whichever of the two it kept — a
+    custom exercise can reach the feed with no template id at all. Exercises
+    with no timer are left out entirely, so a miss and a zero look the same to
+    the caller (both mean "say nothing").
+    """
+    out: dict[str, int] = {}
+    for ex in routine.get("exercises") or []:
+        rest = _rest_seconds(ex)
+        if not rest:
+            continue
+        tid = str(ex.get("exercise_template_id") or "")
+        if tid:
+            out[tid] = rest
+        title = (ex.get("title") or "").strip().lower()
+        if title:
+            out.setdefault(title, rest)
+    return out
+
+
 def summarize_routine(routine: dict) -> dict:
     """A routine's planned exercises and target sets, for the detail embed.
 
     Same shape philosophy as :func:`summarize_workout`: pure, no network, one
-    dict the renderer can walk. Rest-timer and template plumbing are dropped —
-    the embed answers "what am I lifting", not "how is it configured".
+    dict the renderer can walk. Template plumbing is dropped — the embed answers
+    "what am I lifting" — but the rest timer is kept, because "how long do I sit
+    between these" is part of the plan and the card is the only place a member
+    can read it without opening the app.
     """
     exercises: list[dict] = []
     for ex in routine.get("exercises") or []:
@@ -561,6 +605,7 @@ def summarize_routine(routine: dict) -> dict:
             "set_details": details,
             "rep_only": rep_only,
             "notes": (ex.get("notes") or "").strip() or None,
+            "rest_seconds": _rest_seconds(ex),
             "superset_id": ex.get("superset_id", ex.get("supersets_id")),
         })
     return {
@@ -595,6 +640,11 @@ def index_routines(
         out[rid] = {
             "title": (r.get("title") or "").strip(),
             "folder": folder_titles.get(r.get("folder_id")),
+            # The list endpoint carries each routine's full exercise list, so
+            # the planned rest timers ride along for free — a logged workout
+            # never reports rest of its own, and this is the only way the feed
+            # embed can show it without a second call per workout.
+            "rest": routine_rest_index(r),
         }
     return out
 
@@ -990,6 +1040,9 @@ def summarize_workout(workout: dict) -> dict:
             "volume_kg": round(ex_volume),
             "template_id": str(ex.get("exercise_template_id") or "") or None,
             "notes": (ex.get("notes") or "").strip() or None,
+            # Normally absent from a workout payload — read anyway so that if
+            # Hevy ever does report it, the real number beats the routine's plan.
+            "rest_seconds": _rest_seconds(ex),
             "rpe": ex_rpe,
             "distance_m": round(ex_distance) if ex_distance else None,
             "duration_seconds": ex_seconds or None,

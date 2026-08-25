@@ -17660,6 +17660,21 @@ def _hevy_duration_str(seconds: int | None) -> str | None:
     return f"{m}m" if m else f"{s}s"
 
 
+def _hevy_rest_str(seconds: int | None) -> str | None:
+    """Render a rest timer as ``2m`` / ``1m 30s`` / ``45s``.
+
+    Deliberately not :func:`_hevy_duration_str`: that one drops the seconds once
+    there are whole minutes, which is right for "this workout took 1h 23m" and
+    wrong for a rest timer — the commonest setting of all, 90 seconds, would
+    print as "1m"."""
+    if not seconds or seconds <= 0:
+        return None
+    m, s = divmod(int(seconds), 60)
+    if m and s:
+        return f"{m}m {s}s"
+    return f"{m}m" if m else f"{s}s"
+
+
 def _hevy_distance_str(metres: float | None) -> str | None:
     """Human distance: metres below 1 km, otherwise kilometres."""
     if not metres:
@@ -17669,7 +17684,46 @@ def _hevy_distance_str(metres: float | None) -> str | None:
     return f"{metres / 1000:.2f} km".replace(".00 km", " km")
 
 
-def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
+def _hevy_note_lines(note: str | None) -> list[str]:
+    """A Hevy note as embed lines — escaped, whole, and never cut short.
+
+    Notes are coaching cues ("elbows under shoulders, ... do not let the hips
+    sag"), so the old 100-character clamp reliably amputated the half that said
+    what to actually do. Line breaks the member typed are kept as separate lines
+    instead of being flattened into one run-on; the caller decides the prefix
+    and owns the embed's own hard limit."""
+    if not note:
+        return []
+    cleaned = discord.utils.escape_mentions(str(note))
+    cleaned = discord.utils.escape_markdown(cleaned)
+    return [line.strip() for line in cleaned.splitlines() if line.strip()]
+
+
+def _fit_embed_blocks(blocks: list[list[str]], limit: int) -> str:
+    """Join per-exercise line groups into an embed body of at most ``limit``.
+
+    Trailing exercises are dropped whole and counted, rather than slicing the
+    joined text — a body cut mid-sentence reads as a broken bot, and half a
+    coaching cue is worse than an honest "and 2 more"."""
+    kept = list(blocks)
+    dropped = 0
+    while kept:
+        tail = (
+            f"\n-# …and {dropped} more exercise"
+            f"{'s' if dropped != 1 else ''} — open the routine in Hevy"
+        ) if dropped else ""
+        body = "\n".join("\n".join(block) for block in kept) + tail
+        if len(body) <= limit:
+            return body
+        kept.pop()
+        dropped += 1
+    # One exercise whose notes alone blow the whole budget: keep its head line.
+    return "\n".join(blocks[0])[:limit] if blocks else ""
+
+
+def _hevy_exercise_line(
+    ex: dict, kind: str = "", rest_seconds: int | None = None,
+) -> str:
     """One breakdown line: name + set count + the best thing it recorded.
 
     Hevy exercises are not all weight×reps — a set can carry distance, a
@@ -17677,7 +17731,13 @@ def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
     a plank or a treadmill row says something useful instead of just its set
     count, and appends RPE when the member logged one. ``kind`` is the exercise
     template's type; it decides whether the custom metric gets a label (floors
-    for stair machines, steps for treadmills) or stays out of the embed."""
+    for stair machines, steps for treadmills) or stays out of the embed.
+
+    ``rest_seconds`` is the timer the *routine* plans for this exercise. A
+    logged workout carries no rest of its own (verified live: the field is
+    absent from every workout exercise), so the feed embed borrows it from the
+    routine the session was run from — but anything the payload does report
+    wins over it."""
     sets = ex.get("sets") or 0
     # Real working sets, spelled out. "top 100kg×6" hid that the second set was
     # 93kg — a reader couldn't tell a planned drop from a typo. Uniform sets
@@ -17708,6 +17768,9 @@ def _hevy_exercise_line(ex: dict, kind: str = "") -> str:
         bits.append(f"{ex['custom_metric']:g} {metric_label}")
     if ex.get("rpe"):
         bits.append(f"RPE {ex['rpe']:g}")
+    rest = _hevy_rest_str(ex.get("rest_seconds") or rest_seconds)
+    if rest:
+        bits.append(f"⏳ {rest}")
     return f"**{_safe_label(ex.get('title') or 'Exercise')}** · " + " · ".join(bits)
 
 
@@ -17798,9 +17861,13 @@ def _hevy_workout_embed(
     )
     note = summary.get("description")
     if note:
-        embed.add_field(
-            name="Note", value=_safe_label(note)[:1024], inline=False,
-        )
+        # The whole note, not the 60-character head _safe_label defaults to —
+        # this is the member's own write-up of the session, and it was being
+        # guillotined one clause in.
+        value = "\n".join(_hevy_note_lines(note))
+        if len(value) > 1024:  # Discord's own field cap, nothing tighter
+            value = value[:1023].rstrip() + "…"
+        embed.add_field(name="Note", value=value, inline=False)
 
     # Per-exercise breakdown, budgeted against Discord's 1024-char field cap
     # by dropping whole trailing lines (folded into the "…and N more" count)
@@ -17809,17 +17876,34 @@ def _hevy_workout_embed(
     # together with it, never zipped against a truncated one.
     exercises = summary.get("exercises") or []
     marks = hevy_client.superset_marks(exercises)
+    # Hevy never reports how long a member actually rested, so the timers here
+    # come from the routine the workout was run from, matched exercise by
+    # exercise. A freestyle session (no routine_id) simply shows none.
+    rest_plan = (routine or {}).get("rest") or {}
     lines: list[str] = []
+    planned_rest = False
     for ex, marked in list(zip(exercises, marks))[:12]:
         kind = ((templates or {}).get(ex.get("template_id") or "") or {}).get(
             "type", "",
         )
+        planned = rest_plan.get(ex.get("template_id") or "") or rest_plan.get(
+            (ex.get("title") or "").strip().lower(),
+        )
+        if planned and not ex.get("rest_seconds"):
+            planned_rest = True
         prefix = "🔗 " if marked else ""
-        lines.append(prefix + _hevy_exercise_line(ex, kind))
+        lines.append(prefix + _hevy_exercise_line(ex, kind, planned))
     dropped = len(exercises) - len(lines)
+    # Say where the hourglass came from: an unlabelled "⏳ 2m" sitting next to
+    # logged sets reads as something the member did, not something the routine
+    # asks for.
+    legend = (
+        "\n-# ⏳ rest between sets, as the routine plans it"
+        if planned_rest else ""
+    )
     while lines:
         more = f"\n…and {dropped} more" if dropped else ""
-        value = "\n".join(lines) + more
+        value = "\n".join(lines) + more + legend
         if len(value) <= 1024:
             embed.add_field(name="Exercises", value=value, inline=False)
             break
@@ -19041,7 +19125,15 @@ def _hevy_routine_embed(
 
     Same set formatting as the workout feed (uniform sets collapse, differing
     ones are listed) so a routine and the workout it produced read alike.
-    Superset partners share a 🔗 marker, matching the feed embed.
+    Superset partners share a 🔗 marker, matching the feed embed, and each
+    exercise's rest timer rides on the same line — it is part of the plan, and
+    this card is the only place to read it without opening the app.
+
+    Exercise notes are printed in full. They are coaching cues, so the old
+    100-character clamp landed mid-instruction ("do not let the hips sa…") and
+    cut the half that said what to actually do; when the whole card would
+    outgrow Discord's 4096-character description, whole trailing exercises are
+    dropped and counted instead of the text being sliced.
 
     ``usage`` is the caller's hevy_routine_usage row for this routine, when
     they have one. The footer once said "target sets, not a logged workout",
@@ -19049,7 +19141,7 @@ def _hevy_routine_embed(
     the truth. Now the card says what the numbers are ("planned targets") and
     proves the log exists by dating the last run via ``embed.timestamp``
     (footers never render Discord timestamps, so the date rides there)."""
-    lines: list[str] = []
+    blocks: list[list[str]] = []
     for ex in detail.get("exercises") or []:
         marker = "🔗 " if ex.get("superset_id") is not None else ""
         sets = hevy_client.format_set_summary(ex.get("set_details"))
@@ -19063,14 +19155,20 @@ def _hevy_routine_embed(
         if not sets:
             count = ex.get("set_count") or 0
             sets = f"{count} set{'s' if count != 1 else ''}"
-        lines.append(f"{marker}**{_safe_label(ex['title'])}** · {sets}")
-        if ex.get("notes"):
-            lines.append(f"-# {_safe_label(ex['notes'], limit=100)}")
+        head = f"{marker}**{_safe_label(ex['title'])}** · {sets}"
+        rest = _hevy_rest_str(ex.get("rest_seconds"))
+        if rest:
+            head += f" · ⏳ {rest}"
+        block = [head]
+        block.extend(f"-# {line}" for line in _hevy_note_lines(ex.get("notes")))
+        blocks.append(block)
     title = detail.get("title") or "Routine"
     embed = discord.Embed(
         title=f"📋 {_plain_label(title)}",
         colour=HEVY_COLOUR,
-        description="\n".join(lines)[:4096] or "This routine has no exercises.",
+        description=(
+            _fit_embed_blocks(blocks, 4096) or "This routine has no exercises."
+        ),
     )
     count = detail.get("exercise_count") or 0
     embed.set_author(name=(

@@ -736,8 +736,8 @@ def test_index_routines_resolves_folder_titles():
     folders = [{"id": 42, "title": "Push Pull"}]
     got = hevy_client.index_routines(routines, folders)
     assert got == {
-        "r1": {"title": "Arms", "folder": "Push Pull"},
-        "r2": {"title": "Legs", "folder": None},
+        "r1": {"title": "Arms", "folder": "Push Pull", "rest": {}},
+        "r2": {"title": "Legs", "folder": None, "rest": {}},
     }
 
 
@@ -1107,6 +1107,69 @@ def test_summarize_routine_maps_targets():
     assert plank["set_details"] == [] and plank["set_count"] == 1
     assert push["rep_only"] == [15, 12]
     assert push["superset_id"] == 0 and row["superset_id"] is None
+
+
+def test_summarize_routine_carries_rest_timers():
+    """Live payloads hang ``rest_seconds`` off the exercise (verified against a
+    real account: 120/90/60 across one routine). Set-level values are a
+    fallback, and a zero means "no timer", not "0s"."""
+    d = hevy_client.summarize_routine({
+        "id": "r-2", "title": "Full Body",
+        "exercises": [
+            {"title": "Pull Up (Assisted)", "rest_seconds": 120,
+             "sets": [{"weight_kg": 36, "reps": 6}]},
+            {"title": "Push Up", "rest_seconds": 0,
+             "sets": [{"reps": 10}]},
+            {"title": "Plank",
+             "sets": [{"duration_seconds": 40, "rest_seconds": 60}]},
+        ],
+    })
+    pull, push, plank = d["exercises"]
+    assert pull["rest_seconds"] == 120
+    assert push["rest_seconds"] is None      # 0 is "unset", not a 0s rest
+    assert plank["rest_seconds"] == 60       # fallback: read off the sets
+
+
+def test_summarize_workout_has_no_rest_of_its_own():
+    """Hevy's workout payload never carries rest (verified live — the field is
+    absent from every workout exercise), so the feed embed has to borrow the
+    routine's. Read anyway, in case that ever changes."""
+    d = hevy_client.summarize_workout(WORKOUT)
+    assert all(ex["rest_seconds"] is None for ex in d["exercises"])
+    d2 = hevy_client.summarize_workout({
+        "id": "w", "title": "T",
+        "exercises": [{"title": "Squat", "rest_seconds": 180,
+                       "sets": [{"weight_kg": 100, "reps": 5}]}],
+    })
+    assert d2["exercises"][0]["rest_seconds"] == 180
+
+
+def test_routine_rest_index_keys_by_template_and_title():
+    """A workout summary matches back by template id, or by title when the
+    exercise is a custom one with no template."""
+    idx = hevy_client.routine_rest_index({
+        "exercises": [
+            {"title": "Butterfly (Pec Deck)", "exercise_template_id": "T1",
+             "rest_seconds": 60},
+            {"title": "Sled Push", "rest_seconds": 90},
+            {"title": "Stretching", "rest_seconds": 0},
+        ],
+    })
+    assert idx["T1"] == 60 and idx["butterfly (pec deck)"] == 60
+    assert idx["sled push"] == 90
+    assert "stretching" not in idx           # no timer, no entry
+
+
+def test_index_routines_carries_the_rest_plan():
+    """The list endpoint already ships every routine's exercises, so the plan
+    rides along without a second call per workout."""
+    idx = hevy_client.index_routines([{
+        "id": "r-1", "title": "Arms", "folder_id": 42,
+        "exercises": [{"title": "Curl", "exercise_template_id": "C",
+                       "rest_seconds": 75}],
+    }], [{"id": 42, "title": "Push Pull"}])
+    assert idx["r-1"]["folder"] == "Push Pull"
+    assert idx["r-1"]["rest"] == {"C": 75, "curl": 75}
 
 
 def test_fetch_routine_unwraps_envelope_and_none_on_404(monkeypatch):
