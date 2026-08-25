@@ -17070,6 +17070,10 @@ async def hevy_sync_cmd(interaction: discord.Interaction) -> None:
                       f"{'s' if result['weigh_ins_pushed'] != 1 else ''} sent to Hevy")
     if result.get("weigh_ins_imported"):
         scales.append(f"{result['weigh_ins_imported']} imported from Hevy")
+    if result.get("weigh_ins_metrics"):
+        scales.append(f"{result['weigh_ins_metrics']} body-composition "
+                      f"reading{'s' if result['weigh_ins_metrics'] != 1 else ''} "
+                      "filled in from Hevy")
     if result.get("edited"):
         scales.append(f"{result['edited']} edit"
                       f"{'s' if result['edited'] != 1 else ''} applied")
@@ -17251,6 +17255,16 @@ _HEVY_RECONCILE_LIMIT = 200
 #: is not limited this way -- filling Hevy's history costs the member nothing.
 _HEVY_RECONCILE_MAX_AGE_DAYS = 180
 
+#: How stale the reconcile marker has to be before an ordinary poll runs the
+#: merge again. The reconcile used to be a once-per-account event, which meant a
+#: weigh-in the member recorded *in Hevy* after their first sync — from a scale
+#: that writes there, or the Hevy app itself — never reached the bot at all,
+#: while the push direction kept mirroring continuously. Re-running is safe by
+#: construction (a day both sides know is left alone), so this is a schedule
+#: rather than a flag. Six hours: weigh-ins are daily at most, and the whole
+#: merge costs one GET when nothing has changed.
+_HEVY_RECONCILE_TTL = timedelta(hours=6)
+
 #: Accounts with a reconcile in flight in this process. The DB claim below is
 #: the real guard, but a forced /hevy sync deliberately bypasses that claim, and
 #: two forced runs at once would still race.
@@ -17280,27 +17294,36 @@ def _hevy_day_start(date_str: str) -> datetime | None:
 
 
 async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
-    """Merge the bot's bodyweight history with Hevy's, once per account.
+    """Merge the bot's bodyweight history with Hevy's, on a rolling schedule.
 
     Runs when ``measurements_synced_at`` is NULL — which every account already
     linked before this existed is, so they are caught up on their next poll
-    rather than the feature only ever reaching new links.
+    rather than the feature only ever reaching new links — and again whenever
+    that marker is older than :data:`_HEVY_RECONCILE_TTL`. It used to run
+    exactly once per account, ever, which quietly made the import direction a
+    one-shot: anything the member weighed in Hevy after their first sync stayed
+    there forever while the push direction kept mirroring.
 
-    Both directions, each filling only what the other is missing:
+    Three passes, each filling only what the others are missing:
 
     * days the bot has a weigh-in for and Hevy does not are **pushed**;
     * days Hevy has a measurement for and the bot does not are **imported** as
-      weigh-ins (with body fat / lean mass alongside, when Hevy has them).
+      weigh-ins (with body fat / lean mass alongside, when Hevy has them);
+    * days *both* sides have keep the bot's own weigh-in untouched, but any body
+      composition Hevy holds for that day and the bot doesn't is filled in
+      beside it. Hevy records fat and lean mass on some entries and not others,
+      so this is the only way an entry that arrived weight-first ever gains it.
 
-    A day present on both sides is left alone entirely — that is what stops the
-    reconcile from echoing (re-importing a weight this bot pushed a moment ago)
-    and what makes a forced re-run a no-op: anything imported the first time is
-    now one of the bot's own days. There is deliberately no ledger table; the
-    two histories *are* the ledger.
+    The weigh-in on a day present on both sides is never rewritten — that is
+    what stops the reconcile from echoing (re-importing a weight this bot pushed
+    a moment ago) and what makes an immediate re-run a no-op: anything imported
+    the first time is now one of the bot's own days. There is deliberately no
+    ledger table; the two histories *are* the ledger. ``add_body_metrics`` is
+    idempotent on its own unique key, so the third pass re-runs harmlessly too.
 
-    Returns ``{"pushed": int, "imported": int}``.
+    Returns ``{"pushed": int, "imported": int, "metrics": int}``.
     """
-    result = {"pushed": 0, "imported": 0}
+    result = {"pushed": 0, "imported": 0, "metrics": 0}
     user_id = int(row["user_id"])
     guild_id = int(row["guild_id"])
     if not _hevy_push_enabled():
@@ -17317,8 +17340,11 @@ async def _hevy_reconcile_measurements(row, *, force: bool = False) -> dict:
         )
         if synced is None and not db.hevy_claim_measurement_sync(user_id):
             return result  # another run got there first
-    elif not db.hevy_claim_measurement_sync(user_id):
-        return result  # already done, or claimed by a concurrent run
+    elif not db.hevy_claim_measurement_sync(
+        user_id,
+        stale_before=datetime.now(timezone.utc) - _HEVY_RECONCILE_TTL,
+    ):
+        return result  # ran recently, or claimed by a concurrent run
 
     _HEVY_RECONCILE_INFLIGHT.add(user_id)
     try:
@@ -17363,13 +17389,19 @@ async def _hevy_reconcile_locked(
         guild_id, user_id, limit=_HEVY_RECONCILE_LIMIT,
     )
     local_by_day: dict[str, float] = {}
+    # The exact timestamp of the row behind each day, because add_body_metrics
+    # only writes alongside a bodyweights row at the identical instant — a day
+    # string is not enough to find it again.
+    local_at_by_day: dict[str, datetime] = {}
     for bw_row in local_rows:
         when = _parse_hevy_time(bw_row["recorded_at"])
         if when is None:
             continue
         # Oldest-first, so the last write per day wins — the same "later one
         # wins" rule a same-day re-push follows.
-        local_by_day[_hevy_local_day(when)] = float(bw_row["weight_kg"])
+        day = _hevy_local_day(when)
+        local_by_day[day] = float(bw_row["weight_kg"])
+        local_at_by_day[day] = when
 
     # --- bot → Hevy: days Hevy has never heard of --------------------------
     for day in sorted(set(local_by_day) - set(remote_by_day)):
@@ -17433,11 +17465,33 @@ async def _hevy_reconcile_locked(
                 LOG.exception("Hevy: failed to store imported metrics for %s", user_id)
         result["imported"] += 1
 
+    # --- Hevy → bot: composition for a day the bot already weighed ---------
+    # The weigh-in stays exactly as the bot recorded it; only the metrics it has
+    # no row for are filled in. Hevy carries fat/lean on some entries and not
+    # others (and a member can add them days later), so without this pass an
+    # entry the bot saw weight-first could never gain its body composition.
+    for day in sorted(set(remote_by_day) & set(local_by_day)):
+        metrics = hevy_client.metrics_from_measurement(remote_by_day[day])
+        when = local_at_by_day.get(day)
+        if not metrics or when is None:
+            continue
+        try:
+            # Idempotent on its own unique key, so this costs nothing on the
+            # runs where the metrics are already there — which is most of them.
+            result["metrics"] += db.add_body_metrics(
+                guild_id, user_id, metrics, recorded_at=when, source="hevy",
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception(
+                "Hevy: failed to backfill metrics for %s on %s", user_id, day,
+            )
+
     db.hevy_mark_measurements_synced(user_id)  # refresh the timestamp
-    if result["pushed"] or result["imported"]:
+    if result["pushed"] or result["imported"] or result["metrics"]:
         LOG.info(
-            "Hevy: bodyweight reconcile for %s — %d pushed, %d imported",
-            user_id, result["pushed"], result["imported"],
+            "Hevy: bodyweight reconcile for %s — %d pushed, %d imported, "
+            "%d metrics filled",
+            user_id, result["pushed"], result["imported"], result["metrics"],
         )
     return result
 
@@ -17590,6 +17644,23 @@ async def _hevy_routines(user_id: int, api_key: str) -> dict[str, dict]:
     return fetched
 
 
+async def _hevy_workout_total(api_key: str) -> int | None:
+    """The account's lifetime Hevy workout count, or None. Never raises.
+
+    One GET, and only on a cycle that actually has a workout to post — a member
+    who didn't train costs nothing. Cheapest call in the API (the body is a
+    single key), and it is the member's real total rather than the bot's import
+    count, which undercounts everything logged before they linked.
+    """
+    def _fetch() -> int | None:
+        return hevy_client.fetch_workout_count(api_key)
+
+    try:
+        return await bot.loop.run_in_executor(None, _fetch)
+    except Exception:  # pragma: no cover - a garnish must never break the post
+        return None
+
+
 def _hevy_push_enabled() -> bool:
     """True when weigh-ins should be mirrored into linked Hevy accounts."""
     return bool(HEVY_PUSH_BODYWEIGHT) and _hevy_enabled()
@@ -17682,6 +17753,22 @@ def _hevy_distance_str(metres: float | None) -> str | None:
     if metres < 1000:
         return f"{metres:g} m"
     return f"{metres / 1000:.2f} km".replace(".00 km", " km")
+
+
+def _hevy_milestone(number: int | None) -> bool:
+    """Whether a lifetime workout number is worth calling out.
+
+    Sparse on purpose. Every tenth workout would be noise by the second month;
+    these are the numbers a member would actually mention out loud — 10, 25, 50,
+    75, then every hundred, then every 250 once hundreds stop feeling rare.
+    """
+    if not number or number < 10:
+        return False
+    if number < 100:
+        return number == 10 or number % 25 == 0
+    if number < 1000:
+        return number % 100 == 0
+    return number % 250 == 0
 
 
 def _hevy_note_lines(note: str | None) -> list[str]:
@@ -17801,9 +17888,15 @@ def _hevy_workout_embed(
     templates: dict[str, dict] | None = None,
     profile_url: str | None = None,
     routines: dict[str, dict] | None = None,
+    number: int | None = None,
 ) -> discord.Embed:
     """Build the feed embed for a completed Hevy workout — the full stat line,
     a per-exercise breakdown, any new personal bests, and the heaviest set.
+
+    ``number`` is this workout's place in the member's *lifetime* Hevy history
+    (from ``/workouts/count``, so it counts everything they logged before they
+    ever linked the bot). It rides in the footer, and a round one earns its own
+    line — the counter is the sort of thing members like watching accrue.
 
     The stat line adapts to what was actually logged: volume is dropped for a
     session that lifted nothing (it would read "0 kg") in favour of the reps,
@@ -17913,14 +18006,22 @@ def _hevy_workout_embed(
     split = hevy_client.muscle_split(summary, templates or {})
     if len(split) > 1:
         total = sum(kg for _, kg in split) or 1
+        # Eight, not six: crediting Hevy's secondary muscle groups turns a
+        # typical session from five groups into six or seven, and the old cap
+        # would have hidden the very lines this was meant to surface. Each line
+        # is ~30 chars, so eight sits well inside the 1024-char field.
+        shown = split[:8]
+        lines = [
+            f"**{_safe_label(hevy_client.muscle_label(group))}** "
+            f"{kg:,} kg ({kg * 100 // total:.0f}%)"
+            for group, kg in shown
+        ]
+        hidden = len(split) - len(shown)
+        if hidden:
+            lines.append(f"-# …and {hidden} more")
+        lines.append("-# assisting muscles counted at half a share")
         embed.add_field(
-            name="Muscle split",
-            value="\n".join(
-                f"**{_safe_label(hevy_client.muscle_label(group))}** "
-                f"{kg:,} kg ({kg * 100 // total:.0f}%)"
-                for group, kg in split[:6]
-            )[:1024],
-            inline=False,
+            name="Muscle split", value="\n".join(lines)[:1024], inline=False,
         )
 
     if prs_by_equip:
@@ -17937,10 +18038,18 @@ def _hevy_workout_embed(
             value=f"{_safe_label(top['title'])} — {top['weight_kg']:g}kg{reps}",
             inline=False,
         )
+    if _hevy_milestone(number):
+        embed.add_field(
+            name="🏅 Milestone",
+            value=f"That's **workout #{number:,}** on Hevy.",
+            inline=False,
+        )
     when = _parse_hevy_time(summary.get("start_time"))
     if when is not None:
         embed.timestamp = when
-    embed.set_footer(text="via Hevy")
+    embed.set_footer(
+        text=f"via Hevy · workout #{number:,}" if number else "via Hevy",
+    )
     return embed
 
 
@@ -18474,6 +18583,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
     result = {
         "new": 0, "lifts": 0, "volume_kg": 0, "prs": 0, "backfill": False,
         "weigh_ins_pushed": 0, "weigh_ins_imported": 0,
+        "weigh_ins_metrics": 0,
         "edited": 0, "retracted": 0, "deep_imported": 0,
     }
     user_id = int(row["user_id"])
@@ -18585,12 +18695,24 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
             # to import, and skipping it made the workout vanish silently — it
             # was marked imported, so nothing would ever post it again.
             routines = await _hevy_routines(user_id, api_key)
-            for r in imported:
+            # Fetched after the import loop, so it already counts what we are
+            # about to post. Imports run oldest-first, so the last one is the
+            # member's newest workout and takes the total; the ones before it
+            # count back from there. (A backdated workout logged out of order
+            # could take a neighbour's number — it is a footer garnish, and the
+            # alternative is not numbering anything.)
+            total = await _hevy_workout_total(api_key)
+            for offset, r in enumerate(imported):
+                number = None
+                if total is not None:
+                    number = total - (len(imported) - 1 - offset)
+                    if number < 1:
+                        number = None
                 try:
                     await feed_channel.send(
                         embed=_hevy_workout_embed(
                             username, r["summary"], r["prs"],
-                            templates, profile_url, routines,
+                            templates, profile_url, routines, number,
                         ),
                     )
                 except discord.HTTPException:  # pragma: no cover - best effort
@@ -18640,9 +18762,10 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
         merged = await _hevy_reconcile_measurements(row, force=force_backfill)
     except Exception:  # pragma: no cover - defensive
         LOG.exception("Hevy: bodyweight reconcile failed for %s", user_id)
-        merged = {"pushed": 0, "imported": 0}
+        merged = {"pushed": 0, "imported": 0, "metrics": 0}
     result["weigh_ins_pushed"] = merged["pushed"]
     result["weigh_ins_imported"] = merged["imported"]
+    result["weigh_ins_metrics"] = merged["metrics"]
 
     db.hevy_mark_synced(user_id)
     if backfill:

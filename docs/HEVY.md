@@ -177,6 +177,22 @@ value but says so instead of pretending it applied.
   the member actually rested. A freestyle workout shows none. The routine list
   is already fetched for the "from **Push Pull / Arms**" label, so this costs no
   extra API call.
+- **The muscle split credits assisting muscles.** Hevy tags most exercises with
+  secondary muscle groups as well as a primary — 252 of the 451 templates in the
+  live catalogue, up to seven on one exercise — and the split used to read only
+  the primary, so a pulling day reported pure "Lats" and the biceps and forearm
+  work was invisible. Each exercise's volume is now **apportioned**: the primary
+  takes one share, each secondary half a share, normalised. Apportioning rather
+  than crediting every muscle the full amount keeps the split adding up to the
+  session's total volume, which is printed directly above it — on a real leg day
+  this makes glutes the fourth-biggest line where they were previously absent.
+  Costs no extra API call: the template catalogue is already fetched and cached
+  for a day, and the field rode in the same payload all along.
+- **Workouts are numbered.** The footer reads `via Hevy · workout #143`, from
+  `/workouts/count`, so it is the member's lifetime Hevy total including
+  everything they logged before they ever linked the bot — and a round number
+  (10, 25, 50, 75, then every hundred, then every 250) gets its own line. One
+  extra GET, and only on a cycle that actually has a workout to post.
 - **What the embed shows:** exercises, sets (working vs warmup), reps, volume,
   duration, per-exercise breakdown and top set, plus — where Hevy has the data —
   a **muscle-group split**, RPE, dropset and to-failure counts, distance/time
@@ -269,25 +285,35 @@ written to that member's Hevy body measurements for the day.
 - Turn it off with **Mirror weigh-ins to Hevy** in the dashboard, or
   `HEVY_PUSH_BODYWEIGHT=0`.
 
-### The one-time reconcile
+### The rolling reconcile
 
 Mirroring only covers weigh-ins from the moment it is switched on, which would
-leave every existing member with two half-histories. So the **first** poll after
-an account is linked merges them, in both directions at once:
+leave every existing member with two half-histories. So the first poll after an
+account is linked merges them, in both directions at once — and it keeps doing
+so, every **6 hours** (`_HEVY_RECONCILE_TTL`):
 
 | | Bot has the day | Bot doesn't |
 | --- | --- | --- |
-| **Hevy has the day** | left alone | imported as a weigh-in |
+| **Hevy has the day** | weigh-in left alone; any body composition the bot lacks is filled in beside it | imported as a weigh-in |
 | **Hevy doesn't** | pushed to Hevy | — |
 
+- **It used to run exactly once per account, ever.** That quietly made the
+  *import* direction a one-shot: anything a member weighed in Hevy after their
+  first sync — from a scale that writes there, or the Hevy app itself — stayed
+  there forever, while the push direction kept mirroring continuously. The
+  marker is now a rolling "last ran" timestamp rather than a done-flag.
 - **Already-linked members get this too.** The marker starts NULL, so an account
   linked long before the feature existed looks exactly like a fresh one to the
   poll and is caught up on its next pass. Nobody has to re-link.
-- **A day both sides already have is never touched.** That is what stops the
-  reconcile echoing — re-importing a weight the bot pushed moments earlier — and
-  what makes re-running it (`/hevy sync`) a no-op: anything imported the first
-  time is now one of the bot's own days. There is no ledger table; the two
-  histories *are* the ledger.
+- **A day both sides already have keeps the bot's weigh-in.** That is what stops
+  the reconcile echoing — re-importing a weight the bot pushed moments earlier —
+  and what makes re-running it (`/hevy sync`) a no-op: anything imported the
+  first time is now one of the bot's own days. There is no ledger table; the two
+  histories *are* the ledger. Body composition is the one exception: Hevy records
+  fat and lean mass on some entries and not others, and a member can add them
+  days after the weight, so those are filled in alongside the existing weigh-in
+  when the bot has no row for them. That write is idempotent on its own unique
+  key, so repeating it costs nothing.
 - **Imported days land at local midday**, matching how the bot materialises any
   other date without a time — midnight would sort before every same-day scale
   reading and could collide exactly with one.

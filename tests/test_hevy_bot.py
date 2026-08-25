@@ -12,7 +12,7 @@ os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 
 import asyncio  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 import pytest  # noqa: E402
@@ -166,7 +166,7 @@ def test_two_weigh_ins_on_one_local_day_share_a_hevy_entry(push_env, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# One-time two-way bodyweight reconcile
+# Two-way bodyweight reconcile (recurring)
 # ---------------------------------------------------------------------------
 
 class _Row(dict):
@@ -226,7 +226,7 @@ def test_reconcile_fills_each_side_with_what_the_other_is_missing(reconcile_env)
 
     out = _run(bot_mod._hevy_reconcile_measurements(env.row()))
 
-    assert out == {"pushed": 1, "imported": 1}
+    assert out == {"pushed": 1, "imported": 1, "metrics": 0}
     # Only the day Hevy lacked was pushed; the shared day was left alone.
     assert [day for day, _ in env.pushed] == ["2026-08-01"]
     # The day only Hevy had is now a real weigh-in, at local midday.
@@ -247,11 +247,11 @@ def test_reconcile_runs_once_and_is_a_noop_when_forced_again(reconcile_env):
     # Marked done, so an ordinary poll skips it entirely.
     assert env.row()["measurements_synced_at"] is not None
     assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
-        "pushed": 0, "imported": 0,
+        "pushed": 0, "imported": 0, "metrics": 0,
     }
     # Even forced, it finds nothing new — no duplicate weigh-in.
     out = _run(bot_mod._hevy_reconcile_measurements(env.row(), force=True))
-    assert out == {"pushed": 0, "imported": 0}
+    assert out == {"pushed": 0, "imported": 0, "metrics": 0}
     assert len(env.db.bodyweight_history(42, 7, limit=50)) == 1
 
 
@@ -291,7 +291,7 @@ def test_reconcile_leaves_the_marker_unset_when_hevy_is_unreachable(reconcile_en
 
     monkeypatch.setattr(hevy_client, "fetch_body_measurements", _boom)
     assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
-        "pushed": 0, "imported": 0,
+        "pushed": 0, "imported": 0, "metrics": 0,
     }
     assert env.row()["measurements_synced_at"] is None
 
@@ -302,9 +302,70 @@ def test_reconcile_is_skipped_when_the_push_setting_is_off(reconcile_env,
     monkeypatch.setattr(bot_mod, "HEVY_PUSH_BODYWEIGHT", False, raising=False)
     env.set_remote([{"date": "2026-07-20", "weight_kg": 83.2}])
     assert _run(bot_mod._hevy_reconcile_measurements(env.row())) == {
-        "pushed": 0, "imported": 0,
+        "pushed": 0, "imported": 0, "metrics": 0,
     }
     assert env.row()["measurements_synced_at"] is None
+
+
+def test_reconcile_reruns_once_the_marker_goes_stale(reconcile_env):
+    """The gap this closes: the reconcile used to claim its marker once and
+    never again, so the *import* direction was a one-shot. A weigh-in the member
+    recorded in Hevy the following week — from a scale that writes there — could
+    never reach the bot, while the push direction kept mirroring continuously.
+    """
+    env = reconcile_env
+    env.set_remote([{"date": "2026-07-20", "weight_kg": 83.2}])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1
+
+    # A new Hevy-side weigh-in, and an immediate poll: still inside the TTL, so
+    # the claim is refused and nothing is walked.
+    env.set_remote([
+        {"date": "2026-07-20", "weight_kg": 83.2},
+        {"date": "2026-07-27", "weight_kg": 82.8},
+    ])
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 0
+
+    # Age the marker past the TTL, exactly as the passage of time would.
+    stale = datetime.now(timezone.utc) - bot_mod._HEVY_RECONCILE_TTL - timedelta(minutes=1)
+    env.db.hevy_mark_measurements_synced(7, stale)
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 1
+    days = [r["recorded_at"][:10]
+            for r in env.db.bodyweight_history(42, 7, limit=50)]
+    assert days == ["2026-07-20", "2026-07-27"]
+    # ...and the marker is fresh again, so the next poll is a no-op.
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["imported"] == 0
+
+
+def test_reconcile_fills_composition_for_a_day_the_bot_already_weighed(
+    reconcile_env,
+):
+    """Hevy carries fat/lean on some entries and not others (2 of this account's
+    30), and a member can add them days after the weight. The weigh-in itself is
+    the bot's own and must not be touched — but the composition beside it was
+    previously unreachable, because a day both sides know was skipped entirely.
+    """
+    env = reconcile_env
+    env.db.set_bodyweight(
+        42, 7, 103.3,
+        recorded_at=datetime(2026, 8, 21, 6, 30, tzinfo=timezone.utc),
+    )
+    env.set_remote([{"date": "2026-08-21", "weight_kg": 103.3,
+                     "lean_mass_kg": 82.02, "fat_percent": 20.6}])
+
+    out = _run(bot_mod._hevy_reconcile_measurements(env.row()))
+
+    assert out == {"pushed": 0, "imported": 0, "metrics": 2}
+    # The member's own weigh-in is untouched — one row, at its own timestamp.
+    history = env.db.bodyweight_history(42, 7, limit=50)
+    assert len(history) == 1
+    assert history[0]["recorded_at"].startswith("2026-08-21T06:30")
+    fat = env.db.body_metric_history(7, "body_fat_pct", limit=10)
+    assert [round(p["value"], 1) for p in fat] == [20.6]
+
+    # Idempotent: a later run adds nothing, because add_body_metrics dedupes.
+    stale = datetime.now(timezone.utc) - bot_mod._HEVY_RECONCILE_TTL - timedelta(minutes=1)
+    env.db.hevy_mark_measurements_synced(7, stale)
+    assert _run(bot_mod._hevy_reconcile_measurements(env.row()))["metrics"] == 0
 
 
 def test_reconcile_refuses_to_import_ancient_history(reconcile_env, monkeypatch):
@@ -366,7 +427,7 @@ def test_reconcile_claim_blocks_a_concurrent_run(reconcile_env):
     # The loser still believes it has work to do, and must bail anyway.
     assert env.db.hevy_claim_measurement_sync(7) is False
     assert _run(bot_mod._hevy_reconcile_measurements(stale)) == {
-        "pushed": 0, "imported": 0,
+        "pushed": 0, "imported": 0, "metrics": 0,
     }
     # Releasing hands the retry back.
     env.db.hevy_release_measurement_sync(7)
@@ -1133,6 +1194,47 @@ def test_workout_embed_stays_quiet_about_rest_when_there_is_no_routine():
     })
     body = bot_mod._hevy_workout_embed("poshy", summary).fields[0].value
     assert "⏳" not in body
+
+
+def test_milestone_numbers_are_sparse():
+    """Every tenth workout would be noise by the second month. These are the
+    numbers a member would actually mention out loud."""
+    hit = [n for n in range(1, 1600) if bot_mod._hevy_milestone(n)]
+    assert hit[:6] == [10, 25, 50, 75, 100, 200]
+    assert hit[-3:] == [1000, 1250, 1500]
+    assert not bot_mod._hevy_milestone(None)
+    assert not bot_mod._hevy_milestone(1)      # nobody celebrates their first
+    assert not bot_mod._hevy_milestone(1100)   # past 1000 it is every 250
+
+
+def _numbered_embed(number):
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Push",
+        "start_time": "2026-08-19T13:16:09+00:00",
+        "exercises": [{"title": "Curl", "sets": [{"weight_kg": 20, "reps": 10}]}],
+    })
+    return bot_mod._hevy_workout_embed(
+        "poshy", summary, None, None, None, None, number,
+    )
+
+
+def test_workout_embed_numbers_the_workout_in_the_footer():
+    """From /workouts/count, so it is the member's lifetime Hevy total —
+    including everything they logged before they ever linked the bot."""
+    assert _numbered_embed(143).footer.text == "via Hevy · workout #143"
+    assert _numbered_embed(1234).footer.text == "via Hevy · workout #1,234"
+    # Hevy unreachable, or a count that can't be trusted: no number, no lie.
+    assert _numbered_embed(None).footer.text == "via Hevy"
+
+
+def test_workout_embed_celebrates_a_round_number():
+    names = [f.name for f in _numbered_embed(100).fields]
+    assert "🏅 Milestone" in names
+    value = next(f.value for f in _numbered_embed(100).fields
+                 if f.name == "🏅 Milestone")
+    assert "#100" in value
+    # An ordinary workout gets the footer number but no fanfare.
+    assert "🏅 Milestone" not in [f.name for f in _numbered_embed(101).fields]
 
 
 def test_workout_embed_keeps_the_whole_description():

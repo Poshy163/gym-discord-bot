@@ -259,6 +259,28 @@ def verify_key(api_key: str) -> dict:
     return {"ok": True, "count": count}
 
 
+def fetch_workout_count(api_key: str) -> int | None:
+    """How many workouts the account holds, or None if Hevy wouldn't say.
+
+    Same endpoint as :func:`verify_key`, which raises on a bad key because that
+    is the whole point of it there. Here the number is a garnish on the feed
+    embed, so every failure — including a rejected key — degrades to None and
+    the embed simply doesn't number the workout.
+
+    Worth using in preference to counting the bot's own imports: this is the
+    member's *lifetime* Hevy total, including everything they logged before the
+    bot existed, which is the number they'd recognise.
+    """
+    try:
+        data = _get(api_key, "/workouts/count")
+    except HevyError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    count = _as_int(data.get("workout_count", data.get("count")))
+    return count if count is not None and count >= 0 else None
+
+
 def fetch_workouts(api_key: str, page: int = 1, page_size: int = 10) -> list[dict]:
     """Most recent workouts (one page). Hevy returns newest-first."""
     data = _get(api_key, "/workouts", {"page": page, "pageSize": page_size})
@@ -1113,12 +1135,32 @@ def muscle_label(group: str) -> str:
     return MUSCLE_LABELS.get(key) or key.replace("_", " ").capitalize() or "Other"
 
 
+#: How much of an exercise's volume a *secondary* muscle group is credited with,
+#: relative to the primary. Hevy tags e.g. a Lat Pulldown as lats + upper back,
+#: biceps and forearms; counting only the primary made a pulling day read as
+#: pure "Lats" and hid the arm work entirely. Half is a judgement call, not a
+#: measurement — it is the conventional rule of thumb for assisting muscles, and
+#: the ranking is far more robust to the exact number than the raw totals are.
+SECONDARY_SHARE = 0.5
+
+
 def muscle_split(summary: dict, templates: dict) -> list[tuple[str, int]]:
-    """Volume per primary muscle group, heaviest first.
+    """Volume per muscle group, heaviest first, secondaries included.
 
     ``templates`` maps ``exercise_template_id`` to a template dict; exercises
     whose template isn't in the map are skipped rather than bucketed as "other",
     so a partially-loaded catalogue under-reports instead of lying.
+
+    Each exercise's volume is **apportioned** across the muscles Hevy tags it
+    with — the primary at 1, each secondary at :data:`SECONDARY_SHARE`, then
+    normalised so the shares sum to one. Apportioning rather than crediting each
+    muscle the full amount keeps the invariant that the split adds up to the
+    workout's total volume, which is printed right above it in the embed; the
+    obvious alternative (give lats 850kg *and* biceps 850kg) prints numbers that
+    silently exceed the session total and cannot be reconciled by a reader.
+
+    An exercise Hevy tags with no secondaries is unaffected: its primary takes
+    the whole volume exactly as before.
 
     This is deliberately **display-only** and keyed off the template id. Muscle
     groups are never fed back into :func:`app.aliases.canonicalize`: equipment
@@ -1131,15 +1173,27 @@ def muscle_split(summary: dict, templates: dict) -> list[tuple[str, int]]:
         template = templates.get(ex.get("template_id") or "")
         if not isinstance(template, dict):
             continue
-        group = (template.get("primary_muscle_group") or "").strip().lower()
-        if not group:
+        primary = (template.get("primary_muscle_group") or "").strip().lower()
+        if not primary:
             continue
-        totals[group] = totals.get(group, 0.0) + float(ex.get("volume_kg") or 0)
+        volume = float(ex.get("volume_kg") or 0)
+        if volume <= 0:
+            continue
+        shares: dict[str, float] = {primary: 1.0}
+        for raw in template.get("secondary_muscle_groups") or []:
+            group = str(raw or "").strip().lower()
+            # A group listed as both primary and secondary keeps its full
+            # weight rather than being topped up past it.
+            if group and group not in shares:
+                shares[group] = SECONDARY_SHARE
+        denominator = sum(shares.values()) or 1.0
+        for group, share in shares.items():
+            totals[group] = totals.get(group, 0.0) + volume * share / denominator
     ranked = sorted(
         ((g, round(v)) for g, v in totals.items() if v > 0),
         key=lambda pair: (-pair[1], pair[0]),
     )
-    return ranked
+    return [pair for pair in ranked if pair[1] > 0]
 
 
 #: Template types whose ``custom_metric`` has a display label. Everything else
@@ -1184,6 +1238,15 @@ def index_templates(templates: list[dict]) -> dict[str, dict]:
             "primary_muscle_group": (
                 template.get("primary_muscle_group") or ""
             ).strip().lower(),
+            # Hevy tags most templates with assisting muscles too (252 of the
+            # 451 in the live catalogue, up to seven on one exercise). Kept so
+            # :func:`muscle_split` can credit them — dropping the key here was
+            # what made a pulling day read as pure "Lats".
+            "secondary_muscle_groups": [
+                str(g or "").strip().lower()
+                for g in (template.get("secondary_muscle_groups") or [])
+                if str(g or "").strip()
+            ],
             # Hevy's OpenAPI spec names this field ``equipment_category``;
             # the live API actually sends ``equipment`` (verified against a
             # real account, like the supersets_id/superset_id mismatch). Read

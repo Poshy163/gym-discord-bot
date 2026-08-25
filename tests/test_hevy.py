@@ -285,6 +285,76 @@ def test_muscle_split_skips_exercises_with_no_known_template():
     assert hevy_client.muscle_split(s, {}) == []
 
 
+def test_index_templates_keeps_secondary_muscle_groups():
+    """The live catalogue tags 252 of 451 templates with assisting muscles, and
+    this index used to drop the key — which is what made a pulling day read as
+    pure "Lats"."""
+    got = hevy_client.index_templates([{
+        "id": "T1", "title": "Lat Pulldown (Cable)",
+        "primary_muscle_group": "Lats",
+        "secondary_muscle_groups": ["Upper_Back", "biceps", "", None],
+    }])
+    assert got["T1"]["secondary_muscle_groups"] == ["upper_back", "biceps"]
+    # A template Hevy tags with nothing still indexes cleanly.
+    bare = hevy_client.index_templates([{"id": "T2", "title": "Plank"}])
+    assert bare["T2"]["secondary_muscle_groups"] == []
+
+
+def test_muscle_split_apportions_secondaries_and_conserves_volume():
+    """The real shape of this account's data: a Lat Pulldown is lats + three
+    assisting groups. Splitting the volume rather than crediting each group the
+    full amount keeps the total equal to the workout's volume, which the embed
+    prints directly above it."""
+    templates = hevy_client.index_templates([
+        {"id": "T1", "title": "Lat Pulldown (Cable)",
+         "primary_muscle_group": "lats",
+         "secondary_muscle_groups": ["upper_back", "biceps", "forearms"]},
+    ])
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Pull",
+        "exercises": [{"title": "Lat Pulldown (Cable)",
+                       "exercise_template_id": "T1",
+                       "sets": [{"weight_kg": 50, "reps": 10}] * 2},  # 1000 kg
+                      ],
+    })
+    split = dict(hevy_client.muscle_split(summary, templates))
+    # Shares are 1 + 0.5*3 = 2.5, so lats take 1/2.5 and each helper 0.2.
+    assert split == {"lats": 400, "upper_back": 200,
+                     "biceps": 200, "forearms": 200}
+    assert sum(split.values()) == summary["volume_kg"] == 1000
+
+
+def test_muscle_split_leaves_a_template_with_no_secondaries_alone():
+    """The old behaviour has to survive untouched for the 199 templates Hevy
+    tags with nothing — the primary keeps the whole volume."""
+    templates = hevy_client.index_templates([
+        {"id": "TPL-SQUAT", "title": "Squat",
+         "primary_muscle_group": "quadriceps"},
+        {"id": "TPL-BENCH", "title": "Bench", "primary_muscle_group": "chest"},
+    ])
+    s = hevy_client.summarize_workout(RICH_WORKOUT)
+    assert hevy_client.muscle_split(s, templates) == [
+        ("quadriceps", 1640), ("chest", 600),
+    ]
+
+
+def test_muscle_split_never_credits_one_group_twice_for_an_exercise():
+    """A template that lists its own primary among the secondaries must not have
+    its share topped up past a full one."""
+    templates = hevy_client.index_templates([{
+        "id": "T1", "title": "Odd", "primary_muscle_group": "chest",
+        "secondary_muscle_groups": ["chest", "triceps"],
+    }])
+    summary = hevy_client.summarize_workout({
+        "id": "w", "title": "Push",
+        "exercises": [{"title": "Odd", "exercise_template_id": "T1",
+                       "sets": [{"weight_kg": 60, "reps": 5}]}],  # 300 kg
+    })
+    split = dict(hevy_client.muscle_split(summary, templates))
+    assert split == {"chest": 200, "triceps": 100}
+    assert sum(split.values()) == 300
+
+
 def test_index_templates_ignores_entries_without_an_id():
     got = hevy_client.index_templates([{"title": "no id"}, {"id": "A", "title": "x"}])
     assert list(got) == ["A"]
@@ -430,6 +500,24 @@ def test_auth_and_missing_map_to_typed_errors(monkeypatch):
     }))
     # 404 is "nothing recorded that day", not a failure.
     assert hevy_client.fetch_body_measurement("k", "2026-06-01") is None
+
+
+def test_fetch_workout_count_reads_the_live_key_and_never_raises(monkeypatch):
+    """Live shape is ``{"workout_count": 2}``. Unlike verify_key this is a
+    garnish on the feed embed, so every failure — a rejected key included —
+    has to come back as None rather than taking the whole post down with it."""
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/workouts/count"): _FakeResponse(200, {"workout_count": 143}),
+    }))
+    assert hevy_client.fetch_workout_count("k") == 143
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/workouts/count"): _FakeResponse(401),
+    }))
+    assert hevy_client.fetch_workout_count("k") is None
+    monkeypatch.setattr(hevy_client, "requests", _FakeRequests({
+        ("GET", "/workouts/count"): _FakeResponse(200, {"nothing": "useful"}),
+    }))
+    assert hevy_client.fetch_workout_count("k") is None
 
 
 def test_fetch_user_info_unwraps_the_data_envelope(monkeypatch):

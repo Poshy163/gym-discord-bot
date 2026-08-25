@@ -685,10 +685,13 @@ CREATE INDEX IF NOT EXISTS idx_apple_health_workout_user_started
 -- first sync after linking: the workout payload never names its owner, so
 -- without them the feed can only ever show the member's Discord name and cannot
 -- link their public Hevy profile.
--- ``measurements_synced_at`` marks the one-time bodyweight reconcile between the
--- bot and Hevy's body measurements. NULL means "not done yet", which is what
--- lets accounts linked before the reconcile existed pick it up on their next
--- poll rather than only ever benefiting new links.
+-- ``measurements_synced_at`` is when the bodyweight reconcile between the bot
+-- and Hevy's body measurements last ran. NULL means "never", which is what lets
+-- accounts linked before the reconcile existed pick it up on their next poll
+-- rather than only ever benefiting new links. It is a rolling timestamp, not a
+-- done-flag: the reconcile re-runs once the marker is older than
+-- ``_HEVY_RECONCILE_TTL``, so weigh-ins the member records in Hevy after their
+-- first sync still reach the bot.
 CREATE TABLE IF NOT EXISTS hevy_account (
     user_id               INTEGER PRIMARY KEY,
     guild_id              INTEGER NOT NULL,
@@ -4283,8 +4286,9 @@ class Database:
 
     def hevy_claim_measurement_sync(
         self, user_id: int, at: datetime | None = None,
+        stale_before: datetime | None = None,
     ) -> bool:
-        """Atomically claim the one-time bodyweight reconcile. True if won.
+        """Atomically claim the bodyweight reconcile. True if won.
 
         Claim-before-work, like :meth:`hevy_mark_workout`, because the reconcile
         writes through ``set_bodyweight`` — which appends with no unique
@@ -4292,17 +4296,38 @@ class Database:
         overlapping runs (the poll firing on startup while somebody runs
         ``/hevy sync``) both used to read a NULL marker, both walk the same
         history and both import it, leaving two identical weigh-ins at the same
-        timestamp. Only the writer whose UPDATE actually matched a NULL row may
-        proceed; the loser returns immediately.
+        timestamp. Only the writer whose UPDATE actually matched may proceed;
+        the loser returns immediately.
+
+        ``stale_before`` makes the claim **recurring**: a marker older than that
+        moment is up for grabs again. Without it the claim can only ever be won
+        once per account, which meant weigh-ins the member recorded in Hevy
+        *after* their first sync — from a scale that writes to Hevy, say — never
+        reached the bot at all, while the push direction kept mirroring
+        continuously. The reconcile is idempotent by construction (a day present
+        on both sides is left alone), so re-running it is safe; this is what lets
+        it run on a schedule instead of exactly once in an account's lifetime.
+
+        Marker comparison is lexicographic on the stored ISO-8601 strings, which
+        :func:`_normalize_iso` always writes as UTC with the same layout, so
+        string order is chronological order.
 
         The caller must :meth:`hevy_release_measurement_sync` if it then fails,
-        or a transient outage burns the one chance to merge."""
+        or a transient outage costs it a whole interval."""
         with self._conn() as c:
-            cur = c.execute(
-                "UPDATE hevy_account SET measurements_synced_at = ? "
-                "WHERE user_id = ? AND measurements_synced_at IS NULL",
-                (_normalize_iso(at), user_id),
-            )
+            if stale_before is None:
+                cur = c.execute(
+                    "UPDATE hevy_account SET measurements_synced_at = ? "
+                    "WHERE user_id = ? AND measurements_synced_at IS NULL",
+                    (_normalize_iso(at), user_id),
+                )
+            else:
+                cur = c.execute(
+                    "UPDATE hevy_account SET measurements_synced_at = ? "
+                    "WHERE user_id = ? AND (measurements_synced_at IS NULL "
+                    "OR measurements_synced_at < ?)",
+                    (_normalize_iso(at), user_id, _normalize_iso(stale_before)),
+                )
             return (cur.rowcount or 0) > 0
 
     def hevy_release_measurement_sync(self, user_id: int) -> None:
