@@ -10798,6 +10798,25 @@ def _perfectgym_client_for_user(row) -> "revo_perfectgym.PerfectGymClient":
     return client
 
 
+def _replace_cached_revo_client(
+    user_id: int,
+    client: "revo_client.RevoClient",
+) -> None:
+    """Activate a freshly linked web client and invalidate sibling sessions.
+
+    Revo uses three independent authenticated backends.  A successful relink
+    proves the new credentials only for ``revocentral``; any cached Netpulse or
+    PerfectGym client still belongs to the previous credential/account context.
+    In particular, PerfectGym keeps the member's entry barcode in memory, so it
+    must not survive a relink.  Replace/drop all three cache entries atomically
+    before any post-link profile lookup can run.
+    """
+    with _revo_clients_lock:
+        _revo_user_clients[user_id] = client
+        _revo_netpulse_clients.pop(user_id, None)
+        _revo_perfectgym_clients.pop(user_id, None)
+
+
 def _drop_cached_client(user_id: int) -> None:
     # Drop all three backend sessions together: an auth failure on one usually
     # means the stored password changed, which invalidates the others too.
@@ -12107,9 +12126,11 @@ async def revo_link_cmd(
         except Exception as exc:
             LOG.exception("Revo link db write failed")
             return f"db-error: {exc}"
-        # Cache the freshly-authenticated client.
-        with _revo_clients_lock:
-            _revo_user_clients[interaction.user.id] = client
+        # Activate the freshly-authenticated web client and invalidate the two
+        # independent mobile-backend sessions.  Those sessions may still hold
+        # the previous linked account's profile or physical entry barcode, so
+        # they must be gone before the PerfectGym nickname lookup below.
+        _replace_cached_revo_client(interaction.user.id, client)
         # Best-effort: auto-name the member from their PerfectGym first name so
         # they show up as e.g. "Sean" across the bot. Always overwrites; never
         # fatal (a failed fetch just leaves any existing nickname in place).
@@ -12168,10 +12189,15 @@ async def revo_unlink_cmd(interaction: discord.Interaction) -> None:
 # to streaks.php / raffle.php that we can't work around from a scraper. Kept
 # distinct from auth/network errors so users aren't wrongly told to re-link or
 # "try again in a minute".
-_REVO_STREAKS_GUARDED_MSG = (
-    "🔒 Revo is currently blocking access to its **streaks** page, so weekly "
-    "streaks and the per-day check-in calendar aren't available right now. Your "
-    "ticket balance, attendance feed and live gym counts still work."
+_REVO_STREAK_GUARDED_MSG = (
+    "🔒 Revo's dedicated **streaks** page is restricted, and the rewards summary "
+    "didn't contain a fallback streak count. Your ticket balance, coarse "
+    "attendance feed and live gym counts still work."
+)
+_REVO_CALENDAR_GUARDED_MSG = (
+    "🔒 Revo is currently blocking its **per-day check-in calendar**. Your weekly "
+    "streak still comes from the rewards summary; ticket-based attendance and "
+    "live gym counts also keep working, but individual visit days are unavailable."
 )
 _REVO_RAFFLE_GUARDED_MSG = (
     "🔒 Revo is currently blocking access to its **raffle** page, so the draw "
@@ -12230,7 +12256,7 @@ async def revo_streak_cmd(
 
     result = await bot.loop.run_in_executor(None, _do)
     if result == "guarded":
-        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        await interaction.followup.send(_REVO_STREAK_GUARDED_MSG, ephemeral=True)
         return
     if isinstance(result, str):
         msg = (
@@ -12426,7 +12452,7 @@ async def revo_calendar_cmd(
 
     result = await bot.loop.run_in_executor(None, _do)
     if result == "guarded":
-        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        await interaction.followup.send(_REVO_CALENDAR_GUARDED_MSG, ephemeral=True)
         return
     if isinstance(result, str):
         msg = (
@@ -12572,7 +12598,7 @@ async def revo_calendar_compare_cmd(
     # The guard is page-level (blocks everyone), so if it fired and nothing came
     # back, say so plainly rather than rendering a wall of "unavailable" rows.
     if guarded and all(cal is None for _uid, cal in results):
-        await interaction.followup.send(_REVO_STREAKS_GUARDED_MSG, ephemeral=True)
+        await interaction.followup.send(_REVO_CALENDAR_GUARDED_MSG, ephemeral=True)
         return
 
     def _count(cal: "dict[int, bool] | None") -> int:
@@ -12790,7 +12816,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     row = db.get_revo_account(interaction.user.id)
     personal = row is not None
 
-    def _do() -> "tuple[int | None, revo_client.RaffleInfo | None, dict[str, str | None]] | str":
+    def _do() -> "tuple[int | None, revo_client.RaffleInfo | None, str, dict[str, str | None]] | str":
         try:
             if row is not None:
                 client = _client_for_user(row)
@@ -12800,21 +12826,35 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
             # the prize copy live on other pages that still render, so a guarded
             # raffle must not sink the whole reply.
             raffle: revo_client.RaffleInfo | None = None
+            raffle_state = "ok"
             try:
                 raffle = client.get_raffle()
+            except revo_client.RevoAuthError:
+                raise
             except revo_client.RevoAccessGuarded:
+                raffle_state = "guarded"
                 LOG.info("Revo raffle: page access-guarded")
+            except revo_client.RevoPageUnreadable:
+                raffle_state = "unreadable"
+                LOG.warning("Revo raffle: page shape unreadable", exc_info=True)
+            except Exception:  # pragma: no cover - network, best effort
+                raffle_state = "unavailable"
+                LOG.warning("Revo raffle: page fetch failed", exc_info=True)
             tickets = None
             try:
                 tickets, _rows = client.get_tickets()
+            except revo_client.RevoAuthError:
+                raise
             except Exception:  # pragma: no cover - non-fatal
                 LOG.warning("Revo raffle: ticket fetch failed", exc_info=True)
             prize: dict[str, str | None] = {"monthly": None, "major": None}
             try:
                 prize = client.get_prize_pool()
+            except revo_client.RevoAuthError:
+                raise
             except Exception:  # pragma: no cover - non-fatal
                 LOG.warning("Revo raffle: prize-pool fetch failed", exc_info=True)
-            return tickets, raffle, prize
+            return tickets, raffle, raffle_state, prize
         except revo_client.RevoUnavailable as exc:
             return f"no-credentials: {exc}"
         except revo_client.RevoAuthError as exc:
@@ -12840,7 +12880,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    tickets, raffle, prize = result
+    tickets, raffle, raffle_state, prize = result
     lines = ["🎰 **Revo Raffle**"]
     if personal and tickets is not None:
         display = _bot_name(interaction.user.id, interaction.user.display_name)
@@ -12849,7 +12889,11 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
         # whether these tickets are entered at all — an opted-out member would be
         # told their tickets are in play when they aren't (the exact failure
         # parse_raffle_optin exists to prevent). Say only what we know: the count.
-        suffix = " in the draw" if raffle is not None else ""
+        suffix = (
+            " in the draw"
+            if raffle is not None and raffle.opted_in is True
+            else ""
+        )
         lines.append(
             f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''}"
             f"{suffix}"
@@ -12868,14 +12912,17 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
         if prize.get("major"):
             lines.append(f"-# 🏆 {prize['major']}")
     else:
-        # raffle.php is access-guarded: show the prize copy we still have (it
-        # lives on prize-pool.php) and say the countdowns are unavailable rather
-        # than inventing them.
+        # Show the prize copy we still have (it lives on prize-pool.php), while
+        # describing the raffle failure according to evidence rather than
+        # labelling every malformed/network response as an access restriction.
         if prize.get("monthly"):
             lines.append(f"-# 🏆 {prize['monthly']}")
         if prize.get("major"):
             lines.append(f"-# 🏆 {prize['major']}")
-        lines.append(_REVO_RAFFLE_GUARDED_MSG)
+        if raffle_state == "guarded":
+            lines.append(_REVO_RAFFLE_GUARDED_MSG)
+        else:
+            lines.append("⚠️ Revo raffle details are temporarily unavailable.")
     if not personal:
         lines.append("-# Link your account with `/revo_link` to show *your* ticket count.")
     await interaction.followup.send(
@@ -12929,30 +12976,64 @@ async def revo_summary_cmd(
     def _do() -> "dict[str, object] | str":
         try:
             client = _client_for_user(row)
-            # Tickets first: ticket-tally.php still renders, and it's the fetch
-            # that triggers login (so a real auth failure surfaces here, not
-            # swallowed by a per-page guard catch below).
-            avail, _rows = client.get_tickets()
-            # streaks.php (streak + calendar) and raffle.php are currently
-            # access-guarded; each is best-effort so a guard on one doesn't blank
-            # the whole dashboard. Track which so the render can say "restricted".
-            streaks_guarded = False
+            # Keep each independently rendered portal tile best-effort. Auth
+            # failures still abort the whole summary, but a guard, shape change,
+            # or network failure on one page must not hide the remaining pages.
+            avail = None
+            tickets_state = "ok"
+            try:
+                avail, _rows = client.get_tickets()
+            except revo_client.RevoAuthError:
+                raise
+            except revo_client.RevoAccessGuarded:
+                tickets_state = "guarded"
+            except revo_client.RevoPageUnreadable:
+                tickets_state = "unreadable"
+            except Exception:  # pragma: no cover - network, best effort
+                tickets_state = "unavailable"
+                LOG.warning("Revo summary: ticket fetch failed", exc_info=True)
+            # The weekly streak survives on the rewards landing, independently
+            # of the guarded per-day calendar. Track each source separately so a
+            # calendar block does not hide a valid live streak in the summary.
+            streak_state = "ok"
             streak = None
             try:
                 streak = client.get_streak_weeks()
+            except revo_client.RevoAuthError:
+                raise
             except revo_client.RevoAccessGuarded:
-                streaks_guarded = True
+                streak_state = "guarded"
+            except revo_client.RevoPageUnreadable:
+                streak_state = "unreadable"
+            except Exception:  # pragma: no cover - network, best effort
+                streak_state = "unavailable"
+                LOG.warning("Revo summary: streak fetch failed", exc_info=True)
             calendar: dict[int, bool] = {}
+            calendar_state = "ok"
             try:
                 calendar = client.get_streak_calendar(m, y)
+            except revo_client.RevoAuthError:
+                raise
             except revo_client.RevoAccessGuarded:
-                streaks_guarded = True
+                calendar_state = "guarded"
+            except revo_client.RevoPageUnreadable:
+                calendar_state = "unreadable"
+            except Exception:  # pragma: no cover - network, best effort
+                calendar_state = "unavailable"
+                LOG.warning("Revo summary: calendar fetch failed", exc_info=True)
             raffle = None
-            raffle_guarded = False
+            raffle_state = "ok"
             try:
                 raffle = client.get_raffle()
+            except revo_client.RevoAuthError:
+                raise
             except revo_client.RevoAccessGuarded:
-                raffle_guarded = True
+                raffle_state = "guarded"
+            except revo_client.RevoPageUnreadable:
+                raffle_state = "unreadable"
+            except Exception:  # pragma: no cover - network, best effort
+                raffle_state = "unavailable"
+                LOG.warning("Revo summary: raffle fetch failed", exc_info=True)
             prize: dict[str, str | None] = {"monthly": None, "major": None}
             try:
                 prize = client.get_prize_pool()
@@ -12986,10 +13067,12 @@ async def revo_summary_cmd(
                 )
             return {
                 "streak": streak,
-                "streaks_guarded": streaks_guarded,
+                "streak_state": streak_state,
+                "calendar_state": calendar_state,
                 "tickets": avail,
+                "tickets_state": tickets_state,
                 "raffle": raffle,
-                "raffle_guarded": raffle_guarded,
+                "raffle_state": raffle_state,
                 "calendar": calendar,
                 "prize": prize,
                 "membership": membership,
@@ -13013,30 +13096,42 @@ async def revo_summary_cmd(
         return
 
     streak = result["streak"]
-    streaks_guarded = bool(result.get("streaks_guarded"))
+    streak_state = str(result.get("streak_state") or "ok")
+    calendar_state = str(result.get("calendar_state") or "ok")
     tickets = result["tickets"]
+    tickets_state = str(result.get("tickets_state") or "ok")
     raffle = result["raffle"]
-    raffle_guarded = bool(result.get("raffle_guarded"))
+    raffle_state = str(result.get("raffle_state") or "ok")
     calendar = result["calendar"] or {}
     prize = result.get("prize") or {"monthly": None, "major": None}
     month_checkins = sum(1 for v in calendar.values() if v)
     month_name = today.strftime("%B")
     display = _bot_name(target.id, target.display_name)
 
-    # While streaks.php is access-guarded we get no streak and an empty calendar;
-    # showing "0 check-ins" would read as "hasn't trained", which is wrong — say
-    # "restricted" instead of implying a real zero.
-    if streaks_guarded:
+    # Do not let one guarded tile blank the other: the weekly count survives on
+    # the rewards landing even while the per-day calendar is restricted.
+    if streak_state == "guarded":
         streak_txt = "restricted 🔒"
-        checkins_txt = "restricted 🔒"
+    elif streak_state != "ok":
+        streak_txt = "temporarily unavailable ⚠️"
     else:
         streak_txt = (
             f"**{streak} week{'s' if streak != 1 else ''}**"
             if streak is not None
             else "*unknown*"
         )
+    if calendar_state == "guarded":
+        checkins_txt = "restricted 🔒"
+    elif calendar_state != "ok":
+        checkins_txt = "temporarily unavailable ⚠️"
+    else:
         checkins_txt = f"**{month_checkins}**"
-    tickets_txt = f"**{tickets}**" if tickets is not None else "*unknown*"
+    if tickets_state == "guarded":
+        tickets_txt = "restricted 🔒"
+    elif tickets_state != "ok":
+        tickets_txt = "temporarily unavailable ⚠️"
+    else:
+        tickets_txt = f"**{tickets}**" if tickets is not None else "*unknown*"
     lines = [
         f"🏋️ **{display}** — Revo summary",
         f"🔥 Weekly streak: {streak_txt}",
@@ -13080,8 +13175,11 @@ async def revo_summary_cmd(
         lines.append(_format_draw_countdown(raffle.major_draw_days, "Major"))
     if prize.get("major"):
         lines.append(f"-# 🏆 {prize['major']}")
-    if raffle is None and raffle_guarded:
-        lines.append(_REVO_RAFFLE_GUARDED_MSG)
+    if raffle is None:
+        if raffle_state == "guarded":
+            lines.append(_REVO_RAFFLE_GUARDED_MSG)
+        elif raffle_state != "ok":
+            lines.append("⚠️ Revo raffle details are temporarily unavailable.")
     await interaction.followup.send(
         "\n".join(lines),
         allowed_mentions=discord.AllowedMentions.none(),
@@ -13787,9 +13885,9 @@ async def _poll_one_account(row) -> None:
         The announcement below reads ``source`` so it only claims "trained today"
         when that's actually what the data supports.
 
-        ``streak_readable`` is False when the streaks page couldn't be read at all
-        (guarded or erroring), which is different from a streak that is genuinely
-        unknown — see :class:`revo_client.AttendanceInfo`.
+        ``streak_readable`` is False only when neither the rewards-landing tile
+        nor the dedicated streak page produced a count; the calendar can remain
+        guarded independently — see :class:`revo_client.AttendanceInfo`.
         """
         try:
             client = _client_for_user(row)
@@ -13814,7 +13912,10 @@ async def _poll_one_account(row) -> None:
                             prev_month.year, prev_month.month, prev_day
                         ).strftime("%Y-%m-%d")
                         source = "calendar"
-                except revo_client.RevoAccessGuarded:  # pragma: no cover
+                except (
+                    revo_client.RevoAccessGuarded,
+                    revo_client.RevoPageUnreadable,
+                ):  # pragma: no cover
                     pass
             return latest_iso, streak, source, streak_readable
         except revo_client.RevoAuthError as exc:
@@ -13833,11 +13934,9 @@ async def _poll_one_account(row) -> None:
     # Advance the cursor to the newest date we know about, then persist first so
     # a notify-failure doesn't replay forever. ISO dates sort lexicographically.
     cursor = max(d for d in (prev_checkin, latest_iso) if d) if (prev_checkin or latest_iso) else None
-    # Persist the live streak whenever the streaks page actually answered — even
-    # if that answer is None (a streak really can lapse, and freezing a stale one
-    # would mis-rank the leaderboard and mislead the AI coach). Only when the page
-    # was UNREADABLE (access-guarded or erroring) do we keep the last known value
-    # rather than nulling it.
+    # Persist the live streak whenever either source produced a count, including
+    # zero when it lapses. Only when both sources were unreadable do we retain the
+    # last known value rather than replacing it with an unverified absence.
     db.update_revo_checkin_state(
         user_id, cursor, streak if streak_readable else prev_streak,
     )

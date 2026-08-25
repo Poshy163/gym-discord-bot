@@ -109,6 +109,14 @@ def test_parse_streak_calendar_empty_or_garbage():
     assert revo_client.parse_streak_calendar('{"weeks_data":"oops"}') == {}
 
 
+def test_parse_streak_calendar_rejects_invalid_cell_instead_of_shifting_dates():
+    body = (
+        '{"month_name":"August","weeks_data":{'
+        '"week1":{"1":"0","2":"changed","3":"1"},"week2":[]}}'
+    )
+    assert revo_client.parse_streak_calendar(body) == {}
+
+
 # A faithful (synthetic) slice of ticket-tally.php in the current DOM shape:
 # a headline "Tickets Available" counter built from single-digit <span> cells,
 # then history rows as three-column grid blocks in DATE -> DELTA -> SOURCE
@@ -187,6 +195,19 @@ def test_parse_tickets_filters_available_pseudo_row():
     assert rows[0].date == "11/01/2025"
 
 
+def test_parse_tickets_identifies_cells_after_another_reorder():
+    """Date/delta/source are shape-classified, not tied to DOM positions."""
+    html = """
+        <div class='grid-cols-3 px-2 list grid'>
+            <div class='font-thin'>Attendance</div>
+            <div class='font-thin'>17/08/2026</div>
+            <div class='font-bold'>+2 Tickets</div>
+        </div>
+    """
+    _avail, rows = revo_client.parse_tickets(html)
+    assert rows == [revo_client.TicketRow(2, "Attendance", "17/08/2026")]
+
+
 def test_parse_tickets_empty_when_no_rows():
     avail, rows = revo_client.parse_tickets("<html>nothing here</html>")
     assert avail is None
@@ -225,6 +246,30 @@ def test_parse_rewards_landing_extracts_fav_club_and_count():
 def test_parse_rewards_landing_missing_tile():
     fav_id, name, in_club = revo_client.parse_rewards_landing("<html>no tile</html>")
     assert (fav_id, name, in_club) == (None, None, None)
+
+
+def test_parse_rewards_landing_streak_is_scoped_to_streak_tile():
+    """Other landing counters must not be mistaken for the weekly streak."""
+    html = """
+        <a href="/portal/rewards/ticket-tally.php"><span>4</span><span>3</span></a>
+        <a class="h-full"
+           href="https://revocentral.revofitness.com.au/portal/rewards/streaks.php">
+            <div class="breaks-number"><img src="flame.png"><span>6</span></div>
+            <img src="streaks-logo.png">
+        </a>
+        <a href="/portal/club-counter.php?id=25"><span>0</span><span>7</span></a>
+    """
+    assert revo_client.parse_rewards_landing_streak(html) == 6
+
+
+def test_parse_rewards_landing_streak_joins_split_counter_and_handles_missing():
+    html = """
+        <a href='/portal/rewards/streaks.php'>
+            <span>1</span><span>3</span>
+        </a>
+    """
+    assert revo_client.parse_rewards_landing_streak(html) == 13
+    assert revo_client.parse_rewards_landing_streak("<html>no streak tile</html>") is None
 
 
 def test_parse_prize_pool_monthly_then_major():
@@ -522,10 +567,45 @@ def test_get_streak_weeks_parses_when_not_guarded(monkeypatch):
 
 
 @pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_streak_weeks_uses_working_rewards_landing_before_guarded_page(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    calls = []
+
+    def _get(path):
+        calls.append(path)
+        if path == revo_client.REWARDS_PATH:
+            return '<a href="/portal/rewards/streaks.php"><span>6</span></a>'
+        return revo_client.GUARD_BODY
+
+    monkeypatch.setattr(c, "_get", _get)
+    assert c.get_streak_weeks() == 6
+    assert calls == [revo_client.REWARDS_PATH]
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_rewards_landing_includes_streak(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    monkeypatch.setattr(
+        c,
+        "_get",
+        lambda _path: '<a href="/portal/rewards/streaks.php"><span>8</span></a>',
+    )
+    assert c.get_rewards_landing().streak_weeks == 8
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
 def test_get_raffle_raises_on_guard(monkeypatch):
     c = revo_client.RevoClient("e@x", "pw")
     monkeypatch.setattr(c, "_get", lambda path: revo_client.GUARD_BODY)
     with pytest.raises(revo_client.RevoAccessGuarded):
+        c.get_raffle()
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_raffle_rejects_empty_or_unexpected_page(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    monkeypatch.setattr(c, "_get", lambda _path: "<html>login</html>")
+    with pytest.raises(revo_client.RevoPageUnreadable):
         c.get_raffle()
 
 
@@ -538,6 +618,86 @@ def test_get_streak_calendar_raises_on_guard(monkeypatch):
     )
     with pytest.raises(revo_client.RevoAccessGuarded):
         c.get_streak_calendar(8, 2026)
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_streak_calendar_raises_on_unexpected_200_shape(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    c._logged_in = True
+    monkeypatch.setattr(c._http, "get", lambda *a, **k: _FakeResp("<html>login</html>"))
+    with pytest.raises(revo_client.RevoPageUnreadable):
+        c.get_streak_calendar(8, 2026)
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_streak_calendar_rejects_incomplete_requested_month(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    c._logged_in = True
+    body = (
+        '{"month_name":"August","weeks_data":{'
+        '"week1":{"1":"0","2":"1"},"week2":[]}}'
+    )
+    monkeypatch.setattr(c._http, "get", lambda *a, **k: _FakeResp(body))
+    with pytest.raises(revo_client.RevoPageUnreadable):
+        c.get_streak_calendar(8, 2026)
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_tickets_rejects_guard_and_unreadable_nonempty_ledger(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    monkeypatch.setattr(c, "_get", lambda _path: revo_client.GUARD_BODY)
+    with pytest.raises(revo_client.RevoAccessGuarded):
+        c.get_tickets()
+
+    # A parsed balance with no history is shape drift for a non-empty account,
+    # not evidence that the attendance fallback is healthy.
+    monkeypatch.setattr(c, "_get", lambda _path: "<div>4 1 Tickets Available</div>")
+    with pytest.raises(revo_client.RevoPageUnreadable):
+        c.get_tickets()
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_tickets_rejects_partially_parsed_history(monkeypatch):
+    c = revo_client.RevoClient("e@x", "pw")
+    html = """
+        <div>4 1 Tickets Available</div>
+        <div class="list grid-cols-3">
+            <div>19/08/2026</div><div>changed</div><div>Attendance</div>
+        </div>
+        <div class="list grid-cols-3">
+            <div>12/08/2026</div><div>+2 Tickets</div><div>Attendance</div>
+        </div>
+    """
+    monkeypatch.setattr(c, "_get", lambda _path: html)
+    with pytest.raises(revo_client.RevoPageUnreadable):
+        c.get_tickets()
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        "<div>99/99/2026</div><div>+2 Tickets</div><div>Attendance</div>",
+        (
+            "<div>19/08/2026</div><div>+2 Tickets</div>"
+            "<div>icon</div><div>Attendance</div>"
+        ),
+    ],
+)
+def test_get_tickets_rejects_invalid_date_or_extra_column(monkeypatch, bad_row):
+    c = revo_client.RevoClient("e@x", "pw")
+    html = (
+        "<div>4 1 Tickets Available</div>"
+        f'<div class="list grid-cols-3">{bad_row}</div>'
+    )
+    monkeypatch.setattr(c, "_get", lambda _path: html)
+    with pytest.raises(revo_client.RevoPageUnreadable):
+        c.get_tickets()
+
+
+def test_latest_attendance_ticket_date_rejects_impossible_future_cursor():
+    rows = [revo_client.TicketRow(2, "Attendance", "99/99/2026")]
+    assert revo_client.latest_attendance_ticket_date(rows) is None
 
 
 @pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
@@ -575,10 +735,12 @@ def test_get_latest_attendance_falls_back_to_tickets_when_guarded(monkeypatch):
     ]
     monkeypatch.setattr(c, "get_streak_calendar", _guarded)
     monkeypatch.setattr(c, "get_tickets", lambda: (41, rows))
+    monkeypatch.setattr(c, "get_streak_weeks", lambda: 6)
     info = c.get_latest_attendance(8, 2026)
     assert info.date == "2026-08-12"
     assert info.source == "tickets"
-    assert info.streak_weeks is None  # streak page is guarded too
+    assert info.streak_weeks == 6  # survives via the rewards-landing tile
+    assert info.streak_readable is True
 
 
 @pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
@@ -589,10 +751,29 @@ def test_get_latest_attendance_tickets_fallback_empty(monkeypatch):
         raise revo_client.RevoAccessGuarded("streaks guarded")
 
     monkeypatch.setattr(c, "get_streak_calendar", _guarded)
-    monkeypatch.setattr(c, "get_tickets", lambda: (41, []))
+    monkeypatch.setattr(
+        c,
+        "get_tickets",
+        lambda: (41, [revo_client.TicketRow(2, "Monthiversary", "07/08/2026")]),
+    )
+    monkeypatch.setattr(c, "get_streak_weeks", lambda: 6)
     info = c.get_latest_attendance(8, 2026)
     assert info.date is None
     assert info.source is None
+    assert info.streak_weeks == 6
+
+
+@pytest.mark.skipif(not revo_client.available(), reason="requests not installed")
+def test_get_latest_attendance_falls_back_when_calendar_shape_is_empty(monkeypatch):
+    """A changed 200 response must not recreate the original silent outage."""
+    c = revo_client.RevoClient("e@x", "pw")
+    rows = [revo_client.TicketRow(2, "Attendance", "12/08/2026")]
+    monkeypatch.setattr(c, "get_streak_calendar", lambda _m, _y: {})
+    monkeypatch.setattr(c, "get_tickets", lambda: (41, rows))
+    monkeypatch.setattr(c, "get_streak_weeks", lambda: 6)
+    info = c.get_latest_attendance(8, 2026)
+    assert (info.date, info.source) == ("2026-08-12", "tickets")
+    assert (info.streak_weeks, info.streak_readable) == (6, True)
 
 
 @pytest.mark.skipif(not revo_client.available(), reason="requests not installed")

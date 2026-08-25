@@ -6,8 +6,9 @@
 > usage terms of revofitness.com.au may restrict scraping. Use a single
 > low-frequency poll, identify the bot in `User-Agent`, and stop if they object.
 >
-> 🧭 **Probing this again?** Read **§9.3** (mine the Angular templates — the
-> highest-yield discovery channel, and ~30 templates are still unmined), **§8.1**
+> 🧭 **Probing this again?** Read **§9.3** (the Angular-template inventory was
+> complete for the 2026-08 snapshot; re-run it when bundle, template, or
+> feature-configuration evidence changes), **§8.1**
 > (PerfectGym status taxonomy) and **§7.1** (Netpulse response oracle) *before*
 > spending requests. Several conclusions in older revisions of this file were
 > confidently wrong; each corrected one is marked ✅ **Correction** inline.
@@ -48,14 +49,16 @@ Verified by re-testing every gated route with a confirmed L2 cookie (and various
 > calendar. Re-probed exhaustively (Referer, full Chrome UA, `Sec-Fetch-*`,
 > `X-Requested-With`, `X-Forwarded-For`, param/case/path variants, warm-up GET of
 > the rewards index first, and a fresh re-login): **all return the identical 17
-> bytes**, so it is no more client-settable here than it was for club-counter.
+> bytes**, so none of those tested request fields bypasses the route decision.
 > **Still working (2026-08):** the rewards landing (`/portal/rewards/`),
 > `ticket-tally.php` and `prize-pool.php`. See §3.2.4 for how the poller fell back
-> to ticket-tally, and `revo_client.is_access_guarded()` / `RevoAccessGuarded`
-> for how the code now distinguishes this from an auth/parse failure.
+> to ticket-tally for coarse attendance **and the landing for the weekly streak**;
+> `revo_client.is_access_guarded()` / `RevoAccessGuarded` distinguish the known
+> guard, while `RevoPageUnreadable` catches other 200/redirect shape failures.
 
-> 🧪 **"Just emulate the app" was tried (2026-08) and does NOT work — don't
-> re-run it.** 24 variants against `streaks.php`: mobile WebView User-Agents
+> 🧪 **Common request-shape emulation was tried (2026-08) and does NOT work from
+> the tested client context — don't re-run the same header matrix.** 24 variants
+> against `streaks.php`: mobile WebView User-Agents
 > (Android `; wv`, iOS WKWebView, app-suffixed UAs), the **Android package name in
 > `X-Requested-With`** (`com.netpulse.mobile.revofitness` — the classic app-webview
 > tell, and the one gap the earlier probe left, since it only tried the
@@ -65,18 +68,18 @@ Verified by re-testing every gated route with a confirmed L2 cookie (and various
 > The `https://localhost/portal/...` link hard-coded in the rewards landing HTML
 > looks like a webview breadcrumb, but faking that origin changes nothing.
 >
-> **This proves the gate is on the source IP, not the request.** On one and the
-> same authenticated session the rewards landing renders (17 KB) while
-> `streaks.php` dies (17 bytes); the only variable is which PHP script runs, and
-> since *no* header/UA/origin alters `streaks.php`, its check must read
-> `REMOTE_ADDR` (not spoofable — this server ignores `X-Forwarded-For`). So the app
-> works because its requests reach these pages from an **allowlisted network**
-> (in-club kiosk, or Revo's own server relaying the page to the app), **not**
-> because it sends a magic header. Emulating that from a scraper is impossible by
-> request-shaping. The only way to learn what the app actually does is to
-> **intercept the app's own TLS traffic on-device** (mitmproxy/Charles + the phone
-> + its CA cert) — which may well show it hitting a *different* backend, not
-> `streaks.php` at all. Nothing header-shaped will get past this.
+> **What this proves — and what it does not.** On one authenticated session the
+> rewards landing renders (17 KB) while `streaks.php` dies (17 bytes), and none of
+> the tested UA/header/origin shapes change that result. The decision is therefore
+> server-side, and those common WebView signals **alone** did not bypass it in the
+> tested context. **It does not prove an IP allowlist:** every probe kept the same
+> source IP, and no on-device
+> traffic was captured. A server feature flag, extra app cookie or signed launch
+> token, network/TLS identity, relay, or a different phone backend remain possible.
+> Correct conclusion: header-only spoofing is not a demonstrated fix; the exact
+> predicate is unknown. Useful next evidence includes a controlled
+> Wi-Fi-versus-cellular phone test or consented on-device traffic capture. Do not
+> state `REMOTE_ADDR`/IP allowlisting as fact without that evidence.
 
 `club-counter.php` and `massage-chair.php` — the *only* two pages that
 server-rendered dynamic in-club blobs (live occupancy + the access QR) — now
@@ -95,8 +98,8 @@ This is **not** membership gating and **not** a data move:
   endpoint/JS-var/JSON-key to retarget to. The all-clubs board **cannot** be
   restored from the web.
 
-Pattern is consistent with an **IP / app-context allowlist** (in-club kiosk /
-app-webview), not a per-account check. Effect on code: `parse_club_counter()`
+An IP/app-context allowlist was the initial hypothesis, but §1.2 records why the
+actual server-side predicate remains unknown. Effect on code: `parse_club_counter()`
 now finds none of `clubCounterLists` / `barGraphData` / `favoriteClubId` and
 returns `({}, None)`, so `get_club_counter` degrades gracefully.
 
@@ -122,7 +125,7 @@ Status legend: ✅ accessible at level 1 · 🔒 redirects to `/portal/` (L2 onl
 | GET | `/portal/` | 403 | (Direct index forbidden) |
 | GET | `/portal/api/` | ✅ | Returns literal `:)` — no JSON API mounted here |
 | GET | `/portal/club-counter.php` | ⛔ | **Blocked (2026-07):** returns 200 + 17-byte `Invalid Access! B` (see §1.2). The all-clubs board is gone. Fav-club-only live count survives on the rewards landing (§3.5). |
-| GET | `/portal/rewards/` | ✅ | Rewards landing (ticket count + favourite-club summary) |
+| GET | `/portal/rewards/` | ✅ | Rewards landing (weekly streak + ticket count + favourite-club summary) |
 | GET | `/portal/rewards/streaks.php` | ⛔ | **Blocked (2026-08):** 200 + 17-byte `Invalid Access! B` (§1.2). Was: current weekly streak + monthly check-in calendar. |
 | GET | `/portal/rewards/streaks.php?m=<MM>&y=<YYYY>` | ⛔ | **Blocked (2026-08):** same guard. Was: **JSON** per-day attendance (§3.2.1). This is the feed the attendance poller lost. |
 | GET | `/portal/rewards/ticket-tally.php` | ✅ | Available tickets + dated history of how each was earned. Now also the **attendance-poll fallback** (§3.2.4). |
@@ -220,16 +223,19 @@ Key points:
 - This is the **only level-1 source for per-day attendance** — far more granular than `ticket-tally.php` (which exposes only the most recent ~10 entries).
 
 Parsed by `app.revo_client.parse_streak_calendar()` and exposed on the
-client as `RevoClient.get_streak_calendar(month, year) -> {dom: bool}`.
+client as `RevoClient.get_streak_calendar(month, year) -> {dom: bool}`. The live
+client validates the returned month name, the requested month's exact day count,
+and exact `0`/`1` cells; any partial or shifted shape raises
+`RevoPageUnreadable` rather than inventing dates.
 
 #### 3.2.2 Check-in latency — why the feed can never be real-time
 
-The attendance feed is **structurally incapable of being real-time**, and it is
-worth recording exactly why so nobody re-litigates it.
+The **currently known member-facing attendance feed cannot be real-time**, and it
+is worth recording the evidence and its limits so nobody re-runs the same probes.
 
-**1. There is no timestamp anywhere.** The calendar's finest unit is a *day*: a
-cell is `"0"` or `"1"`. No Revo backend exposes when a member walked in. This
-isn't an assumption — the entire member-facing API surface has been enumerated:
+**1. There is no timestamp in any known source.** The calendar's finest unit is a
+*day*: a cell is `"0"` or `"1"`. None of the enumerated member-facing routes
+exposes when a member walked in:
 - `revocentral` — every check-in/visit/history route 302s even at L2 (§1.1, §2).
 - **PerfectGym ClientPortal2 — exhaustively mapped.** Both discovery channels
   were run to completion: the JS bundles, *and* all 101 fetchable Angular
@@ -308,13 +314,14 @@ byte-identical body** (same sha256, same 387 bytes). The cell universe is strict
   `API/massage-chair-qr.php` → `validUntilUtc`. It is a **QR expiry minted at
   request time** (returned even with no `hcId`), not a record of a visit. Useless
   as a check-in signal — and it mints an access credential, so don't call it.
-- **The `Invalid Access! B` guard is not client-settable.** 21 requests (3 targets ×
+- **The tested request fields do not alter the `Invalid Access! B` guard.** 21
+  requests (3 targets ×
   7 header shapes: bot UA, full browser UA, `X-Requested-With`, `Referer`,
   `Origin`, `Sec-Fetch-*`, `X-Forwarded-For`) all returned the identical 17-byte
-  body. It keys on something we cannot set from here — consistent with the
-  IP/app-context theory in §1.2, and not worth further attempts.
+  body. Repeating those shapes is not worthwhile; this does not identify the
+  unknown server-side predicate (see §1.2).
 
-So the best any implementation can ever say is **"trained today"**, never
+So the best the current integration can support is **"trained today"**, never
 "checked in at 6:42am". The announcement wording reflects that deliberately.
 
 **2. Revo batches attendance in, roughly twice a day.** Observed behaviour is
@@ -355,8 +362,8 @@ against a portal the notes ask us to treat gently (§6). What *is* worth doing:
 
 #### 3.2.3 The only real-time path: external presence, not Revo
 
-Since no Revo backend can ever say *when* someone trained, genuinely real-time
-detection has to come from a signal the member already emits. This project
+Since no known Revo member source says *when* someone trained, genuinely real-time
+detection currently has to come from a signal the member already emits. This project
 already has one wired up: **Home Assistant** (`docs/HOME_ASSISTANT.md`).
 
 The pieces are all in place, which is what makes this the realistic option:
@@ -390,39 +397,38 @@ cursor never advanced. No crash, just no announcements.
 
 **Fix:** `RevoClient.get_latest_attendance(month, year)` now prefers the
 calendar and **falls back to the newest `Attendance` grant on `ticket-tally.php`**
-(which still renders) when the calendar raises `RevoAccessGuarded`. It returns an
-`AttendanceInfo(date, source, streak_weeks)` so the poller can word the ping
-honestly:
+(which still renders) when the calendar raises `RevoAccessGuarded` **or loses its
+expected response shape**. The weekly streak is read separately from the streak
+tile duplicated on the still-working rewards landing. It returns an
+`AttendanceInfo(date, source, streak_weeks)` so the poller can word the ping honestly:
 
 - `source == "calendar"` — a real per-day visit; announces "trained at Revo
   today / (day)" with the weekly streak.
 - `source == "tickets"` — the ticket-tally `Attendance` grant, a **coarse,
   roughly-weekly reward dated to *issuance*** (§3.3), not the training day. The
-  ping says "**has been training at Revo recently**" and omits the streak (the
-  streaks page is guarded too, so there's no reliable number — do **not** try to
-  reconstruct one from the irregular grant cadence).
+  ping says "**has been training at Revo recently**". It may still include the
+  independently read landing streak; it does **not** try to reconstruct a streak
+  from the irregular ticket-grant cadence.
   > ⚠️ Not "today", and **not "this week" either**: a grant issued Tue can reward
   > training from the *previous* week, so a week-level claim is falsifiable in
   > ordinary use. "Recently" is the true resolution of this signal.
 
 `AttendanceInfo.streak_readable` is the other half of the contract, and it exists
-because "the streak is 0/unknown" and "we couldn't read the streak" must not be
+because "the streak is 0" and "neither streak source was readable" must not be
 conflated when the value is **cached**:
 
-- **readable** (the page answered, even with `None`) → write it through. A streak
-  really can lapse, and freezing a stale one mis-ranks the streak leaderboard and
-  feeds the AI-coach payload (`last_streak_weeks`) a number the member no longer
-  has.
-- **unreadable** (guarded *or* a transient 5xx/timeout) → keep the last known
-  value rather than nulling it, and suppress the leaderboard on that ping, since
-  nobody's cached value is being refreshed while the page is down.
+- **readable integer** (including `0`) → write it through. A streak really can
+  lapse, and freezing a stale one mis-ranks the leaderboard and feeds the AI-coach
+  payload (`last_streak_weeks`) a number the member no longer has.
+- **unreadable** (both sources absent/guarded, or a transient failure) → keep the
+  last known value rather than nulling it with an unverified parse absence.
 
 The streak is read on **every** poll — including polls where this month holds no
 visit yet — for the same reason: reading it only alongside a check-in would let a
 cached streak freeze for anyone mid-gap and never clear for someone who churned.
 It is also read **defensively**: any failure degrades to "no streak tail", never
-an aborted poll. Letting a transient streaks.php error escape would drop a real
-check-in announcement entirely, which is the worse failure.
+an aborted poll. The landing is preferred; the dedicated page is a fallback if
+Revo later removes that tile while restoring `streaks.php`.
 
 Trade-offs to remember before "improving" this: the ticket fallback lags real
 visits by days and collapses several visits in a week into one grant, so it will
@@ -431,6 +437,16 @@ announce at most ~weekly, never per-visit. It is strictly worse than the calenda
 transparently goes back to the calendar (calendar-first), no code change needed.
 The cursor (`last_checkin_date`) tolerates the source switch because it only ever
 advances to a lexicographically newer ISO date.
+
+The fallback now detects the specific failure shapes behind this outage:
+`get_tickets()` rejects the known guard, every malformed candidate history row,
+and a non-zero ticket balance with no parseable history. A redirected, partial,
+or malformed calendar raises `RevoPageUnreadable` and activates ticket fallback
+even if Revo changes the literal `Invalid Access! B` body. A legitimate
+zero-balance/empty ledger remains a supported empty state, so this is targeted
+shape validation rather than a guarantee that every future portal change will be
+detected. `/revo_summary` tracks each tile independently and labels a known guard
+as `restricted`, while shape/network failures are `temporarily unavailable`.
 
 **One more guard consequence worth not re-discovering:** `raffle.php` is the only
 readable source of monthly-draw **opt-in state** (§3.4), so while it is guarded
@@ -529,7 +545,8 @@ Tickets Available: 31
     pairs them off a single fetch so a caller can't announce one without the other.
   - `/revo_raffle` and `/revo_summary` now warn when `opted_in is False`, and only
     ever for the member's **own** account — opt state is personal and both replies
-    are public.
+    are public. `/revo_raffle` says tickets are "in the draw" only when
+    `opted_in is True`; `False` and unreadable state never imply entry.
   - ✅ **Correction to §2's table: `optval` is a pure TOGGLE, not a `0`/`1`
     setter.** `script.js` sends `data-opt-val="1"` from *both* buttons and then
     shows/hides based on the returned `Status`. There is no read-only variant of
@@ -561,15 +578,23 @@ The landing renders the member's **favourite-club tile** as a single
   e.g. `0`,`0`,`2` → `2`), and
 - the club **name** in a `rounded-full` white pill `<div>` (e.g. `Modbury`).
 
+It also renders a separate flame tile linking to `rewards/streaks.php`; its
+visible numeric `<span>` is the member's **current weekly streak**. Live re-check
+on 2026-08-25: the landing still rendered a 17,537-byte page with streak `6` while
+both variants of `streaks.php` returned the 17-byte guard. This is now the primary
+weekly-streak source; the dedicated page is only a fallback.
+
 This is the **only surviving live occupancy signal** now that `club-counter.php`
 is guarded (§1.2), and the **replacement source for the favourite club** now
 that the `favoriteClubId` JS var died with that page (it was returning `None`).
 
-Parsed by `revo_client.parse_rewards_landing(html) -> (fav_club_id, fav_club_name,
-in_club)` and exposed as `RevoClient.get_rewards_landing()`. `/busy` and
-`/revo_link`'s fav-club capture both read it. Limitation: it's only the
-**session account's own** fav club — not all clubs, and not an arbitrary club a
-requesting user names (point them at the Revo app's Live Member Counter).
+The favourite-club tile is parsed by `parse_rewards_landing()`; the streak tile by
+`parse_rewards_landing_streak()`. Both are exposed together as
+`RevoClient.get_rewards_landing() -> RewardsLanding`. `/busy`, `/revo_link`'s
+fav-club capture, `/revo_streak`, `/revo_summary`, and the poller read it.
+Limitation: the club portion is only the **session account's own** fav club — not
+all clubs, and not an arbitrary club a requesting user names (point them at the
+Revo app's Live Member Counter).
 
 ## 4. Reference scraper
 
@@ -694,10 +719,11 @@ Scoped to data we can actually read at **level 1**. (Things requiring L2 are not
 
 ## 7. Mobile backend — Netpulse (EGYM)
 
-Revo's phone app (`com.netpulse.mobile.revofitness`) does **not** use the
-`revocentral` web portal above — it talks to a **Netpulse (EGYM)** white-label
-backend at `https://revofitness.netpulse.com/np/`. See **`app/revo_netpulse.py`**
-for the read-only client.
+The confirmed native API slice of Revo's phone app
+(`com.netpulse.mobile.revofitness`) talks to a **Netpulse (EGYM)** white-label
+backend at `https://revofitness.netpulse.com/np/`. That does not establish that
+every app flow avoids `revocentral`; rewards may still use an embedded WebView,
+relay, or another backend. See **`app/revo_netpulse.py`** for the read-only client.
 
 - **Auth (corrects the old "bearer token" guess in §1.1):** a **form-POST
   credential login** — `POST /np/exerciser/login` with `username`/`password`

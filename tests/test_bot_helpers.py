@@ -1093,6 +1093,140 @@ def test_revo_card_client_refuses_unlinked_user(monkeypatch):
     assert bot._revo_card_client_for_user(999) is None
 
 
+def test_revo_relink_invalidates_stale_mobile_clients_before_profile_use(monkeypatch):
+    """A successful relink must retire every old backend session immediately.
+
+    PerfectGym caches the physical entry barcode in memory.  Keeping that client
+    while replacing only the revocentral client would let /revo_card return the
+    previously linked account's barcode, and would also let the post-link nickname
+    lookup read the previous profile.  Exercise the real /revo_link callback and
+    then resolve the card client to prove both mobile caches were replaced/dropped.
+    """
+    import app.bot as bot
+
+    user_id = 4242
+    old_web = object()
+    old_netpulse = object()
+    old_perfectgym = MagicMock()
+    old_perfectgym.get_first_name.side_effect = AssertionError(
+        "the previous PerfectGym profile survived relink"
+    )
+    old_perfectgym.get_card_number.return_value = "previous-card"
+    monkeypatch.setattr(bot, "_revo_user_clients", {user_id: old_web})
+    monkeypatch.setattr(bot, "_revo_netpulse_clients", {user_id: old_netpulse})
+    monkeypatch.setattr(bot, "_revo_perfectgym_clients", {user_id: old_perfectgym})
+
+    class _FreshWebClient:
+        member_id = 9001
+        membership_level = 2
+
+        def login(self):
+            return None
+
+        def get_rewards_landing(self):
+            return bot.revo_client.RewardsLanding(25, "Modbury", 7)
+
+    fresh_web = _FreshWebClient()
+    monkeypatch.setattr(bot.revo_client, "available", lambda: True)
+    monkeypatch.setattr(bot.revo_client, "encrypt_password", lambda _pw: "enc-new")
+    monkeypatch.setattr(bot.revo_client, "decrypt_password", lambda _token: "new-password")
+    monkeypatch.setattr(bot.revo_client, "RevoClient", lambda _email, _pw: fresh_web)
+
+    stored: dict[str, object] = {}
+
+    def _store_link(**kwargs):
+        stored.update(kwargs)
+
+    def _get_link(uid):
+        if uid != user_id or not stored:
+            return None
+        return {
+            "user_id": user_id,
+            "email": stored["email"],
+            "password_enc": stored["password_enc"],
+        }
+
+    monkeypatch.setattr(bot.db, "link_revo_account", _store_link)
+    monkeypatch.setattr(bot.db, "get_revo_account", _get_link)
+    monkeypatch.setattr(bot.db, "nickname_owner", lambda _nick: None)
+    monkeypatch.setattr(bot.db, "set_user_nickname", lambda *_a, **_k: None)
+
+    fresh_perfectgym = MagicMock()
+    fresh_perfectgym.get_first_name.return_value = "New Member"
+    fresh_perfectgym.get_card_number.return_value = "new-card"
+    perfectgym_builds = []
+
+    def _fresh_perfectgym(email, password):
+        perfectgym_builds.append((email, password))
+        return fresh_perfectgym
+
+    monkeypatch.setattr(bot.revo_perfectgym, "PerfectGymClient", _fresh_perfectgym)
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot, "REVO_DEFAULT_NOTIFY_CHANNEL_ID", None)
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    monkeypatch.setattr(bot, "bot", SimpleNamespace(loop=_Loop()))
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    asyncio.run(
+        bot.revo_link_cmd.callback(
+            interaction,
+            email="new@example.test",
+            password="new-password",
+        )
+    )
+
+    assert bot._revo_user_clients[user_id] is fresh_web
+    assert user_id not in bot._revo_netpulse_clients
+    assert bot._revo_perfectgym_clients[user_id] is fresh_perfectgym
+    assert perfectgym_builds == [("new@example.test", "new-password")]
+    assert old_perfectgym.get_first_name.call_count == 0
+
+    # The safety-critical consumer now resolves the freshly built client, never
+    # the stale object that still holds the previous account's cached barcode.
+    card_client = bot._revo_card_client_for_user(user_id)
+    assert card_client is fresh_perfectgym
+    assert card_client.get_card_number() == "new-card"
+
+
+def test_revo_unlink_clears_all_backend_clients(monkeypatch):
+    """Unlink already promises credential removal, including every live session."""
+    import app.bot as bot
+
+    user_id = 4242
+    other_id = 9001
+    monkeypatch.setattr(
+        bot, "_revo_user_clients", {user_id: object(), other_id: object()}
+    )
+    monkeypatch.setattr(
+        bot, "_revo_netpulse_clients", {user_id: object(), other_id: object()}
+    )
+    monkeypatch.setattr(
+        bot, "_revo_perfectgym_clients", {user_id: object(), other_id: object()}
+    )
+    monkeypatch.setattr(bot.db, "unlink_revo_account", lambda uid: uid == user_id)
+
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.response.send_message = AsyncMock()
+    asyncio.run(bot.revo_unlink_cmd.callback(interaction))
+
+    for cache in (
+        bot._revo_user_clients,
+        bot._revo_netpulse_clients,
+        bot._revo_perfectgym_clients,
+    ):
+        assert user_id not in cache
+        assert other_id in cache
+    assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+
+
 def test_revo_card_acknowledges_when_credential_undecryptable(monkeypatch):
     """A REVO_FERNET_KEY rotation leaves the stored credential undecryptable, so
     resolving the per-user client raises RevoUnavailable BEFORE the interaction is
@@ -1215,6 +1349,154 @@ def test_summary_status_line_is_self_only():
     # regardless of how bad their standing is.
     assert bot._summary_status_line(suspended, is_self=False) is None
     assert bot._summary_status_line(MS("Current", True, True), is_self=False) is None
+
+
+def test_revo_summary_keeps_landing_streak_when_calendar_is_guarded(monkeypatch):
+    """Calendar restriction must not hide the independent landing streak."""
+    import app.bot as bot
+
+    user_id = 4242
+    row = {"user_id": user_id}
+
+    class _Client:
+        def get_tickets(self):
+            return 43, [bot.revo_client.TicketRow(2, "Attendance", "19/08/2026")]
+
+        def get_streak_weeks(self):
+            return 6
+
+        def get_streak_calendar(self, _month, _year):
+            raise bot.revo_client.RevoAccessGuarded("calendar guarded")
+
+        def get_raffle(self):
+            raise bot.revo_client.RevoAccessGuarded("raffle guarded")
+
+        def get_prize_pool(self):
+            return {"monthly": None, "major": None}
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot.revo_client, "available", lambda: True)
+    monkeypatch.setattr(bot.revo_netpulse, "available", lambda: False)
+    monkeypatch.setattr(bot.revo_perfectgym, "available", lambda: False)
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: row if uid == user_id else None)
+    monkeypatch.setattr(bot, "_client_for_user", lambda _row: _Client())
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_bot_name", lambda _uid, _fallback: "Tester")
+    monkeypatch.setattr(bot, "bot", SimpleNamespace(loop=_Loop()))
+
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.user.display_name = "Tester"
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    asyncio.run(bot.revo_summary_cmd.callback(interaction))
+
+    sent = interaction.followup.send.call_args.args[0]
+    assert "Weekly streak: **6 weeks**" in sent
+    assert "check-ins: restricted" in sent
+
+
+def test_revo_summary_degrades_sources_without_mislabeling_shape_drift(monkeypatch):
+    """One broken tile must not abort the summary or be called restricted."""
+    import app.bot as bot
+
+    user_id = 4242
+    row = {"user_id": user_id}
+
+    class _Client:
+        def get_tickets(self):
+            raise bot.revo_client.RevoAccessGuarded("tickets guarded")
+
+        def get_streak_weeks(self):
+            return 6
+
+        def get_streak_calendar(self, _month, _year):
+            raise bot.revo_client.RevoPageUnreadable("calendar changed")
+
+        def get_raffle(self):
+            raise bot.revo_client.RevoPageUnreadable("raffle changed")
+
+        def get_prize_pool(self):
+            return {"monthly": None, "major": None}
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot.revo_client, "available", lambda: True)
+    monkeypatch.setattr(bot.revo_netpulse, "available", lambda: False)
+    monkeypatch.setattr(bot.revo_perfectgym, "available", lambda: False)
+    monkeypatch.setattr(
+        bot.db,
+        "get_revo_account",
+        lambda uid: row if uid == user_id else None,
+    )
+    monkeypatch.setattr(bot, "_client_for_user", lambda _row: _Client())
+    monkeypatch.setattr(bot, "_deny_invisible_target", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_bot_name", lambda _uid, _fallback: "Tester")
+    monkeypatch.setattr(bot, "bot", SimpleNamespace(loop=_Loop()))
+
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.user.display_name = "Tester"
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    asyncio.run(bot.revo_summary_cmd.callback(interaction))
+
+    sent = interaction.followup.send.call_args.args[0]
+    assert "Weekly streak: **6 weeks**" in sent
+    assert "check-ins: temporarily unavailable" in sent
+    assert "Tickets available: restricted" in sent
+    assert "raffle details are temporarily unavailable" in sent
+
+
+def test_revo_raffle_never_calls_opted_out_tickets_in_the_draw(monkeypatch):
+    """An explicit opt-out must not be followed by a false entry claim."""
+    import app.bot as bot
+
+    user_id = 4242
+    row = {"user_id": user_id}
+
+    class _Client:
+        def get_raffle(self):
+            return bot.revo_client.RaffleInfo(6, 40, False)
+
+        def get_tickets(self):
+            return 35, []
+
+        def get_prize_pool(self):
+            return {"monthly": None, "major": None}
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot.revo_client, "available", lambda: True)
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: row)
+    monkeypatch.setattr(bot, "_client_for_user", lambda _row: _Client())
+    monkeypatch.setattr(bot, "_bot_name", lambda _uid, _fallback: "Tester")
+    monkeypatch.setattr(bot, "bot", SimpleNamespace(loop=_Loop()))
+
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.user.display_name = "Tester"
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    asyncio.run(bot.revo_raffle_cmd.callback(interaction))
+
+    sent = interaction.followup.send.call_args.args[0]
+    assert "**35** tickets" in sent
+    assert "in the draw" not in sent
+    assert "not entered" in sent
 
 
 def _dir(name, city, lat, lng, state, id_=None):
@@ -3245,9 +3527,9 @@ class _Boom:
 def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False):
     """Drive _poll_one_account with the network + DB + Discord stubbed out.
 
-    ``guarded`` simulates the streaks page being access-guarded: the calendar
-    raises ``RevoAccessGuarded`` and the attendance date comes from a ticket-tally
-    ``Attendance`` row (dated to ``latest_iso``) instead — the real fallback path.
+    ``guarded`` simulates the per-day calendar being access-guarded: attendance
+    comes from a ticket-tally ``Attendance`` row while the weekly streak remains
+    readable from the rewards landing.
 
     Returns (sent_texts, fetch_calls, saved_state).
     """
@@ -3276,8 +3558,6 @@ def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False
 
         def get_streak_weeks(self):
             fetches.append(("streak",))
-            if guarded:
-                raise bot.revo_client.RevoAccessGuarded("streaks guarded")
             if isinstance(streak, _Boom):
                 raise streak.exc
             return streak
@@ -3386,11 +3666,11 @@ def test_poll_cursor_never_goes_backwards(monkeypatch):
 def test_poll_ticket_fallback_wording_when_streaks_guarded(monkeypatch):
     """When streaks.php is access-guarded the poller falls back to the
     ticket-tally Attendance grant — a coarse weekly issuance date, not the
-    training day — so it must NOT claim a specific day, and must not carry a
-    (now-unavailable) streak number."""
+    training day — so it must NOT claim a specific day. The weekly streak is
+    independently readable from the rewards landing and may still be included."""
     row = _revo_row(last_checkin_date="2026-07-20", last_streak_weeks=5)
     sent, fetches, saved = _run_poll(
-        monkeypatch, row, latest_iso="2026-07-31", guarded=True,
+        monkeypatch, row, latest_iso="2026-07-31", streak=6, guarded=True,
     )
     assert len(sent) == 1
     assert "has been training at Revo recently" in sent[0]
@@ -3398,11 +3678,10 @@ def test_poll_ticket_fallback_wording_when_streaks_guarded(monkeypatch):
     assert "today" not in sent[0]
     assert "yesterday" not in sent[0]
     assert "this week" not in sent[0]
-    assert "streak" not in sent[0]  # streaks page guarded ⇒ no streak tail
+    assert "streak: **6 weeks**" in sent[0]
     assert ("tickets",) in fetches  # it used the ticket fallback
-    # Cursor advanced to the ticket date; last-known streak (5) is preserved,
-    # not nulled, while streaks are guarded.
-    assert saved == [(42, "2026-07-31", 5)]
+    # Cursor advanced to the ticket date and the live landing streak was saved.
+    assert saved == [(42, "2026-07-31", 6)]
 
 
 def test_poll_persists_a_lapsed_streak_when_the_page_is_readable(monkeypatch):
@@ -3414,9 +3693,9 @@ def test_poll_persists_a_lapsed_streak_when_the_page_is_readable(monkeypatch):
     has."""
     row = _revo_row(last_checkin_date="2026-07-20", last_streak_weeks=9)
     _sent, _f, saved = _run_poll(
-        monkeypatch, row, latest_iso="2026-07-31", streak=None,
+        monkeypatch, row, latest_iso="2026-07-31", streak=0,
     )
-    assert saved == [(42, "2026-07-31", None)]
+    assert saved == [(42, "2026-07-31", 0)]
 
 
 def test_poll_refreshes_streak_even_with_no_checkin_this_month(monkeypatch):
@@ -3449,12 +3728,14 @@ def test_poll_still_announces_when_the_streak_fetch_errors(monkeypatch):
     assert saved == [(42, "2026-07-31", 4)]
 
 
-def test_poll_ticket_fallback_preserves_last_streak(monkeypatch):
-    """A guarded streak read must not overwrite a previously-cached streak with
-    None (so /revo_streak_compare's cached fallback stays useful)."""
+def test_poll_ticket_fallback_preserves_last_streak_if_landing_is_unreadable(monkeypatch):
+    """A failed landing streak read must preserve the previously cached value."""
+    import app.bot as bot
+
     row = _revo_row(last_checkin_date=None, last_streak_weeks=7)
     _sent, _f, saved = _run_poll(
         monkeypatch, row, latest_iso="2026-07-28", guarded=True,
+        streak=_Boom(bot.revo_client.RevoPageUnreadable("landing reshaped")),
     )
     # First poll after linking is silent, but the baseline still records the
     # ticket date and keeps the old streak value.

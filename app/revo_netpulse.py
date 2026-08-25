@@ -1,8 +1,10 @@
 """Revo Fitness mobile-backend (Netpulse / EGYM) client.
 
-Revo's phone app (``com.netpulse.mobile.revofitness``) does **not** talk to the
-``revocentral`` web portal that :mod:`app.revo_client` scrapes. It talks to a
-**Netpulse (EGYM) white-label** backend at ``https://revofitness.netpulse.com/np/``.
+Revo's phone app (``com.netpulse.mobile.revofitness``) uses a **Netpulse (EGYM)
+white-label** native backend at ``https://revofitness.netpulse.com/np/``, separate
+from the ``revocentral`` web portal that :mod:`app.revo_client` scrapes. This does
+not rule out an embedded rewards WebView or relay; no on-device capture of that
+specific phone flow is recorded.
 This module is the thin, read-only client for the small slice of that backend
 that is actually useful to the bot.
 
@@ -12,13 +14,13 @@ The web portal lost live occupancy when ``club-counter.php`` was access-guarded,
 so the Netpulse backend looked like the way back to real per-club headcounts and
 per-visit check-ins. A single consented login test settled it:
 
-* **Occupancy (`gym-busyness`) and check-in history are NOT provisioned for
-  Revo's tenant.** ``gym-busyness`` returns ``{"message":"The requested
-  resource does not exist."}`` and ``check-ins/history`` returns
-  ``{"checkIns": []}``. Every club in the directory reports ``"mms":
+* **Known Netpulse routes do not expose occupancy (`gym-busyness`) or check-in
+  history for Revo.** ``gym-busyness`` returns ``{"message":"The requested
+  resource does not exist."}``, and ``check-ins/history`` plus the tested route
+  variants return 404. Every club in the directory reports ``"mms":
   "perfectgym"`` — Revo runs member management / access / occupancy on
-  **PerfectGym**, not on Netpulse, so those Netpulse endpoints are dark for this
-  tenant. Neither can be restored here.
+  **PerfectGym**, not on Netpulse. Those known Netpulse routes cannot supply the
+  missing data; this does not prove that no other app flow or relay exists.
 * **What IS provisioned:** the member's **membership** (type / subtype / join
   date) and a full **club directory** (name, suburb/state, hours, geo). That's
   what this client exposes.

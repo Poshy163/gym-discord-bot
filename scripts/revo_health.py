@@ -76,8 +76,9 @@ def main() -> int:
     if any(s.status == revo_client.HEALTH_GUARDED for s in sources):
         print(
             "\nNote: [BLOCKED] is Revo refusing the page server-side, not a "
-            "problem with the account, the network or this bot. It is not "
-            "client-settable and there is nothing to retry — see "
+            "login failure. The tested browser/app headers did not change it "
+            "in the documented probes; the exact server-side predicate is "
+            "unknown. See "
             "docs/REVO_PORTAL.md section 1.2."
         )
     return _EXIT.get(state, 2)

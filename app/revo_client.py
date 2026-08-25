@@ -22,7 +22,9 @@ import re
 import threading
 import time
 import urllib.parse
+from calendar import month_name, monthrange
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 LOG = logging.getLogger("gymbot.revo")
@@ -46,10 +48,11 @@ REQUEST_TIMEOUT = 20
 # returned with HTTP 200 and a 17-byte body (see docs/REVO_PORTAL.md §1.2). It
 # began (2026-07) on ``club-counter.php`` / ``massage-chair.php``, and as of
 # ~2026-08 it also covers ``streaks.php`` (HTML *and* the ``?m=&y=`` calendar
-# JSON) and ``raffle.php``. It keys on an IP / app-context we cannot set from a
-# scraper — every header / referer / cookie / param variation returns the same
-# 17 bytes — so it cannot be worked around client-side. ``ticket-tally.php``,
-# ``prize-pool.php`` and the rewards landing are (so far) unaffected.
+# JSON) and ``raffle.php``. Common UA / referer / origin / app-header variations
+# all return the same 17 bytes, so request-header spoofing is not a workaround.
+# The exact server-side predicate is unknown because no on-device request or
+# alternate source network was captured. ``ticket-tally.php``, ``prize-pool.php``
+# and the rewards landing are (so far) unaffected.
 GUARD_BODY = "Invalid Access! B"
 
 # Live counter is refreshed on the server side fairly slowly; cache for a
@@ -72,8 +75,18 @@ class RevoAccessGuarded(RevoUnavailable):
     A subclass of :class:`RevoUnavailable` so existing broad ``except`` handlers
     keep degrading gracefully, but distinct so callers that want to say "Revo has
     restricted this page" (rather than "no data" or "wrong credentials") can catch
-    it specifically. The guard is *not* client-settable, so retrying with different
-    headers/params is pointless — treat it as "this page is unavailable to us".
+    it specifically. Retrying the already-tested headers/params is pointless;
+    treat it as "this page is unavailable from this client context".
+    """
+
+
+class RevoPageUnreadable(RevoUnavailable):
+    """Raised when a portal page answered but its expected shape was absent.
+
+    Revo's access controls return HTTP 200, so status alone is not evidence that
+    a source is usable.  Keeping shape drift distinct from an empty *valid* data
+    set lets the poller fall back instead of silently treating a login page,
+    redirect, or changed guard string as "no attendance".
     """
 
 
@@ -161,13 +174,15 @@ class TicketRow:
 class RewardsLanding:
     """The member-specific bits scraped from ``/portal/rewards/``.
 
-    This is what survives now that ``club-counter.php`` is access-guarded: the
-    account's *own* favourite club (id + name) and its live head-count. Any
-    field may be ``None`` if the landing didn't render the fav-club tile.
+    This is what survives now that ``club-counter.php`` and ``streaks.php`` are
+    access-guarded: the account's *own* favourite club (id + name), its live
+    head-count, and the current weekly streak tile. Any field may be ``None``
+    if its tile did not render.
     """
     fav_club_id: Optional[int]
     fav_club_name: Optional[str]
     in_club: Optional[int]
+    streak_weeks: Optional[int] = None
 
 
 def parse_member_cookie(raw: str | None) -> tuple[Optional[int], Optional[int]]:
@@ -249,6 +264,12 @@ _FAV_DIGIT_SPAN_RE = re.compile(r"<span[^>]*>\s*(\d)\s*</span>", re.I | re.S)
 _FAV_PILL_RE = re.compile(
     r"<div[^>]*\brounded-full\b[^>]*>(.*?)</div>", re.I | re.S
 )
+_LANDING_STREAK_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*\bhref=[\"'][^\"']*/rewards/streaks\.php(?:\?[^\"']*)?[\"']"
+    r"[^>]*>(.*?)</a>",
+    re.I | re.S,
+)
+_COUNTER_SPAN_RE = re.compile(r"<span\b[^>]*>\s*(\d+)\s*</span>", re.I | re.S)
 
 
 def parse_rewards_landing(
@@ -278,6 +299,23 @@ def parse_rewards_landing(
     return fav_id, name, in_club
 
 
+def parse_rewards_landing_streak(html: str) -> Optional[int]:
+    """Read the weekly streak counter duplicated on the rewards landing.
+
+    The dedicated streak page is currently access-guarded, but the still-live
+    landing links to it with a flame tile whose visible ``<span>`` is the same
+    weekly count.  Scope the parse to that anchor so ticket, occupancy, and draw
+    counters elsewhere on the page cannot be mistaken for a streak.  Joining
+    span values supports both one ``13`` span and Revo's usual ``1``/``3``
+    split-counter shape.
+    """
+    anchor = _LANDING_STREAK_ANCHOR_RE.search(html)
+    if not anchor:
+        return None
+    parts = _COUNTER_SPAN_RE.findall(anchor.group(1))
+    return int("".join(parts)) if parts else None
+
+
 def parse_streak_weeks(html: str) -> Optional[int]:
     """Pull the headline "N WEEKS" streak count from the streaks page.
 
@@ -297,7 +335,12 @@ def parse_streak_weeks(html: str) -> Optional[int]:
     return int("".join(digits)) if digits else None
 
 
-def parse_streak_calendar(body: str) -> dict[int, bool]:
+def parse_streak_calendar(
+    body: str,
+    *,
+    month: int | None = None,
+    year: int | None = None,
+) -> dict[int, bool]:
     """Decode the JSON returned by ``streaks.php?m=&y=`` into ``{day: attended}``.
 
     The endpoint returns an inline JSON document (Content-Type is mislabelled
@@ -320,8 +363,12 @@ def parse_streak_calendar(body: str) -> dict[int, bool]:
     week-by-week order and assign ascending day-of-month numbers to the
     non-null cells.
 
-    Returns a ``{day_of_month: attended}`` dict. Empty dict if the body is
-    missing/unparseable (callers can treat this as "no data for that month").
+    When ``month`` and ``year`` are supplied, the response month name and exact
+    number of real day cells must match the requested month. Returns a
+    ``{day_of_month: attended}`` dict, or an empty dict when the body is missing,
+    malformed, incomplete, or contains a value other than exact ``0``/``1``.
+    Failing the whole parse is deliberate: skipping one bad cell would shift
+    every later value onto the wrong calendar date.
     """
     if not body:
         return {}
@@ -333,6 +380,18 @@ def parse_streak_calendar(body: str) -> dict[int, bool]:
     if not isinstance(weeks, dict):
         return {}
 
+    expected_days: int | None = None
+    if (month is None) != (year is None):
+        return {}
+    if month is not None and year is not None:
+        try:
+            expected_days = monthrange(year, month)[1]
+            expected_name = month_name[month]
+        except (IndexError, ValueError):
+            return {}
+        if payload.get("month_name") != expected_name:
+            return {}
+
     out: dict[int, bool] = {}
     dom = 1
     # Week keys are insertion-ordered ("week1".."week6") in the wire format,
@@ -343,34 +402,35 @@ def parse_streak_calendar(body: str) -> dict[int, bool]:
         if isinstance(cells, list):
             iterable: list[Any] = list(cells)
         elif isinstance(cells, dict):
-            iterable = [cells[k] for k in sorted(cells.keys(), key=lambda k: int(k))]
+            try:
+                ordered_keys = sorted(cells.keys(), key=lambda k: int(k))
+            except (TypeError, ValueError):
+                return {}
+            iterable = [cells[k] for k in ordered_keys]
         else:
-            continue
+            return {}
         for v in iterable:
             if v is None:
                 continue
-            try:
-                attended = int(v) == 1
-            except (TypeError, ValueError):
-                continue
+            if isinstance(v, str) and v in {"0", "1"}:
+                attended = v == "1"
+            elif type(v) is int and v in {0, 1}:
+                attended = v == 1
+            else:
+                return {}
             out[dom] = attended
             dom += 1
+    if expected_days is not None and len(out) != expected_days:
+        return {}
     return out
 
 
 # Each ticket-tally history entry renders as a three-column grid "list" block.
-# As of ~2026-07 the child order inside the block is DATE -> DELTA -> SOURCE
-# (it used to be DELTA -> SOURCE -> DATE). We parse per block and read the three
-# children *positionally* rather than with a flat ordered regex, so a future
-# child reorder can't silently mis-pair a source with the wrong date (which is
-# exactly the bug the old flat regex had after this reorder — it dropped the
-# newest row and shifted every source onto the next-older row's date).
-_TICKET_BLOCK_OPEN_RE = re.compile(
-    r'<div\b[^>]*class="[^"]*\blist\b[^"]*\bgrid-cols-3\b[^"]*"[^>]*>',
-    re.I,
-)
-_TICKET_CELL_RE = re.compile(r"<div\b[^>]*>(.*?)</div>", re.I | re.S)
-_TICKET_DELTA_RE = re.compile(r"[-+]?(\d+)")
+# Its children have already changed order once. Parse direct children, identify
+# the date and delta cells by shape, and treat the remaining cell as the source.
+# Another reorder then cannot silently pair a source with the wrong date, while
+# an added/removed column fails closed rather than being truncated to three.
+_TICKET_DELTA_RE = re.compile(r"[-+]?(\d+)\s*Tickets?", re.I)
 _TICKET_DATE_RE = re.compile(r"\d{2}/\d{2}/\d{4}")
 
 
@@ -379,16 +439,71 @@ def _strip_tags(fragment: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment)).strip()
 
 
-def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
-    """Parse the ticket-tally page.
+class _TicketHistoryHTMLParser(HTMLParser):
+    """Collect direct child cells from each ticket-history candidate block."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.div_depth = 0
+        self.block_depth: int | None = None
+        self.cell_depth: int | None = None
+        self.cell_parts: list[str] = []
+        self.current_cells: list[str] = []
+        self.blocks: list[list[str]] = []
+        self.candidate_count = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if tag != "div":
+            if self.cell_depth is not None and tag in {"br", "p"}:
+                self.cell_parts.append(" ")
+            return
+
+        self.div_depth += 1
+        if self.block_depth is None:
+            attr_map = {key.casefold(): value or "" for key, value in attrs}
+            classes = set(attr_map.get("class", "").split())
+            if {"list", "grid-cols-3"}.issubset(classes):
+                self.candidate_count += 1
+                self.block_depth = self.div_depth
+                self.current_cells = []
+            return
+
+        if self.div_depth == self.block_depth + 1:
+            self.cell_depth = self.div_depth
+            self.cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.cell_depth is not None:
+            self.cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() != "div":
+            return
+        if self.block_depth is not None:
+            if self.cell_depth == self.div_depth:
+                self.current_cells.append(_strip_tags("".join(self.cell_parts)))
+                self.cell_depth = None
+                self.cell_parts = []
+            elif self.block_depth == self.div_depth:
+                self.blocks.append(self.current_cells)
+                self.block_depth = None
+                self.current_cells = []
+        self.div_depth = max(0, self.div_depth - 1)
+
+
+def _parse_tickets_with_completeness(
+    html: str,
+) -> tuple[Optional[int], list[TicketRow], int]:
+    """Parse ticket data and count candidate history blocks that were malformed.
 
     Returns ``(available_tickets, history_rows_newest_first)``. The ``Available``
     pseudo-row that appears alongside the headline counter is filtered out.
 
     The available balance comes from the headline counter (a run of single-digit
     ``<span>`` cells before "Tickets Available"). Each history row is a
-    ``<div class="list … grid-cols-3 …">`` block whose three children are, in
-    order, the date, the ``+N Tickets`` delta, and the source label. Deltas of
+    ``<div class="list … grid-cols-3 …">`` block whose three children contain a
+    date, the ``+N Tickets`` delta, and the source label in any order. Deltas of
     ``+2`` (recent grants) and ``+1`` (older ones, pre-~08/05/2026) both parse.
     """
     text = re.sub(r"<script[\s\S]*?</script>", " ", html)
@@ -401,22 +516,52 @@ def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
         if digits:
             avail = int("".join(digits))
 
+    parser = _TicketHistoryHTMLParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:  # pragma: no cover - HTMLParser is deliberately forgiving
+        return avail, [], 1
+
     rows: list[TicketRow] = []
-    opens = list(_TICKET_BLOCK_OPEN_RE.finditer(html))
-    for idx, mo in enumerate(opens):
-        start = mo.end()
-        end = opens[idx + 1].start() if idx + 1 < len(opens) else len(html)
-        cells = [_strip_tags(c) for c in _TICKET_CELL_RE.findall(html[start:end])[:3]]
-        if len(cells) < 3:
+    malformed_blocks = parser.candidate_count - len(parser.blocks)
+    for cells in parser.blocks:
+        if len(cells) != 3:
+            malformed_blocks += 1
             continue
-        date_cell, delta_cell, source_cell = cells
-        date_m = _TICKET_DATE_RE.search(date_cell)
-        delta_m = _TICKET_DELTA_RE.search(delta_cell)
-        if not date_m or not delta_m:
+        date_idx = next(
+            (i for i, cell in enumerate(cells) if _TICKET_DATE_RE.fullmatch(cell)),
+            None,
+        )
+        delta_idx = next(
+            (i for i, cell in enumerate(cells) if _TICKET_DELTA_RE.fullmatch(cell)),
+            None,
+        )
+        if date_idx is None or delta_idx is None or date_idx == delta_idx:
+            malformed_blocks += 1
+            continue
+        source_idx = next(
+            (i for i in range(3) if i not in (date_idx, delta_idx)),
+            None,
+        )
+        if source_idx is None:
+            malformed_blocks += 1
+            continue
+        date_m = _TICKET_DATE_RE.fullmatch(cells[date_idx])
+        delta_m = _TICKET_DELTA_RE.fullmatch(cells[delta_idx])
+        if date_m is None or delta_m is None:  # narrowed above; type-safe guard
+            malformed_blocks += 1
+            continue
+        if _ddmmyyyy_to_iso(date_m.group(0)) is None:
+            malformed_blocks += 1
+            continue
+        source_cell = cells[source_idx]
+        if not source_cell:
+            malformed_blocks += 1
             continue
         # The headline "Tickets Available" counter is not a grid-cols-3 block,
         # but keep filtering an "Available" source defensively.
-        if source_cell == "Available":
+        if source_cell.casefold() == "available":
             continue
         rows.append(
             TicketRow(
@@ -425,7 +570,19 @@ def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
                 date=date_m.group(0),
             )
         )
-    return avail, rows
+    return avail, rows, malformed_blocks
+
+
+def parse_tickets(html: str) -> tuple[Optional[int], list[TicketRow]]:
+    """Parse the ticket-tally page.
+
+    Returns ``(available_tickets, history_rows_newest_first)``. The public parser
+    remains tolerant for fixture/diagnostic use; :meth:`RevoClient.get_tickets`
+    additionally rejects any malformed candidate row so polling cannot accept a
+    silently truncated ledger.
+    """
+    available, rows, _malformed = _parse_tickets_with_completeness(html)
+    return available, rows
 
 
 def latest_attended_day(calendar: dict[int, bool]) -> Optional[int]:
@@ -443,11 +600,14 @@ def latest_attended_day(calendar: dict[int, bool]) -> Optional[int]:
 
 def _ddmmyyyy_to_iso(date_str: str) -> Optional[str]:
     """Convert a portal ``dd/mm/yyyy`` date to ISO ``YYYY-MM-DD`` (None if bad)."""
-    m = re.match(r"\s*(\d{2})/(\d{2})/(\d{4})", date_str or "")
-    if not m:
+    clean = (date_str or "").strip()
+    if _TICKET_DATE_RE.fullmatch(clean) is None:
         return None
-    day, month, year = m.groups()
-    return f"{year}-{month}-{day}"
+    try:
+        parsed = time.strptime(clean, "%d/%m/%Y")
+    except ValueError:
+        return None
+    return time.strftime("%Y-%m-%d", parsed)
 
 
 def latest_attendance_ticket_date(rows: list["TicketRow"]) -> Optional[str]:
@@ -482,8 +642,8 @@ class AttendanceInfo:
         day and ``streak_weeks`` may be populated.
       * ``"tickets"`` — the ticket-tally ``Attendance`` grant, used only while the
         calendar is access-guarded; ``date`` is a coarse, lagging *issuance* date
-        (the member trained on or before it, often days earlier) and
-        ``streak_weeks`` is ``None`` (the streak page is guarded too).
+        (the member trained on or before it, often days earlier). ``streak_weeks``
+        may still be populated from the surviving rewards-landing tile.
       * ``None`` — nothing found (no visits recorded, or the fallback was empty).
 
     ``date`` is ISO ``YYYY-MM-DD`` or ``None``.
@@ -721,10 +881,12 @@ class RevoClient:
         return parse_club_counter(self._get(CLUB_COUNTER_PATH))
 
     def get_rewards_landing(self) -> RewardsLanding:
-        """Scrape the rewards landing for the account's fav-club live count."""
-        fav_id, fav_name, in_club = parse_rewards_landing(self._get(REWARDS_PATH))
+        """Scrape the rewards landing for its surviving member summary tiles."""
+        html = self._get(REWARDS_PATH)
+        fav_id, fav_name, in_club = parse_rewards_landing(html)
         return RewardsLanding(
             fav_club_id=fav_id, fav_club_name=fav_name, in_club=in_club,
+            streak_weeks=parse_rewards_landing_streak(html),
         )
 
     def get_prize_pool(self) -> dict[str, Optional[str]]:
@@ -732,18 +894,38 @@ class RevoClient:
         return parse_prize_pool(self._get(PRIZE_POOL_PATH))
 
     def get_streak_weeks(self) -> Optional[int]:
+        # The still-readable rewards landing duplicates the weekly streak tile.
+        # Prefer it so a guard on the dedicated page no longer takes streaks
+        # offline. Fall back to the old page in case Revo later removes the tile
+        # while restoring streaks.php.
+        try:
+            landing_streak = self.get_rewards_landing().streak_weeks
+            if landing_streak is not None:
+                return landing_streak
+        except RevoAuthError:
+            raise
+        except Exception:  # pragma: no cover - transient landing failure
+            LOG.warning(
+                "Revo rewards-landing streak fetch failed for %s",
+                self.email,
+                exc_info=True,
+            )
         html = self._get(STREAKS_PATH)
         if is_access_guarded(html):
             raise RevoAccessGuarded("Revo has access-guarded the streaks page.")
-        return parse_streak_weeks(html)
+        streak = parse_streak_weeks(html)
+        if streak is None:
+            raise RevoPageUnreadable("Revo streak response had no streak counter.")
+        return streak
 
     def get_streak_calendar(self, month: int, year: int) -> dict[int, bool]:
         """Per-day attendance for the given calendar month.
 
         Calls the undocumented JSON variant of the streaks page exposed via
         ``streaks.php?m=<MM>&y=<YYYY>`` (discovered in the rewards
-        ``script.js``). Returns ``{day_of_month: attended_bool}`` — empty
-        dict if the response was unparseable or the route was redirected.
+        ``script.js``). Returns ``{day_of_month: attended_bool}``; raises
+        :class:`RevoPageUnreadable` if the response redirects or loses its
+        expected day-cell shape.
 
         Suitable for building per-user attendance timelines (the ticket-tally
         page only exposes the most recent ~10 entries).
@@ -770,22 +952,42 @@ class RevoClient:
             self.login()
             r = _do_get()
         if r.status_code in (301, 302):
-            return {}
+            raise RevoPageUnreadable(
+                "Revo streak calendar redirected to an unexpected page."
+            )
         r.raise_for_status()
         if is_access_guarded(r.text):
             raise RevoAccessGuarded("Revo has access-guarded the streaks calendar.")
-        return parse_streak_calendar(r.text)
+        calendar = parse_streak_calendar(r.text, month=month, year=year)
+        if not calendar:
+            raise RevoPageUnreadable(
+                "Revo streak calendar response had no readable day cells."
+            )
+        return calendar
 
     def get_tickets(self) -> tuple[Optional[int], list[TicketRow]]:
-        return parse_tickets(self._get(TICKETS_PATH))
+        html = self._get(TICKETS_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the ticket ledger.")
+        available, rows, malformed_blocks = _parse_tickets_with_completeness(html)
+        if malformed_blocks:
+            raise RevoPageUnreadable(
+                "Revo ticket ledger contained an unreadable history row."
+            )
+        if available is None or (available > 0 and not rows):
+            raise RevoPageUnreadable(
+                "Revo ticket ledger response did not have a readable history."
+            )
+        return available, rows
 
     def get_latest_attendance(self, month: int, year: int) -> AttendanceInfo:
         """Most recent attendance date, resilient to the streaks-page guard.
 
         Prefers the per-day streaks calendar (a real visit day, plus the weekly
-        streak). When ``streaks.php`` is access-guarded (:data:`GUARD_BODY`),
-        falls back to the newest ``Attendance`` grant on ``ticket-tally.php``,
-        which still renders. The returned :class:`AttendanceInfo` carries the
+        streak). When ``streaks.php`` is access-guarded (:data:`GUARD_BODY`) or
+        answers with an unreadable shape, falls back to the newest ``Attendance``
+        grant on ``ticket-tally.php``, which still renders. The returned
+        :class:`AttendanceInfo` carries the
         ``source`` so the poller can word an announcement honestly — a ticket
         grant date is coarser and later than the day the member actually trained.
 
@@ -795,13 +997,31 @@ class RevoClient:
         """
         try:
             cal = self.get_streak_calendar(month, year)
-        except RevoAccessGuarded:
+            if not cal:
+                raise RevoPageUnreadable(
+                    "Revo streak calendar returned no readable day cells."
+                )
+        except (RevoAccessGuarded, RevoPageUnreadable):
             iso = latest_attendance_ticket_date(self.get_tickets()[1])
+            streak: Optional[int] = None
+            streak_readable = False
+            try:
+                # The rewards landing carries this even while the calendar is
+                # guarded, so ticket-based attendance need not lose the weekly
+                # streak as well.
+                streak = self.get_streak_weeks()
+                streak_readable = True
+            except Exception:  # pragma: no cover - optional tail, never sink feed
+                LOG.warning(
+                    "Revo fallback streak fetch failed for %s",
+                    self.email,
+                    exc_info=True,
+                )
             return AttendanceInfo(
                 date=iso,
                 source="tickets" if iso else None,
-                streak_weeks=None,
-                streak_readable=False,  # streaks page is guarded too
+                streak_weeks=streak,
+                streak_readable=streak_readable,
             )
 
         # The streak is an optional *tail* on the announcement, never a reason to
@@ -816,7 +1036,7 @@ class RevoClient:
         streak_readable = False
         try:
             streak = self.get_streak_weeks()
-            streak_readable = True
+            streak_readable = streak is not None
         except RevoAccessGuarded:  # streaks HTML guarded even when calendar isn't
             streak = None
         except Exception:  # pragma: no cover - network
@@ -843,17 +1063,27 @@ class RevoClient:
         announcing a countdown to someone who isn't entered.
 
         Raises :class:`RevoAccessGuarded` when ``raffle.php`` returns the access
-        guard, so callers can distinguish "Revo blocked this page" from a genuine
-        parse of an empty/opted-out page.
+        guard and :class:`RevoPageUnreadable` when none of its expected fields
+        parse. An opted-out page is still valid because ``opted_in`` is then
+        explicitly ``False``.
         """
         html = self._get(RAFFLE_PATH)
         if is_access_guarded(html):
             raise RevoAccessGuarded("Revo has access-guarded the raffle page.")
         days = parse_raffle(html)
+        opted_in = parse_raffle_optin(html)
+        if (
+            days["monthly_draw_days"] is None
+            and days["major_draw_days"] is None
+            and opted_in is None
+        ):
+            raise RevoPageUnreadable(
+                "Revo raffle response had no countdown or opt-in state."
+            )
         return RaffleInfo(
             monthly_draw_days=days["monthly_draw_days"],
             major_draw_days=days["major_draw_days"],
-            opted_in=parse_raffle_optin(html),
+            opted_in=opted_in,
         )
 
 
