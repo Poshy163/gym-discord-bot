@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
@@ -1724,3 +1725,26 @@ def test_hevy_equipment_map_requires_auth(tmp_path):
             db.close()
 
     _run(scenario())
+def test_hevy_tab_uses_the_shared_fetch_helper(tmp_path):
+    """Opening the tab failed with "get is not defined" before a single request
+    went out: renderHevy called a get() that no script on the page defines.
+    api() is the helper every other tab uses (and it handles the 401)."""
+    async def go():
+        db = Database(tmp_path / "hevy-tab.sqlite3")
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            body = await (await client.get("/")).text()
+            render = body[
+                body.index("async function renderHevy"):
+                body.index("function hevyMapDraw")
+            ]
+            assert 'await api("/api/hevy/equipment");if(!d)return;' in render
+            assert re.search(r"(?<![\w.$])get\(", render) is None
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+

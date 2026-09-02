@@ -17721,29 +17721,28 @@ async def _hevy_push_bodyweight(
 
 
 def _hevy_duration_str(seconds: int | None) -> str | None:
-    """Render a workout's elapsed time as ``1h 23m`` / ``45m`` / ``30s``."""
+    """Render an elapsed time as ``1h 23m 5s`` / ``49m 12s`` / ``7m`` / ``30s``.
+
+    Zero parts are dropped, nothing else is. This used to round to the minute
+    once there was one — a 7m 30s elliptical set printed "7m", and the 49m 12s
+    session around it printed "49m" — which reads as wrong next to the app,
+    where the seconds are right there."""
     if not seconds or seconds <= 0:
         return None
     h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m"
-    return f"{m}m" if m else f"{s}s"
+    parts = [f"{h}h" if h else "", f"{m}m" if m else "", f"{s}s" if s else ""]
+    return " ".join(part for part in parts if part)
 
 
 def _hevy_rest_str(seconds: int | None) -> str | None:
     """Render a rest timer as ``2m`` / ``1m 30s`` / ``45s``.
 
-    Deliberately not :func:`_hevy_duration_str`: that one drops the seconds once
-    there are whole minutes, which is right for "this workout took 1h 23m" and
-    wrong for a rest timer — the commonest setting of all, 90 seconds, would
-    print as "1m"."""
-    if not seconds or seconds <= 0:
-        return None
-    m, s = divmod(int(seconds), 60)
-    if m and s:
-        return f"{m}m {s}s"
-    return f"{m}m" if m else f"{s}s"
+    Now simply :func:`_hevy_duration_str`. The two only differed while that one
+    dropped the seconds, which printed the commonest rest setting of all, 90
+    seconds, as "1m". Kept under its own name so a call site still says which
+    kind of time it is showing."""
+    return _hevy_duration_str(seconds)
 
 
 def _hevy_distance_str(metres: float | None) -> str | None:
@@ -18885,8 +18884,18 @@ async def hevy_recent_cmd(
         )
     except hevy_client.HevyError:  # pragma: no cover - unreadable stored key
         pass
+    # This command shows the member's *latest* workout, so its number is simply
+    # their lifetime total — no counting back across a batch like the feed does.
+    number = None
+    try:
+        number = await _hevy_workout_total(
+            hevy_client.decrypt_key(row["api_key_enc"]),
+        )
+    except hevy_client.HevyError:  # pragma: no cover - unreadable stored key
+        pass
     embed = _hevy_workout_embed(
         _display_name(target), summary, None, templates, profile_url, routines,
+        number,
     )
     await interaction.followup.send(
         embed=embed, allowed_mentions=discord.AllowedMentions.none(),

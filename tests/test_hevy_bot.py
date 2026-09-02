@@ -1108,9 +1108,24 @@ def test_routine_embed_renders_targets_and_supersets():
     assert "planned targets" in embed.footer.text
 
 
+def test_duration_str_keeps_the_seconds():
+    """The feed rounded every time down to the minute: a 7m 30s elliptical set
+    read "7m" and the 49m 12s workout it sat in read "49m". Only zero parts are
+    dropped now."""
+    assert bot_mod._hevy_duration_str(450) == "7m 30s"
+    assert bot_mod._hevy_duration_str(2952) == "49m 12s"
+    assert bot_mod._hevy_duration_str(1800) == "30m"
+    assert bot_mod._hevy_duration_str(3600) == "1h"
+    assert bot_mod._hevy_duration_str(3605) == "1h 5s"
+    assert bot_mod._hevy_duration_str(4985) == "1h 23m 5s"
+    assert bot_mod._hevy_duration_str(30) == "30s"
+    assert bot_mod._hevy_duration_str(0) is None
+    assert bot_mod._hevy_duration_str(None) is None
+
+
 def test_rest_str_keeps_the_seconds():
-    """90s is the commonest rest setting there is, and _hevy_duration_str
-    renders it "1m" — hence a separate formatter."""
+    """90s is the commonest rest setting there is, and the duration formatter
+    once rendered it "1m" — the reason this has its own name."""
     assert bot_mod._hevy_rest_str(90) == "1m 30s"
     assert bot_mod._hevy_rest_str(120) == "2m"
     assert bot_mod._hevy_rest_str(45) == "45s"

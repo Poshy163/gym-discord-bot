@@ -4060,7 +4060,7 @@ function daySeg(){return `<span class="dayseg">`+
 // history is a migration decision, not a dashboard side effect.
 let HEVY_MAP_ROWS=[];
 async function renderHevy(v){
-  const d=await get("/api/hevy/equipment");
+  const d=await api("/api/hevy/equipment");if(!d)return;
   HEVY_MAP_ROWS=d.rows||[];
   if(!HEVY_MAP_ROWS.length){
     v.innerHTML='<div class="state-card"><h2>No Hevy catalogue yet</h2>'+
