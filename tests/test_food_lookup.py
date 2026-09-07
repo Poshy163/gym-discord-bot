@@ -6,7 +6,10 @@ often arrive as strings, brands as comma lists, nutriments partial).
 """
 from __future__ import annotations
 
-from app.food_lookup import FoodInfo, parse_product
+import pytest
+
+from app import food_lookup
+from app.food_lookup import FoodInfo, FoodLookupError, parse_product
 
 
 def test_parse_product_full_record():
@@ -64,6 +67,14 @@ def test_parse_product_rejects_unusable():
         "product_name": "Bad data",
         "nutriments": {"energy-kj_100g": "n/a"},
     }) is None
+    assert parse_product({
+        "product_name": "Bad shape",
+        "nutriments": ["not", "a", "mapping"],
+    }) is None
+    assert parse_product({
+        "product_name": "Non-finite",
+        "nutriments": {"energy-kj_100g": "NaN"},
+    }) is None
 
 
 def test_parse_product_blank_optional_fields():
@@ -78,3 +89,32 @@ def test_parse_product_blank_optional_fields():
     assert info.brand is None
     assert info.barcode is None
     assert info.serving_g is None
+
+
+def test_get_rejects_valid_json_with_wrong_top_level_shape(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return ["unexpected"]
+
+    class Requests:
+        class RequestException(Exception):
+            pass
+
+        @staticmethod
+        def get(*_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(food_lookup, "requests", Requests)
+    with pytest.raises(FoodLookupError, match="unexpected response shape"):
+        food_lookup._get("https://example.invalid", {})
+
+
+def test_search_rejects_non_list_products(monkeypatch):
+    monkeypatch.setattr(
+        food_lookup, "_get", lambda *_a, **_kw: {"products": {"bad": "shape"}},
+    )
+    with pytest.raises(FoodLookupError, match="unexpected products list"):
+        food_lookup.search("oats")

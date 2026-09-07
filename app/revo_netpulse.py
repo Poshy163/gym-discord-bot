@@ -2,9 +2,9 @@
 
 Revo's phone app (``com.netpulse.mobile.revofitness``) uses a **Netpulse (EGYM)
 white-label** native backend at ``https://revofitness.netpulse.com/np/``, separate
-from the ``revocentral`` web portal that :mod:`app.revo_client` scrapes. This does
-not rule out an embedded rewards WebView or relay; no on-device capture of that
-specific phone flow is recorded.
+from the ``revocentral`` web portal that :mod:`app.revo_client` scrapes. Android
+4.3 code and authenticated reads confirm that its rewards WebView uses a BMA
+SSO token obtained from this backend.
 This module is the thin, read-only client for the small slice of that backend
 that is actually useful to the bot.
 
@@ -20,10 +20,12 @@ per-visit check-ins. A single consented login test settled it:
   variants return 404. Every club in the directory reports ``"mms":
   "perfectgym"`` — Revo runs member management / access / occupancy on
   **PerfectGym**, not on Netpulse. Those known Netpulse routes cannot supply the
-  missing data; this does not prove that no other app flow or relay exists.
+  missing data directly. The verified BMA token handoff restores the rewards
+  calendar through Revo Central instead.
 * **What IS provisioned:** the member's **membership** (type / subtype / join
   date) and a full **club directory** (name, suburb/state, hours, geo). That's
-  what this client exposes.
+  what this client exposes to users. It also supplies the BMA rewards token
+  internally to :mod:`app.revo_client`.
 
 Auth (correction to the old web-portal notes)
 ---------------------------------------------
@@ -36,13 +38,14 @@ TLS interception is required.
 
 Security (hard rules — mirror :mod:`app.revo_client`)
 -----------------------------------------------------
-The login and membership responses carry **secrets**: the ``JSESSIONID``
+The login, membership and rewards-token responses carry **secrets**: the ``JSESSIONID``
 cookie, ``externalAuthToken`` / ``externalIdToken`` / ``externalRefreshToken``,
 ``egymAccountId``, and a membership ``barcode`` / ``agreementNumber`` /
 ``barcodeExpiresAt`` (a live digital door-access credential). This client MUST
-NOT log them, MUST NOT return them from public methods, and MUST NOT persist
-them. The pure parsers below are the scrubbing boundary: they read the raw
-payload but return only non-sensitive fields.
+NOT log or persist them. Public user-facing results return only non-sensitive
+fields through the pure parsers below. The explicit internal
+``get_rewards_token`` credential boundary may return the BMA launch token only
+to another backend client in this process; it must never reach UI or diagnostics.
 
 Import-safe: ``requests`` is imported lazily so the bot boots without it — check
 :func:`available` (or catch :class:`NetpulseUnavailable`) before use.
@@ -54,18 +57,25 @@ import logging
 import re
 import threading
 import time as _time
+import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Optional
+
+from . import revo_http
 
 LOG = logging.getLogger("gymbot.revo.netpulse")
 
-# Netpulse (EGYM) white-label backend for Revo's app. Reachable; only the
-# membership + club-directory slice is provisioned for Revo's tenant.
+# Netpulse (EGYM) backend: membership, club directory and rewards SSO issuer.
 NETPULSE_BASE = "https://revofitness.netpulse.com/np/"
 LOGIN_PATH = "exerciser/login"
 CLUBS_PATH = "company/children?responseType=basic"
 MEMBERSHIP_PATH = "exerciser/{uuid}/membership"
+REWARDS_TOKEN_PATH = (
+    "micro-web-app/v1.0/exercisers/{uuid}/tokens/BMA"
+)
+REWARDS_TOKEN_PARTNER = "BMA"
+REWARDS_TOKEN_REFRESH_MARGIN = timedelta(seconds=30)
 
 REQUEST_TIMEOUT = 30
 
@@ -520,6 +530,46 @@ _dir_lock = threading.Lock()
 _dir_cache: tuple[float, tuple[Club, ...]] = (0.0, ())
 
 
+def _valid_membership_payload(body: Any) -> bool:
+    """Whether a decoded response still matches Netpulse's membership shape."""
+    if not isinstance(body, dict) or not any(
+        key in body
+        for key in (
+            "membershipType", "membershipSubtype", "expired",
+            "contractSignedDate", "createdAt",
+        )
+    ):
+        return False
+    string_fields = (
+        "membershipType", "membershipSubtype", "contractSignedDate", "createdAt",
+    )
+    if any(
+        body.get(key) is not None and not isinstance(body.get(key), str)
+        for key in string_fields
+    ):
+        return False
+    return body.get("expired") is None or isinstance(body.get("expired"), bool)
+
+
+def _valid_club_payload(body: Any) -> bool:
+    """Reject schema drift rather than presenting malformed data as no clubs."""
+    return isinstance(body, list) and all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and bool(entry["name"].strip())
+        for entry in body
+    )
+
+
+def _redirects_to_login(response: Any) -> bool:
+    """True only when Netpulse explicitly redirects to its login endpoint."""
+    if response.status_code not in (301, 302, 303, 307, 308):
+        return False
+    location = str((getattr(response, "headers", {}) or {}).get("Location", ""))
+    path = urllib.parse.urlsplit(location).path.rstrip("/")
+    return path.endswith("/" + LOGIN_PATH) or path == LOGIN_PATH
+
+
 def fetch_club_directory() -> list[Club]:
     """Fetch the public club directory with **no credentials at all**.
 
@@ -533,13 +583,26 @@ def fetch_club_directory() -> list[Club]:
         raise NetpulseUnavailable(
             "The 'requests' package is required to fetch the Revo club directory."
         )
-    r = requests.get(
+    r = revo_http.request(
+        requests, "get",
         NETPULSE_BASE + CLUBS_PATH,
+        NetpulseUnavailable,
         headers={"User-Agent": DEFAULT_HEADERS["User-Agent"], "Accept": "application/json"},
         timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
-    r.raise_for_status()
-    return parse_club_directory(r.json())
+    revo_http.check_status(r, NetpulseUnavailable)
+    if 300 <= r.status_code < 400:
+        raise NetpulseUnavailable("Revo club directory returned an unexpected redirect.")
+    if revo_http.is_login_html(r):
+        raise NetpulseUnavailable("Revo club directory returned a login page.")
+    try:
+        body = r.json()
+    except ValueError:
+        raise NetpulseUnavailable("Revo club directory returned invalid JSON.") from None
+    if not _valid_club_payload(body):
+        raise NetpulseUnavailable("Revo club directory returned an unexpected response.")
+    return parse_club_directory(body)
 
 
 def shared_club_directory() -> list[Club]:
@@ -565,6 +628,27 @@ def shared_club_directory() -> list[Club]:
 # HTTP client
 # ---------------------------------------------------------------------------
 
+def _looks_like_jwt(value: str) -> bool:
+    """Validate JWT framing without decoding or surfacing credential contents."""
+    parts = value.strip().split(".")
+    return len(parts) == 3 and all(
+        part and re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts
+    )
+
+
+def _parse_utc_expiry(value: object) -> Optional[datetime]:
+    """Parse Netpulse's ISO expiry, treating its naive timestamps as UTC."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
 class NetpulseClient:
     """Read-only session against the Revo Netpulse backend.
 
@@ -582,8 +666,13 @@ class NetpulseClient:
         self._password = password
         self._http = requests.Session()
         self._http.headers.update(DEFAULT_HEADERS)
+        self._lock = threading.RLock()
         self._uuid: Optional[str] = None
         self._logged_in = False
+        # Internal launch credential for Revo's BMA rewards micro web app. It is
+        # deliberately kept off public dataclasses, diagnostics and persistence.
+        self._rewards_token: Optional[str] = None
+        self._rewards_token_expires_at: Optional[datetime] = None
         # Non-secret session context, safe to surface.
         self.home_club_name: Optional[str] = None
         self.chain_name: Optional[str] = None
@@ -594,43 +683,161 @@ class NetpulseClient:
         Raises :class:`NetpulseAuthError` on failure. Never logs the response
         body (it carries tokens + a door barcode).
         """
-        r = self._http.post(
-            NETPULSE_BASE + LOGIN_PATH,
-            data={"username": self.email, "password": self._password},
-            timeout=REQUEST_TIMEOUT,
-        )
-        try:
-            body = r.json()
-        except ValueError:
-            body = None
-        if r.status_code != 200 or not isinstance(body, dict) or "uuid" not in body:
-            raise NetpulseAuthError(
-                f"Netpulse login failed for {self.email!r} (status {r.status_code})."
+        with self._lock:
+            # A failed reauthentication must not leave the old identity or
+            # JSESSIONID looking usable to the next caller.
+            self._logged_in = False
+            self._uuid = None
+            self._rewards_token = None
+            self._rewards_token_expires_at = None
+            self.home_club_name = None
+            self.chain_name = None
+            self._http.cookies.clear()
+            r = revo_http.request(
+                self._http, "post", NETPULSE_BASE + LOGIN_PATH,
+                NetpulseUnavailable,
+                data={"username": self.email, "password": self._password},
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
             )
-        self._uuid = body.get("uuid")
-        self.home_club_name = body.get("homeClubName")
-        self.chain_name = body.get("chainName")
-        self._logged_in = True
-        # Note: no exerciser uuid / token / barcode in the log line.
-        LOG.info("Netpulse login OK email=%s home_club=%s", self.email, self.home_club_name)
+            if r.status_code == 401:
+                raise NetpulseAuthError("Netpulse rejected the supplied credentials.")
+            revo_http.check_status(r, NetpulseUnavailable)
+            if 300 <= r.status_code < 400:
+                raise NetpulseUnavailable("Netpulse login returned an unexpected redirect.")
+            if revo_http.is_login_html(r):
+                raise NetpulseAuthError("Netpulse login returned a password form.")
+            try:
+                body = r.json()
+            except ValueError:
+                raise NetpulseAuthError("Netpulse login returned invalid JSON.") from None
+            uuid = body.get("uuid") if isinstance(body, dict) else None
+            if not isinstance(uuid, str) or not uuid.strip():
+                raise NetpulseAuthError("Netpulse login returned an invalid account response.")
+            self._uuid = uuid.strip()
+            self.home_club_name = body.get("homeClubName")
+            self.chain_name = body.get("chainName")
+            self._logged_in = True
+            LOG.info("Netpulse login succeeded")
 
     def _ensure_login(self) -> None:
         if not self._logged_in:
             self.login()
 
-    def _get_json(self, path: str) -> Any:
-        r = self._http.get(NETPULSE_BASE + path, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
+    def _get_json(self, path_for_uuid=None, *, path: str | None = None) -> Any:
+        """Authenticated JSON GET with one bounded session refresh.
+
+        ``path_for_uuid`` is evaluated after login and again after refresh so a
+        rotated exerciser UUID cannot leave the retry pointed at the old account.
+        """
+        with self._lock:
+            self._ensure_login()
+            for attempt in range(2):
+                request_path = (
+                    path_for_uuid(self._uuid) if path_for_uuid is not None else path
+                )
+                r = revo_http.request(
+                    self._http, "get", NETPULSE_BASE + str(request_path),
+                    NetpulseUnavailable, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                )
+                expired = r.status_code == 401 or _redirects_to_login(r) or \
+                    revo_http.is_login_html(r)
+                if expired:
+                    if attempt:
+                        self._logged_in = False
+                        self._uuid = None
+                        self._rewards_token = None
+                        self._rewards_token_expires_at = None
+                        raise NetpulseAuthError(
+                            "Netpulse session expired again after reauthentication."
+                        )
+                    self.login()
+                    continue
+                revo_http.check_status(r, NetpulseUnavailable)
+                if 300 <= r.status_code < 400:
+                    raise NetpulseUnavailable(
+                        "Netpulse returned an unexpected redirect."
+                    )
+                try:
+                    return r.json()
+                except ValueError:
+                    raise NetpulseUnavailable(
+                        "Netpulse returned invalid JSON."
+                    ) from None
+            raise NetpulseAuthError("Netpulse session could not be refreshed.")
+
+    def get_rewards_token(self, *, force_refresh: bool = False) -> str:
+        """Return the internal BMA micro-web-app launch credential.
+
+        This is a credential boundary for another backend client in this
+        process. Callers must not expose the returned token in UI, diagnostics,
+        logs or persistence. The fixed endpoint and partner are taken from the
+        verified Revo Android app flow; arbitrary partners and URLs are not
+        accepted here.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            if (
+                not force_refresh
+                and self._rewards_token is not None
+                and self._rewards_token_expires_at is not None
+                and now + REWARDS_TOKEN_REFRESH_MARGIN
+                < self._rewards_token_expires_at
+            ):
+                return self._rewards_token
+
+            # Once a refresh is required, the prior credential is no longer a
+            # valid fallback. A failed transport or rejected response must make
+            # the next caller fetch again rather than silently reuse it.
+            self._rewards_token = None
+            self._rewards_token_expires_at = None
+            body = self._get_json(
+                lambda uuid: REWARDS_TOKEN_PATH.format(
+                    uuid=urllib.parse.quote(str(uuid), safe=""),
+                ),
+            )
+            if not isinstance(body, dict):
+                raise NetpulseUnavailable(
+                    "Netpulse rewards token returned an unexpected response."
+                )
+            provider = body.get("provider")
+            partner = body.get("partner")
+            token = body.get("accessToken")
+            raw_expiry = body.get("accessTokenExpiresAt")
+            if (
+                not isinstance(provider, str)
+                or not provider.strip()
+                or partner != REWARDS_TOKEN_PARTNER
+                or not isinstance(token, str)
+                or not _looks_like_jwt(token)
+            ):
+                raise NetpulseUnavailable(
+                    "Netpulse rewards token returned an unexpected response."
+                )
+            expires_at = _parse_utc_expiry(raw_expiry)
+            now = datetime.now(timezone.utc)
+            if expires_at is None or now + REWARDS_TOKEN_REFRESH_MARGIN >= expires_at:
+                raise NetpulseUnavailable(
+                    "Netpulse rewards token returned an invalid expiry."
+                )
+
+            self._rewards_token = token
+            self._rewards_token_expires_at = expires_at
+            return token
 
     def get_membership(self) -> Membership:
         """Return the member's non-secret membership facts."""
-        self._ensure_login()
-        return parse_membership(
-            self._get_json(MEMBERSHIP_PATH.format(uuid=self._uuid))
+        body = self._get_json(
+            lambda uuid: MEMBERSHIP_PATH.format(uuid=uuid),
         )
+        if not _valid_membership_payload(body):
+            raise NetpulseUnavailable("Netpulse membership returned an unexpected response.")
+        return parse_membership(body)
 
     def get_clubs(self) -> list[Club]:
         """Return the Netpulse club directory."""
-        self._ensure_login()
-        return parse_club_directory(self._get_json(CLUBS_PATH))
+        body = self._get_json(path=CLUBS_PATH)
+        if not _valid_club_payload(body):
+            raise NetpulseUnavailable("Netpulse club directory returned an unexpected response.")
+        return parse_club_directory(body)

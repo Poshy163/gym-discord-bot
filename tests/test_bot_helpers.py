@@ -272,6 +272,46 @@ def test_stop_background_loops_cancels_and_drains_schedulers(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_bot_disables_mentions_by_default():
+    from app import bot as bot_mod
+
+    mentions = bot_mod.bot.allowed_mentions
+    assert mentions.everyone is False
+    assert mentions.roles is False
+    assert mentions.users is False
+
+
+def test_ready_jobs_do_not_overlap_and_can_run_again(monkeypatch):
+    from app import bot as bot_mod
+
+    async def scenario():
+        gate = asyncio.Event()
+        starts = 0
+
+        async def job():
+            nonlocal starts
+            starts += 1
+            await gate.wait()
+
+        monkeypatch.setattr(bot_mod.bot, "loop", asyncio.get_running_loop())
+        bot_mod._ready_tasks.clear()
+        first = bot_mod._start_ready_task("scan", job)
+        await asyncio.sleep(0)
+        assert first is not None
+        assert bot_mod._start_ready_task("scan", job) is None
+        assert starts == 1
+
+        gate.set()
+        await first
+        await asyncio.sleep(0)
+        second = bot_mod._start_ready_task("scan", job)
+        assert second is not None
+        await second
+        assert starts == 2
+
+    asyncio.run(scenario())
+
+
 def test_finish_bot_shutdown_awaits_close_and_drains_stragglers(monkeypatch):
     from app import bot as bot_mod
 
@@ -1359,6 +1399,9 @@ def test_revo_summary_keeps_landing_streak_when_calendar_is_guarded(monkeypatch)
     row = {"user_id": user_id}
 
     class _Client:
+        def get_ticket_balance(self):
+            return 43
+
         def get_tickets(self):
             return 43, [bot.revo_client.TicketRow(2, "Attendance", "19/08/2026")]
 
@@ -1409,6 +1452,9 @@ def test_revo_summary_degrades_sources_without_mislabeling_shape_drift(monkeypat
     row = {"user_id": user_id}
 
     class _Client:
+        def get_ticket_balance(self):
+            return 43
+
         def get_tickets(self):
             raise bot.revo_client.RevoAccessGuarded("tickets guarded")
 
@@ -1453,7 +1499,8 @@ def test_revo_summary_degrades_sources_without_mislabeling_shape_drift(monkeypat
     sent = interaction.followup.send.call_args.args[0]
     assert "Weekly streak: **6 weeks**" in sent
     assert "check-ins: temporarily unavailable" in sent
-    assert "Tickets available: restricted" in sent
+    assert "Tickets available: **43**" in sent
+    assert "Recent ticket activity is temporarily unavailable" in sent
     assert "raffle details are temporarily unavailable" in sent
 
 
@@ -1465,6 +1512,9 @@ def test_revo_raffle_never_calls_opted_out_tickets_in_the_draw(monkeypatch):
     row = {"user_id": user_id}
 
     class _Client:
+        def get_ticket_balance(self):
+            return 35
+
         def get_raffle(self):
             return bot.revo_client.RaffleInfo(6, 40, False)
 
@@ -1497,6 +1547,54 @@ def test_revo_raffle_never_calls_opted_out_tickets_in_the_draw(monkeypatch):
     assert "**35** tickets" in sent
     assert "in the draw" not in sent
     assert "not entered" in sent
+
+
+def test_revo_raffle_keeps_verified_balance_when_ledger_and_draw_are_down(
+    monkeypatch,
+):
+    import app.bot as bot
+
+    user_id = 4243
+    row = {"user_id": user_id}
+
+    class _Client:
+        def get_ticket_balance(self):
+            return 27
+
+        def get_tickets(self):
+            raise bot.revo_client.RevoFeatureUnavailable("ledger redirected")
+
+        def get_raffle(self):
+            raise bot.revo_client.RevoFeatureUnavailable("draw redirected")
+
+        def get_prize_pool(self):
+            raise bot.revo_client.RevoPageUnreadable("prize redirected")
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn):
+            return fn()
+
+    monkeypatch.setattr(bot, "REVO_DISABLED", False)
+    monkeypatch.setattr(bot.revo_client, "available", lambda: True)
+    monkeypatch.setattr(bot.db, "get_revo_account", lambda uid: row)
+    monkeypatch.setattr(bot, "_client_for_user", lambda _row: _Client())
+    monkeypatch.setattr(bot, "_bot_name", lambda _uid, _fallback: "Tester")
+    monkeypatch.setattr(bot, "bot", SimpleNamespace(loop=_Loop()))
+
+    interaction = MagicMock()
+    interaction.user.id = user_id
+    interaction.user.display_name = "Tester"
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+
+    asyncio.run(bot.revo_raffle_cmd.callback(interaction))
+
+    sent = interaction.followup.send.call_args.args[0]
+    assert "**27** tickets" in sent
+    assert "in the draw" not in sent
+    assert "Ticket activity is unavailable through the web portal" in sent
+    assert "Raffle details are unavailable through the web portal" in sent
+    assert "open the Revo app" in sent
 
 
 def _dir(name, city, lat, lng, state, id_=None):
@@ -3524,7 +3622,10 @@ class _Boom:
         self.exc = exc
 
 
-def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False):
+def _run_poll(
+    monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False,
+    send_error=None, attendance_error=None,
+):
     """Drive _poll_one_account with the network + DB + Discord stubbed out.
 
     ``guarded`` simulates the per-day calendar being access-guarded: attendance
@@ -3540,6 +3641,8 @@ def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False
 
     class _Chan:
         async def send(self, text, **kw):
+            if send_error is not None:
+                raise send_error
             sent.append(text)
 
     class _Client:
@@ -3573,6 +3676,8 @@ def _run_poll(monkeypatch, row, *, latest_iso, streak=3, now=None, guarded=False
             return (41, [row])
 
         def get_latest_attendance(self, m, y):
+            if attendance_error is not None:
+                raise attendance_error
             # Exercise the REAL calendar-first fallback logic against this fake's
             # primitives, rather than reimplementing it in the test.
             return bot.revo_client.RevoClient.get_latest_attendance(self, m, y)
@@ -3726,6 +3831,33 @@ def test_poll_still_announces_when_the_streak_fetch_errors(monkeypatch):
     assert "streak" not in sent[0]  # no tail — we couldn't read it
     # Unreadable ⇒ keep the last known streak rather than nulling it.
     assert saved == [(42, "2026-07-31", 4)]
+
+
+def test_poll_retries_visit_after_transient_discord_delivery_failure(monkeypatch):
+    response = MagicMock(status=503, reason="unavailable")
+    error = discord.HTTPException(response, "temporary outage")
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=3)
+
+    sent, _fetches, saved = _run_poll(
+        monkeypatch, row, latest_iso="2026-07-31", streak=3,
+        send_error=error,
+    )
+
+    assert sent == []
+    assert saved == []
+
+
+def test_poll_refreshes_streak_without_inventing_cursor_when_attendance_is_down(
+    monkeypatch,
+):
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=3)
+    sent, _fetches, saved = _run_poll(
+        monkeypatch, row, latest_iso=None, streak=7,
+        attendance_error=RuntimeError("attendance sources unavailable"),
+    )
+
+    assert sent == []
+    assert saved == [(42, "2026-07-28", 7)]
 
 
 def test_poll_ticket_fallback_preserves_last_streak_if_landing_is_unreadable(monkeypatch):

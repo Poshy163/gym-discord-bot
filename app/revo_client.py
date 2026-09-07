@@ -1,9 +1,9 @@
 """Revo Fitness client portal scraper used by the bot.
 
-The portal exposes no JSON API at any membership tier — every page server-renders
-its data into HTML or inline `<script>` blocks. We log in with form-encoded
-credentials, persist the `Member` cookie in a `requests.Session`, and parse the
-relevant fragments out of the HTML.
+Rewards pages render HTML, with a JSON variant for the attendance calendar.
+The landing uses a legacy Member-cookie session. Protected rewards reads use
+the Android app's Netpulse BMA SSO token in a query parameter, acquired and
+refreshed internally for the same account.
 
 See ``docs/REVO_PORTAL.md`` for the full reverse-engineering notes (endpoint
 inventory, gating, security caveats).
@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Optional
 
+from . import revo_http, revo_netpulse
+
 LOG = logging.getLogger("gymbot.revo")
 
 BASE_URL = "https://revocentral.revofitness.com.au"
@@ -40,6 +42,9 @@ STREAKS_PATH = "/portal/rewards/streaks.php"
 TICKETS_PATH = "/portal/rewards/ticket-tally.php"
 RAFFLE_PATH = "/portal/rewards/raffle.php"
 PRIZE_POOL_PATH = "/portal/rewards/prize-pool.php"
+# Verified in the Android app's rewards WebView and by authenticated reads.
+# Never add account actions or arbitrary URLs to this credential allowlist.
+APP_REWARDS_PATHS = frozenset({STREAKS_PATH, TICKETS_PATH, RAFFLE_PATH, PRIZE_POOL_PATH})
 
 USER_AGENT = "gym-discord-bot/0.1 (+https://github.com/Poshy163/gym-discord-bot)"
 REQUEST_TIMEOUT = 20
@@ -50,9 +55,9 @@ REQUEST_TIMEOUT = 20
 # ~2026-08 it also covers ``streaks.php`` (HTML *and* the ``?m=&y=`` calendar
 # JSON) and ``raffle.php``. Common UA / referer / origin / app-header variations
 # all return the same 17 bytes, so request-header spoofing is not a workaround.
-# The exact server-side predicate is unknown because no on-device request or
-# alternate source network was captured. ``ticket-tally.php``, ``prize-pool.php``
-# and the rewards landing are (so far) unaffected.
+# These are historical cookie-only observations. Android APK analysis and live
+# reads on 2026-09-07 verified the BMA SSO token flow for rewards. We retain this
+# exact guard classifier for outages and the legacy club-counter path.
 GUARD_BODY = "Invalid Access! B"
 
 # Live counter is refreshed on the server side fairly slowly; cache for a
@@ -88,6 +93,10 @@ class RevoPageUnreadable(RevoUnavailable):
     set lets the poller fall back instead of silently treating a login page,
     redirect, or changed guard string as "no attendance".
     """
+
+
+class RevoFeatureUnavailable(RevoPageUnreadable):
+    """The authenticated portal redirects this feature to its app-close page."""
 
 
 def is_access_guarded(body: str | None) -> bool:
@@ -183,6 +192,7 @@ class RewardsLanding:
     fav_club_name: Optional[str]
     in_club: Optional[int]
     streak_weeks: Optional[int] = None
+    tickets_available: Optional[int] = None
 
 
 def parse_member_cookie(raw: str | None) -> tuple[Optional[int], Optional[int]]:
@@ -316,6 +326,18 @@ def parse_rewards_landing_streak(html: str) -> Optional[int]:
     return int("".join(parts)) if parts else None
 
 
+def parse_rewards_landing_tickets(html: str) -> Optional[int]:
+    """Read only the raffle tile's verified balance, never infer ledger entries."""
+    anchor = re.search(
+        r"<a\b[^>]*\bhref=[\"'][^\"']*/rewards/raffle\.php(?:\?[^\"']*)?[\"'][^>]*>(.*?)</a>",
+        html, re.I | re.S,
+    )
+    if not anchor:
+        return None
+    parts = _COUNTER_SPAN_RE.findall(anchor.group(1))
+    return int("".join(parts)) if parts else None
+
+
 def parse_streak_weeks(html: str) -> Optional[int]:
     """Pull the headline "N WEEKS" streak count from the streaks page.
 
@@ -361,12 +383,13 @@ def parse_streak_calendar(
     belong to the neighbouring month; ``"0"`` / ``"1"`` are real days, with
     ``"1"`` meaning the user checked in. We walk the slots in left-to-right
     week-by-week order and assign ascending day-of-month numbers to the
-    non-null cells.
+    non-null cells. The current frontend also defines ``2`` as Les Mills only
+    and ``3`` as Gym & Les Mills. Only ``1`` and ``3`` count as a gym visit.
 
     When ``month`` and ``year`` are supplied, the response month name and exact
     number of real day cells must match the requested month. Returns a
     ``{day_of_month: attended}`` dict, or an empty dict when the body is missing,
-    malformed, incomplete, or contains a value other than exact ``0``/``1``.
+    malformed, incomplete, or contains a value outside the verified ``0``..``3`` codes.
     Failing the whole parse is deliberate: skipping one bad cell would shift
     every later value onto the wrong calendar date.
     """
@@ -412,10 +435,10 @@ def parse_streak_calendar(
         for v in iterable:
             if v is None:
                 continue
-            if isinstance(v, str) and v in {"0", "1"}:
-                attended = v == "1"
-            elif type(v) is int and v in {0, 1}:
-                attended = v == 1
+            if isinstance(v, str) and v in {"0", "1", "2", "3"}:
+                attended = v in {"1", "3"}
+            elif type(v) is int and v in {0, 1, 2, 3}:
+                attended = v in {1, 3}
             else:
                 return {}
             out[dom] = attended
@@ -794,11 +817,10 @@ class _RewardsCache:
 
 
 class RevoClient:
-    """Authenticated session against the Revo portal.
+    """Account-scoped portal session and lazy mobile rewards authentication.
 
-    Thread-safe — internal lock serialises login retries so a burst of
-    concurrent ``/busy`` invocations doesn't trigger N parallel logins on
-    cookie expiry.
+    The internal lock serializes complete reads and token/session refreshes.
+    Netpulse's lock is only taken inside this lock; it never calls back here.
     """
 
     def __init__(self, email: str, password: str) -> None:
@@ -810,8 +832,9 @@ class RevoClient:
         self._password = password
         self._http = requests.Session()
         self._http.headers["User-Agent"] = USER_AGENT
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._logged_in = False
+        self._mobile: revo_netpulse.NetpulseClient | None = None
         self.member_id: Optional[int] = None
         self.membership_level: Optional[int] = None
 
@@ -823,52 +846,108 @@ class RevoClient:
             self._login_locked()
 
     def _login_locked(self) -> None:
-        r = self._http.post(
+        self._logged_in = False
+        self.member_id = self.membership_level = None
+        self._http.cookies.clear()
+        r = revo_http.request(self._http, "post",
             BASE_URL + LOGIN_PATH,
+            RevoUnavailable,
             data={"user": self.email, "password": self._password},
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
         )
         # Successful login lands on /portal/rewards/. Failure re-renders the
         # login form (still 200), so we use the URL as the success signal.
-        if "/portal/rewards" not in r.url:
-            raise RevoAuthError(
-                f"Revo login failed for {self.email!r} (landed on {r.url})."
-            )
+        revo_http.check_status(r, RevoUnavailable)
+        target = urllib.parse.urlsplit(r.url)
+        if (target.hostname != urllib.parse.urlsplit(BASE_URL).hostname
+                or not target.path.startswith("/portal/rewards")
+                or revo_http.is_login_html(r)):
+            raise RevoAuthError("Revo login failed. Check credentials and relink your account.")
         self.member_id, self.membership_level = parse_member_cookie(
             self._http.cookies.get("Member")
         )
         self._logged_in = True
-        LOG.info(
-            "Revo login OK email=%s member_id=%s level=%s",
-            self.email, self.member_id, self.membership_level,
-        )
+        LOG.info("Revo login succeeded")
 
     def _get(self, path: str) -> str:
         """GET ``path`` with auto-relogin on session expiry."""
+        with self._lock:
+            return self._get_locked(path)
+
+    def _get_locked(self, path: str, **kwargs) -> str:
+        if path in APP_REWARDS_PATHS:
+            return self._get_app_feature_locked(path, **kwargs)
         if not self._logged_in:
             self.login()
-        r = self._http.get(
-            BASE_URL + path, timeout=REQUEST_TIMEOUT, allow_redirects=False,
-        )
-        # Session-expired pages redirect back to /portal/login.php.
-        if r.status_code in (301, 302) and "login.php" in r.headers.get("Location", ""):
+        def read():
+            return revo_http.request(self._http, "get", BASE_URL + path,
+                RevoUnavailable, timeout=REQUEST_TIMEOUT, allow_redirects=False, **kwargs)
+
+        def expired(response):
+            location = response.headers.get("Location", "")
+            return (response.status_code == 401 or revo_http.is_login_html(response)
+                    or (300 <= response.status_code < 400 and "login.php" in location))
+
+        r = read()
+        if expired(r):
             LOG.info("Revo session expired, re-logging in")
             self.login()
-            r = self._http.get(
-                BASE_URL + path, timeout=REQUEST_TIMEOUT, allow_redirects=False,
-            )
-        if r.status_code in (301, 302):
-            # Still redirecting — usually means the route is gated (level 2,
-            # mobile-only, etc.). Surface as an empty body; callers decide
-            # how to handle it.
-            LOG.debug(
-                "Revo %s redirected to %s (status=%s)",
-                path, r.headers.get("Location"), r.status_code,
-            )
-            return ""
-        r.raise_for_status()
+            r = read()
+            if expired(r):
+                self._logged_in = False
+                raise RevoAuthError("Revo session expired after reauthentication. Relink your account.")
+        if 300 <= r.status_code < 400:
+            target = urllib.parse.urlsplit(r.headers.get("Location", ""))
+            if "closePage" in urllib.parse.parse_qs(target.query, keep_blank_values=True):
+                raise RevoFeatureUnavailable(
+                    "This feature is unavailable through the Revo web portal. Open it in the Revo app."
+                )
+            raise RevoPageUnreadable("Revo redirected this source to an unavailable page.")
+        revo_http.check_status(r, RevoUnavailable)
         return r.text
+
+    def _get_app_feature_locked(self, path: str, *, params=None) -> str:
+        """Read an allowlisted rewards page using the Android app's SSO flow.
+
+        The mobile session belongs to this account and is independent of the
+        legacy Member cookie. Netpulse owns token caching and expiry; rejected
+        tokens get one refresh. No redirect is followed with a credential.
+        """
+        if path not in APP_REWARDS_PATHS:
+            raise RevoUnavailable("Unsupported Revo app feature.")
+        if params and (path != STREAKS_PATH or set(params) - {"m", "y"}):
+            raise RevoUnavailable("Unsupported Revo app feature parameters.")
+        if self._mobile is None:
+            self._mobile = revo_netpulse.NetpulseClient(self.email, self._password)
+        for attempt in range(2):
+            try:
+                token = self._mobile.get_rewards_token(force_refresh=bool(attempt))
+            except revo_netpulse.NetpulseAuthError:
+                raise RevoAuthError("Revo app login failed. Relink your account.") from None
+            except revo_netpulse.NetpulseUnavailable:
+                raise RevoUnavailable("Revo app authentication is temporarily unavailable.") from None
+            response = revo_http.request(
+                self._http, "get", BASE_URL + path, RevoUnavailable,
+                params={**(params or {}), "token": token},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            )
+            target = urllib.parse.urlsplit(response.headers.get("Location", ""))
+            redirect = 300 <= response.status_code < 400
+            rejected = (response.status_code == 401 or revo_http.is_login_html(response)
+                        or (redirect and (target.path == LOGIN_PATH or
+                            "closePage" in urllib.parse.parse_qs(target.query, keep_blank_values=True))))
+            if rejected:
+                if not attempt:
+                    continue
+                raise RevoFeatureUnavailable(
+                    "Revo rejected this feature after refreshing the app session. Try the Revo app."
+                )
+            if redirect:
+                raise RevoPageUnreadable("Revo app feature returned an unexpected redirect.")
+            revo_http.check_status(response, RevoUnavailable)
+            return response.text
+        raise RevoFeatureUnavailable("Revo app feature is unavailable.")
 
     # ---- public read endpoints ----------------------------------------
 
@@ -878,20 +957,50 @@ class RevoClient:
         ``club-counter.php`` is access-guarded now, so this degrades gracefully
         to ``({}, None)``. Prefer :meth:`get_rewards_landing`.
         """
-        return parse_club_counter(self._get(CLUB_COUNTER_PATH))
+        html = self._get(CLUB_COUNTER_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the old club counter.")
+        clubs, favorite = parse_club_counter(html)
+        if not clubs:
+            raise RevoPageUnreadable("Revo club counter had no readable counts.")
+        return clubs, favorite
 
     def get_rewards_landing(self) -> RewardsLanding:
         """Scrape the rewards landing for its surviving member summary tiles."""
         html = self._get(REWARDS_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the rewards landing.")
         fav_id, fav_name, in_club = parse_rewards_landing(html)
+        streak = parse_rewards_landing_streak(html)
+        tickets = parse_rewards_landing_tickets(html)
+        if fav_id is None and in_club is None and streak is None and tickets is None:
+            raise RevoPageUnreadable("Revo rewards landing had no readable summary tiles.")
         return RewardsLanding(
             fav_club_id=fav_id, fav_club_name=fav_name, in_club=in_club,
-            streak_weeks=parse_rewards_landing_streak(html),
+            streak_weeks=streak, tickets_available=tickets,
         )
+
+    def get_ticket_balance(self) -> Optional[int]:
+        """Read a ticket total independently of the unavailable attendance ledger."""
+        try:
+            tickets = self.get_rewards_landing().tickets_available
+            if tickets is not None:
+                return tickets
+        except RevoAuthError:
+            raise
+        except RevoUnavailable:
+            pass
+        return self.get_tickets()[0]
 
     def get_prize_pool(self) -> dict[str, Optional[str]]:
         """Fetch the current monthly + major prize copy."""
-        return parse_prize_pool(self._get(PRIZE_POOL_PATH))
+        html = self._get(PRIZE_POOL_PATH)
+        if is_access_guarded(html):
+            raise RevoAccessGuarded("Revo has access-guarded the prize pool.")
+        prizes = parse_prize_pool(html)
+        if not any(prizes.values()):
+            raise RevoPageUnreadable("Revo prize pool had no readable prize details.")
+        return prizes
 
     def get_streak_weeks(self) -> Optional[int]:
         # The still-readable rewards landing duplicates the weekly streak tile.
@@ -906,9 +1015,7 @@ class RevoClient:
             raise
         except Exception:  # pragma: no cover - transient landing failure
             LOG.warning(
-                "Revo rewards-landing streak fetch failed for %s",
-                self.email,
-                exc_info=True,
+                "Revo rewards-landing streak fetch failed",
             )
         html = self._get(STREAKS_PATH)
         if is_access_guarded(html):
@@ -934,31 +1041,11 @@ class RevoClient:
             raise ValueError(f"month must be 1..12, got {month!r}")
         if not 2000 <= year <= 2100:
             raise ValueError(f"year out of plausible range: {year!r}")
-        if not self._logged_in:
-            self.login()
-
-        def _do_get() -> "requests.Response":
-            return self._http.get(
-                BASE_URL + STREAKS_PATH,
-                params={"m": month, "y": year},
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=False,
-            )
-
-        r = _do_get()
-        # Same session-expiry handling as _get(): re-login on redirect to login.
-        if r.status_code in (301, 302) and "login.php" in r.headers.get("Location", ""):
-            LOG.info("Revo session expired during calendar fetch, re-logging in")
-            self.login()
-            r = _do_get()
-        if r.status_code in (301, 302):
-            raise RevoPageUnreadable(
-                "Revo streak calendar redirected to an unexpected page."
-            )
-        r.raise_for_status()
-        if is_access_guarded(r.text):
+        with self._lock:
+            body = self._get_locked(STREAKS_PATH, params={"m": month, "y": year})
+        if is_access_guarded(body):
             raise RevoAccessGuarded("Revo has access-guarded the streaks calendar.")
-        calendar = parse_streak_calendar(r.text, month=month, year=year)
+        calendar = parse_streak_calendar(body, month=month, year=year)
         if not calendar:
             raise RevoPageUnreadable(
                 "Revo streak calendar response had no readable day cells."
@@ -1010,12 +1097,10 @@ class RevoClient:
                 # guarded, so ticket-based attendance need not lose the weekly
                 # streak as well.
                 streak = self.get_streak_weeks()
-                streak_readable = True
+                streak_readable = streak is not None
             except Exception:  # pragma: no cover - optional tail, never sink feed
                 LOG.warning(
-                    "Revo fallback streak fetch failed for %s",
-                    self.email,
-                    exc_info=True,
+                    "Revo fallback streak fetch failed",
                 )
             return AttendanceInfo(
                 date=iso,
@@ -1040,7 +1125,7 @@ class RevoClient:
         except RevoAccessGuarded:  # streaks HTML guarded even when calendar isn't
             streak = None
         except Exception:  # pragma: no cover - network
-            LOG.warning("Revo streak fetch failed for %s", self.email, exc_info=True)
+            LOG.warning("Revo streak fetch failed")
             streak = None
 
         latest_day = latest_attended_day(cal)
@@ -1122,10 +1207,12 @@ def _probe(label: str, fn) -> SourceHealth:
         got = fn()
     except RevoAccessGuarded:
         return SourceHealth(label, HEALTH_GUARDED, "blocked by Revo (Invalid Access)")
-    except RevoAuthError as exc:
-        return SourceHealth(label, HEALTH_ERROR, f"auth failed: {exc}")
+    except RevoAuthError:
+        return SourceHealth(label, HEALTH_ERROR, "authentication failed; relink your account")
+    except RevoFeatureUnavailable:
+        return SourceHealth(label, HEALTH_ERROR, "feature unavailable; try opening it in the Revo app")
     except Exception as exc:  # pragma: no cover - network
-        return SourceHealth(label, HEALTH_ERROR, str(exc)[:120])
+        return SourceHealth(label, HEALTH_ERROR, type(exc).__name__)
     return SourceHealth(label, HEALTH_OK if got else HEALTH_EMPTY)
 
 
@@ -1138,15 +1225,16 @@ def probe_sources(client: "RevoClient", month: int, year: int) -> list[SourceHea
     calendar just parsed to empty. This turns that class of failure into
     something a human can see in one command instead of a log dig.
 
-    Costs one request per source, so callers should rate-limit it (the portal
+    Uses bounded reads including documented fallbacks; callers should rate-limit it (the portal
     notes ask for gentle traffic) — it is a diagnostic, not a poll.
     """
     return [
-        # The attendance feed's primary source, and the one currently guarded.
+        # The attendance feed's primary source, using the app SSO token.
         _probe("Check-in calendar", lambda: client.get_streak_calendar(month, year)),
         _probe("Weekly streak", lambda: client.get_streak_weeks() is not None),
         # The fallback that keeps the attendance feed alive while the above is out.
         _probe("Tickets", lambda: client.get_tickets()[0] is not None),
+        _probe("Ticket balance", lambda: client.get_ticket_balance() is not None),
         _probe("Raffle", lambda: client.get_raffle()),
         _probe("Prize pool", lambda: any(client.get_prize_pool().values())),
         _probe(
@@ -1230,26 +1318,13 @@ def shared_club_counter() -> tuple[dict[str, ClubInfo], Optional[int]]:
 def club_counter_with_client(
     client: RevoClient,
 ) -> tuple[dict[str, ClubInfo], Optional[int]]:
-    """Cached club-counter fetch using *any* authenticated client.
+    """Read the linked account without sharing its private favourite-club ID.
 
-    Mirrors :func:`shared_club_counter` but lets callers fall back to a
-    user-supplied :class:`RevoClient` (e.g. one built from the invoking
-    user's linked credentials) when no shared env-var account is set.
-    Results populate the same TTL cache so subsequent /busy calls — from
-    anyone — reuse the data.
+    Public occupancy comes from PerfectGym and has its own cache. This legacy
+    portal response also contains account-specific data, so it must never seed
+    the shared account's cache.
     """
-    global _shared_counters
-    now = time.monotonic()
-    with _shared_lock:
-        cache = _shared_counters
-        if cache.clubs and (now - cache.fetched_at) < CLUB_COUNTER_TTL_SECONDS:
-            return cache.clubs, cache.favorite
-    clubs, favorite = client.get_club_counter()
-    with _shared_lock:
-        _shared_counters = _CountersCache(
-            fetched_at=now, clubs=clubs, favorite=favorite,
-        )
-    return clubs, favorite
+    return client.get_club_counter()
 
 
 def shared_rewards_landing() -> RewardsLanding:

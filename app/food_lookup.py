@@ -14,6 +14,7 @@ so response parsing can be unit-tested from fixture dicts.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 LOG = logging.getLogger("gymbot.foodlookup")
@@ -63,9 +64,10 @@ def _num(v: object) -> float | None:
     if v is None or v == "":
         return None
     try:
-        return float(v)
+        number = float(v)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def parse_product(p: dict) -> FoodInfo | None:
@@ -77,6 +79,8 @@ def parse_product(p: dict) -> FoodInfo | None:
     if not name:
         return None
     nutr = p.get("nutriments") or {}
+    if not isinstance(nutr, dict):
+        return None
     kj = _num(nutr.get("energy-kj_100g"))
     kcal = _num(nutr.get("energy-kcal_100g"))
     if kj is None:
@@ -114,9 +118,12 @@ def _get(url: str, params: dict) -> dict:
             f"Open Food Facts returned HTTP {resp.status_code}"
         )
     try:
-        return resp.json()
+        data = resp.json()
     except ValueError as exc:
         raise FoodLookupError("Open Food Facts returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise FoodLookupError("Open Food Facts returned an unexpected response shape")
+    return data
 
 
 def by_barcode(code: str) -> FoodInfo | None:
@@ -138,7 +145,10 @@ def search(query: str, *, limit: int = 5) -> list[FoodInfo]:
         "fields": _FIELDS,
     })
     out: list[FoodInfo] = []
-    for p in data.get("products") or []:
+    products = data.get("products") or []
+    if not isinstance(products, list):
+        raise FoodLookupError("Open Food Facts returned an unexpected products list")
+    for p in products:
         info = parse_product(p)
         # Search hits without energy are useless for calorie logging.
         if info is not None and info.has_energy:

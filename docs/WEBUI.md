@@ -33,6 +33,14 @@ browser stacks its channel list above chat on phones. Keyboard users can press
 section, loading state, errors, dialogs, and action notifications are also
 exposed to assistive technology.
 
+The header reports whether the dashboard API is reachable, whether the Discord
+bot is down while the dashboard remains available, and when the dashboard API
+has not been checked for two minutes. It does not claim that Discord, Revo, or
+other upstream sources are current. A linked Revo account shows its last saved
+poll time on the member page, explicitly as cached metadata. Use the theme
+button to cycle between system, dark, and light appearance; the choice stays in
+that browser.
+
 ## The audit log
 
 The audit log is a single append-only trail in the `audit_log` table, written
@@ -109,6 +117,14 @@ Change the password later under **Settings → Dashboard account**. That signs
 out every existing session, including your own on other devices.
 
 Lost it? `docker compose exec gym-bot python -m app.supervisor reset-password`.
+
+## Safe local UI preview
+
+For a disposable browser preview with seeded fake members and no Discord worker,
+run `python scripts/preview_webui.py --port 8082`, then open
+`http://127.0.0.1:8082/` and sign in with `preview-only-password`. The script
+binds only to loopback and deletes its temporary database and placeholder data
+when stopped with Ctrl+C.
 
 ## Security notes
 

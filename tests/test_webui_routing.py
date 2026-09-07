@@ -228,6 +228,15 @@ def test_dashboard_shell_has_responsive_accessible_navigation(tmp_path):
             assert "@media (max-width:720px)" in body
             assert "prefers-reduced-motion:reduce" in body
             assert 'event.key!=="/"' in body
+            assert 'id="connectionState" role="status" aria-live="polite"' in body
+            assert 'id="themeBtn"' in body
+            assert 'data-theme="light"' in body
+            assert '<meta name="theme-color" content="#0b0e14">' in body
+            assert ':root[data-theme="light"] nav{' in body
+            assert 'aria-label="${esc(s.label)}"' in body
+            assert 'class="pill faint revo-cache"' in body
+            assert 'function connectionState(kind,detail)' in body
+            assert 'function refreshConnectionAge()' in body
         finally:
             await client.close()
             db.close()

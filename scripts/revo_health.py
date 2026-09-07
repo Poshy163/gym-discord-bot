@@ -18,7 +18,7 @@ Exit codes: ``0`` check-in tracking healthy · ``1`` degraded (fallback in use) 
 ``2`` down · ``3`` couldn't log in / no credentials. That makes it usable as a
 cron canary, not just something a human reads.
 
-It costs one request per source, so run it on demand — the portal notes ask for
+It performs bounded reads per source (including documented fallbacks), so run it on demand — the portal notes ask for
 gentle traffic (§6). This is a diagnostic, not a poll.
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -59,11 +60,19 @@ def main() -> int:
     try:
         client.login()
     except Exception as exc:
-        print(f"Login FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"Login FAILED: {type(exc).__name__}", file=sys.stderr)
+        client._http.close()
         return 3
-    print(f"Logged in: member_id={client.member_id} level={client.membership_level}\n")
+    try:
+        return _report(client)
+    finally:
+        client._http.close()
 
-    now = datetime.now()
+
+def _report(client) -> int:
+    print("Logged in successfully. Account identifiers omitted.\n")
+
+    now = datetime.now(ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Australia/Adelaide")))
     sources = revo_client.probe_sources(client, now.month, now.year)
     state, explanation = revo_client.attendance_feed_state(sources)
 

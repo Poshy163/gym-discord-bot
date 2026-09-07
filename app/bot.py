@@ -325,7 +325,12 @@ if AUTO_UNTIMEOUT:
     # bot also receives them where available.
     intents.members = True
     intents.moderation = True
-bot = commands.Bot(command_prefix="!gym ", intents=intents)
+# Deny mention parsing by default. Individual notification paths opt in to the
+# one role/user mention they intentionally send.
+bot = commands.Bot(
+    command_prefix="!gym ", intents=intents,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 # Make every slash command usable in DMs and as a user-installed app, not just
 # in guild channels. These tree-level defaults are inherited by all commands
@@ -3140,6 +3145,26 @@ async def _sync_commands(*, force: bool = False) -> dict:
     return {"action": action, "count": len(synced)}
 
 
+_ready_tasks: dict[str, asyncio.Task] = {}
+
+
+def _start_ready_task(name: str, factory) -> asyncio.Task | None:
+    """Start one reconnect-sensitive startup job at a time."""
+    current = _ready_tasks.get(name)
+    if current is not None and not current.done():
+        LOG.info("Startup job %s is already running; reconnect will reuse it", name)
+        return None
+    task = bot.loop.create_task(factory(), name=f"gymbot:{name}")
+    _ready_tasks[name] = task
+
+    def _forget(done: asyncio.Task) -> None:
+        if _ready_tasks.get(name) is done:
+            _ready_tasks.pop(name, None)
+
+    task.add_done_callback(_forget)
+    return task
+
+
 @bot.event
 async def on_ready() -> None:
     LOG.info(
@@ -3162,7 +3187,7 @@ async def on_ready() -> None:
     # read the empty list as "nowhere to catch up on", so the default config
     # logged live in every channel and caught up in none of them.
     if BACKFILL_ON_START:
-        bot.loop.create_task(_run_startup_backfill())
+        _start_ready_task("startup-backfill", _run_startup_backfill)
     else:
         # No backfill to wait on — start auditing live data changes now.
         db.audit_live = True
@@ -3173,7 +3198,7 @@ async def on_ready() -> None:
     # activity feed isn't empty on a fresh deploy. Independent of the lift/calorie
     # backfill above and of GYM_CHANNEL_IDS.
     if ENABLE_MESSAGE_LOGGING and MESSAGE_LOG_BACKFILL_DAYS > 0:
-        bot.loop.create_task(_backfill_message_logs())
+        _start_ready_task("message-log-backfill", _backfill_message_logs)
 
     if ENABLE_MEMBER_MIRROR:
         LOG.info(
@@ -3181,7 +3206,7 @@ async def on_ready() -> None:
             "Make sure the Server Members intent is toggled on in the Discord "
             "Developer Portal."
         )
-        bot.loop.create_task(_webui_sync_all_guilds())
+        _start_ready_task("member-mirror", _webui_sync_all_guilds)
 
     if REMINDER_CHANNEL_ID and not weekly_reminder.is_running():
         weekly_reminder.start()
@@ -12816,7 +12841,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
     row = db.get_revo_account(interaction.user.id)
     personal = row is not None
 
-    def _do() -> "tuple[int | None, revo_client.RaffleInfo | None, str, dict[str, str | None]] | str":
+    def _do() -> "tuple[int | None, str, revo_client.RaffleInfo | None, str, dict[str, str | None]] | str":
         try:
             if row is not None:
                 client = _client_for_user(row)
@@ -12831,6 +12856,9 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
                 raffle = client.get_raffle()
             except revo_client.RevoAuthError:
                 raise
+            except revo_client.RevoFeatureUnavailable:
+                raffle_state = "portal"
+                LOG.info("Revo raffle: unavailable through web portal")
             except revo_client.RevoAccessGuarded:
                 raffle_state = "guarded"
                 LOG.info("Revo raffle: page access-guarded")
@@ -12841,12 +12869,23 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
                 raffle_state = "unavailable"
                 LOG.warning("Revo raffle: page fetch failed", exc_info=True)
             tickets = None
+            ledger_state = "ok"
             try:
-                tickets, _rows = client.get_tickets()
+                tickets = client.get_ticket_balance()
             except revo_client.RevoAuthError:
                 raise
             except Exception:  # pragma: no cover - non-fatal
-                LOG.warning("Revo raffle: ticket fetch failed", exc_info=True)
+                LOG.warning("Revo raffle: ticket balance fetch failed", exc_info=True)
+            try:
+                client.get_tickets()
+            except revo_client.RevoAuthError:
+                raise
+            except revo_client.RevoFeatureUnavailable:
+                ledger_state = "portal"
+                LOG.info("Revo raffle: ticket ledger unavailable through web portal")
+            except Exception:  # pragma: no cover - non-fatal
+                ledger_state = "unavailable"
+                LOG.info("Revo raffle: ticket activity ledger unavailable")
             prize: dict[str, str | None] = {"monthly": None, "major": None}
             try:
                 prize = client.get_prize_pool()
@@ -12854,7 +12893,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
                 raise
             except Exception:  # pragma: no cover - non-fatal
                 LOG.warning("Revo raffle: prize-pool fetch failed", exc_info=True)
-            return tickets, raffle, raffle_state, prize
+            return tickets, ledger_state, raffle, raffle_state, prize
         except revo_client.RevoUnavailable as exc:
             return f"no-credentials: {exc}"
         except revo_client.RevoAuthError as exc:
@@ -12880,7 +12919,7 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    tickets, raffle, raffle_state, prize = result
+    tickets, ledger_state, raffle, raffle_state, prize = result
     lines = ["🎰 **Revo Raffle**"]
     if personal and tickets is not None:
         display = _bot_name(interaction.user.id, interaction.user.display_name)
@@ -12898,6 +12937,10 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
             f"🎟️ **{display}** — **{tickets}** ticket{'s' if tickets != 1 else ''}"
             f"{suffix}"
         )
+    if personal and ledger_state == "portal":
+        lines.append("-# Ticket activity is unavailable through the web portal; open the Revo app.")
+    elif personal and ledger_state != "ok":
+        lines.append("-# Recent ticket activity is temporarily unavailable.")
     if raffle is not None:
         lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
         if prize.get("monthly"):
@@ -12919,7 +12962,9 @@ async def revo_raffle_cmd(interaction: discord.Interaction) -> None:
             lines.append(f"-# 🏆 {prize['monthly']}")
         if prize.get("major"):
             lines.append(f"-# 🏆 {prize['major']}")
-        if raffle_state == "guarded":
+        if raffle_state == "portal":
+            lines.append("⚠️ Raffle details are unavailable through the web portal; open the Revo app.")
+        elif raffle_state == "guarded":
             lines.append(_REVO_RAFFLE_GUARDED_MSG)
         else:
             lines.append("⚠️ Revo raffle details are temporarily unavailable.")
@@ -12982,7 +13027,7 @@ async def revo_summary_cmd(
             avail = None
             tickets_state = "ok"
             try:
-                avail, _rows = client.get_tickets()
+                avail = client.get_ticket_balance()
             except revo_client.RevoAuthError:
                 raise
             except revo_client.RevoAccessGuarded:
@@ -12991,7 +13036,18 @@ async def revo_summary_cmd(
                 tickets_state = "unreadable"
             except Exception:  # pragma: no cover - network, best effort
                 tickets_state = "unavailable"
-                LOG.warning("Revo summary: ticket fetch failed", exc_info=True)
+                LOG.warning("Revo summary: ticket balance fetch failed", exc_info=True)
+            ticket_ledger_state = "ok"
+            try:
+                client.get_tickets()
+            except revo_client.RevoAuthError:
+                raise
+            except revo_client.RevoFeatureUnavailable:
+                ticket_ledger_state = "portal"
+                LOG.info("Revo summary: ticket ledger unavailable through web portal")
+            except Exception:  # pragma: no cover - independently optional
+                ticket_ledger_state = "unavailable"
+                LOG.info("Revo summary: ticket activity ledger unavailable")
             # The weekly streak survives on the rewards landing, independently
             # of the guarded per-day calendar. Track each source separately so a
             # calendar block does not hide a valid live streak in the summary.
@@ -13027,6 +13083,8 @@ async def revo_summary_cmd(
                 raffle = client.get_raffle()
             except revo_client.RevoAuthError:
                 raise
+            except revo_client.RevoFeatureUnavailable:
+                raffle_state = "portal"
             except revo_client.RevoAccessGuarded:
                 raffle_state = "guarded"
             except revo_client.RevoPageUnreadable:
@@ -13071,6 +13129,7 @@ async def revo_summary_cmd(
                 "calendar_state": calendar_state,
                 "tickets": avail,
                 "tickets_state": tickets_state,
+                "ticket_ledger_state": ticket_ledger_state,
                 "raffle": raffle,
                 "raffle_state": raffle_state,
                 "calendar": calendar,
@@ -13100,6 +13159,7 @@ async def revo_summary_cmd(
     calendar_state = str(result.get("calendar_state") or "ok")
     tickets = result["tickets"]
     tickets_state = str(result.get("tickets_state") or "ok")
+    ticket_ledger_state = str(result.get("ticket_ledger_state") or "ok")
     raffle = result["raffle"]
     raffle_state = str(result.get("raffle_state") or "ok")
     calendar = result["calendar"] or {}
@@ -13138,6 +13198,10 @@ async def revo_summary_cmd(
         f"📅 {month_name} check-ins: {checkins_txt}",
         f"🎟️ Tickets available: {tickets_txt}",
     ]
+    if ticket_ledger_state == "portal":
+        lines.append("-# Ticket activity is unavailable through the web portal; open the Revo app.")
+    elif ticket_ledger_state != "ok":
+        lines.append("-# Recent ticket activity is temporarily unavailable.")
     if raffle is not None:
         lines.append(_format_draw_countdown(raffle.monthly_draw_days, "Monthly"))
         # Raffle opt state is personal, and this reply is public — only ever tell
@@ -13176,7 +13240,9 @@ async def revo_summary_cmd(
     if prize.get("major"):
         lines.append(f"-# 🏆 {prize['major']}")
     if raffle is None:
-        if raffle_state == "guarded":
+        if raffle_state == "portal":
+            lines.append("⚠️ Raffle details are unavailable through the web portal; open the Revo app.")
+        elif raffle_state == "guarded":
             lines.append(_REVO_RAFFLE_GUARDED_MSG)
         elif raffle_state != "ok":
             lines.append("⚠️ Revo raffle details are temporarily unavailable.")
@@ -13876,8 +13942,8 @@ async def _poll_one_account(row) -> None:
     if prev_checkin == today_iso:
         return
 
-    def _fetch() -> "tuple[str | None, int | None, str | None, bool] | str":
-        """Return (latest_iso, streak_weeks, source, streak_readable) or an error.
+    def _fetch() -> "tuple[str | None, int | None, str | None, bool, bool] | str":
+        """Return attendance/streak fields plus a degraded flag, or an error.
 
         ``source`` is ``"calendar"`` (the per-day streaks calendar — a real visit
         day) or ``"tickets"`` (the ticket-tally ``Attendance`` grant, used only
@@ -13917,39 +13983,57 @@ async def _poll_one_account(row) -> None:
                     revo_client.RevoPageUnreadable,
                 ):  # pragma: no cover
                     pass
-            return latest_iso, streak, source, streak_readable
+            return latest_iso, streak, source, streak_readable, False
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(user_id)
             return f"auth-failed: {exc}"
         except Exception as exc:  # pragma: no cover - network
-            return f"error: {exc}"
+            # Attendance sources can fail together while the rewards landing
+            # still carries a verified weekly streak. Preserve that independent
+            # signal without inventing or advancing an attendance cursor.
+            try:
+                streak = client.get_streak_weeks()
+            except revo_client.RevoAuthError as auth_exc:
+                _drop_cached_client(user_id)
+                return f"auth-failed: {auth_exc}"
+            except Exception:
+                return f"error: {exc}"
+            return None, streak, None, streak is not None, True
 
     result = await bot.loop.run_in_executor(None, _fetch)
     if isinstance(result, str):
         LOG.warning("Revo poll skipped user %s: %s", user_id, result)
         return
-    latest_iso, streak, source, streak_readable = result
-    _log_feed_source_change(source)
+    latest_iso, streak, source, streak_readable, attendance_unavailable = result
+    if attendance_unavailable:
+        LOG.warning(
+            "Revo attendance unavailable for user %s; refreshed weekly streak only",
+            user_id,
+        )
+    else:
+        _log_feed_source_change(source)
 
-    # Advance the cursor to the newest date we know about, then persist first so
-    # a notify-failure doesn't replay forever. ISO dates sort lexicographically.
+    # ISO dates sort lexicographically. Keep refreshed streak state, but don't
+    # acknowledge a new visit until Discord accepts its notification.
     cursor = max(d for d in (prev_checkin, latest_iso) if d) if (prev_checkin or latest_iso) else None
     # Persist the live streak whenever either source produced a count, including
     # zero when it lapses. Only when both sources were unreadable do we retain the
     # last known value rather than replacing it with an unverified absence.
-    db.update_revo_checkin_state(
-        user_id, cursor, streak if streak_readable else prev_streak,
-    )
+    next_streak = streak if streak_readable else prev_streak
 
     if latest_iso is None:
+        db.update_revo_checkin_state(user_id, cursor, next_streak)
         return
     if prev_checkin is None:
         # First poll after link — establish baseline silently.
+        db.update_revo_checkin_state(user_id, cursor, next_streak)
         LOG.info("Revo baseline established for user %s (date=%s)", user_id, latest_iso)
         return
     if latest_iso <= prev_checkin:
+        db.update_revo_checkin_state(user_id, cursor, next_streak)
         return
     if notify_channel_id is None:
+        db.update_revo_checkin_state(user_id, cursor, next_streak)
         return
 
     channel = bot.get_channel(int(notify_channel_id))
@@ -14046,6 +14130,8 @@ async def _poll_one_account(row) -> None:
         )
     except discord.HTTPException:
         LOG.exception("Revo poll: failed to post attendance ping for user %s", user_id)
+        return
+    db.update_revo_checkin_state(user_id, cursor, next_streak)
 
 
 @revo_attendance_poll.before_loop
@@ -14768,9 +14854,12 @@ class StravaCardioPickerView(discord.ui.View):
                     label=str(program["name"])[:100],
                     value=str(program["id"]),
                     description=(
-                        f"{cardio.format_number(cardio.total_minutes(
-                            cardio.segments_from_rows(program['segments'])
-                        ))} mins · {str(program['pace']).replace('_', ' ')} pace"
+                        "{} mins · {} pace".format(
+                            cardio.format_number(cardio.total_minutes(
+                                cardio.segments_from_rows(program["segments"])
+                            )),
+                            str(program["pace"]).replace("_", " "),
+                        )
                     )[:100],
                     default=index == 0,
                 )

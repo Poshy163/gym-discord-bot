@@ -1109,6 +1109,38 @@ def test_member_exposes_presence_tracking_state(tmp_path):
     _run(go())
 
 
+def test_member_exposes_only_safe_revo_cache_metadata(tmp_path):
+    """The member page can label cached Revo data without leaking credentials
+    or notification destinations from the linked-account row."""
+    async def go():
+        db = Database(tmp_path / "g.sqlite3")
+        db.upsert_member(1, 100, "alice", "Alice")
+        db.link_revo_account(100, "alice@example.test", "encrypted-secret",
+                             7, 2, 3, 1, 99)
+        db.update_revo_checkin_state(100, "2026-09-06", 4)
+        app = build_app(db=db, password="secret")
+        client = await _client(app)
+        try:
+            await _login(client)
+            member = await (await client.get(
+                "/api/member?guild=1&user=100"
+            )).json()
+            assert member["revo_linked"] is True
+            assert member["revo"]["last_checkin_date"] == "2026-09-06"
+            assert member["revo"]["streak_weeks"] == 4
+            assert member["revo"]["last_polled_at"]
+            assert set(member["revo"]) == {
+                "last_polled_at", "last_checkin_date", "streak_weeks",
+            }
+            serialized = str(member)
+            for secret in ("alice@example.test", "encrypted-secret"):
+                assert secret not in serialized
+        finally:
+            await client.close()
+            db.close()
+    _run(go())
+
+
 def test_member_exposes_nutrition_streaks(tmp_path):
     async def go():
         db = Database(tmp_path / "g.sqlite3")

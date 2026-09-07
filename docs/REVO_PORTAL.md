@@ -1,5 +1,15 @@
 # Revo Fitness Client Portal — Reverse-Engineering Notes
 
+> **7 September 2026 Android investigation:** Calendar, raffle, ticket history
+> and prize reads are restored. Revo Android 4.3 obtains a BMA SSO token from
+> Netpulse and passes it to the rewards WebView as `?token=...`. Cookie-only
+> portal login lacks that context and redirects these pages to `/?closePage`.
+> The client now performs the verified token exchange with bounded refresh;
+> all seven source probes pass on the authorised account. See the
+> [APK trace and live capability matrix](APPLICATION_AUDIT_2026-09-07.md).
+> Earlier endpoint/header conclusions below describe historical cookie-only
+> tests and must not be read as limitations of the restored app-token path.
+
 > ⚠️ **Security note:** Credentials have been shared in plaintext during research
 > more than once (most recently 2026-07). **Rotate the Revo password**, and never
 > commit credentials to the repo. Treat these notes as "what we discovered" —

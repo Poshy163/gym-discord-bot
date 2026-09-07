@@ -613,6 +613,7 @@ def test_get_raffle_rejects_empty_or_unexpected_page(monkeypatch):
 def test_get_streak_calendar_raises_on_guard(monkeypatch):
     c = revo_client.RevoClient("e@x", "pw")
     c._logged_in = True
+    monkeypatch.setattr(revo_client.revo_netpulse.NetpulseClient, "get_rewards_token", lambda *a, **k: "synthetic-token")
     monkeypatch.setattr(
         c._http, "get", lambda *a, **k: _FakeResp(revo_client.GUARD_BODY),
     )
@@ -624,6 +625,7 @@ def test_get_streak_calendar_raises_on_guard(monkeypatch):
 def test_get_streak_calendar_raises_on_unexpected_200_shape(monkeypatch):
     c = revo_client.RevoClient("e@x", "pw")
     c._logged_in = True
+    monkeypatch.setattr(revo_client.revo_netpulse.NetpulseClient, "get_rewards_token", lambda *a, **k: "synthetic-token")
     monkeypatch.setattr(c._http, "get", lambda *a, **k: _FakeResp("<html>login</html>"))
     with pytest.raises(revo_client.RevoPageUnreadable):
         c.get_streak_calendar(8, 2026)
@@ -633,6 +635,7 @@ def test_get_streak_calendar_raises_on_unexpected_200_shape(monkeypatch):
 def test_get_streak_calendar_rejects_incomplete_requested_month(monkeypatch):
     c = revo_client.RevoClient("e@x", "pw")
     c._logged_in = True
+    monkeypatch.setattr(revo_client.revo_netpulse.NetpulseClient, "get_rewards_token", lambda *a, **k: "synthetic-token")
     body = (
         '{"month_name":"August","weeks_data":{'
         '"week1":{"1":"0","2":"1"},"week2":[]}}'
@@ -871,6 +874,9 @@ class _HealthClient:
     def get_tickets(self):
         return (self._act("tickets", 41), [])
 
+    def get_ticket_balance(self):
+        return self._act("tickets", 41)
+
     def get_raffle(self):
         return self._act("raffle", revo_client.RaffleInfo(1, 2, True))
 
@@ -887,7 +893,7 @@ def test_probe_sources_all_healthy():
     sources = revo_client.probe_sources(_HealthClient(), 8, 2026)
     assert {s.label for s in sources} == {
         "Check-in calendar", "Weekly streak", "Tickets",
-        "Raffle", "Prize pool", "Rewards landing",
+        "Raffle", "Prize pool", "Rewards landing", "Ticket balance",
     }
     assert all(s.ok for s in sources), [(s.label, s.status) for s in sources]
 
@@ -930,5 +936,5 @@ def test_probe_sources_survives_a_totally_broken_client():
         raffle="boom", prize="boom", landing="boom",
     )
     sources = revo_client.probe_sources(client, 8, 2026)
-    assert len(sources) == 6
+    assert len(sources) == 7
     assert all(s.status == revo_client.HEALTH_ERROR for s in sources)

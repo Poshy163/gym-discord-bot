@@ -781,6 +781,7 @@ def build_app(
         start, end = _today()
         cal_goal = db.calorie_goal_get(gid, uid)
         pro_goal = db.protein_goal_get(gid, uid)
+        revo = db.get_revo_account(uid)
         cal_today, _ = db.calorie_total_between(gid, uid, start, end)
         pro_today, _ = db.protein_total_between(gid, uid, start, end)
         bw = [
@@ -829,7 +830,24 @@ def build_app(
             "overview": _stringify_ids(overview),
             "audit": audit,
             "strava_linked": db.get_strava_account(uid) is not None,
-            "revo_linked": db.get_revo_account(uid) is not None,
+            "revo_linked": revo is not None,
+            # The dashboard may show only non-sensitive cached poll metadata.
+            # In particular, never expose the linked email, encrypted password,
+            # ticket signature, or the notification destination.
+            "revo": (
+                {
+                    # Keep this projection tolerant of old/synthetic account
+                    # rows used by maintenance tooling. A missing cache field
+                    # means "not checked", never a member-page 500.
+                    "last_polled_at": revo["last_polled_at"]
+                    if "last_polled_at" in revo.keys() else None,
+                    "last_checkin_date": revo["last_checkin_date"]
+                    if "last_checkin_date" in revo.keys() else None,
+                    "streak_weeks": revo["last_streak_weeks"]
+                    if "last_streak_weeks" in revo.keys() else None,
+                }
+                if revo is not None else None
+            ),
             # The member's own Home Assistant. Only ever the host they connected
             # to -- the stored token is encrypted and is never exposed here.
             "ha_server": (
@@ -2222,6 +2240,7 @@ LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gym Dashboard — Sign in</title>
+<meta name="theme-color" content="#0b0e14">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
 :root{color-scheme:dark}
@@ -2252,6 +2271,13 @@ button:hover{filter:brightness(1.08)}
 button:focus-visible,input:focus-visible{outline:2px solid #67e8f9;outline-offset:2px}
 .err{color:#f85149;margin:0 0 .75rem;font-size:.88rem}
 .sub{color:#6e7681;font-size:.78rem;margin-top:1.25rem;text-align:center}
+@media (prefers-color-scheme:light){
+  :root{color-scheme:light}
+  body{color:#18212b;background:radial-gradient(1200px 600px at 50% -10%,#dbeafe 0%,#f6f8fb 58%)}
+  .card{background:rgba(255,255,255,.82);border-color:#cbd5e1;box-shadow:0 24px 60px #64748b33}
+  label,.sub{color:#52606d}.remember{color:#334155}.remember small{color:#64748b}
+  input{color:#18212b;background:#fff;border-color:#94a3b8}
+}
 </style></head><body>
 <form class="card" method="post" action="/login">
 <div class="brand"><img src="/logo.svg" alt=""><b>Gym Dashboard</b></div>
@@ -2305,6 +2331,7 @@ this page can claim the bot — keep the port off the public internet.</p>
 DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gym Dashboard</title>
+<meta name="theme-color" content="#0b0e14">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
 :root{
@@ -2314,6 +2341,22 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   --indigo:#818cf8; --cyan:#22d3ee; --accent:linear-gradient(90deg,#6366f1,#22d3ee);
   --header-h:112px;
 }
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#f6f8fb; --panel:#ffffff; --panel2:#f1f5f9; --line:#cbd5e1;
+  --text:#172033; --muted:#52606d; --faint:#64748b;
+  --indigo:#4f46e5; --cyan:#0891b2;
+}
+:root[data-theme="light"] body{background:radial-gradient(1100px 520px at 100% -5%,#dbeafe 0%,rgba(246,248,251,0) 60%),radial-gradient(900px 500px at -5% 0%,#cffafe 0%,rgba(246,248,251,0) 55%),var(--bg)}
+:root[data-theme="light"] .chrome{background:rgba(255,255,255,.84);box-shadow:0 8px 24px #64748b22}
+:root[data-theme="light"] nav{background:rgba(248,250,252,.82)}
+:root[data-theme="light"] nav a:hover{background:#e2e8f0}
+:root[data-theme="light"] nav a.active{color:#172033;background:linear-gradient(90deg,#c7d2fe,#cffafe);box-shadow:inset 0 0 0 1px #a5b4fc}
+:root[data-theme="light"] .stat{background:linear-gradient(180deg,#fff,#f8fafc)}
+:root[data-theme="light"] thead th{background:#f1f5f9}
+:root[data-theme="light"] tbody td{border-color:#e2e8f0}
+:root[data-theme="light"] tbody tr:hover td{background:#eef2ff}
+:root[data-theme="light"] .box,:root[data-theme="light"] .act-card,:root[data-theme="light"] .vc-chan{box-shadow:0 1px 2px #64748b12}
 *{box-sizing:border-box}
 body{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;color:var(--text);
 background:radial-gradient(1100px 520px at 100% -5%,#172036 0%,rgba(11,14,20,0) 60%),
@@ -2358,6 +2401,13 @@ td.right{text-align:right}
 .bwlist summary{cursor:pointer;font-size:13px}
 .bwlist table{margin-top:6px;font-size:13px}
 form.inline{margin:0}
+.connection{display:inline-flex;align-items:center;gap:.38rem;padding:.3rem .55rem;
+border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.76rem;
+white-space:nowrap;font-variant-numeric:tabular-nums}
+.connection-dot{width:8px;height:8px;border-radius:50%;background:#6e7681;flex:none}
+.connection.connected .connection-dot{background:#3fb950;box-shadow:0 0 0 3px #3fb95022}
+.connection.attention .connection-dot{background:#e3b341;box-shadow:0 0 0 3px #e3b34122}
+.connection.disconnected .connection-dot{background:#f85149;box-shadow:0 0 0 3px #f8514922}
 
 /* nav */
 nav{display:flex;gap:.3rem;padding:.55rem 1.4rem;flex-wrap:nowrap;overflow-x:auto;
@@ -2430,6 +2480,8 @@ color:#fff;font-weight:600;font-size:.8em}
 .pill{display:inline-flex;align-items:center;gap:.35rem;padding:.16rem .6rem;
 border-radius:999px;font-size:.78rem;border:1px solid var(--line);margin:2px 1px;
 background:#ffffff08}
+.revo-cache{max-width:100%;white-space:normal;line-height:1.35}
+.revo-cache>span{min-width:0}
 .pill .dot{width:8px;height:8px;border-radius:50%}
 .modrow{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:.35rem 0}
 .pill a.rmrole{cursor:pointer;color:var(--faint);margin-left:.15rem;font-size:.8em}
@@ -2778,6 +2830,7 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
   header .sp{display:none}
   .header-action .btn-label{display:none}
   .header-action{padding:.45rem .58rem}
+  .connection{padding:.38rem}.connection-label{display:none}
   nav{padding:.45rem .65rem}
   nav a{padding:.4rem .68rem;font-size:.86rem}
   main{padding:1rem .75rem 4rem}
@@ -2830,6 +2883,12 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
   <div class="gselect"><label class="sr-only" for="guild">Discord server</label>
     <select id="guild" onchange="onGuild()" aria-label="Discord server"></select></div>
   <span class="sp"></span>
+  <div class="connection attention" id="connectionState" role="status" aria-live="polite"
+    aria-atomic="true" title="Checking dashboard connection"><span class="connection-dot"
+    aria-hidden="true"></span><span class="connection-label">Checking connection</span></div>
+  <button class="btn header-action" id="themeBtn" type="button" onclick="cycleTheme()"
+    aria-label="Switch colour theme" title="Switch colour theme"><span aria-hidden="true">◐</span>
+    <span class="btn-label">Theme</span></button>
   <button class="btn header-action" id="syncBtn" onclick="resync()"
     title="Re-pull members and roles from Discord"><span aria-hidden="true">↻</span>
     <span class="btn-label">Sync</span></button>
@@ -2871,6 +2930,58 @@ function actionLabel(a){return ACTION_LABEL[a]||esc(a);}
 let guild=null,tab="overview",AV={},dataUserFilter=null,auditCat="",currentMember=null,lbEquip="",currentFoods=[],currentNutrition=null,auditOffset=0,auditRows=[],ALL_ROLES=[];
 // Current search term, persisted across live re-renders so typing isn't lost.
 let SEARCH="";
+let THEME="system",LAST_VERIFIED=0,CONNECTION_KIND="loading";
+
+function applyTheme(){
+  const prefersLight=window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches;
+  const resolved=THEME==="system"?(prefersLight?"light":"dark"):THEME;
+  document.documentElement.dataset.theme=resolved;
+  const themeMeta=document.querySelector('meta[name="theme-color"]');
+  if(themeMeta)themeMeta.content=resolved==="light"?"#f6f8fb":"#0b0e14";
+  const btn=document.getElementById("themeBtn");
+  if(btn){const label=`Theme: ${THEME}${THEME==="system"?` (${resolved})`:""}`;
+    btn.title=`${label}. Click to change.`;btn.setAttribute("aria-label",label);}
+}
+function initTheme(){
+  try{THEME=localStorage.getItem("gymdash-theme")||"system";}catch(e){}
+  if(!["system","dark","light"].includes(THEME))THEME="system";
+  applyTheme();
+}
+function cycleTheme(){
+  THEME=THEME==="system"?"dark":THEME==="dark"?"light":"system";
+  try{localStorage.setItem("gymdash-theme",THEME);}catch(e){}
+  applyTheme();toast(`Theme: ${THEME}`);
+}
+function connectionState(kind,detail){
+  const el=document.getElementById("connectionState");if(!el)return;
+  CONNECTION_KIND=kind;
+  const now=Date.now();let label,title;
+  if(kind==="connected"){
+    LAST_VERIFIED=now;label="Dashboard connected";title="Dashboard API responded just now.";
+  }else if(kind==="refresh"){
+    label="Refresh to verify";title=detail||"The network changed. Refresh to verify dashboard data.";
+  }else if(kind==="attention"){
+    label="Dashboard action unavailable";title=detail||"The dashboard responded, but this action is unavailable.";
+  }else if(kind==="worker-down"){
+    label="Bot disconnected";title="The dashboard is available, but the Discord bot is not running. Check Settings.";
+  }else if(kind==="offline"){
+    label="You are offline";title="This browser has no network connection. Showing the last rendered data.";
+  }else{
+    label="Dashboard unavailable";title=detail||"The dashboard service did not respond. Showing the last rendered data.";
+  }
+  el.className=`connection ${kind==="connected"?"connected":kind==="offline"||kind==="error"?"disconnected":"attention"}`;
+  el.title=title;el.setAttribute("aria-label",`${label}. ${title}`);
+  const text=el.querySelector(".connection-label");if(text)text.textContent=label;
+}
+function refreshConnectionAge(){
+  if(CONNECTION_KIND!=="connected"||!LAST_VERIFIED||Date.now()-LAST_VERIFIED<120000)return;
+  const el=document.getElementById("connectionState");if(!el)return;
+  const mins=Math.floor((Date.now()-LAST_VERIFIED)/60000);
+  el.className="connection attention";
+  el.title=`No dashboard API response has been checked for ${mins} minute${mins===1?"":"s"}. This does not describe Discord or Revo freshness.`;
+  el.setAttribute("aria-label",`Dashboard not recently checked. ${el.title}`);
+  const text=el.querySelector(".connection-label");if(text)text.textContent="Dashboard not recently checked";
+}
 
 function searchBar(ph){
   const label=ph||"Search";
@@ -3088,18 +3199,25 @@ function who(uid,name){return `<span class="who">${avFor(uid,name)}<a class="lin
 function toLogin(){
   location.href="/login?next="+encodeURIComponent(location.pathname+location.search);
 }
-async function api(p){const r=await fetch(p);if(r.status===401){toLogin();return null;}
-  if(!r.ok)throw new Error((await r.text())||`Request failed (${r.status})`);
-  return r.json();}
+async function api(p){let r;
+  try{r=await fetch(p);}catch(e){connectionState(navigator.onLine?"error":"offline");
+    throw new Error(navigator.onLine?"Dashboard service is unreachable.":"You appear to be offline.");}
+  if(r.status===401){toLogin();return null;}
+  if(!r.ok){const text=await r.text();let data={};try{data=text?JSON.parse(text):{};}catch(e){}
+    connectionState(data.worker_down?"worker-down":"attention",data.error||text);
+    throw new Error(data.error||text||`Request failed (${r.status})`);}
+  connectionState("connected");return r.json();}
 async function post(p,b){
   let r;
   try{r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(b)});}
-  catch(e){return {ok:false,error:"Dashboard service is unreachable."};}
+  catch(e){connectionState(navigator.onLine?"error":"offline");return {ok:false,error:"Dashboard service is unreachable."};}
   if(r.status===401){toLogin();return null;}
   const text=await r.text();let data={};
   try{data=text?JSON.parse(text):{};}catch(e){data={error:text};}
-  if(!r.ok)return {ok:false,error:data.error||text||`Request failed (${r.status})`};
+  if(!r.ok){if(r.status>=500)connectionState(data.worker_down?"worker-down":"attention",data.error||text);
+    return {ok:false,error:data.error||text||`Request failed (${r.status})`};}
+  connectionState("connected");
   return data;
 }
 function spinner(){return '<div class="center" role="status"><div class="spin" aria-hidden="true"></div><span>Loading…</span></div>';}
@@ -3371,7 +3489,7 @@ function adminUserControl(s,id,dis){
   return `<input type="hidden" id="${id}" value="${esc(s.value)}">
     <div class="admin-picker">
       <div class="admin-summary">${adminSummary(s.value)}</div>
-      <button class="btn sm" onclick="openAdminPicker()"${dis}>Select profiles</button>
+      <button class="btn sm" aria-label="Select ${esc(s.label)}" onclick="openAdminPicker()"${dis}>Select profiles</button>
     </div>`;
 }
 
@@ -3392,21 +3510,21 @@ function settingRow(s){
   }else if(s.kind==="bool"){
     const on=String(s.value).toLowerCase();
     const isOn=["1","true","yes","y","on"].includes(on);
-    control=`<div class="seg" id="${id}" data-val="${isOn}">
-      <button class="${isOn?"on":""}" onclick="setBool('${s.key}',true)"${dis}>On</button>
-      <button class="${!isOn?"on":""}" onclick="setBool('${s.key}',false)"${dis}>Off</button></div>`;
+    control=`<div class="seg" id="${id}" data-val="${isOn}" role="group" aria-label="${esc(s.label)}">
+      <button class="${isOn?"on":""}" aria-label="Turn ${esc(s.label)} on" onclick="setBool('${s.key}',true)"${dis}>On</button>
+      <button class="${!isOn?"on":""}" aria-label="Turn ${esc(s.label)} off" onclick="setBool('${s.key}',false)"${dis}>Off</button></div>`;
   }else if(s.choices&&s.choices.length){
-    control=`<select id="${id}"${dis}>`+s.choices.map(c=>
+    control=`<select id="${id}" aria-label="${esc(s.label)}"${dis}>`+s.choices.map(c=>
       `<option value="${esc(c)}"${String(s.value)===c?" selected":""}>${esc(c)}</option>`).join("")
       +`</select><button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`;
   }else if(s.secret){
     const hint=s.is_set?`<span class="faint">${esc(s.masked)}</span>`:'<span class="faint">not set</span>';
-    control=`<input type="password" id="${id}" placeholder="${s.is_set?"unchanged":"not set"}"
+    control=`<input type="password" id="${id}" aria-label="${esc(s.label)}" placeholder="${s.is_set?"unchanged":"not set"}"
       autocomplete="new-password"${dis}>${hint}
       <button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`
       +(s.is_set?`<button class="btn sm" onclick="clearSetting('${s.key}')"${dis}>Clear</button>`:"");
   }else{
-    control=`<input type="text" id="${id}" value="${esc(s.value)}"${dis}>
+    control=`<input type="text" id="${id}" aria-label="${esc(s.label)}" value="${esc(s.value)}"${dis}>
       <button class="btn sm" onclick="saveSetting('${s.key}')"${dis}>Save</button>`;
   }
 
@@ -3650,7 +3768,16 @@ async function renderMembers(v){
         ${m.present?'':'<span class="pill faint">left</span>'}</td>
       <td class="muted">${esc(m.username)}</td>
       <td>${m.role_count}</td>
-      <td class="muted">${fmtTs(m.joined_at)}</td></tr>`).join("")}</tbody></table></div>`;
+    <td class="muted">${fmtTs(m.joined_at)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function revoPill(revo){
+  if(!revo)return "";
+  if(!revo.last_polled_at)return '<span class="pill faint revo-cache" title="Linked, but no Revo poll has been saved yet."><span>Revo cached · no saved poll</span></span>';
+  const checked=fmtTs(revo.last_polled_at);
+  const streak=revo.streak_weeks==null?"":` · ${revo.streak_weeks} week${revo.streak_weeks===1?"":"s"}`;
+  const visit=revo.last_checkin_date?` Latest stored check-in: ${revo.last_checkin_date}.`:"";
+  return `<span class="pill faint revo-cache" title="Last saved Revo poll: ${esc(checked)}.${esc(visit)} This is cached metadata and does not prove Revo is reachable now."><span>Revo cached · last saved ${esc(checked)}${esc(streak)}</span></span>`;
 }
 
 async function memberView(uid){
@@ -3674,7 +3801,7 @@ async function memberView(uid){
       <div><h2>${esc(m.display_name||uid)}</h2>
       <div class="muted">${esc(m.username||"")}</div>
       <div class="chips">${d.strava_linked?'<span class="pill">🟧 Strava</span>':''}
-        ${d.revo_linked?'<span class="pill">🟢 Revo</span>':''}
+        ${revoPill(d.revo)}
         ${d.ha_server?`<span class="pill" title="${esc(d.ha_server)}${d.ha_prefix?" · "+esc(d.ha_prefix):" · no sensors linked yet"}">🏠 Home Assistant</span>`:''}
         ${d.calorie_streak>=2?`<span class="pill">🔥 ${d.calorie_streak}d calories</span>`:''}
         ${d.protein_streak>=2?`<span class="pill">🔥 ${d.protein_streak}d protein</span>`:''}
@@ -3700,7 +3827,7 @@ async function memberView(uid){
             `<div class="faint" style="margin-top:3px;font-size:11px">also: ${
               f.aliases.map(a=>`<span class="pill">${esc(a)}
                 <a class="link" title="remove this name"
-                   onclick="foodAliasDel('${uid}','${esc(a)}')">×</a></span>`).join(" ")
+                   onclick="foodAliasDel(${jsq(uid)},${jsq(a)})">×</a></span>`).join(" ")
             }</div>`:''}</td>
           <td>${Math.round(f.kcal)} kcal</td>
           <td>${f.protein_g!=null?Math.round(f.protein_g)+' g':'<span class="faint">—</span>'}</td>
@@ -3802,7 +3929,7 @@ function foodAliasAdd(uid,i){
       anything else you call it.</div>
     <label>Name</label><input id="fa_alias" placeholder="e.g. boneless wicked wings">
     <div class="dlg-actions"><button class="btn" onclick="editDlg.close()">Cancel</button>
-    <button class="btn primary" onclick="foodAliasSave('${uid}','${esc(f.name)}')">Add</button></div>`;
+    <button class="btn primary" onclick="foodAliasSave(${jsq(uid)},${jsq(f.name)})">Add</button></div>`;
   dlg.showModal();
 }
 async function foodAliasSave(uid,name){
@@ -3890,7 +4017,7 @@ async function sendInvite(){
   if(!r)return;
   if(r.ok){
     res.innerHTML=`<div class="kv"><span>Invite</span><span><a class="link" href="${esc(r.link)}" target="_blank">${esc(r.link)}</a>
-      <button class="btn sm" onclick="navigator.clipboard.writeText('${esc(r.link)}');toast('Copied')">Copy</button></span></div>
+      <button class="btn sm" onclick="navigator.clipboard.writeText(${jsq(r.link)});toast('Copied')">Copy</button></span></div>
       <div style="margin-top:.5rem" class="${r.dmed?'':'faint'}">${r.dmed?'✅ DM sent to the user.'
         :'⚠️ Could not DM them'+(r.error?': '+esc(r.error):'')+'. Share the link manually.'}</div>`;
     toast(r.dmed?"Invite sent ✓":"Invite link ready");
@@ -3941,7 +4068,7 @@ async function renderRoles(v){
     <tbody>${d.roles.map(r=>`<tr>
       <td><span class="pill"><span class="dot" style="background:${roleColor(r.color)}"></span>${esc(r.name)}</span>
         ${r.managed?'<span class="pill faint">managed</span>':''}</td>
-      <td><a class="link" onclick="roleView('${r.role_id}','${esc(r.name).replace(/'/g,"&#39;")}')">${r.members}</a></td>
+      <td><a class="link" onclick="roleView(${jsq(r.role_id)},${jsq(r.name)})">${r.members}</a></td>
       <td class="muted">${r.position}</td></tr>`).join("")}</tbody></table></div>`;
 }
 async function roleView(rid,name){
@@ -4003,7 +4130,7 @@ function dataRow(kind,r){
   if(kind==="lifts")cells=`<td><b>${esc(r.equipment)}</b></td><td>${r.weight_kg}${r.bw?' <span class="faint">(BW+)</span>':''}</td><td class="muted">${r.reps??""}</td>`;
   else if(kind==="calories")cells=`<td><b>${Math.round(r.kcal)}</b></td><td class="muted">${esc(r.note||"")}</td>`;
   else cells=`<td><b>${Math.round(r.grams)} g</b></td><td class="muted">${esc(r.note||"")}</td>`;
-  const editBtn=kind==="lifts"?`<button class="btn sm" onclick='editLift(${JSON.stringify(r)})'>Edit</button>`:"";
+  const editBtn=kind==="lifts"?`<button class="btn sm" onclick="editLiftJson(${jsq(JSON.stringify(r))})">Edit</button>`:"";
   return `<tr><td class="muted" style="white-space:nowrap">${fmtTs(r.logged_at)}</td>
     <td>${who(r.user_id,r.username)}</td>${cells}
     <td><div class="row-actions">${editBtn}
@@ -4014,6 +4141,7 @@ async function delData(kind,id){
   const path={lifts:"/api/lifts/delete",calories:"/api/calories/delete",protein:"/api/protein/delete"}[kind];
   const r=await post(path,{guild,id});toast(r&&r.ok?"Deleted ✓":"Failed");render();
 }
+function editLiftJson(raw){editLift(JSON.parse(raw));}
 function editLift(r){
   const dlg=document.getElementById("editDlg");
   dlg.innerHTML=`<h2>Edit lift</h2>
@@ -4095,7 +4223,7 @@ function hevyMapDraw(){
       <td><input value="${esc(r.equipment)}" id="hevyEq-${esc(r.template_id)}"
         style="min-width:180px">${r.overridden?' <span class="pill">pinned</span>':''}</td>
       <td class="right"><button class="btn sm"
-        onclick="hevyMapSave('${esc(r.template_id)}')">Save</button></td>
+        onclick="hevyMapSave(${jsq(r.template_id)})">Save</button></td>
     </tr>`).join("")}
   </tbody></table>
   ${rows.length>shown.length?`<p class="muted">…and ${rows.length-shown.length} more — narrow the filter.</p>`:""}`;
@@ -4427,7 +4555,7 @@ function mediaHtml(media){
     m.kind==="video"
     ? `<video class="dc-att" src="${esc(m.url)}" autoplay loop muted playsinline></video>`
     : m.kind==="image"
-    ? `<img class="dc-att" src="${esc(m.url)}" loading="lazy" alt="" onclick="window.open('${esc(m.url)}','_blank')">`
+    ? `<img class="dc-att" src="${esc(m.url)}" loading="lazy" alt="" onclick="window.open(${jsq(m.url)},'_blank','noopener')">`
     : `<a class="dc-file" href="${esc(m.url)}" target="_blank" rel="noopener">📎 ${esc(m.name||"file")}</a>`
   ).join("")}</div>`;
 }
@@ -4584,6 +4712,11 @@ window.addEventListener("keydown",event=>{
   const search=document.querySelector("#view .search");
   if(search){event.preventDefault();search.focus();search.select();}
 });
+
+window.addEventListener("offline",()=>connectionState("offline"));
+window.addEventListener("online",()=>{connectionState("refresh","Network restored; refresh to verify dashboard data.");});
+initTheme();
+setInterval(refreshConnectionAge,30000);
 
 boot().catch(error=>{
   const view=document.getElementById("view");

@@ -26,7 +26,7 @@ import os
 import signal
 import sys
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import config as config_mod
@@ -414,6 +414,25 @@ async def _sleep_until(hour: int, minute: int, tz) -> None:
     await asyncio.sleep(max(1.0, (target - now).total_seconds()))
 
 
+async def _to_thread_drain_on_cancel(func, /, *args):
+    """Run blocking work and join its thread before propagating cancellation."""
+    work = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        # asyncio.to_thread cannot stop a function already executing.  Draining
+        # it here keeps shutdown from closing SQLite under an in-flight backup.
+        await work
+        raise
+
+
+async def _cancel_and_drain(tasks: list[asyncio.Task]) -> None:
+    """Cancel background loops and wait until their cleanup has settled."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def backup_loop(db: Database, settings: SettingsService) -> None:
     """Nightly snapshot into BACKUP_DIR.
 
@@ -435,19 +454,27 @@ async def backup_loop(db: Database, settings: SettingsService) -> None:
         stamp = datetime.now(_tz_of(cfg)).strftime("%Y%m%d")
         dest = backup_dir / f"gym-{stamp}.sqlite3"
         try:
-            await asyncio.to_thread(db.backup_to, dest)
+            await _to_thread_drain_on_cancel(db.backup_to, dest)
         except Exception:
             LOG.exception("Nightly DB backup failed")
             continue
         try:
-            ok, detail = await asyncio.to_thread(db.verify_snapshot, dest)
+            ok, detail = await _to_thread_drain_on_cancel(db.verify_snapshot, dest)
         except Exception:
             LOG.exception("DB backup verification raised: %s", dest)
+            with contextlib.suppress(OSError):
+                dest.unlink()
+            continue
         else:
             if ok:
                 LOG.info("DB backup written and verified: %s", dest)
             else:
                 LOG.error("DB backup FAILED verification (%s): %s", detail, dest)
+                # Do not let an invalid newest snapshot displace a known-good
+                # older one during rotation.
+                with contextlib.suppress(OSError):
+                    dest.unlink()
+                continue
         try:
             snaps = sorted(backup_dir.glob("gym-*.sqlite3"))
             for old in snaps[: max(0, len(snaps) - keep)]:
@@ -642,8 +669,7 @@ async def _run() -> int:
     await stop.wait()
 
     LOG.info("Shutting down.")
-    for task in tasks:
-        task.cancel()
+    await _cancel_and_drain(tasks)
     await supervisor.shutdown()
     if runner is not None:
         await runner.cleanup()

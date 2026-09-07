@@ -88,12 +88,14 @@ import math
 import os
 import re
 import threading
+from urllib.parse import urljoin, urlsplit
 import time
 from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Any, Optional
 
 from . import revo_client  # for state_for_club() — the primary state source
+from . import revo_http
 
 LOG = logging.getLogger("gymbot.revo.perfectgym")
 
@@ -308,6 +310,9 @@ def parse_members_in_clubs(payload: Any) -> list[ClubOccupancy]:
         if not isinstance(name, str) or not name.strip():
             continue
         name = name.strip()
+        count = _as_opt_int(entry.get("UsersCountCurrentlyInClub"))
+        if count is None or count < 0:
+            continue
         suburb_addr, state_addr = _suburb_state_from_address(entry.get("ClubAddress"))
         # Primary: our curated name→state directory; fallback: the parsed tail.
         state = revo_client.state_for_club(name) or state_addr
@@ -319,7 +324,7 @@ def parse_members_in_clubs(payload: Any) -> list[ClubOccupancy]:
                 name=name,
                 suburb=suburb,
                 state=state,
-                count=_as_int(entry.get("UsersCountCurrentlyInClub")),
+                count=count,
                 capacity=_as_opt_int(entry.get("UsersLimit")),
             )
         )
@@ -767,9 +772,14 @@ def _needs_relogin(response: Any) -> bool:
     or a ``401``.
     """
     status = getattr(response, "status_code", None)
-    if status == 401:
+    if status == 401 or revo_http.is_login_html(response):
         return True
-    return isinstance(status, int) and 300 <= status < 400
+    if isinstance(status, int) and 300 <= status < 400:
+        location = getattr(response, "headers", {}).get("Location", "")
+        target = urlsplit(urljoin(PERFECTGYM_BASE + "/", location))
+        return (target.hostname == urlsplit(PERFECTGYM_BASE).hostname
+                and target.path.rstrip("/").lower().endswith("/auth/login"))
+    return False
 
 
 class PerfectGymClient:
@@ -791,7 +801,7 @@ class PerfectGymClient:
         self._password = password
         self._http = requests.Session()
         self._http.headers.update(DEFAULT_HEADERS)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._logged_in = False
         # Non-secret session context (the only *public* thing kept from the
         # profile). home_club_id is a plain int; everything below is private.
@@ -822,22 +832,30 @@ class PerfectGymClient:
             self._login_locked()
 
     def _login_locked(self) -> None:
-        r = self._http.post(
+        self._logged_in = False
+        self.home_club_id = None
+        self._membership = self._user_number = self._first_name = self._photo_url = None
+        self._http.cookies.clear()
+        r = revo_http.request(self._http, "post",
             PERFECTGYM_BASE + LOGIN_PATH,
+            PerfectGymUnavailable,
             data=json.dumps(
                 {"RememberMe": False, "Login": self.email, "Password": self._password}
             ),
             timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
         )
         try:
             body = r.json()
         except ValueError:
             body = None
+        if r.status_code == 429 or r.status_code >= 500:
+            revo_http.check_status(r, PerfectGymUnavailable)
         has_token = any(c.name == "CpAuthToken" for c in self._http.cookies)
-        has_profile = isinstance(body, dict) and isinstance(body.get("User"), dict)
+        has_profile = _member(body) is not None
         if r.status_code != 200 or not (has_token or has_profile):
             raise PerfectGymAuthError(
-                f"PerfectGym login failed for {self.email!r} (status {r.status_code})."
+                f"PerfectGym login failed (HTTP {r.status_code}). Check credentials and relink your account."
             )
         self.home_club_id = _home_club_id(body)
         # Stash the two profile projections we serve later, straight off this
@@ -851,22 +869,23 @@ class PerfectGymClient:
         self._first_name = _first_name(body)
         self._photo_url = _photo_url(body)
         self._logged_in = True
-        # Non-secret log line only: email + the home-club integer. Never the
-        # token, the profile body, the membership flags, or the barcode.
-        LOG.info(
-            "PerfectGym login OK email=%s home_club_id=%s",
-            self.email, self.home_club_id,
-        )
+        # Record only the stage, never account context or response bodies.
+        LOG.info("PerfectGym login succeeded")
 
     def _do_get(self, path: str) -> Any:
-        return self._http.get(
+        return revo_http.request(self._http, "get",
             PERFECTGYM_BASE + path,
+            PerfectGymUnavailable,
             timeout=REQUEST_TIMEOUT,
             allow_redirects=False,
         )
 
     def _get_json(self, path: str) -> Any:
         """GET ``path`` as JSON, re-logging in once on session expiry."""
+        with self._lock:
+            return self._get_json_locked(path)
+
+    def _get_json_locked(self, path: str) -> Any:
         if not self._logged_in:
             self.login()
         r = self._do_get(path)
@@ -876,18 +895,31 @@ class PerfectGymClient:
             self.login()
             r = self._do_get(path)
             if _needs_relogin(r):
+                self._logged_in = False
                 raise PerfectGymAuthError(
                     "PerfectGym session could not be re-established "
                     f"(status {getattr(r, 'status_code', '?')})."
                 )
-        r.raise_for_status()
-        return r.json()
+        revo_http.check_status(r, PerfectGymUnavailable)
+        if 300 <= r.status_code < 400:
+            raise PerfectGymUnavailable("PerfectGym returned an unexpected redirect.")
+        try:
+            return r.json()
+        except ValueError:
+            raise PerfectGymUnavailable("PerfectGym returned unreadable data instead of JSON.") from None
 
     # ---- public read endpoints ----------------------------------------
 
     def get_club_occupancy(self) -> list[ClubOccupancy]:
         """Return live occupancy for every club (one backend call)."""
-        return parse_members_in_clubs(self._get_json(OCCUPANCY_PATH))
+        body = self._get_json(OCCUPANCY_PATH)
+        entries = body.get("UsersInClubList") if isinstance(body, dict) else body
+        if not isinstance(entries, list):
+            raise PerfectGymUnavailable("PerfectGym occupancy response had no club list.")
+        clubs = parse_members_in_clubs(body)
+        if len(clubs) != len(entries):
+            raise PerfectGymUnavailable("PerfectGym occupancy response contained unreadable counts.")
+        return clubs
 
     def get_club_list(self) -> list[ClubDirEntry]:
         """Return the public club directory (ids + geo + opening dates), no PII.
@@ -897,8 +929,15 @@ class PerfectGymClient:
         (``CLUB_DIR_TTL_SECONDS``), kept separate from the 60s occupancy cache
         because the directory barely changes.
         """
-        return parse_club_list(self._get_json(GEO_CLUBLIST_PATH))
+        body = self._get_json(GEO_CLUBLIST_PATH)
+        if not isinstance(body, list):
+            raise PerfectGymUnavailable("PerfectGym directory response had no club list.")
+        clubs = parse_club_list(body)
+        if len(clubs) != len(body):
+            raise PerfectGymUnavailable("PerfectGym directory contained unreadable clubs.")
+        return clubs
 
+    @revo_http.serialized
     def get_membership_status(self) -> MembershipStatus:
         """Return the non-sensitive membership summary (contract/payment/card).
 
@@ -909,6 +948,7 @@ class PerfectGymClient:
             self.login()
         return self._membership or MembershipStatus(None, None, None)
 
+    @revo_http.serialized
     def get_card_number(self) -> Optional[str]:
         """Return the member's entry BARCODE (``UserNumber``) — SENSITIVE.
 
@@ -923,6 +963,7 @@ class PerfectGymClient:
             self.login()
         return self._user_number
 
+    @revo_http.serialized
     def get_first_name(self) -> Optional[str]:
         """Return the member's non-secret first name from the login profile.
 
@@ -934,6 +975,7 @@ class PerfectGymClient:
             self.login()
         return self._first_name
 
+    @revo_http.serialized
     def get_photo_url(self, refresh: bool = False) -> Optional[str]:
         """Return the member's SIGNED profile-photo URL — a capability URL.
 

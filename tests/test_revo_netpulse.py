@@ -8,7 +8,10 @@ carries.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
+
+import pytest
 
 from app import revo_netpulse as np
 
@@ -278,3 +281,361 @@ def test_postcode_is_normalised_from_a_dirty_field():
     assert pc("SA ") is None
     assert pc("WA 615") is None   # malformed, not a real postcode
     assert pc(None) is None
+
+
+class _Response:
+    def __init__(self, status=200, body=None, text="", headers=None):
+        self.status_code = status
+        self._body = body
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _Cookies:
+    def __init__(self):
+        self.clear_calls = 0
+
+    def clear(self):
+        self.clear_calls += 1
+
+
+class _Session:
+    def __init__(self, posts, gets):
+        self.posts = list(posts)
+        self.gets = list(gets)
+        self.post_calls = []
+        self.get_calls = []
+        self.headers = {}
+        self.cookies = _Cookies()
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        item = self.posts.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        item = self.gets.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _client(monkeypatch, session):
+    class Requests:
+        Session = staticmethod(lambda: session)
+
+    monkeypatch.setattr(np, "requests", Requests)
+    return np.NetpulseClient("private@example.test", "private-password")
+
+
+_TOKEN_A = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0.signature_a"
+_TOKEN_B = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJiIn0.signature_b"
+
+
+def _token_body(token=_TOKEN_A, *, expiry="2099-09-07T11:42:45", partner="BMA"):
+    return {
+        "provider": "revo-rewards",
+        "partner": partner,
+        "accessToken": token,
+        "accessTokenExpiresAt": expiry,
+    }
+
+
+def test_concurrent_initial_requests_share_one_login(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member-a"})],
+        [_Response(body=_FAKE_MEMBERSHIP), _Response(body=_FAKE_MEMBERSHIP)],
+    )
+    client = _client(monkeypatch, session)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _n: client.get_membership(), range(2)))
+    assert [r.membership_type for r in results] == ["Basic", "Basic"]
+    assert len(session.post_calls) == 1
+
+
+def test_authenticated_club_directory_success_path_is_preserved(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member-a"})],
+        [_Response(body=_FAKE_CLUBS)],
+    )
+    client = _client(monkeypatch, session)
+    clubs = client.get_clubs()
+    assert [club.name for club in clubs] == ["Angle Vale", "Modbury"]
+    assert len(session.post_calls) == 1
+
+
+def test_expired_session_reauthenticates_once_and_rebuilds_uuid_url(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "old-uuid"}), _Response(body={"uuid": "new-uuid"})],
+        [_Response(status=401), _Response(body=_FAKE_MEMBERSHIP)],
+    )
+    client = _client(monkeypatch, session)
+    assert client.get_membership().membership_subtype == "Level 2"
+    assert "old-uuid" in session.get_calls[0][0]
+    assert "new-uuid" in session.get_calls[1][0]
+    assert len(session.post_calls) == 2
+
+
+def test_concurrent_expired_requests_share_one_reauthentication(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "old"}), _Response(body={"uuid": "fresh"})],
+        [
+            _Response(status=401),
+            _Response(body=_FAKE_MEMBERSHIP),
+            _Response(body=_FAKE_MEMBERSHIP),
+        ],
+    )
+    client = _client(monkeypatch, session)
+    client.login()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _n: client.get_membership(), range(2)))
+    assert [r.membership_type for r in results] == ["Basic", "Basic"]
+    assert len(session.post_calls) == 2
+    assert all("fresh" in call[0] for call in session.get_calls[1:])
+
+
+def test_login_html_200_is_expiry_and_second_expiry_stops(monkeypatch):
+    password_form = '<html><input name="password" type="password"></html>'
+    session = _Session(
+        [_Response(body={"uuid": "first"}), _Response(body={"uuid": "second"})],
+        [
+            _Response(text=password_form),
+            _Response(status=302, headers={"Location": "/np/exerciser/login"}),
+        ],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseAuthError, match="expired again"):
+        client.get_membership()
+    assert len(session.post_calls) == 2
+    assert client._uuid is None
+    assert client._logged_in is False
+
+
+def test_429_does_not_trigger_login_retry(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(status=429)],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable, match="rate limit"):
+        client.get_membership()
+    assert len(session.post_calls) == 1
+
+
+def test_unrelated_redirect_does_not_trigger_login_retry(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(status=302, headers={"Location": "/maintenance"})],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable, match="unexpected redirect"):
+        client.get_membership()
+    assert len(session.post_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [[], {}, {"membershipType": []}, None, ValueError("bad json")],
+)
+def test_membership_rejects_malformed_json_shapes(monkeypatch, body):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(body=body)],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable):
+        client.get_membership()
+
+
+@pytest.mark.parametrize("body", [{}, [{"uuid": "club-without-name"}], ["bad"]])
+def test_clubs_reject_malformed_json_shapes(monkeypatch, body):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(body=body)],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable, match="unexpected response"):
+        client.get_clubs()
+
+
+def test_failed_login_clears_identity_and_keeps_secrets_out_of_error(monkeypatch):
+    leaked = (
+        "https://private@example.test:private-password@host/"
+        "?uuid=secret-uuid&token=secret-token"
+    )
+    session = _Session([RuntimeError(leaked)], [])
+    client = _client(monkeypatch, session)
+    client._uuid = "prior-uuid"
+    client._logged_in = True
+    with pytest.raises(np.NetpulseUnavailable) as raised:
+        client.login()
+    message = str(raised.value)
+    for secret in (
+        "private@example.test", "private-password", "prior-uuid",
+        "secret-uuid", "secret-token", leaked,
+    ):
+        assert secret not in message
+    assert client._uuid is None
+    assert client._logged_in is False
+    assert session.cookies.clear_calls == 1
+
+
+def test_login_requires_nonempty_uuid(monkeypatch):
+    session = _Session([_Response(body={"uuid": "  "})], [])
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseAuthError, match="invalid account response"):
+        client.login()
+
+
+def test_login_transport_and_upstream_failures_are_not_auth_errors(monkeypatch):
+    for result in (RuntimeError("network failed"), _Response(status=429), _Response(status=503)):
+        session = _Session([result], [])
+        client = _client(monkeypatch, session)
+        with pytest.raises(np.NetpulseUnavailable):
+            client.login()
+
+
+def test_login_401_is_an_auth_error(monkeypatch):
+    client = _client(monkeypatch, _Session([_Response(status=401)], []))
+    with pytest.raises(np.NetpulseAuthError, match="rejected"):
+        client.login()
+
+
+def test_requests_disable_automatic_redirects(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(body=_FAKE_MEMBERSHIP)],
+    )
+    client = _client(monkeypatch, session)
+    client.get_membership()
+    assert session.post_calls[0][1]["allow_redirects"] is False
+    assert session.get_calls[0][1]["allow_redirects"] is False
+
+
+def test_rewards_token_is_cached_and_force_refreshes(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member/a"})],
+        [_Response(body=_token_body()), _Response(body=_token_body(_TOKEN_B))],
+    )
+    client = _client(monkeypatch, session)
+    assert client.get_rewards_token() == _TOKEN_A
+    assert client.get_rewards_token() == _TOKEN_A
+    assert client.get_rewards_token(force_refresh=True) == _TOKEN_B
+    assert len(session.get_calls) == 2
+    assert "member%2Fa/tokens/BMA" in session.get_calls[0][0]
+
+
+def test_rewards_token_refreshes_inside_margin(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [
+            _Response(body=_token_body(expiry="2000-01-01T00:00:00")),
+        ],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable, match="invalid expiry"):
+        client.get_rewards_token()
+    assert client._rewards_token is None
+
+
+def test_concurrent_rewards_token_reads_share_one_fetch(monkeypatch):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(body=_token_body())],
+    )
+    client = _client(monkeypatch, session)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        values = list(pool.map(lambda _n: client.get_rewards_token(), range(4)))
+    assert values == [_TOKEN_A] * 4
+    assert len(session.get_calls) == 1
+
+
+def test_rewards_tokens_are_isolated_per_client(monkeypatch):
+    first = _client(
+        monkeypatch,
+        _Session([_Response(body={"uuid": "one"})], [_Response(body=_token_body())]),
+    )
+    second = _client(
+        monkeypatch,
+        _Session(
+            [_Response(body={"uuid": "two"})],
+            [_Response(body=_token_body(_TOKEN_B))],
+        ),
+    )
+    assert first.get_rewards_token() == _TOKEN_A
+    assert second.get_rewards_token() == _TOKEN_B
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {},
+        _token_body(token="not-a-jwt"),
+        _token_body(partner="OTHER"),
+        _token_body(expiry="not-a-date"),
+        {**_token_body(), "provider": ""},
+    ],
+)
+def test_rewards_token_rejects_bad_schema_without_caching_or_leaking(monkeypatch, body):
+    session = _Session(
+        [_Response(body={"uuid": "member"})],
+        [_Response(body=body)],
+    )
+    client = _client(monkeypatch, session)
+    with pytest.raises(np.NetpulseUnavailable) as raised:
+        client.get_rewards_token()
+    assert client._rewards_token is None
+    assert _TOKEN_A not in str(raised.value)
+    assert _TOKEN_B not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "failed_refresh",
+    [RuntimeError("transport contained token=old-secret"), _Response(body={})],
+)
+def test_failed_force_refresh_discards_old_token(monkeypatch, failed_refresh):
+    session = _Session(
+        [],
+        [failed_refresh, _Response(body=_token_body(_TOKEN_B))],
+    )
+    client = _client(monkeypatch, session)
+    client._logged_in = True
+    client._uuid = "member"
+    client._rewards_token = _TOKEN_A
+    client._rewards_token_expires_at = np._parse_utc_expiry("2099-01-01T00:00:00")
+
+    with pytest.raises(np.NetpulseUnavailable) as raised:
+        client.get_rewards_token(force_refresh=True)
+    assert _TOKEN_A not in str(raised.value)
+    assert client._rewards_token is None
+    assert client._rewards_token_expires_at is None
+
+    # A normal follow-up must fetch rather than reuse the rejected old cache.
+    assert client.get_rewards_token() == _TOKEN_B
+    assert len(session.get_calls) == 2
+
+
+def test_login_and_failed_session_refresh_clear_rewards_token(monkeypatch):
+    session = _Session(
+        [
+            _Response(body={"uuid": "first"}),
+            _Response(body={"uuid": "second"}),
+        ],
+        [_Response(body=_token_body()), _Response(status=401), _Response(status=401)],
+    )
+    client = _client(monkeypatch, session)
+    assert client.get_rewards_token() == _TOKEN_A
+    client._rewards_token_expires_at = None
+    with pytest.raises(np.NetpulseAuthError, match="expired again"):
+        client.get_rewards_token()
+    assert client._rewards_token is None
+    assert client._rewards_token_expires_at is None

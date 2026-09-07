@@ -168,6 +168,7 @@ def test_find_club_case_insensitive_over_name_and_suburb():
 class _FakeResp:
     def __init__(self, status, json_body=None):
         self.status_code = status
+        self.headers = {"Location": "/ClientPortal2/Auth/Login"} if status == 302 else {}
         self._json = json_body
 
     def json(self):
@@ -194,7 +195,7 @@ class _FakeSession:
         self.login_count = 0
         self.get_calls = []
 
-    def post(self, url, data=None, timeout=None):
+    def post(self, url, data=None, timeout=None, **kwargs):
         self.login_count += 1
         self.cookies = [SimpleNamespace(name="CpAuthToken")]  # synthetic cookie
         # Fake profile: only HomeClubId is read; no real PII.
@@ -254,7 +255,7 @@ def test_no_relogin_when_first_get_succeeds():
 
 def test_login_failure_raises_auth_error():
     class _FailSession(_FakeSession):
-        def post(self, url, data=None, timeout=None):
+        def post(self, url, data=None, timeout=None, **kwargs):
             self.login_count += 1
             return _FakeResp(401)  # no cookie, no profile
 
@@ -660,7 +661,7 @@ class _ProfileSession(_FakeSession):
         super().__init__(get_responses)
         self._profile = profile
 
-    def post(self, url, data=None, timeout=None):
+    def post(self, url, data=None, timeout=None, **kwargs):
         self.login_count += 1
         self.cookies = [SimpleNamespace(name="CpAuthToken")]
         return _FakeResp(200, json_body=self._profile)
@@ -793,7 +794,7 @@ class _RotatingPhotoSession(_FakeSession):
     Lets a test prove ``get_photo_url(refresh=True)`` actually re-logs in (and so
     returns a currently-valid signature) rather than serving the stale stash.
     """
-    def post(self, url, data=None, timeout=None):
+    def post(self, url, data=None, timeout=None, **kwargs):
         self.login_count += 1
         self.cookies = [SimpleNamespace(name="CpAuthToken")]
         return _FakeResp(200, json_body={"User": {"Member": {
@@ -839,8 +840,10 @@ def test_photo_url_is_never_logged(caplog):
     assert "FAKE-SIGNATURE-NEVER-LOG-THIS" not in caplog.text
     assert "pgaustoragev2" not in caplog.text
     assert "sig=" not in caplog.text
-    # The login line that IS emitted stays email + home_club_id only.
-    assert "home_club_id=7" in caplog.text
+    # Diagnostics indicate success without private account context.
+    assert "PerfectGym login succeeded" in caplog.text
+    assert client.email not in caplog.text
+    assert "home_club_id" not in caplog.text
 
     # The signed URL is not exposed as a public attribute (it lives on a private
     # field), so a repr of the client's public surface can't leak it.
