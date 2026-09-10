@@ -13,6 +13,12 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token-not-used")
 import asyncio  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
+import io  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from dataclasses import replace  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import pytest  # noqa: E402
 
 import app.bot as bot_mod  # noqa: E402
 from app import strava_client  # noqa: E402
@@ -219,6 +225,224 @@ def test_webhook_and_backfill_share_durable_dedupe(monkeypatch):
         assert imported["channel_id"] == 333
     finally:
         db.unlink_strava_account(user_id)
+
+
+@pytest.mark.parametrize("url_length", [2048, 2049, 7000])
+def test_strava_map_obeys_discord_image_limit(monkeypatch, url_length):
+    monkeypatch.setattr(bot_mod, "STRAVA_MAPBOX_TOKEN", "pk.test")
+    prefix = "https://api.mapbox.com/"
+    url = prefix + "x" * (url_length - len(prefix))
+    assert len(url) == url_length
+    monkeypatch.setattr(strava_client, "mapbox_route_url", lambda *a, **k: url)
+    downloads = []
+
+    def download(value):
+        downloads.append(value)
+        return b"map-image"
+
+    monkeypatch.setattr(strava_client, "download_mapbox_route_png", download)
+    activity = _act(sport_type="Walk", map={"polyline": "route"})
+    embed, file = bot_mod._strava_embed_and_file(activity, "Walker")
+    assert len(embed.image.url) <= 2048
+    if url_length == 2048:
+        assert embed.image.url == url
+        assert file is None
+        assert downloads == []
+    else:
+        assert embed.image.url == "attachment://route.png"
+        assert file.fp.read() == b"map-image"
+        assert downloads == [url]
+        file.close()
+        # A rename keeps the attachment and does no blocking network/render work.
+        embed, file = bot_mod._strava_embed_and_file(activity, "Walker", render_route=False)
+        assert embed.image.url == "attachment://route.png"
+        assert file is None
+        assert downloads == [url]
+
+
+def test_strava_long_map_download_failure_uses_local_route(monkeypatch):
+    monkeypatch.setattr(bot_mod, "STRAVA_MAPBOX_TOKEN", "pk.test")
+    # A dense route fits Mapbox's request limit but not Discord's embed limit.
+    activity = _act(sport_type="Walk", distance=10160, map={"polyline": "??" * 800})
+    url = strava_client.mapbox_route_url(activity.map_polyline, "pk.test")
+    assert 2048 < len(url) < 8000
+    monkeypatch.setattr(strava_client, "download_mapbox_route_png", lambda url: None)
+    monkeypatch.setattr(bot_mod, "_render_strava_route_png", lambda route: io.BytesIO(b"local-map"))
+    embed, file = bot_mod._strava_embed_and_file(activity, "Walker")
+    assert embed.image.url == "attachment://route.png"
+    assert file.fp.read() == b"local-map"
+    file.close()
+    monkeypatch.setattr(bot_mod, "_render_strava_route_png", lambda route: None)
+    embed, file = bot_mod._strava_embed_and_file(activity, "Walker")
+    assert not embed.image.url
+    assert file is None
+
+
+def test_strava_oversized_photo_cannot_block_post(monkeypatch):
+    activity = _act(photos={"primary": {"urls": {"600": "https://example.com/" + "x" * 2048}}})
+    assert len(activity.photo_url) > 2048
+    embed, file = bot_mod._strava_embed_and_file(activity, "Walker")
+    assert not embed.image.url
+    assert file is None
+
+
+@pytest.fixture
+def recovery_env(monkeypatch, tmp_path):
+    from app.db import Database
+
+    database = Database(tmp_path / "recovery.sqlite3")
+    monkeypatch.setattr(bot_mod, "db", database)
+    database.link_strava_account(7, 42, "a", "r", 1, None, None)
+    monkeypatch.setattr(bot_mod, "_strava_enabled", lambda: True)
+    monkeypatch.setattr(bot_mod, "STRAVA_FEED_CHANNEL_ID", 333)
+    monkeypatch.setattr(bot_mod, "STRAVA_SPORT_ALLOW", set())
+    monkeypatch.setattr(bot_mod, "STRAVA_MIN_DISTANCE_M", 0)
+    monkeypatch.setattr(bot_mod, "STRAVA_MIN_DURATION_S", 0)
+    sent = []
+
+    async def send(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(id=444 + len(sent))
+
+    async def channel():
+        return SimpleNamespace(id=333, send=send)
+
+    monkeypatch.setattr(bot_mod, "_strava_feed_channel", channel)
+    monkeypatch.setattr(bot_mod, "_strava_embed_and_file", lambda *a: (object(), None))
+    now = datetime.now(timezone.utc)
+    activities = [
+        _act(id=activity_id, sport_type="Walk", start_date=(now - timedelta(hours=106 - activity_id)).isoformat())
+        for activity_id in range(101, 106)
+    ]
+    fetched = []
+    afters = []
+
+    async def summaries(row, after):
+        afters.append(after)
+        return [act for act in reversed(activities) if strava_client.start_unix(act) > after]
+
+    async def fetch(row, activity_id):
+        fetched.append(activity_id)
+        return next(act for act in activities if act.id == activity_id)
+
+    monkeypatch.setattr(bot_mod, "_strava_fetch_backfill_summaries", summaries)
+    monkeypatch.setattr(bot_mod, "_strava_fetch_activity", fetch)
+    yield SimpleNamespace(db=database, sent=sent, fetched=fetched, activities=activities, afters=afters)
+    database.close()
+
+
+def test_startup_recovery_posts_missed_walks_once_including_gap_behind_cursor(recovery_env):
+    env = recovery_env
+    for activity_id in (101, 103, 105):
+        assert env.db.claim_strava_activity(7, activity_id, "webhook")
+        env.db.finish_strava_activity(7, activity_id, message_id=99, channel_id=333)
+    env.db.update_strava_last_activity(7, 105, 99, 333)
+    # Each invocation models the immediate startup pass or a later scheduled pass.
+    asyncio.run(bot_mod.strava_recovery_poll())
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert env.fetched == [102, 104]
+    assert len(env.sent) == 2
+    assert env.db.get_strava_account(7)["last_activity_id"] == 105
+    assert env.db.get_strava_activity_import(7, 102)["status"] == "complete"
+
+
+def test_recovery_failed_send_retries_on_next_pass(recovery_env, monkeypatch):
+    env = recovery_env
+    env.db.update_strava_last_activity(7, 104)
+
+    async def fail(**kwargs):
+        raise bot_mod.discord.HTTPException(SimpleNamespace(status=400, reason="Bad Request"), "Invalid Form Body")
+
+    async def channel():
+        return SimpleNamespace(id=333, send=fail)
+
+    with monkeypatch.context() as m:
+        m.setattr(bot_mod, "_strava_feed_channel", channel)
+        asyncio.run(bot_mod.strava_recovery_poll())
+    assert env.db.get_strava_activity_import(7, 105) is None
+    assert env.db.get_strava_account(7)["last_activity_id"] == 104
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert env.fetched == [105, 105]
+    assert len(env.sent) == 1
+    assert env.db.get_strava_activity_import(7, 105)["status"] == "complete"
+
+
+def test_recovery_preserves_legacy_cursor_and_limits_each_pass(recovery_env):
+    env = recovery_env
+    env.db.update_strava_last_activity(7, 102)
+    row = env.db.get_strava_account(7)
+    assert asyncio.run(bot_mod._strava_recover_account(row, limit=1)) == 1
+    assert env.fetched == [103]
+    assert asyncio.run(bot_mod._strava_recover_account(env.db.get_strava_account(7))) == 2
+    assert env.fetched == [103, 104, 105]
+
+
+def test_recovery_without_cursor_only_considers_activity_since_link(recovery_env):
+    env = recovery_env
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert env.fetched == []  # All fixture workouts predate this new account link.
+    assert abs(env.afters[0] - datetime.now(timezone.utc).timestamp()) < 10
+
+
+def test_recovery_retries_stale_claim_and_skips_private_activity(recovery_env):
+    env = recovery_env
+    env.db.update_strava_last_activity(7, 103)
+    env.activities[-1] = replace(env.activities[-1], private=True)
+    assert env.db.claim_strava_activity(7, 104, "webhook")
+    with env.db._conn() as c:
+        c.execute("UPDATE strava_activity_import SET processed_at = '2000-01-01T00:00:00+00:00'")
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert env.fetched == [104, 105]
+    assert len(env.sent) == 1
+    assert env.db.get_strava_activity_import(7, 105)["message_id"] is None
+
+
+def test_recovery_failure_does_not_stop_other_accounts(recovery_env, monkeypatch):
+    env = recovery_env
+    env.db.link_strava_account(8, 43, "a", "r", 1, None, None)
+    calls = []
+
+    async def recover(row):
+        calls.append(row["user_id"])
+        if len(calls) == 1:
+            raise RuntimeError("temporary failure")
+        return 0
+
+    monkeypatch.setattr(bot_mod, "_strava_recover_account", recover)
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert set(calls) == {7, 8}
+    monkeypatch.setattr(bot_mod, "_strava_enabled", lambda: False)
+    asyncio.run(bot_mod.strava_recovery_poll())
+    assert len(calls) == 2
+
+
+def test_recovery_and_webhook_overlap_posts_only_once(recovery_env, monkeypatch):
+    env = recovery_env
+    env.db.update_strava_last_activity(7, 104)
+    row = env.db.get_strava_account(7)
+
+    async def overlap():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def send(**kwargs):
+            entered.set()
+            await release.wait()
+            env.sent.append(kwargs)
+            return SimpleNamespace(id=444)
+
+        async def channel():
+            return SimpleNamespace(id=333, send=send)
+
+        monkeypatch.setattr(bot_mod, "_strava_feed_channel", channel)
+        webhook = asyncio.create_task(bot_mod._strava_announce_activity(row, env.activities[-1], source="webhook"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await bot_mod.strava_recovery_poll()
+        release.set()
+        assert await webhook == "posted"
+
+    asyncio.run(overlap())
+    assert len(env.sent) == 1
 
 
 # ---------------------------------------------------------------------------

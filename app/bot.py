@@ -3272,6 +3272,10 @@ async def on_ready() -> None:
             REVO_POLL_MINUTES,
         )
 
+    if _strava_enabled() and not strava_recovery_poll.is_running():
+        strava_recovery_poll.start()
+        LOG.info("Strava recovery scheduled at startup and every 15 minutes")
+
     if _hevy_enabled() and not hevy_poll.is_running():
         hevy_poll.start()
         LOG.info(
@@ -14533,6 +14537,9 @@ def _render_strava_route_png(polyline: str) -> "io.BytesIO | None":
         return None
 
 
+_DISCORD_EMBED_IMAGE_URL_LIMIT = 2048
+
+
 def _strava_embed_and_file(
     activity: "strava_client.StravaActivity", who: str,
     *,
@@ -14544,20 +14551,25 @@ def _strava_embed_and_file(
     the GPS route. Strength/indoor activities with neither just get the embed.
     """
     embed = _build_strava_embed(activity, who)
-    if activity.photo_url:
+    if activity.photo_url and len(activity.photo_url) <= _DISCORD_EMBED_IMAGE_URL_LIMIT:
         embed.set_image(url=activity.photo_url)
         return embed, None
     if activity.map_polyline:
-        # Prefer a real basemap via Mapbox (Discord fetches the URL directly);
-        # otherwise render the bare-line silhouette locally.
+        # Discord's image URL limit is much smaller than Mapbox's request
+        # limit. Attach long maps instead of embedding the full route URL.
         if STRAVA_MAPBOX_TOKEN:
             map_url = strava_client.mapbox_route_url(
                 activity.map_polyline, STRAVA_MAPBOX_TOKEN,
                 style=STRAVA_MAP_STYLE,
             )
-            if map_url:
+            if map_url and len(map_url) <= _DISCORD_EMBED_IMAGE_URL_LIMIT:
                 embed.set_image(url=map_url)
                 return embed, None
+            if map_url and render_route:
+                image = strava_client.download_mapbox_route_png(map_url)
+                if image is not None:
+                    embed.set_image(url="attachment://route.png")
+                    return embed, discord.File(io.BytesIO(image), filename="route.png")
         if not render_route:
             # Rename updates preserve the original ``route.png`` attachment;
             # point the replacement embed at it without rendering a throwaway
@@ -15064,7 +15076,7 @@ async def _strava_announce_activity(
         LOG.exception("Strava: failed to render activity %s", activity_id)
         return "error"
 
-    verb = "backfilled" if source == "backfill" else "just logged"
+    verb = {"backfill": "backfilled", "recovery": "recovered"}.get(source, "just logged")
     kwargs: dict[str, object] = {
         "content": f"{strava_client.sport_emoji(activity.sport_type)} "
         f"{who} {verb} a workout on Strava!",
@@ -15080,6 +15092,9 @@ async def _strava_announce_activity(
         db.release_strava_activity(user_id, activity_id)
         LOG.exception("Strava: failed to post activity %s", activity_id)
         return "error"
+    finally:
+        if file is not None:
+            file.close()
     db.finish_strava_activity(
         user_id,
         activity_id,
@@ -15166,6 +15181,75 @@ async def _strava_fetch_backfill_summaries(
             return f"error: {exc}"
 
     return await bot.loop.run_in_executor(None, _fetch)
+
+
+async def _strava_recover_account(row, *, limit: int = 25) -> int:
+    """Recover recent gaps, including failed sends behind a newer cursor.
+
+    The first ledger entry marks the start of individually tracked history.
+    With only a legacy cursor, recover after that cursor. With neither, only
+    consider workouts since the account was linked, never its older history.
+    """
+    user_id = int(row["user_id"])
+    imports = db.list_strava_activity_imports(user_id)
+    last_id = row["last_activity_id"]
+    anchors = [int(item["activity_id"]) for item in imports]
+    handled = {
+        int(item["activity_id"]) for item in imports
+        if item["status"] == "complete"
+    }
+    if last_id is not None:
+        anchors.append(int(last_id))
+        handled.add(int(last_id))  # Preserve legacy de-duplication.
+    floor = min(anchors) if anchors else None
+    after = datetime.now(timezone.utc) - timedelta(days=30)
+    if floor is None:
+        linked_at = _parse_iso(row["linked_at"])
+        if linked_at is None:
+            return 0
+        after = max(after, linked_at)
+    summaries = await _strava_fetch_backfill_summaries(row, int(after.timestamp()))
+    if isinstance(summaries, str):
+        LOG.warning("Strava recovery listing unavailable; will retry next check")
+        return 0
+    candidates = sorted(
+        {activity.id: activity for activity in summaries}.values(),
+        key=lambda activity: (strava_client.start_unix(activity) or 0, activity.id),
+    )
+    posted = attempted = 0
+    for summary in candidates:
+        if summary.id in handled or (floor is not None and summary.id < floor):
+            continue
+        if attempted >= limit:
+            break
+        current = db.get_strava_account(user_id)
+        if current is None or current["athlete_id"] != row["athlete_id"]:
+            break
+        attempted += 1
+        activity = await _strava_fetch_activity(current, summary.id)
+        if isinstance(activity, str):
+            LOG.warning("Strava recovery fetch unavailable; will retry next check")
+            break
+        status = await _strava_announce_activity(current, activity, source="recovery")
+        if status == "posted":
+            posted += 1
+            LOG.info("Strava recovery posted activity %s", activity.id)
+        elif status in {"error", "no_channel"}:
+            break
+    return posted
+
+
+@tasks.loop(minutes=15)
+async def strava_recovery_poll() -> None:
+    """Run immediately after login and retry recent missed workouts periodically."""
+    if not _strava_enabled() or STRAVA_FEED_CHANNEL_ID is None:
+        return
+    for row in db.list_strava_accounts():
+        try:
+            await _strava_recover_account(row)
+        except Exception:
+            # One account or temporary service error must not stop the loop.
+            LOG.warning("Strava recovery check failed; will retry next check")
 
 
 async def _strava_posted_message(row, activity_id: int):
@@ -15753,6 +15837,7 @@ _BACKGROUND_LOOP_NAMES = (
     "daily_update",
     "weekly_report",
     "revo_attendance_poll",
+    "strava_recovery_poll",
     "hevy_poll",
     "ha_poll",
 )

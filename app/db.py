@@ -3960,6 +3960,15 @@ class Database:
                 (user_id, activity_id),
             ).fetchone()
 
+    def list_strava_activity_imports(self, user_id: int) -> list[sqlite3.Row]:
+        """Read the ledger for recovery, including gaps behind the latest id."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM strava_activity_import WHERE user_id = ? "
+                "ORDER BY activity_id",
+                (user_id,),
+            ).fetchall()
+
     def unlink_strava_account(self, user_id: int) -> bool:
         """Remove a user's Strava link. Returns True if a row existed."""
         with self._conn() as c:

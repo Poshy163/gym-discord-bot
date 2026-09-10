@@ -2,7 +2,8 @@
 
 The bot can post a Discord embed to a shared feed channel the moment any linked
 member finishes a Strava activity. It uses Strava's OAuth2 + **webhook push**, so
-new workouts arrive in real time — no polling.
+new workouts arrive in real time. A recovery check also runs at startup and
+every 15 minutes to retry recent activities missed by webhooks or failed sends.
 
 ```
 member finishes a run  ──▶  Strava  ──POST──▶  bot /strava/webhook
@@ -16,8 +17,8 @@ member finishes a run  ──▶  Strava  ──POST──▶  bot /strava/webho
 
 Because webhooks are a *push*, the bot runs a small `aiohttp` web server
 (`app/strava_web.py`) that **must be reachable from the public internet over
-HTTPS**. If you can't expose a public URL, this integration won't work as-is
-(you'd need to switch to a polling design instead).
+HTTPS**. The recovery check complements webhook delivery; keep the public URL
+configured for OAuth and real-time activity updates.
 
 ---
 
@@ -137,6 +138,17 @@ history; use `/cardio strava_unlink` to detach a stored activity snapshot.
 
 ### Recovering after the Strava API app was inactive
 
+After an update/restart, the bot automatically checks the last 30 days for
+missed activities and repeats the check every 15 minutes. It processes at most
+25 missing activities per linked member per check, oldest first, and respects
+the same privacy and sport/distance/duration filters as live webhooks.
+
+Completed ledger entries prevent duplicate posts. Recovery also checks gaps
+behind the latest activity cursor, back to the first individually tracked
+activity. Accounts with only a legacy cursor resume after it; accounts with no
+tracked history only recover workouts since they linked. Older history remains
+available through the manual backfill command.
+
 Once API access is active again, make sure the webhook exists with
 `/strava_subscription` (run `/strava_subscribe` if it does not), then run:
 
@@ -166,9 +178,14 @@ STRAVA_MAPBOX_TOKEN=pk.xxxx…
 ```
 
 Get a free token at <https://account.mapbox.com/access-tokens/>. With it set,
-maps are rendered via Mapbox's Static Images API (Discord fetches the URL
-directly) with a green start pin, red finish pin, and retina (`@2x`) output.
-Without it, the local silhouette is used.
+maps are rendered via Mapbox's Static Images API with a green start pin, red
+finish pin, and retina (`@2x`) output. Discord fetches short map URLs directly.
+When a map URL exceeds Discord's 2,048-character image limit, the bot downloads
+the PNG and attaches it to the post instead. If the download fails or the route
+exceeds Mapbox's request limit, it uses the local silhouette. If neither image
+can be rendered, the workout stats still post. Oversized photo URLs likewise
+fall back to a route image or stats only. Without a token, the local silhouette
+is used.
 
 Pick the basemap style with `STRAVA_MAP_STYLE` (default `outdoors-v12`):
 
@@ -204,7 +221,8 @@ STRAVA_MAP_STYLE=satellite-streets-v12   # or streets-v12, outdoors-v12
   deletes the stored tokens.
 - **De-dupe/recovery:** the continuation cursor and a durable per-activity
   ledger stop webhook retries or overlapping backfills from double-posting.
-  Failed feed sends release their claim, so the next backfill can retry them.
+  Failed feed sends release their claim, so the next automatic recovery check
+  (or manual backfill) can retry recent activities.
 - **Token refresh:** access tokens (~6h) are refreshed on demand via the stored
   refresh token (serialised per user); Strava rotates refresh tokens, and the
   new pair is persisted.

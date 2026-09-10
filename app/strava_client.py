@@ -787,6 +787,7 @@ MAPBOX_STATIC_BASE = "https://api.mapbox.com/styles/v1/mapbox"
 # Mapbox caps static-image request URLs; long routes can blow past it, in which
 # case we signal the caller to fall back to the local silhouette.
 _MAPBOX_URL_LIMIT = 8000
+_MAPBOX_IMAGE_LIMIT = 5 * 1024 * 1024
 
 
 # Marker colours (start = green, finish = red), matching the local renderer.
@@ -800,7 +801,7 @@ def _mapbox_url(
     overlay_str = ",".join(overlays)
     return (
         f"{MAPBOX_STATIC_BASE}/{style}/static/{overlay_str}/auto/"
-        f"{width}x{height}@2x?padding=40&access_token={token}"
+        f"{width}x{height}@2x.png?padding=40&access_token={token}"
     )
 
 
@@ -848,3 +849,34 @@ def mapbox_route_url(
     if len(url) > _MAPBOX_URL_LIMIT:
         return None
     return url
+
+
+def download_mapbox_route_png(url: str) -> bytes | None:
+    """Fetch a generated map for attachment when its URL cannot fit an embed.
+
+    Only our Mapbox endpoint is accepted. Never follow redirects or log the
+    URL/exception text: both can contain the token and the athlete's route.
+    A failed or oversized response lets the caller use the local renderer.
+    """
+    if requests is None or not url.startswith(MAPBOX_STATIC_BASE + "/"):
+        return None
+    try:
+        with requests.get(
+            url, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                LOG.warning("Mapbox attachment unavailable (HTTP %s)", response.status_code)
+                return None
+            data = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                data.extend(chunk)
+                if len(data) > _MAPBOX_IMAGE_LIMIT:
+                    LOG.warning("Mapbox attachment exceeds size limit")
+                    return None
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                LOG.warning("Mapbox attachment was not a PNG image")
+                return None
+            return bytes(data)
+    except Exception:  # Optional image must never prevent the workout posting.
+        LOG.warning("Mapbox attachment download failed; using local route")
+        return None

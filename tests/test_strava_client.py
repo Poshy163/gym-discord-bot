@@ -181,6 +181,58 @@ def test_mapbox_route_url_none_cases():
     assert strava_client.mapbox_route_url("x" * 9000, "pk.test") is None
 
 
+@pytest.mark.parametrize("status,data,expected", [
+    (200, b"\x89PNG\r\n\x1a\nfake-image", b"\x89PNG\r\n\x1a\nfake-image"),
+    (200, b"<html>error</html>", None),
+    (302, b"\x89PNG\r\n\x1a\n", None),
+    (429, b"rate limited", None),
+])
+def test_download_mapbox_route_png(monkeypatch, status, data, expected):
+    from types import SimpleNamespace
+
+    class Response:
+        status_code = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield data
+
+    def get(url, **kwargs):
+        assert url.startswith(strava_client.MAPBOX_STATIC_BASE)
+        assert kwargs == {
+            "timeout": strava_client.REQUEST_TIMEOUT,
+            "stream": True,
+            "allow_redirects": False,
+        }
+        return Response()
+
+    monkeypatch.setattr(strava_client, "requests", SimpleNamespace(get=get))
+    url = strava_client.mapbox_route_url("abc", "pk.test")
+    assert "@2x.png?" in url
+    assert strava_client.download_mapbox_route_png(url) == expected
+    monkeypatch.setattr(strava_client, "_MAPBOX_IMAGE_LIMIT", 4)
+    assert strava_client.download_mapbox_route_png(url) is None
+
+
+def test_download_mapbox_route_png_does_not_log_secrets(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    def fail(url, **kwargs):
+        raise RuntimeError(url)
+
+    monkeypatch.setattr(strava_client, "requests", SimpleNamespace(get=fail))
+    url = strava_client.mapbox_route_url("private-route", "pk.private-token")
+    assert strava_client.download_mapbox_route_png(url) is None
+    assert "private-route" not in caplog.text
+    assert "pk.private-token" not in caplog.text
+    assert strava_client.download_mapbox_route_png("https://example.com/map") is None
+
+
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
