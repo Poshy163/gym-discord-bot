@@ -13946,8 +13946,8 @@ async def _poll_one_account(row) -> None:
     if prev_checkin == today_iso:
         return
 
-    def _fetch() -> "tuple[str | None, int | None, str | None, bool, bool] | str":
-        """Return attendance/streak fields plus a degraded flag, or an error.
+    def _fetch() -> "tuple[str | None, int | None, str | None, bool, str | None] | str":
+        """Return attendance/streak fields plus an error class, or an error.
 
         ``source`` is ``"calendar"`` (the per-day streaks calendar — a real visit
         day) or ``"tickets"`` (the ticket-tally ``Attendance`` grant, used only
@@ -13987,11 +13987,17 @@ async def _poll_one_account(row) -> None:
                     revo_client.RevoPageUnreadable,
                 ):  # pragma: no cover
                     pass
-            return latest_iso, streak, source, streak_readable, False
+            return latest_iso, streak, source, streak_readable, None
         except revo_client.RevoAuthError as exc:
             _drop_cached_client(user_id)
             return f"auth-failed: {exc}"
         except Exception as exc:  # pragma: no cover - network
+            # A working landing-page streak does not prove the attendance/app
+            # session is healthy. Recreate it on the next scheduled check, just
+            # as a process restart would, while preserving the visit cursor.
+            # Keep the independent occupancy/profile clients intact.
+            with _revo_clients_lock:
+                _revo_user_clients.pop(user_id, None)
             # Attendance sources can fail together while the rewards landing
             # still carries a verified weekly streak. Preserve that independent
             # signal without inventing or advancing an attendance cursor.
@@ -14002,17 +14008,18 @@ async def _poll_one_account(row) -> None:
                 return f"auth-failed: {auth_exc}"
             except Exception:
                 return f"error: {exc}"
-            return None, streak, None, streak is not None, True
+            return None, streak, None, streak is not None, type(exc).__name__
 
     result = await bot.loop.run_in_executor(None, _fetch)
     if isinstance(result, str):
         LOG.warning("Revo poll skipped user %s: %s", user_id, result)
         return
-    latest_iso, streak, source, streak_readable, attendance_unavailable = result
-    if attendance_unavailable:
+    latest_iso, streak, source, streak_readable, attendance_error = result
+    if attendance_error:
         LOG.warning(
-            "Revo attendance unavailable for user %s; refreshed weekly streak only",
-            user_id,
+            "Revo attendance unavailable for user %s (%s); refreshed weekly streak "
+            "only; next poll will use a fresh attendance session",
+            user_id, attendance_error,
         )
     else:
         _log_feed_source_change(source)

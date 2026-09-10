@@ -334,8 +334,19 @@ byte-identical body** (same sha256, same 387 bytes). The cell universe is strict
 So the best the current integration can support is **"trained today"**, never
 "checked in at 6:42am". The announcement wording reflects that deliberately.
 
-**2. Revo batches attendance in, roughly twice a day.** Observed behaviour is
-that a day flips to attended around **05:00 and 17:00 UTC** (≈2:30pm / 2:30am
+**Check session failures before attributing a delay to Revo's batch timing.**
+The `last_polled_at` field also advances when attendance fails but an independent
+weekly streak refresh succeeds; it is not a last-successful-attendance timestamp.
+An update/restart creates fresh account sessions and runs the attendance loop
+immediately, so notifications arriving after an update can indicate recovered
+access. The bot now refreshes the app token once for Revo's HTTP-200
+`Invalid Access! B` response, as it already did for login/close-page responses.
+If attendance still fails, the next scheduled check creates a fresh attendance
+session. The warning records the exception class without response bodies or
+credentials. Existing visit cursors and other account sessions are retained.
+
+**2. Delayed source updates are another possible cause.** Historical observations
+suggested that a day flips to attended around **05:00 and 17:00 UTC** (≈2:30pm / 2:30am
 Adelaide — the clean UTC alignment is what gives the two-batch reading away).
 A morning session therefore surfaces hours later, at the next batch.
 

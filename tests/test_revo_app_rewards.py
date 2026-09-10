@@ -67,7 +67,7 @@ def test_calendar_preserves_month_and_decodes_gym_and_les_mills(monkeypatch):
     assert calls[0][1]["params"] == {"m": 2, "y": 2026, "token": client._mobile.value}
 
 
-@pytest.mark.parametrize("rejected", [Reply(302, location="/?closePage"), Reply(401), Reply(text='<input type="password">')])
+@pytest.mark.parametrize("rejected", [Reply(302, location="/?closePage"), Reply(401), Reply(text='<input type="password">'), Reply(text=revo.GUARD_BODY)])
 def test_rejected_token_refreshes_once_without_portal_relogin(monkeypatch, rejected):
     client, calls = make_client(monkeypatch, [rejected, Reply()])
     assert client._get(revo.RAFFLE_PATH) == "feature"
@@ -79,6 +79,14 @@ def test_repeated_rejection_is_unavailable_and_bounded(monkeypatch):
     client, calls = make_client(monkeypatch, [Reply(302, location="/?closePage")] * 2)
     with pytest.raises(revo.RevoFeatureUnavailable):
         client.get_tickets()
+    assert len(calls) == 2
+    assert client._mobile.calls == [False, True]
+
+
+def test_persistent_http_200_guard_keeps_its_classification_after_refresh(monkeypatch):
+    client, calls = make_client(monkeypatch, [Reply(text=revo.GUARD_BODY)] * 2)
+    with pytest.raises(revo.RevoAccessGuarded):
+        client.get_streak_calendar(9, 2026)
     assert len(calls) == 2
     assert client._mobile.calls == [False, True]
 

@@ -934,12 +934,18 @@ class RevoClient:
             )
             target = urllib.parse.urlsplit(response.headers.get("Location", ""))
             redirect = 300 <= response.status_code < 400
-            rejected = (response.status_code == 401 or revo_http.is_login_html(response)
+            guarded = response.status_code == 200 and is_access_guarded(response.text)
+            rejected = (guarded or response.status_code == 401 or revo_http.is_login_html(response)
                         or (redirect and (target.path == LOGIN_PATH or
                             "closePage" in urllib.parse.parse_qs(target.query, keep_blank_values=True))))
             if rejected:
                 if not attempt:
+                    LOG.info("Revo rewards access rejected; refreshing app session once")
                     continue
+                if guarded:
+                    raise RevoAccessGuarded(
+                        "Revo rewards remained access-guarded after refreshing the app session."
+                    )
                 raise RevoFeatureUnavailable(
                     "Revo rejected this feature after refreshing the app session. Try the Revo app."
                 )

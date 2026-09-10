@@ -3860,6 +3860,35 @@ def test_poll_refreshes_streak_without_inventing_cursor_when_attendance_is_down(
     assert saved == [(42, "2026-07-28", 7)]
 
 
+def test_poll_discards_failed_attendance_session_for_next_scheduled_check(monkeypatch, caplog):
+    import app.bot as bot
+
+    cached = object()
+    monkeypatch.setattr(bot, "_revo_user_clients", {42: cached, 43: object()})
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=3)
+    sent, _fetches, saved = _run_poll(
+        monkeypatch, row, latest_iso=None, streak=7,
+        attendance_error=bot.revo_client.RevoPageUnreadable("private response detail"),
+    )
+    assert sent == []
+    assert saved == [(42, "2026-07-28", 7)]
+    assert 42 not in bot._revo_user_clients
+    assert 43 in bot._revo_user_clients
+    assert "RevoPageUnreadable" in caplog.text
+    assert "private response detail" not in caplog.text
+
+
+def test_poll_keeps_healthy_session_when_no_new_visit_appears(monkeypatch):
+    import app.bot as bot
+
+    cached = object()
+    monkeypatch.setattr(bot, "_revo_user_clients", {42: cached})
+    row = _revo_row(last_checkin_date="2026-07-28", last_streak_weeks=3)
+    sent, _fetches, _saved = _run_poll(monkeypatch, row, latest_iso="2026-07-28")
+    assert sent == []
+    assert bot._revo_user_clients[42] is cached
+
+
 def test_poll_ticket_fallback_preserves_last_streak_if_landing_is_unreadable(monkeypatch):
     """A failed landing streak read must preserve the previously cached value."""
     import app.bot as bot
