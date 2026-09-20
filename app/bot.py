@@ -95,6 +95,7 @@ from . import scaling
 from . import secretbox
 from . import targets as targets_mod
 from . import strava_client
+from . import strava_maps
 from . import strava_web
 from . import tdee as tdee_lib
 from . import ui
@@ -15338,6 +15339,30 @@ async def _strava_posted_message(row, activity_id: int):
         return None
 
 
+_strava_map_refresh_lock = asyncio.Lock()
+
+
+async def _strava_refresh_maps(
+    limit: int = 25, scan_limit: int = 500, before: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Owner command and private worker RPC share the same bounded operation."""
+    if _strava_map_refresh_lock.locked():
+        raise ValueError("A map refresh is already running. Try again after it finishes.")
+    async with _strava_map_refresh_lock:
+        if not _strava_enabled() or bot.user is None:
+            raise ValueError("Strava is not available right now.")
+        channel = await _strava_feed_channel()
+        if channel is None:
+            raise ValueError("The configured Strava feed channel is unavailable.")
+        return await strava_maps.refresh_maps(
+            channel=channel, bot_id=bot.user.id, db=db,
+            fetch_activity=_strava_fetch_activity, token=STRAVA_MAPBOX_TOKEN,
+            style=STRAVA_MAP_STYLE, limit=limit, scan_limit=scan_limit,
+            before=before, dry_run=dry_run,
+        )
+
+
 async def _strava_handle_update(row, activity_id: int) -> None:
     """Edit the posted embed when an activity is renamed (or remove it if it
     was flipped to private)."""
@@ -15811,6 +15836,7 @@ RPC_METHODS: dict[str, object] = {}
 def _register_rpc_methods() -> None:
     """Populate RPC_METHODS once every handler above has been defined."""
     RPC_METHODS.update({
+        "strava_refresh_maps": _strava_refresh_maps,
         "resync": _webui_resync_guild,
         "list_channels": _webui_list_channels,
         "invite_user": _webui_invite_user,
@@ -21446,6 +21472,52 @@ async def strava_latest_cmd(
     if file is not None:
         kwargs["file"] = file
     await interaction.followup.send(**kwargs)
+
+
+@bot.tree.command(
+    name="strava_refresh_maps",
+    description="Owner: refresh existing Strava feed maps using the configured map style.",
+)
+@app_commands.describe(
+    limit="Maximum maps to process (1–25).",
+    scan_limit="Maximum feed messages to scan (1–2000).",
+    before="Resume using next_before from the previous run.",
+    dry_run="Preview candidates without fetching activities or editing posts.",
+)
+async def strava_refresh_maps_cmd(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 25] = 25,
+    scan_limit: app_commands.Range[int, 1, 2000] = 500,
+    before: str | None = None,
+    dry_run: bool = False,
+) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        result = await _strava_refresh_maps(limit, scan_limit, before, dry_run)
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    except Exception:
+        await interaction.followup.send(
+            "Could not read the feed. Check the bot's channel/history permissions and retry.",
+            ephemeral=True,
+        )
+        return
+    text = (f"Scanned {result['scanned']}; candidates {result['candidates']}; "
+            f"updated {result['updated']}; already current {result['already_current']}; "
+            f"skipped {result['skipped']}; failed {result['failed']}.")
+    if dry_run:
+        text += " Preview only; run with dry_run:false to apply."
+    if result["done"]:
+        text += " Reached the end of the feed."
+    elif result["next_before"]:
+        text += f" Resume with before:{result['next_before']}."
+    else:
+        text += " Retry the same command later."
+    await interaction.followup.send(text, ephemeral=True)
 
 
 @bot.tree.command(

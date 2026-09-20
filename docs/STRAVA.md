@@ -232,6 +232,28 @@ STRAVA_MAP_STYLE=satellite-streets-v12   # or streets-v12, outdoors-v12
   it includes a per-athlete 7-day Strava summary (activities, distance, time,
   elevation).
 
+## Refreshing existing maps
+
+Set `STRAVA_MAP_STYLE` to `satellite-streets-v12` for satellite imagery with
+street labels, then apply the settings. New route maps use that style.
+
+The owner-only `/strava_refresh_maps` command updates old maps in the configured
+feed channel without reposting messages. It also finds posts from before the
+activity ledger existed. Linked accounts and Read Message History permission
+are required. Photos, private activities, and activities without routes are
+left alone; unrelated attachments and message content are preserved.
+
+- Preview: `/strava_refresh_maps dry_run:true` inventories up to 25 candidates.
+- Apply: `/strava_refresh_maps` downloads and validates maps before editing.
+- Continue with the returned `before` value until it reports the end of the feed.
+  Omit the preview cursor when applying to include those previewed messages.
+- Each run scans up to 500 messages (`scan_limit` allows up to 2000) and processes
+  up to 25 candidates. Successful updates are remembered for the selected style.
+- On a fetch, image, or edit failure, the operation stops and its resume cursor
+  includes the failed item for retry. Wait for API availability before retrying.
+
+This command does not change activity-import cursors or create new posts.
+
 ## 7. Troubleshooting
 
 - **`/strava_subscribe` fails with a callback error** — your public URL isn't

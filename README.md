@@ -491,6 +491,10 @@ missed feed posts), and owner-only `/strava_subscribe`,
 linked member after an API subscription outage with
 `/strava_backfill all_linked:true`.
 
+After changing `STRAVA_MAP_STYLE`, the owner can run `/strava_refresh_maps`
+to update existing feed maps in place, including older posts without ledger
+entries. See the [map refresh instructions](docs/STRAVA.md#refreshing-existing-maps).
+
 Every new or backfilled feed post also has a **Link to cardio** button. It opens
 a private saved-program and difficulty picker, then records one native cardio
 session with Strava's measured stats. The equivalent slash command is

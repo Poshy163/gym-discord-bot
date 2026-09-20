@@ -41,6 +41,7 @@ SOCKET_ENV = "GYMBOT_CTL_SOCK"
 #: fixed timeout there produces spurious 503s that read as "the bot is down"
 #: when it is merely busy.
 TIMEOUTS: dict[str, float] = {
+    "strava_refresh_maps": 600.0,
     "resync": 120.0,
     "list_channels": 30.0,
     "invite_user": 30.0,

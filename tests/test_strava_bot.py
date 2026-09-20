@@ -45,6 +45,20 @@ def _act(**kw):
     return strava_client.parse_activity(base)
 
 
+def test_refresh_maps_command_is_owner_only(monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.features import INTEGRATION_COMMANDS
+    assert "strava_refresh_maps" in INTEGRATION_COMMANDS
+    refresh = AsyncMock()
+    monkeypatch.setattr(bot_mod, "_strava_refresh_maps", refresh)
+    monkeypatch.setattr(bot_mod, "_is_owner", lambda _: False)
+    interaction = SimpleNamespace(user=SimpleNamespace(id=7), response=SimpleNamespace(
+        send_message=AsyncMock(), defer=AsyncMock()))
+    asyncio.run(bot_mod.strava_refresh_maps_cmd.callback(interaction))
+    refresh.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once_with("Owner only.", ephemeral=True)
+
+
 def _link(user_id: int, athlete_id: int) -> None:
     db.link_strava_account(
         user_id=user_id, athlete_id=athlete_id,

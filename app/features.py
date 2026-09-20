@@ -3,7 +3,7 @@
 INTEGRATION_COMMANDS = frozenset({
     "help", "server", "sync", "hevy", "strava_link", "strava_unlink",
     "strava_status", "strava_latest", "strava_backfill", "strava_subscribe",
-    "strava_subscription", "strava_unsubscribe",
+    "strava_subscription", "strava_unsubscribe", "strava_refresh_maps",
 })
 
 # Operational controls remain available; disabled features retain their data
