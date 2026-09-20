@@ -59,6 +59,24 @@ Environment is also the escape hatch of last resort. If a stored value somehow
 breaks a boot, `docker compose run -e SETTING=value ...` overrides it without
 touching the database.
 
+## Hevy and Strava only
+
+Enable **Settings → Core parsing → Hevy and Strava only**, then apply and
+restart the bot. Alternatively set `INTEGRATIONS_ONLY=true` in the stack's
+environment. The default is off so existing installations retain their behavior.
+
+This mode keeps Hevy and Strava linking, workout import/feed posting, and
+operational settings and backups. It removes other slash commands and dashboard
+sections, rejects their dashboard APIs, ignores chat logging and reaction undo,
+and stops nutrition reminders, scheduled recaps, Revo, Apple Health, Home
+Assistant, presence/sleep, voice and message tracking. Strava posts no longer
+offer the separate cardio-program button. Hevy and Strava's own disable switches
+still apply. Global command-list updates may take time to appear in Discord.
+
+Historical data, credentials, and the stored configuration of disabled features
+are retained. Turning the mode off and restarting restores the full command and
+dashboard surface, with each feature's previously saved settings still in effect.
+
 ## Upgrading an existing deployment
 
 Pull the new image and `docker compose up -d`. Nothing else.

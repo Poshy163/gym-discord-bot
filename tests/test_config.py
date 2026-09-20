@@ -162,6 +162,7 @@ PRE_REFACTOR_DEFAULTS = {
     "DB_PATH": "/data/gym.sqlite3",
     "LOG_LEVEL": "INFO",
     "LOG_FORMAT": "text",
+    "INTEGRATIONS_ONLY": False,
 }
 
 

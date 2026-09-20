@@ -488,6 +488,9 @@ async def game_icon_loop(settings: SettingsService) -> None:
     """Refresh the game-icon map daily. Belongs with the dashboard that reads it."""
     while True:
         cfg = settings.current()
+        if cfg["INTEGRATIONS_ONLY"]:
+            await asyncio.sleep(60)
+            continue
         try:
             await game_icons.refresh(
                 cfg["GAME_ICONS_CACHE"],

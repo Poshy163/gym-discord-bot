@@ -57,7 +57,7 @@ from urllib.parse import quote
 from aiohttp import web
 from yarl import URL  # already a hard dependency of aiohttp
 
-from . import game_icons, ha_client, presence, targets
+from . import features, game_icons, ha_client, presence, targets
 from .voicetime import summarize_voice
 
 LOG = logging.getLogger("gymbot.webui")
@@ -544,7 +544,11 @@ def build_app(
                 "/login" if target == "/"
                 else f"/login?next={quote(target, safe='')}"
             )
-        return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+        body = DASHBOARD_HTML
+        if _integrations_only():
+            body = body.replace("const INTEGRATIONS_ONLY=false;",
+                                "const INTEGRATIONS_ONLY=true;")
+        return web.Response(text=body, content_type="text/html")
 
     # ---- settings ---------------------------------------------------------
 
@@ -554,10 +558,20 @@ def build_app(
                 text="Settings are not available in this deployment.",
             )
 
+    def _integrations_only() -> bool:
+        return bool(settings is not None and settings.current()["INTEGRATIONS_ONLY"])
+
     async def api_settings(request: web.Request) -> web.Response:
         _require(request)
         _need_settings()
         payload = settings.describe()
+        if _integrations_only():
+            payload["groups"] = [
+                {**group, "items": [item for item in group["items"]
+                                    if item["key"] not in features.HIDDEN_SETTINGS]}
+                for group in payload["groups"]
+                if group["key"] in features.INTEGRATION_SETTINGS_GROUPS
+            ]
         payload["worker"] = (
             supervisor.status() if supervisor is not None
             else {"state": "unknown", "headline": "", "log": [],
@@ -735,6 +749,8 @@ def build_app(
 
     async def api_overview(request: web.Request) -> web.Response:
         _require(request)
+        if _integrations_only():
+            return await api_integrations(request)
         gid = _guild_id(request)
         totals = db.server_totals(gid) or {}
         members = db.list_members(gid)
@@ -747,6 +763,24 @@ def build_app(
             "role_count": len(roles),
             "recent_audit": recent,
             "live": _overview_live(gid),
+        })
+
+    async def api_integrations(request: web.Request) -> web.Response:
+        _require(request)
+        gid = _guild_id(request)
+        members = {int(r["user_id"]): r for r in db.list_members(gid)
+                   if r["present"]}
+        # Project safe fields explicitly: these account rows contain tokens.
+        def accounts(rows):
+            return [{"name": members[int(r["user_id"])]["display_name"],
+                     "linked_at": r["linked_at"]}
+                    for r in rows if int(r["user_id"]) in members]
+        cfg = settings.current() if settings is not None else None
+        return web.json_response({
+            "hevy": accounts(db.list_hevy_accounts()),
+            "strava": accounts(db.list_strava_accounts()),
+            "hevy_enabled": cfg is not None and not cfg["HEVY_DISABLED"],
+            "strava_enabled": cfg is not None and not cfg["STRAVA_DISABLED"],
         })
 
     async def api_members(request: web.Request) -> web.Response:
@@ -1983,7 +2017,14 @@ def build_app(
                 status=503,
             )
 
-    app = web.Application(middlewares=[_security_headers, _worker_guard])
+    @web.middleware
+    async def _feature_guard(request: web.Request, handler):
+        if _integrations_only() and not features.path_enabled(request.path):
+            _require(request)
+            raise web.HTTPNotFound(text="Disabled in Hevy and Strava-only mode.")
+        return await handler(request)
+
+    app = web.Application(middlewares=[_security_headers, _worker_guard, _feature_guard])
     app.add_routes([
         web.get("/login", login_get),
         web.post("/login", login_post),
@@ -2011,6 +2052,8 @@ def build_app(
         web.get("/members/{user_id}", index),
         web.get("/api/guilds", api_guilds),
         web.get("/api/overview", api_overview),
+        web.get("/strava", index),
+        web.get("/api/integrations", api_integrations),
         web.get("/api/members", api_members),
         web.get("/api/member", api_member),
         web.get("/api/roles", api_roles),
@@ -2905,7 +2948,11 @@ background:var(--panel);border-radius:9px;font-size:.86rem}
 // Injected from DASHBOARD_TABS in app/webui.py so the nav and the server-side
 // routes cannot drift apart — every slug here must have a matching GET route
 // or a hard refresh on that URL would 404.
-const TABS=/*TABS*/;
+const INTEGRATIONS_ONLY=false;
+const ALL_TABS=/*TABS*/;
+const TABS=INTEGRATIONS_ONLY
+  ? [["overview","📊"],["hevy","🔗"],["strava","🚴"],["settings","⚙️"]]
+  : ALL_TABS;
 const PALETTE=["#6366f1","#22d3ee","#f59e0b","#ef4444","#10b981","#ec4899","#8b5cf6","#14b8a6"];
 const ACTION_LABEL={
   role_add:"➕ role added",role_remove:"➖ role removed",role_create:"🆕 role created",
@@ -3333,10 +3380,11 @@ async function onGuild(){guild=document.getElementById("guild").value;
 
 async function loadAvatars(){AV={};try{const d=await api(`/api/members?guild=${guild}`);
   if(d)for(const m of d.members)AV[m.user_id]={avatar:m.avatar,name:m.display_name};}catch(e){}}
-async function loadRoles(){try{const d=await api(`/api/roles?guild=${guild}`);
+async function loadRoles(){if(INTEGRATIONS_ONLY){ALL_ROLES=[];return;}try{const d=await api(`/api/roles?guild=${guild}`);
   ALL_ROLES=(d&&d.roles)||[];}catch(e){ALL_ROLES=[];}}
 
 async function boot(){
+  if(INTEGRATIONS_ONLY)document.getElementById("syncBtn").remove();
   const route=parsePath();
   const g=await api("/api/guilds");if(!g)return;
   const sel=document.getElementById("guild");
@@ -3413,6 +3461,7 @@ async function render(){
     else if(tab==="leaderboard")await renderLeaderboard(v);
     else if(tab==="audit")await renderAudit(v);
     else if(tab==="hevy")await renderHevy(v);
+    else if(tab==="strava")await renderIntegrations(v,"strava");
     else if(["lifts","calories","protein"].includes(tab))await renderData(v,tab);
   }catch(e){v.innerHTML=errorState(e);}
   finally{v.removeAttribute("aria-busy");}
@@ -3651,7 +3700,7 @@ function findSetting(key){
 async function applySettings(){
   toast("Restarting the bot…");
   await post("/api/settings/apply",{});
-  setTimeout(render,1500);
+  setTimeout(()=>location.reload(),1500);
 }
 async function revertSettings(){
   if(!confirm("Revert to the last configuration the bot started with?\n\n"
@@ -3725,6 +3774,7 @@ function historyBox(h){
 function stat(n,l){return `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`;}
 
 async function renderOverview(v){
+  if(INTEGRATIONS_ONLY)return renderIntegrations(v);
   const d=await api(`/api/overview?guild=${guild}`);if(!d)return;const t=d.totals||{};
   const L=d.live||{};
   // Compact daily message sparkline (last 7d).
@@ -4187,6 +4237,21 @@ function daySeg(){return `<span class="dayseg">`+
 // automatic alias resolution. Only reaches imports from now on — re-filing
 // history is a migration decision, not a dashboard side effect.
 let HEVY_MAP_ROWS=[];
+async function renderIntegrations(v,only){
+  const d=await api(`/api/integrations?guild=${guild}`);if(!d)return;
+  v.innerHTML=pageHead(only==="strava"?"Strava":"Hevy and Strava",
+    "Workout integrations and linked accounts")+
+    (only?[only]:["hevy","strava"]).map(key=>{
+      const title=key==="hevy"?"Hevy":"Strava",rows=d[key]||[];
+      const command=key==="hevy"?"/hevy link":"/strava_link";
+      return `<section class="box"><h2>${title}</h2>
+        <p>${d[key+"_enabled"]?"Enabled":"Disabled"} · ${rows.length} linked account${rows.length===1?"":"s"} in this server</p>
+        ${rows.length?`<ul>${rows.map(r=>`<li>${esc(r.name)} · linked ${esc(fmtTs(r.linked_at))}</li>`).join("")}</ul>`:
+          '<p>No linked accounts in this server.</p>'}
+        <p>Link an account in Discord with <code>${command}</code>.
+        Configure the workout feed in Settings.</p></section>`;
+    }).join("");
+}
 async function renderHevy(v){
   const d=await api("/api/hevy/equipment");if(!d)return;
   HEVY_MAP_ROWS=d.rows||[];

@@ -164,6 +164,7 @@ def _bind_config(cfg: config_mod.Config) -> None:
     the function and leave ``db.audit_live`` False for the rest of the process.
     """
     g = globals()
+    g["INTEGRATIONS_ONLY"] = cfg["INTEGRATIONS_ONLY"]
 
     # -- Discord ----------------------------------------------------------
     g["GYM_CHANNEL_IDS"] = set(cfg["GYM_CHANNEL_IDS"])
@@ -1123,6 +1124,18 @@ async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
     still logged, but they can't add anything to the bot).
     """
     is_autocomplete = interaction.type is discord.InteractionType.autocomplete
+    if INTEGRATIONS_ONLY:
+        from .features import INTEGRATION_COMMANDS
+        name = (interaction.data or {}).get("name", "")
+        if name not in INTEGRATION_COMMANDS:
+            if is_autocomplete:
+                await interaction.response.autocomplete([])
+            else:
+                await interaction.response.send_message(
+                    "This bot is configured for Hevy and Strava only.",
+                    ephemeral=True,
+                )
+            return False
 
     # Resolve the effective guild (own guild, or DM-resolved default) up front so
     # the blacklist gate applies to both guild and DM interactions.
@@ -1144,6 +1157,14 @@ async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
                 ephemeral=True,
             )
             return False
+
+    if INTEGRATIONS_ONLY and interaction.guild is not None:
+        # Keep the integration account directory usable without enabling
+        # general member, role, audit, presence or message mirroring.
+        db.upsert_member(
+            interaction.guild.id, interaction.user.id,
+            interaction.user.name, interaction.user.display_name,
+        )
 
     if interaction.guild_id is not None:
         return True
@@ -3113,6 +3134,14 @@ async def _sync_commands(*, force: bool = False) -> dict:
     stored on a successful sync, so a failed sync is retried on the next
     ``on_ready``/reconnect rather than being silently marked done.
     """
+    if INTEGRATIONS_ONLY:
+        from .features import INTEGRATION_COMMANDS
+        for command in list(bot.tree.get_commands()):
+            if command.name not in INTEGRATION_COMMANDS:
+                bot.tree.remove_command(
+                    command.name,
+                    type=getattr(command, "type", discord.AppCommandType.chat_input),
+                )
     signature = _command_tree_signature()
     if not force and db.meta_get(_CMD_SIG_KEY) == signature:
         LOG.info("Slash commands unchanged since last sync — skipping.")
@@ -3171,6 +3200,9 @@ async def on_ready() -> None:
         "Logged in as %s (id=%s) — gym-bot v%s",
         bot.user, bot.user.id if bot.user else "?", __version__,
     )
+    if INTEGRATIONS_ONLY:
+        for guild in bot.guilds:
+            db.set_guild_meta(guild.id, guild.name, guild.member_count or 0)
     if ENABLE_PRESENCE_TRACKING:
         LOG.info(
             "Presence tracking ENABLED (privileged intents in use). "
@@ -3225,7 +3257,7 @@ async def on_ready() -> None:
             DISPLAY_TZ, BODYWEIGHT_REMINDER_CHANNEL_ID,
         )
 
-    if not streak_saver_loop.is_running():
+    if not INTEGRATIONS_ONLY and not streak_saver_loop.is_running():
         streak_saver_loop.start()
         LOG.info("Streak-saver reminder loop started (15 min cadence)")
 
@@ -3290,7 +3322,8 @@ async def on_ready() -> None:
                 "workout feed."
             )
         await _hevy_announce_recanon()
-        await _announce_release_notes()
+        if not INTEGRATIONS_ONLY:
+            await _announce_release_notes()
 
     if _ha_enabled() and not ha_poll.is_running():
         ha_poll.start()
@@ -4846,6 +4879,8 @@ async def _message_media(message: discord.Message) -> str | None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    if INTEGRATIONS_ONLY:
+        return
     # Message logging for the web dashboard. Logs every author (including bots,
     # so the bot's own announcements show up, and blacklisted users — blacklist
     # only blocks adding data, not logging) in every channel. Runs before the
@@ -5673,6 +5708,8 @@ async def on_message_edit(
     before: discord.Message, after: discord.Message,
 ) -> None:
     """Re-parse edited gym posts so corrections flow into the DB."""
+    if INTEGRATIONS_ONLY:
+        return
     # Keep the message log faithful to the current message: reflect edited text
     # and any media added/swapped by the edit. Runs for every author (bots too)
     # and channel, before the gym-post gates below, mirroring on_message's logger.
@@ -6113,6 +6150,8 @@ async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
     """Logger-or-target reaction undo for a tracked bot reply."""
+    if INTEGRATIONS_ONLY:
+        return
     if payload.user_id == (bot.user.id if bot.user else 0):
         return
     if str(payload.emoji) not in ("❌", "✖️", "🚫"):
@@ -8241,6 +8280,14 @@ def _help_sections() -> dict[str, discord.Embed]:
 
 @bot.tree.command(name="help", description="Show what this bot can do.")
 async def help_cmd(interaction: discord.Interaction) -> None:
+    if INTEGRATIONS_ONLY:
+        await interaction.response.send_message(
+            "**Hevy and Strava**\n"
+            "Use `/hevy` to link and sync workouts, and `/strava_link`, "
+            "`/strava_status` or `/strava_latest` for Strava.\n"
+            "Use `/server` to select your server in DMs.", ephemeral=True,
+        )
+        return
     sections = _help_sections()
     view = ui.Sections(
         sections, owner_id=interaction.user.id, placeholder="Browse commands…",
@@ -15092,7 +15139,8 @@ async def _strava_announce_activity(
     }
     if file is not None:
         kwargs["file"] = file
-    kwargs["view"] = StravaCardioLinkView(user_id, activity_id)
+    if not INTEGRATIONS_ONLY:
+        kwargs["view"] = StravaCardioLinkView(user_id, activity_id)
     try:
         msg = await channel.send(**kwargs)
     except discord.HTTPException:
@@ -15813,7 +15861,8 @@ def _rpc_status() -> dict:
 @bot.event
 async def setup_hook() -> None:  # pragma: no cover - discord runtime
     """Start the auxiliary servers on the bot's event loop before connecting."""
-    bot.add_dynamic_items(StravaCardioLinkButton)
+    if not INTEGRATIONS_ONLY:
+        bot.add_dynamic_items(StravaCardioLinkButton)
     await _start_strava_server()
     if os.getenv(workerlink.ROLE_ENV) == "worker":
         sock = os.getenv(workerlink.SOCKET_ENV)

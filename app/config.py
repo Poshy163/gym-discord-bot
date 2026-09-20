@@ -208,6 +208,11 @@ _SETTINGS: tuple[Setting, ...] = (
             "Empty means nobody."),
 
     # ---- Core parsing ----------------------------------------------------
+    _S("INTEGRATIONS_ONLY", "bool", "false", "core", _bool,
+       apply="worker", label="Hevy and Strava only",
+       help="Disable all other tracking, commands, reminders and dashboard "
+            "sections. Existing history and linked credentials are kept. "
+            "This mode overrides other feature switches until turned off."),
     _S("MIN_LIFTS_FOR_AUTO", "int", "2", "core", _int,
        apply="hot", min=1, max=100, label="Minimum lifts to auto-store",
        help="A message must parse to at least this many lifts before it is "
@@ -819,6 +824,9 @@ def load(db: Any = None, env: Mapping[str, str] | None = None,
             except Exception as exc:  # noqa: BLE001
                 LOG.error("Could not derive %s (%s).", s.key, exc)
 
+    if values["INTEGRATIONS_ONLY"]:
+        from .features import PROFILE_OVERRIDES
+        values.update(PROFILE_OVERRIDES)
     return Config(values, raws, sources)
 
 
