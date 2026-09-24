@@ -86,6 +86,7 @@ from . import game_icons
 from . import gemini_client
 from . import ha_client
 from . import hevy_client
+from .member_names import MemberNames
 from . import nutrition
 from . import protein as protein_mod
 from . import revo_client
@@ -758,6 +759,84 @@ def _display_name(user: object) -> str:
         or getattr(user, "global_name", None)
         or getattr(user, "name", "Unknown user")
     )
+
+
+_member_names = MemberNames()
+
+
+async def _integration_display_name(guild_id: int, user_id: int) -> str:
+    return await _member_names.resolve(bot, db, guild_id, user_id)
+
+
+async def _refresh_linked_member_names() -> dict[tuple[int, int], str]:
+    pairs = {(int(r["guild_id"]), int(r["user_id"]))
+             for r in [*db.list_hevy_accounts(), *db.list_ha_accounts()]}
+    pairs.update((guild.id, int(r["user_id"])) for guild in bot.guilds
+                 for r in db.list_strava_accounts())
+    return {pair: await _integration_display_name(*pair) for pair in sorted(pairs)}
+
+
+async def _repair_integration_names(scan_limit: int = 500) -> dict:
+    """Repair recent bot integration labels and the latest stored scale chart."""
+    if not 1 <= scan_limit <= 2000:
+        raise ValueError("Scan limit must be between 1 and 2000.")
+    _member_names.cache.clear()
+    names = await _refresh_linked_member_names()
+    result = {"resolved": sum(n != "Member" for n in names.values()),
+              "scanned": 0, "updated": 0, "charts": 0, "failed": 0}
+    latest = db.ha_latest_replies()
+    charts = {int(r["chart_message_id"]): int(r["user_id"]) for r in latest
+              if r["chart_message_id"]}
+    channels = {c for c in (HEVY_FEED_CHANNEL_ID, _ha_alert_channel_id()) if c}
+    for channel_id in channels:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        local_names = {uid: name for (gid, uid), name in names.items()
+                       if gid == channel.guild.id and name != "Member"}
+        async for message in channel.history(limit=scan_limit):
+            result["scanned"] += 1
+            if not bot.user or message.author.id != bot.user.id:
+                continue
+            embeds = [e.copy() for e in message.embeds]
+            changed = False
+            for index, embed in enumerate(embeds):
+                footer = str(embed.footer.text or "").lower()
+                if "hevy" not in footer and "home assistant" not in footer:
+                    continue
+                data = embed.to_dict()
+                for part, keys in [(data, ("title", "description")),
+                                   (data.get("author", {}), ("name",)),
+                                   *[(f, ("name", "value")) for f in data.get("fields", [])]]:
+                    for key in keys:
+                        if key in part:
+                            old = part[key]
+                            for uid, name in local_names.items():
+                                part[key] = re.sub(rf"(?<![\d@!]){uid}(?!\d)",
+                                                   lambda _: _plain_label(name), part[key])
+                            changed |= old != part[key]
+                embeds[index] = discord.Embed.from_dict(data)
+            file = None
+            uid = charts.get(message.id)
+            old_chart = next((a for a in message.attachments
+                              if uid and a.filename == f"bodyweight_{uid}.png"), None)
+            if old_chart and uid in local_names:
+                chart = await _updated_bodyweight_chart(uid, local_names[uid])
+                if chart is not None:
+                    file = _bodyweight_chart_file(chart)
+            if not changed and file is None:
+                continue
+            kwargs = {"embeds": embeds, "allowed_mentions": discord.AllowedMentions.none()}
+            if file:
+                kwargs["attachments"] = [a for a in message.attachments if a != old_chart] + [file]
+            try:
+                await message.edit(**kwargs)
+                result["updated"] += 1
+                result["charts"] += int(file is not None)
+            except discord.HTTPException:
+                result["failed"] += 1
+            finally:
+                if file:
+                    file.close()
+    return result
 
 
 def _message_lift_target(message: discord.Message) -> tuple[object, str]:
@@ -3204,6 +3283,7 @@ async def on_ready() -> None:
     if INTEGRATIONS_ONLY:
         for guild in bot.guilds:
             db.set_guild_meta(guild.id, guild.name, guild.member_count or 0)
+        _start_ready_task("integration-member-names", _refresh_linked_member_names)
     if ENABLE_PRESENCE_TRACKING:
         LOG.info(
             "Presence tracking ENABLED (privileged intents in use). "
@@ -15274,6 +15354,7 @@ async def _strava_recover_account(row, *, limit: int = 25) -> int:
         {activity.id: activity for activity in summaries}.values(),
         key=lambda activity: (strava_client.start_unix(activity) or 0, activity.id),
     )
+
     posted = attempted = 0
     for summary in candidates:
         if summary.id in handled or (floor is not None and summary.id < floor):
@@ -15840,6 +15921,7 @@ def _register_rpc_methods() -> None:
     RPC_METHODS.update({
         "strava_refresh_maps": _strava_refresh_maps,
         "ha_backfill": _ha_backfill,
+        "integration_names": _repair_integration_names,
         "resync": _webui_resync_guild,
         "list_channels": _webui_list_channels,
         "invite_user": _webui_invite_user,
@@ -18878,11 +18960,7 @@ async def _hevy_sync_account(row, *, force_backfill: bool = False) -> dict:
         result["error"] = "fetch"
         return result
 
-    member = None
-    guild = bot.get_guild(guild_id)
-    if guild is not None:
-        member = guild.get_member(user_id)
-    username = _display_name(member) if member else str(user_id)
+    username = await _integration_display_name(guild_id, user_id)
     feed_channel = (
         bot.get_channel(HEVY_FEED_CHANNEL_ID) if HEVY_FEED_CHANNEL_ID else None
     )
@@ -20152,11 +20230,7 @@ async def _ha_sync_account_locked(row, states: list[dict], *, backfill_days: int
     if channel is None:
         return result
 
-    member = None
-    guild = bot.get_guild(guild_id)
-    if guild is not None:
-        member = guild.get_member(user_id)
-    username = _display_name(member) if member else str(user_id)
+    username = await _integration_display_name(guild_id, user_id)
     # The whole pending batch is committed now, so one render captures the
     # actual latest global timeline. Attach it to the summary or newest routine
     # announcement rather than posting a second standalone message.

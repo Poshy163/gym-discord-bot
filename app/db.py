@@ -5097,6 +5097,16 @@ class Database:
                  _normalize_iso(measured_at)),
             )
 
+    def ha_latest_replies(self) -> list[sqlite3.Row]:
+        """Newest tracked scale announcement per member, including its chart."""
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT r.* FROM ha_reply_tracking r WHERE r.reply_message_id = "
+                "(SELECT s.reply_message_id FROM ha_reply_tracking s "
+                "WHERE s.user_id = r.user_id ORDER BY s.created_at DESC, "
+                "s.reply_message_id DESC LIMIT 1)"
+            ))
+
     def ha_release_reading(self, user_id: int, reading_key: str) -> bool:
         """Give back a claim made by :meth:`ha_mark_reading`.
 
