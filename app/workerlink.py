@@ -42,6 +42,7 @@ SOCKET_ENV = "GYMBOT_CTL_SOCK"
 #: when it is merely busy.
 TIMEOUTS: dict[str, float] = {
     "strava_refresh_maps": 600.0,
+    "ha_backfill": 600.0,
     "resync": 120.0,
     "list_channels": 30.0,
     "invite_user": 30.0,

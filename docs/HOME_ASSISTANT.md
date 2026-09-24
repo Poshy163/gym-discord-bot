@@ -256,6 +256,16 @@ really somebody else standing on the scale, say. Deletions are audited like ever
 other dashboard edit.
 
 ## Behaviour notes
+- **Workout-only mode includes smart scales.** `INTEGRATIONS_ONLY` keeps HA
+  polling, scale commands, the configured weigh-in feed, and scale reaction undo
+  available while calorie/protein tracking and reminders remain disabled.
+  Scale imports in this mode do not recalculate protein targets.
+- **Recovery after downtime.** If polling has missed at least an hour (or three
+  polling intervals, whichever is longer), the next successful poll checks the
+  configured `HA_BACKFILL_DAYS` window again. Existing import keys prevent
+  duplicates; recorder failures remain eligible for retry. Multiple recovered
+  readings are announced as one summary. Recovery is limited to history the
+  scale or HA recorder still retains.
 - **Scale bounce is debounced.** A reading arriving within half an hour of an
   already-stored weigh-in is the same session — someone stepping back on to
   double-check — and is suppressed rather than imported (its body-composition

@@ -1,16 +1,18 @@
-"""Shared policy for the optional Hevy and Strava-only deployment."""
+"""Shared policy for workout integrations and smart-scale imports."""
 
 INTEGRATION_COMMANDS = frozenset({
     "help", "server", "sync", "hevy", "strava_link", "strava_unlink",
     "strava_status", "strava_latest", "strava_backfill", "strava_subscribe",
     "strava_subscription", "strava_unsubscribe", "strava_refresh_maps",
+    "setup_ha", "ha_link", "ha_entities", "ha_unlink", "ha_status",
+    "ha_body", "ha_graph", "ha_help", "bodyweight_history", "bodyweight_graph",
 })
 
 # Operational controls remain available; disabled features retain their data
 # and stored configuration, so switching back does not require relinking.
 INTEGRATION_SETTINGS_GROUPS = frozenset({
     "discord", "admin", "core", "strava", "hevy", "backup", "webui",
-    "storage", "logging",
+    "storage", "logging", "homeassistant",
 })
 HIDDEN_SETTINGS = frozenset({
     "GYM_CHANNEL_IDS", "MIN_LIFTS_FOR_AUTO", "PARSE_REPLY_MAX_ITEMS",
@@ -21,7 +23,6 @@ HIDDEN_SETTINGS = frozenset({
 PROFILE_OVERRIDES = {
     "APPLE_HEALTH_DISABLED": True,
     "REVO_DISABLED": True,
-    "HA_DISABLED": True,
     "BACKFILL_ON_START": False,
     "ENABLE_PRESENCE_TRACKING": False,
     "ENABLE_VOICE_TRACKING": False,
@@ -31,7 +32,6 @@ PROFILE_OVERRIDES = {
     "AUTO_UNTIMEOUT": False,
     "HEVY_PUSH_BODYWEIGHT": False,
     "REMINDER_CHANNEL_ID": None,
-    "BODYWEIGHT_REMINDER_CHANNEL_ID": None,
     "DAILY_UPDATE_CHANNEL_ID": None,
     "WEEKLY_REPORT_CHANNEL_ID": None,
 }

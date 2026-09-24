@@ -5091,8 +5091,10 @@ class Database:
         with self._conn() as c:
             c.execute(
                 "UPDATE ha_account SET last_reading_at = ?, last_weight_kg = ? "
-                "WHERE user_id = ?",
-                (_normalize_iso(measured_at), float(weight_kg), user_id),
+                "WHERE user_id = ? AND (last_reading_at IS NULL OR "
+                "julianday(last_reading_at) <= julianday(?))",
+                (_normalize_iso(measured_at), float(weight_kg), user_id,
+                 _normalize_iso(measured_at)),
             )
 
     def ha_release_reading(self, user_id: int, reading_key: str) -> bool:
@@ -5683,6 +5685,7 @@ class Database:
         recorded_at: datetime | None = None,
         actor_id: int | None = None,
         actor_name: str | None = None,
+        *, update_protein_target: bool = True,
     ) -> int | None:
         """Record a new bodyweight measurement for a user.
 
@@ -5711,6 +5714,8 @@ class Database:
                 actor_name=actor_name,
                 detail=f"bodyweight {float(weight_kg):g} kg",
             )
+            if not update_protein_target:
+                return None
             return self._apply_bodyweight_protein_link(
                 c, guild_id, user_id, float(weight_kg),
             )

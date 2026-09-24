@@ -209,8 +209,9 @@ _SETTINGS: tuple[Setting, ...] = (
 
     # ---- Core parsing ----------------------------------------------------
     _S("INTEGRATIONS_ONLY", "bool", "false", "core", _bool,
-       apply="worker", label="Hevy and Strava only",
-       help="Disable all other tracking, commands, reminders and dashboard "
+       apply="worker", label="Workouts and smart scales only",
+       help="Keep Hevy, Strava and Home Assistant smart-scale imports. "
+            "Disable other tracking, commands, reminders and dashboard "
             "sections. Existing history and linked credentials are kept. "
             "This mode overrides other feature switches until turned off."),
     _S("MIN_LIFTS_FOR_AUTO", "int", "2", "core", _int,

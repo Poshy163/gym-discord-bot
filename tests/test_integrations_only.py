@@ -16,9 +16,10 @@ def test_profile_overrides_other_switches_without_erasing_them():
     cfg = config.load(env={"INTEGRATIONS_ONLY": "true", "HA_DISABLED": "false",
                            "REMINDER_CHANNEL_ID": "123",
                            "ENABLE_MESSAGE_LOGGING": "true"})
-    assert cfg["HA_DISABLED"] is True
+    assert cfg["HA_DISABLED"] is False
     assert cfg["ENABLE_MESSAGE_LOGGING"] is False
-    assert cfg["BODYWEIGHT_REMINDER_CHANNEL_ID"] is None
+    assert cfg["BODYWEIGHT_REMINDER_CHANNEL_ID"] == 123
+    assert cfg["REMINDER_CHANNEL_ID"] is None
     assert cfg["WEEKLY_REPORT_CHANNEL_ID"] is None
     assert cfg.raw("REMINDER_CHANNEL_ID") == "123"
     assert cfg["HEVY_DISABLED"] is False
@@ -58,6 +59,7 @@ def test_restricted_routes_settings_and_history_preservation(tmp_path):
             assert {"INTEGRATIONS_ONLY", "HEVY_DISABLED", "STRAVA_DISABLED"} <= keys
             assert not keys & features.HIDDEN_SETTINGS
             assert "REVO_DISABLED" not in keys
+            assert {"HA_DISABLED", "HA_BACKFILL_DAYS", "BODYWEIGHT_REMINDER_CHANNEL_ID"} <= keys
             overview = await (await client.get("/api/overview?guild=1")).json()
             assert overview["hevy_enabled"] and overview["strava_enabled"]
             assert len(overview["hevy"]) == len(overview["strava"]) == 1
@@ -86,7 +88,6 @@ def test_chat_and_old_commands_cannot_write_in_restricted_mode(monkeypatch):
         # any message, downloading attachments, or writing tracking data.
         await bot.on_message(object())
         await bot.on_message_edit(object(), object())
-        await bot.on_raw_reaction_add(object())
         interaction = SimpleNamespace(
             type=None, data={"name": "calories"}, response=AsyncMock(),
         )
@@ -110,7 +111,7 @@ def test_command_sync_removes_disabled_commands(monkeypatch):
     async def callback(interaction):
         pass
 
-    for name in ("hevy", "strava_status", "calories", "protein", "coach"):
+    for name in ("hevy", "strava_status", "ha_status", "ha_graph", "calories", "protein", "coach"):
         tree.add_command(app_commands.Command(name=name, description=name, callback=callback))
     monkeypatch.setattr(bot, "bot", SimpleNamespace(tree=tree))
     monkeypatch.setattr(bot, "INTEGRATIONS_ONLY", True)
@@ -119,5 +120,18 @@ def test_command_sync_removes_disabled_commands(monkeypatch):
     monkeypatch.setattr(tree, "sync", AsyncMock(return_value=[]))
     monkeypatch.setattr(bot, "db", MagicMock())
     asyncio.run(bot._sync_commands(force=True))
-    assert {c.name for c in tree.get_commands()} == {"hevy", "strava_status"}
+    assert {c.name for c in tree.get_commands()} == {"hevy", "strava_status", "ha_status", "ha_graph"}
     tree.sync.assert_awaited_once()
+
+
+def test_restricted_undo_routes_only_to_scale_handler(monkeypatch):
+    from app import bot
+    monkeypatch.setattr(bot, "INTEGRATIONS_ONLY", True)
+    scale = AsyncMock(return_value=True)
+    nutrition = AsyncMock()
+    monkeypatch.setattr(bot, "_handle_ha_reaction_undo", scale)
+    monkeypatch.setattr(bot, "_handle_nutrition_reaction_undo", nutrition)
+    payload = SimpleNamespace(user_id=123, emoji="❌")
+    asyncio.run(bot.on_raw_reaction_add(payload))
+    scale.assert_awaited_once_with(payload)
+    nutrition.assert_not_awaited()

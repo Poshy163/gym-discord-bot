@@ -6151,11 +6151,12 @@ async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
     """Logger-or-target reaction undo for a tracked bot reply."""
-    if INTEGRATIONS_ONLY:
-        return
     if payload.user_id == (bot.user.id if bot.user else 0):
         return
     if str(payload.emoji) not in ("❌", "✖️", "🚫"):
+        return
+    if INTEGRATIONS_ONLY:
+        await _handle_ha_reaction_undo(payload)
         return
     rec = db.get_reply(payload.message_id)
     if rec is None:
@@ -8283,9 +8284,10 @@ def _help_sections() -> dict[str, discord.Embed]:
 async def help_cmd(interaction: discord.Interaction) -> None:
     if INTEGRATIONS_ONLY:
         await interaction.response.send_message(
-            "**Hevy and Strava**\n"
+            "**Hevy, Strava and smart scales**\n"
             "Use `/hevy` to link and sync workouts, and `/strava_link`, "
             "`/strava_status` or `/strava_latest` for Strava.\n"
+            "Use `/ha_help`, `/ha_status`, `/ha_body` and `/ha_graph` for your scale.\n"
             "Use `/server` to select your server in DMs.", ephemeral=True,
         )
         return
@@ -15837,6 +15839,7 @@ def _register_rpc_methods() -> None:
     """Populate RPC_METHODS once every handler above has been defined."""
     RPC_METHODS.update({
         "strava_refresh_maps": _strava_refresh_maps,
+        "ha_backfill": _ha_backfill,
         "resync": _webui_resync_guild,
         "list_channels": _webui_list_channels,
         "invite_user": _webui_invite_user,
@@ -19690,7 +19693,8 @@ def _ha_backfill_embed(member_name: str, stats: dict) -> discord.Embed:
     if latest is not None:
         lines.append(f"Latest: **{latest:.2f} kg**")
     embed = discord.Embed(
-        title=f"⚖️ {_plain_label(member_name)} linked their scale",
+        title=(f"⚖️ {_plain_label(member_name)} recovered scale history"
+               if stats.get("recovery") else f"⚖️ {_plain_label(member_name)} linked their scale"),
         description="\n".join(lines),
         colour=ui.HOME_ASSISTANT,
     )
@@ -19843,6 +19847,7 @@ def _ha_import_reading(
     try:
         protein_grams = db.set_bodyweight(
             guild_id, user_id, weight_kg, recorded_at=measured_at,
+            update_protein_target=not INTEGRATIONS_ONLY,
         )
     except Exception:  # pragma: no cover - defensive
         LOG.exception("Home Assistant: failed to store weigh-in for %s", user_id)
@@ -19916,7 +19921,23 @@ async def _ha_fetch_history(
         return None
 
 
-async def _ha_sync_account(row, states: list[dict]) -> dict:
+_ha_sync_locks: dict[int, asyncio.Lock] = {}
+
+
+async def _ha_sync_account(row, states: list[dict], *, backfill_days: int | None = None) -> dict:
+    user_id = int(row["user_id"])
+    async with _ha_sync_locks.setdefault(user_id, asyncio.Lock()):
+        current = db.ha_get(user_id)
+        if current is None:
+            return {"new": 0, "metrics": 0, "backfill": False, "latest_kg": None,
+                    "protein_grams": None}
+        # Refresh cursors after acquiring the lock; a poll may have just finished.
+        return await _ha_sync_account_locked(
+            {**dict(row), **dict(current)}, states, backfill_days=backfill_days,
+        )
+
+
+async def _ha_sync_account_locked(row, states: list[dict], *, backfill_days: int | None = None) -> dict:
     """Import a linked member's new weigh-ins and announce the newest one.
 
     ``states`` is the shared ``/api/states`` response, fetched once per poll.
@@ -19941,7 +19962,16 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
     never_backfilled = (
         "backfilled_at" not in row.keys() or row["backfilled_at"] is None
     )
-    backfill = (first_sync or never_backfilled) and HA_BACKFILL_DAYS > 0
+    days = min(max(HA_BACKFILL_DAYS if backfill_days is None else backfill_days, 0),
+               ha_client.MAX_BACKFILL_DAYS)
+    last_sync = ha_client.parse_ha_time(row["last_synced_at"])
+    missed_polls = last_sync is not None and (
+        datetime.now(timezone.utc) - last_sync
+        > timedelta(minutes=max(60, HA_POLL_MINUTES * 3))
+    )
+    recovering = backfill_days is not None or missed_polls
+    backfill = (first_sync or never_backfilled or recovering) and days > 0
+    history_failed = False
     result["backfill"] = backfill
     # Whether a multi-weigh-in import is announced as "linked their scale".
     # Kept separate from `backfill` so a HA_BACKFILL_DAYS=0 install still
@@ -19979,7 +20009,7 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
         # included, so HA_BACKFILL_DAYS=0 still means "from now on" rather than
         # "never".
         cutoff = datetime.now(timezone.utc) - timedelta(
-            days=min(max(HA_BACKFILL_DAYS, 0), ha_client.MAX_BACKFILL_DAYS),
+            days=days,
         )
         newest = attr_readings[-1]
         for entry in attr_readings:
@@ -20038,7 +20068,7 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
             )
             history = await _ha_fetch_history(
                 _ha_cfg_for(row), entity_id,
-                min(HA_BACKFILL_DAYS, ha_client.MAX_BACKFILL_DAYS),
+                days,
                 unit=str(
                     (weight_state.get("attributes") or {}).get(
                         "unit_of_measurement") or ""
@@ -20048,6 +20078,8 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
                 # The recorder call failed. Do NOT mark the account backfilled, or
                 # a transient error burns the one-time history import for good.
                 backfill = False
+                history_failed = True
+                result["history_failed"] = True
                 result["backfill"] = False
                 history = []
             live_key = reading["key"] if reading else ""
@@ -20090,7 +20122,8 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
             r["reading"] = entry
             imported.append(r)
 
-    db.ha_mark_synced(user_id)
+    if not history_failed:
+        db.ha_mark_synced(user_id)
     if backfill:
         db.ha_mark_backfilled(user_id)
 
@@ -20136,7 +20169,7 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
     routine_posts: list[tuple[discord.Message, datetime]] = []
     routine_chart_message_id: int | None = None
     try:
-        if is_first_import and len(imported) > 1:
+        if (is_first_import or recovering) and len(imported) > 1:
             weights = [r["weight_kg"] for r in imported]
             times = [r["measured_at"] for r in imported]
             posted = await _ha_send_announcement(
@@ -20146,6 +20179,7 @@ async def _ha_sync_account(row, states: list[dict]) -> dict:
                     "first": min(times), "last": max(times),
                     "min_kg": min(weights), "max_kg": max(weights),
                     "latest_kg": newest["weight_kg"],
+                    "recovery": recovering and not is_first_import,
                 }),
                 chart,
             )
@@ -20442,6 +20476,26 @@ async def ha_poll() -> None:
             LOG.exception(
                 "Home Assistant poll failed for user %s", row["user_id"],
             )
+
+
+async def _ha_backfill(days: int = 14) -> dict:
+    """Private worker operation to replay available history without resetting deduplication."""
+    if not _ha_enabled():
+        raise ValueError("Home Assistant imports are disabled or unavailable.")
+    if not 1 <= days <= ha_client.MAX_BACKFILL_DAYS:
+        raise ValueError("Backfill days are outside the supported range.")
+    result = {"accounts": 0, "new": 0, "metrics": 0, "failed": 0}
+    for row in db.list_ha_synced():
+        result["accounts"] += 1
+        states = await _ha_fetch_states_for(row)
+        if states is None:
+            result["failed"] += 1
+            continue
+        stats = await _ha_sync_account(row, states, backfill_days=days)
+        result["new"] += stats["new"]
+        result["metrics"] += stats["metrics"]
+        result["failed"] += int(bool(stats.get("history_failed")))
+    return result
 
 
 @ha_poll.before_loop

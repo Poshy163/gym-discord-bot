@@ -1002,6 +1002,58 @@ def test_a_successful_empty_history_does_mark_the_backfill(monkeypatch):
     assert _bot_db.ha_get(uid)["backfilled_at"] is not None
 
 
+def test_outage_recovers_recorder_history_and_retry_is_idempotent(monkeypatch):
+    uid = _user()
+    now = datetime.now(timezone.utc)
+    _bot_db.ha_link(uid, GUILD, "outage")
+    _bot_db.ha_mark_synced(uid, at=now - timedelta(days=4))
+    _bot_db.ha_mark_backfilled(uid, at=now - timedelta(days=30))
+    monkeypatch.setattr(bot_mod, "HA_BACKFILL_DAYS", 14)
+    monkeypatch.setattr(bot_mod, "_ha_fetch_history", AsyncMock(return_value=[
+        (now - timedelta(days=3), 81.0), (now - timedelta(days=1), 80.0)]))
+    states = [_state("sensor.outage_weight", "79", "kg", last_changed=now.isoformat())]
+    result, embeds = _sync(uid, states, monkeypatch)
+    assert result["new"] == 3 and result["backfill"]
+    assert len(embeds) == 1 and "recovered scale history" in embeds[0].title
+    repeat, embeds = _sync(uid, states, monkeypatch, backfill_days=14)
+    assert repeat["new"] == 0 and not embeds
+
+
+def test_outage_history_failure_keeps_retry_due_and_guard_monotonic(monkeypatch):
+    uid = _user()
+    now = datetime.now(timezone.utc)
+    old_sync = now - timedelta(days=4)
+    _bot_db.ha_link(uid, GUILD, "retry")
+    _bot_db.ha_mark_synced(uid, at=old_sync)
+    _bot_db.ha_mark_backfilled(uid, at=old_sync)
+    monkeypatch.setattr(bot_mod, "HA_BACKFILL_DAYS", 14)
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(bot_mod, "_ha_fetch_history", fetch)
+    states = [_state("sensor.retry_weight", "79", "kg", last_changed=now.isoformat())]
+    result, _ = _sync(uid, states, monkeypatch)
+    assert result["new"] == 1 and result["history_failed"]
+    assert ha_client.parse_ha_time(_bot_db.ha_get(uid)["last_synced_at"]) == old_sync
+    fetch.return_value = [(now - timedelta(days=2), 80.0)]
+    result, _ = _sync(uid, states, monkeypatch)
+    assert result["new"] == 1
+    row = _bot_db.ha_get(uid)
+    assert ha_client.parse_ha_time(row["last_reading_at"]) == now
+    assert row["last_weight_kg"] == 79
+
+
+def test_restricted_scale_import_does_not_update_protein(monkeypatch):
+    uid = _user()
+    _bot_db.ha_link(uid, GUILD, "restricted")
+    monkeypatch.setattr(bot_mod, "INTEGRATIONS_ONLY", True)
+    from unittest.mock import Mock
+    target_update = Mock(side_effect=AssertionError("Protein tracking must remain off"))
+    monkeypatch.setattr(_bot_db, "_apply_bodyweight_protein_link", target_update)
+    result = _ha_import_reading(uid, GUILD, 80.0, datetime.now(timezone.utc))
+    assert result["protein_grams"] is None
+    assert _bot_db.get_latest_bodyweight(GUILD, uid)["weight_kg"] == 80.0
+    target_update.assert_not_called()
+
+
 def test_unlink_then_relink_does_not_duplicate_weigh_ins(monkeypatch):
     """Unlink/relink is what a member tries when sync looks stuck. It must not
     re-import weigh-ins that are still inside the backfill window."""

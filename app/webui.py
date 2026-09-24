@@ -566,12 +566,21 @@ def build_app(
         _need_settings()
         payload = settings.describe()
         if _integrations_only():
+            # The scale feed shares a setting with weekly weight reminders;
+            # expose its destination without exposing or enabling reminders.
+            scale_channel = next(
+                item for group in payload["groups"] for item in group["items"]
+                if item["key"] == "BODYWEIGHT_REMINDER_CHANNEL_ID"
+            )
             payload["groups"] = [
                 {**group, "items": [item for item in group["items"]
                                     if item["key"] not in features.HIDDEN_SETTINGS]}
                 for group in payload["groups"]
                 if group["key"] in features.INTEGRATION_SETTINGS_GROUPS
             ]
+            for group in payload["groups"]:
+                if group["key"] == "homeassistant":
+                    group["items"].append({**scale_channel, "label": "Scale announcement channel"})
         payload["worker"] = (
             supervisor.status() if supervisor is not None
             else {"state": "unknown", "headline": "", "log": [],
